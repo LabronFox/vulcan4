@@ -90,6 +90,15 @@ Eventually the captain's Odin 2. Never an emulator.
 - **PAYOFF:** nothing for the user to supply but their own disc, no BIOS distribution question,
   a deterministic boot, and one less thing that can differ between machines.
 - **STATUS:** ⬜ waiting on G1.1 — a first boot with no BIOS is the *first* boot worth having.
+- **⚠️ CAPTAIN'S GUIDANCE (2026-09-29):** *"if the bios thing is an issue. i dont mind having it but
+  eventually i want to not need it."*
+  → **A BIOS-derived stopgap is permitted if it ever unblocks a boot. The goal itself does not
+  move: v1.0 must run with no BIOS.**
+  → **Mechanism, stated plainly, because "have a BIOS" is not a checkbox for us:** the PS2 BIOS is
+  itself R5900 code — it would have to be *recompiled or emulated* to be used, which is more work
+  and legal noise than implementing the handful of calls GT4 actually makes. So the natural path is
+  and stays **HLE**: implement the calls, name the ones we have not, and let the list drive.
+  → G1.1's boot report produces exactly that list. Nobody has to decide anything today.
 
 ### ⬜ G1.1 — Recompiled code executes
 - **DONE WHEN:** the runtime loads the recompiled image and executes real GT4 code, with every

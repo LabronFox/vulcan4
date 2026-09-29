@@ -77,6 +77,10 @@ namespace
     constexpr const char *kHaltReturnedToEntry = "returned_to_entry";
     constexpr const char *kHaltInSyscall = "stuck_in_syscall";
     constexpr const char *kHaltSpinningInGuest = "spinning_in_guest_code";
+    // A cycle of guest PCs that keeps repeating with no new PC ever reached. This is distinct
+    // from kHaltSpinTrap (one PC revisited) and from kHaltInSyscall (a syscall that is executing):
+    // here the guest is executing normally, over and over, and going nowhere.
+    constexpr const char *kHaltCycleNoProgress = "guest_cycle_no_progress";
 
     // ---------------------------------------------------------------- budgets
     //
@@ -88,6 +92,7 @@ namespace
     {
         uint64_t maxEntries = 2000000;   // total guest function entries
         uint32_t maxRepeatedPc = 1000000; // consecutive returns to the same PC
+        uint64_t maxCycleRepeats = 24;      // repeats of a PC-cycle before we call it no-progress
         int maxSeconds = 120;            // wall clock
     };
 
@@ -316,6 +321,22 @@ int main(int argc, char *argv[])
     ps2_stubs::resetMpegStubState();
     runtime.initializeEeKernelState(rdram);
 
+    // Initialise the EE scheduler.
+    //
+    // This is the one line PS2Runtime::run() does that a hand-rolled harness is easy to miss, and
+    // missing it is invisible until the guest loops. The recompiled code calls
+    // runtime->eeCheckpointDue() on every loop back-edge, and that reads
+    // EeScheduler::checkpointDue(), which only starts returning true once the scheduler has been
+    // reset -- it decides from a deadline cycle counter that reset() initialises. Unreset, the
+    // deadline is 0, the pending flag is false, and eeCheckpointDue() returns false forever.
+    //
+    // The consequence measured in goal G1.4: GT4's convergence loop at 0x01028740 has a
+    // conditional back-edge that is taken on every iteration, so it *would* yield to the driver
+    // every time round -- but it never did, the driver regained control only 3 times for the whole
+    // run, and no progress, cycle or no-progress detector placed in the driver could see the loop
+    // at all. Both accessors used here are public.
+    runtime.eeScheduler().reset(rdram, ctx);
+
     const uint32_t entryPoint = ctx.pc;
     const uint32_t tableBase = g_ps2RecompiledFunctionTableBase;
     const uint32_t tableEnd = g_ps2RecompiledFunctionTableEnd;
@@ -346,6 +367,19 @@ int main(int argc, char *argv[])
 
     uint32_t previousPc = 0xffffffffu;
     uint32_t repeatedPc = 0;
+
+    // ---- cycle detector
+    //
+    // The guest can be executing correctly and still be going nowhere: it cycles through the same
+    // small set of PCs forever without ever reaching a new one. The same-PC detector above cannot
+    // see that, because no single PC repeats in a row. This records the recent PC history and, if
+    // the last N entries are the same cycle over and over, stops and says so. It is general: it
+    // knows nothing about the guest, it just notices that no new address is being reached.
+    std::vector<uint32_t> pcHistory;
+    std::unordered_map<uint32_t, size_t> cycleStartIndex; // pc -> where it was last seen
+    size_t cycleLength = 0;
+    uint64_t cycleRepeats = 0;
+    uint32_t cycleFirstPc = 0;
 
     // Optional tracing, so a run that never reaches the report line can still be diagnosed
     // instead of just timing out. VULCAN4_TRACE=<n> prints the pc of the first n entries and
@@ -419,6 +453,51 @@ int main(int argc, char *argv[])
         {
             previousPc = ctx.pc;
             repeatedPc = 0;
+        }
+
+        // ---- cycle detection
+        {
+            const auto seen = cycleStartIndex.find(ctx.pc);
+            if (seen != cycleStartIndex.end() && seen->second < pcHistory.size())
+            {
+                const size_t length = pcHistory.size() - seen->second;
+                if (length > 0 && length == cycleLength)
+                {
+                    if (++cycleRepeats >= budget.maxCycleRepeats)
+                    {
+                        haltReason = kHaltCycleNoProgress;
+                        haltPc = ctx.pc;
+                        haltDetail = "guest is cycling through " + std::to_string(cycleLength)
+                            + " addresses and has reached no new one in "
+                            + std::to_string(cycleRepeats) + " repeats (first 0x"
+                            + toHex(cycleFirstPc) + ")";
+                        break;
+                    }
+                }
+                else if (length != cycleLength)
+                {
+                    cycleLength = length;
+                    cycleRepeats = 0;
+                    cycleFirstPc = pcHistory[seen->second];
+                }
+            }
+            else
+            {
+                cycleLength = 0;
+                cycleRepeats = 0;
+            }
+            cycleStartIndex[ctx.pc] = pcHistory.size();
+            pcHistory.push_back(ctx.pc);
+            if (pcHistory.size() > 4096)
+            {
+                pcHistory.erase(pcHistory.begin(), pcHistory.begin() + 2048);
+                // index bookkeeping is relative, so rebuild it after the trim
+                cycleStartIndex.clear();
+                for (size_t i = 0; i < pcHistory.size(); ++i)
+                {
+                    cycleStartIndex[pcHistory[i]] = i;
+                }
+            }
         }
 
         // ---- resolve the current PC to a generated function

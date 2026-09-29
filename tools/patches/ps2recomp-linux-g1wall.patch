@@ -149,7 +149,7 @@ index 0000000..4636c5e
 +
 +static const unsigned kSyscallNameCount = 58;
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
-index 9614016..15fed60 100644
+index 9614016..fd38670 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
 @@ -1,6 +1,10 @@
@@ -205,7 +205,7 @@ index 9614016..15fed60 100644
              uint32_t entry = 0;
              std::memcpy(&entry, entryPtr, sizeof(entry));
              ++scannedWords;
-@@ -910,7 +942,118 @@ namespace ps2_syscalls
+@@ -910,7 +942,130 @@ namespace ps2_syscalls
                                    matches,
                                    matchCount);
  
@@ -249,6 +249,11 @@ index 9614016..15fed60 100644
 +            {
 +                const uint32_t kKseg1 = 0x80000000u;
 +                const uint32_t returned = foundMatch ? (kKseg1 | (resultAddr & PS2_RAM_MASK)) : end;
++                // The guest's own loop registers, so the convergence test can be recomputed from
++                // the log instead of guessed at from disassembly. Reading intent out of
++                // instructions has been wrong repeatedly in this project; reading it out of the
++                // values the guest actually held is not.
++                auto gpr = [&ctx](unsigned n) { return getRegU32(ctx, n); };
 +                std::cerr << "[FindAddress] call=" << thisCall
 +                          << " a0=0x" << std::hex << originalStart
 +                          << " a1=0x" << originalEnd
@@ -258,6 +263,13 @@ index 9614016..15fed60 100644
 +                          << " outcome=" << (foundMatch ? "hit" : "miss")
 +                          << " caller_pc=0x" << callerPc
 +                          << " caller_ra=0x" << getRegU32(ctx, 31)
++                          << " s0=0x" << gpr(16)
++                          << " s1=0x" << gpr(17)
++                          << " s2=0x" << gpr(18)
++                          << " s3=0x" << gpr(19)
++                          << " s4=0x" << gpr(20)
++                          << " s5=0x" << gpr(21)
++                          << " v0=0x" << gpr(2)
 +                          << " scanned=" << std::dec << scannedWords
 +                          << std::endl;
 +            }

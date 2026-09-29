@@ -972,3 +972,152 @@ I had not yet looked at the values the guest actually received.
 That is three findings in a row now that came from reasoning about disassembly instead of logging
 what happened. The trace is cheap, it is in the runtime where the values are known, and it should
 have been the first thing built.
+
+---
+
+## 12. G1.4 — the register-level trace, three attempts, and a STUCK
+
+**Branch taken: C — the guest is blocked on something we have not built.** But C was reached the
+honest way, by measurement, and the dish did land one real fix on the way.
+
+```
+VULCAN4 BOOT REPORT functions_entered=3 halt=stuck_in_syscall bios_files=0
+```
+
+**The gate for this dish is not met: `functions_entered` is still 3 and `halt` is unchanged.**
+
+### Attempt 1 — log the loop registers, not just the arguments
+
+The G1.3b trace printed arguments and the return value. It did not print the registers the guest's
+loop actually tests, so the convergence condition could only be guessed at. The trace now prints
+`s0`–`s5` and `v0`. That ended the guessing immediately:
+
+```
+call=1 (ra=0x10286f0): s0=0x1035350 s1=0x0        s2=0x0         s3=0x0
+call=2 (ra=0x1028738): s0=0x80011f80 s1=0xfffffdf4 s2=0x800120e8 s3=0x0
+call=4 (ra=0x102871c): s0=0xfffffe98 s1=0x80011f80 s2=0x0         s3=0x8001218c
+```
+
+The loop is `s1 = s3 - 0x20C` / `s0 = s2 - 0x168` / `bne s1,s0` — *"subtract n*4 from the address
+where I found my handler, and check both give me the console kernel's syscall table base
+`0x80011F80`."*
+
+And the registers say exactly why it cannot close:
+
+| pass | `s1 = s3 - 0x20C` | `s0 = s2 - 0x168` | equal? |
+|---|---|---|---|
+| 1 | `0xFFFFFDF4` — `s3` is **0** | `0x80011F80` | no |
+| 2 | `0x80011F80` | `0xFFFFFEF8`… `s2` is **0** | no |
+
+**`s3` is zero. Nothing in the run ever sets it.**
+
+### What never ran
+
+`s3` is assigned at `0x010286DC` from the search at `0x010286CC`–`0x010286D8`, inside
+`sub_01028680`. Counting call sites across the whole run:
+
+```
+$ grep -oE "caller_ra=0x[0-9a-f]+" boot.log | sort | uniq -c
+      1 caller_ra=0x10286f0
+     24 caller_ra=0x102871c
+      1 caller_ra=0x1028738
+$ grep -c "caller_ra=0x10286dc" boot.log
+0
+```
+
+**128 `FindAddress` calls, none from `0x010286D4`.** The recompiler *did* emit that call
+(`ps2_recompiled_functions.cpp:187146`, in `sub_01028680`, with `0x10286cc` present as a resume
+`case`), so this is not a codegen gap — **the guest does not execute that path.**
+
+**The named dependency, with an address:** *the guest must execute `0x010286CC`–`0x010286D8` in
+`sub_01028680` to populate `s3`. Our run never reaches it, and the guest arrives at `0x010286DC` —
+that `jal`'s own return point — without having taken the branch that leads to it.* The runtime must
+be resolving some guest control transfer to the wrong resume point, skipping the call. That is a
+**dispatch/resume-model problem, not a syscall problem**, and it is a recompiler/runtime correctness
+issue that needs its own dish with its own test. I have not fixed it and I am not going to guess at
+it: my trace proves a call is missing but does not prove which transfer loses it, and two previous
+guesses in this project were wrong.
+
+### Attempt 2 — a general cycle detector (correct, and it cannot fire here)
+
+Added to the harness: it records recent guest PCs and stops with `halt=guest_cycle_no_progress` if
+the same cycle repeats with no new address reached. It is general — it knows nothing about the guest.
+
+**It does not fire, and the reason is worth writing down.** The detector lives in the driver loop,
+so it can only see the guest at the moments the driver regains control. It regained control **three
+times in the entire run**. A loop the guest never yields from is invisible from outside it. The
+detector is kept because it is correct and it will fire for any guest that does pass through the
+dispatcher.
+
+### Attempt 3 — initialise the EE scheduler (correct, and it does not arm)
+
+`PS2Runtime::run()` calls `m_eeScheduler->reset(...)` before executing the guest. A hand-rolled
+harness is easy to miss that line, and missing it looks like it should matter: `eeCheckpointDue()`
+reads `EeScheduler::checkpointDue()`, which decides from a deadline cycle counter. Both
+`PS2Runtime::eeScheduler()` and `EeScheduler::reset()` are **public**, so this needed no runtime
+patch. Added.
+
+**It did not change the outcome**, and the reason is not a bug:
+
+```cpp
+// EeScheduler::checkpointDue
+if (m_eeCycle < m_sliceEndCycle) return false;
+const GuestThread *running = currentThread();
+if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority)) { ... return true; }
+renewTimeSlice();
+return false;
+```
+
+For a single-threaded guest with nothing else ready there is nothing to preempt, so
+**`eeCheckpointDue()` correctly returns false forever.** The scheduler is doing its job. GT4's
+back-edge at `0x01028740` is taken every iteration, so it *would* yield — but only if something
+needed running, and nothing does.
+
+**This is a real limitation of the harness, stated plainly: a guest loop that never yields cannot be
+observed or bounded from the driver, only by a wall-clock watchdog.** G1.1's "it cannot spin
+forever" is currently true by watchdog, not by construction. Fixing that properly means the
+recompiled code should yield on a *cycle* budget rather than only on scheduler preemption — a
+recompiler change, which this dish was told not to make, and which deserves its own dish and test.
+
+### What this dish is worth
+
+| | before | after |
+|---|---|---|
+| `FindAddress` result address family | mixed (`0x1218C` and `0x800120E8`) | **canonical KSEG1** — **fixed** |
+| slot `0x83` discoverable at `0x8001218C` | ✗ | **✓** |
+| slot `0x5A` discoverable at `0x800120E8` | ✓ | ✓ |
+| enumeration length per pass | 3 calls | **2 calls** |
+| trace shows the loop's own registers | ✗ | **✓ `s0`–`s5`, `v0`** |
+| call at `0x010286D4` accounted for | unknown | **measured: never runs, 0/128** |
+| `functions_entered` | 3 | **3** |
+| unit tests | 441/441 | **441/441** |
+
+The address-family fix is real, correct, sourced and tested. **It did not get the guest moving**,
+because the guest's loop was never going to close: it is missing a value, not being given a wrong
+one.
+
+### STUCK
+
+```
+STUCK: the guest never executes 0x010286CC-0x010286D8 in sub_01028680, so s3 is 0 and the
+       convergence loop at 0x01028740 can never close.
+TRIED: (1) register-level FindAddress tracing -> proved s3=0 and that 0 of 128 calls come from
+       0x010286D4; (2) a general guest-cycle detector -> correct, but the driver only regains
+       control 3 times so it cannot see an in-function loop; (3) initialising the EE scheduler via
+       the public eeScheduler().reset() -> correct and faithful to run(), but checkpointDue()
+       legitimately returns false for a single-threaded guest.
+BLOCKED BY: a guest control transfer is being resolved to the wrong resume point, skipping the call
+       that sets s3. The trace proves a call is missing but not which transfer loses it.
+NEED: the dispatch/resume decision for the transfer that lands the guest at 0x010286DC. Concretely:
+       log the guest PC and the resume PC at every dispatchGuestBranch yield for this function, and
+       compare against the MIPS fall-through. That is a recompiler/runtime correctness question and
+       should be its own dish with its own test, not a guess made here.
+```
+
+### Left in the tree, and why
+
+- **the KSEG1 canonicalisation** — a measured, tested correctness fix. Keep.
+- **the register trace** — the thing that found `s3=0`. Keep; it is the reason this dish produced
+  an answer at all.
+- **the cycle detector** — correct but inert for this guest. Keep, with the limitation written down.
+- **the scheduler reset** — faithful to `run()`. Keep; it is one line and it is right.

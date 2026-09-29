@@ -196,6 +196,35 @@ Eventually the captain's Odin 2. Never an emulator.
   not, because the values the guest actually received had never been logged. Three findings in a
   row came from reasoning about disassembly instead of logging what happened.
 
+### ⬜ G1.4 — The next wall *(STUCK: gate not met, functions_entered still 3, halt unchanged)*
+- **RESULT (2026-09-29):** ❌ `functions_entered=3 halt=stuck_in_syscall bios_files=0`. Branch **C**
+  (blocked on something not built). Tests **441/441**.
+- **LANDED ANYWAY — a real, tested fix:** `FindAddress` now returns the **canonical KSEG1 address**
+  (`0x80000000 | physical`) instead of echoing whichever alias the caller happened to search
+  through. Slot `0x83` is now discoverable at `0x8001218C` (it was reported as `0x1218C`), both
+  kernel slots resolve, and the enumeration shortened from 3 calls per pass to 2.
+- **THE NAMED WALL, at an address:** the loop at `0x01028740` converges when
+  `s3 - 0x20C == s2 - 0x168`, i.e. when both handlers are found at `0x80011F80 + n*4`. **The
+  register trace shows `s3 = 0`** — nothing ever sets it. `s3` is assigned at `0x010286DC` from the
+  search at `0x010286CC`–`0x010286D8` in `sub_01028680`, and **that search never runs**: of 128
+  `FindAddress` calls, **0** come from `0x010286D4`. The recompiler emitted the call correctly, so
+  this is not a codegen gap — **a guest control transfer is being resolved to the wrong resume point
+  and skipping the call.**
+- **WHY IT IS NOT A SYSCALL PROBLEM:** the syscall completes and returns every time.
+  `stuck_in_syscall` is a slightly misleading name for it.
+- **TWO CORRECT THINGS THAT DID NOT ARM, both kept with the reason written down:** a general
+  guest-cycle detector in the driver (correct, but the driver regains control only 3 times, so an
+  in-function loop is invisible from outside), and `eeScheduler().reset()` via public API
+  (faithful to `run()`, but `checkpointDue()` correctly returns false for a single-threaded guest).
+- **CONSEQUENCE, stated plainly:** a guest loop that never yields **cannot be observed or bounded
+  from the driver**, only by the wall-clock watchdog. G1.1's "it cannot spin forever" is true by
+  watchdog, not by construction. Fixing that means recompiled code should yield on a **cycle budget**,
+  not only on scheduler preemption — a recompiler change that wants its own dish and its own test.
+- **STUCK — what the next dish needs:** log the guest PC and the resume PC at every
+  `dispatchGuestBranch` yield for `sub_01028680` and compare against the MIPS fall-through. That
+  identifies which transfer lands the guest at `0x010286DC` instead of executing the `jal`. A
+  measurement, not another guess.
+
 ### ⬜ G1.0 — **NO BIOS REQUIRED** *(the captain's bucket-list item, 2026-09-29)*
 - **Captain's words:** *"one thing to add to the bucket list. making it run without a bios."*
 - **DONE WHEN:** Vulcan 4 boots and runs with **no BIOS file anywhere on the machine** — every

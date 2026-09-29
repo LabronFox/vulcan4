@@ -52,6 +52,24 @@ Eventually the captain's Odin 2. Never an emulator.
 
 ## G1 — FIRST BOOT
 
+### ⬜ G1.0 — **NO BIOS REQUIRED** *(the captain's bucket-list item, 2026-09-29)*
+- **Captain's words:** *"one thing to add to the bucket list. making it run without a bios."*
+- **DONE WHEN:** Vulcan 4 boots and runs with **no BIOS file anywhere on the machine** — every
+  call GT4 makes into the console's own OS is served by our runtime and **named in a log**,
+  never silently stubbed. A `BIOS` path search that finds nothing is a *pass*, not an error.
+- **WHY IT'S THE NATURAL SHAPE:** an emulator has to *be* the console, so it needs the real
+  BIOS dump — the PS2's OS, legally awkward and a setup step for every user. A recomp is
+  different: the game's code is native, and the handful of things it asks of the OS are
+  **syscalls**. Our runtime answers them itself (high-level emulation). PS2Recomp's runtime is
+  already built around exactly that — a syscall dispatcher and named stubs.
+- **THE HONEST WORK:** the dispatcher existing is not the same as *covering what GT4 calls*.
+  This goal is done when GT4's own call list is satisfied by our handlers, and the ones we have
+  not implemented announce themselves. Memory card services, DVD access and the IOP modules
+  (`IRX/` on the disc) are the parts most likely to need real work.
+- **PAYOFF:** nothing for the user to supply but their own disc, no BIOS distribution question,
+  a deterministic boot, and one less thing that can differ between machines.
+- **STATUS:** ⬜ waiting on G1.1 — a first boot with no BIOS is the *first* boot worth having.
+
 ### ⬜ G1.1 — Recompiled code executes
 - **DONE WHEN:** the runtime loads the recompiled image and executes real GT4 code, with every
   unimplemented call **named** (not silently stubbed): a log showing N functions entered and

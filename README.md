@@ -7,8 +7,18 @@ into C++ — then compiled for the machine you are actually sitting at. The game
 physics, race rules, AI, menus and event structure run as native code, because it *is* the
 game, just natively compiled.
 
-Sibling project: [`vulcan6`](https://github.com/LabronFox/vulcan6) (Gran Turismo 6 → modern
-hardware). Vulcan 6 is **on hold** while PS3-side recompilation tooling matures; Vulcan 4 is
+## Who this is for — the captain's words, 2026-09-29
+
+> *"i wanna be early. i want to make sure all the fellow gt4 lovers just like me are gonna
+> enjoy this game."*
+
+That is the point of the project, and it is the test every dish is judged against. Being early
+is not a vanity goal — **the two walls in this file are the reason nobody has done it yet**, and
+they are also the reason a working native GT4 would matter to people who have played this game
+for twenty years. When there is something to show, it gets shown to them.
+
+Sibling project: [`vulcan6`](https://github.com/LabronFox/Vulcan-6) (Gran Turismo 6 → modern
+hardware, now **private** and on hold) while PS3-side recompilation tooling matures; Vulcan 4 is
 the project that can move today, because the PS2 recompilation path is real and public.
 
 ## Why 4 first

@@ -149,10 +149,21 @@ index 0000000..4636c5e
 +
 +static const unsigned kSyscallNameCount = 58;
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
-index 9614016..6641944 100644
+index 9614016..15fed60 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
-@@ -845,6 +845,8 @@ namespace ps2_syscalls
+@@ -1,6 +1,10 @@
+ #include "Common.h"
+ #include "System.h"
+ 
++#include <array>
++#include <mutex>
++#include <set>
++
+ namespace ps2_syscalls
+ {
+     void GsSetCrt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -845,6 +849,8 @@ namespace ps2_syscalls
          bool aborted = false;
          bool allZero = true;
          bool foundMatch = false;
@@ -161,7 +172,7 @@ index 9614016..6641944 100644
  
          for (uint32_t addr = start; addr < end; addr += sizeof(uint32_t))
          {
-@@ -856,6 +858,32 @@ namespace ps2_syscalls
+@@ -856,6 +862,32 @@ namespace ps2_syscalls
                  break;
              }
  
@@ -194,11 +205,64 @@ index 9614016..6641944 100644
              uint32_t entry = 0;
              std::memcpy(&entry, entryPtr, sizeof(entry));
              ++scannedWords;
-@@ -910,7 +938,39 @@ namespace ps2_syscalls
+@@ -910,7 +942,118 @@ namespace ps2_syscalls
                                    matches,
                                    matchCount);
  
 -        setReturnU32(ctx, resultAddr);
++        // ---------------------------------------------------------------- FindAddress trace
++        //
++        // Goal G1.3b: log the call, not just the count. Reconstructing what the guest meant from
++        // disassembly has already been wrong twice in this project (the G0.1 endianness
++        // generalisation, and the 0xA4 stride in G1.3), so the arguments and the value actually
++        // returned in $v0 are printed here, where they are known, rather than inferred later.
++        //
++        // The pre-existing diagnostics below print the INTERNAL resultAddr, which is 0 on a miss
++        // and is NOT what the guest receives. That mismatch cost a whole dish, so this line
++        // prints the real return value.
++        //
++        // The first N calls are always printed; after that a call is printed only when its
++        // argument tuple has not been seen, so a loop that repeats one call is not drowned out.
++        {
++            static const uint32_t kAlwaysTraceFirstCalls = 24;
++            static std::mutex traceMutex;
++            static uint64_t callNumber = 0;
++            static std::set<std::array<uint32_t, 3>> seenArgumentTuples;
++
++            const std::array<uint32_t, 3> args = {originalStart, originalEnd, target};
++            bool shouldPrint = false;
++            uint64_t thisCall = 0;
++            {
++                std::lock_guard<std::mutex> lock(traceMutex);
++                thisCall = ++callNumber;
++                if (thisCall <= kAlwaysTraceFirstCalls)
++                {
++                    shouldPrint = true;
++                }
++                else if (seenArgumentTuples.insert(args).second)
++                {
++                    shouldPrint = true;
++                }
++            }
++
++            if (shouldPrint)
++            {
++                const uint32_t kKseg1 = 0x80000000u;
++                const uint32_t returned = foundMatch ? (kKseg1 | (resultAddr & PS2_RAM_MASK)) : end;
++                std::cerr << "[FindAddress] call=" << thisCall
++                          << " a0=0x" << std::hex << originalStart
++                          << " a1=0x" << originalEnd
++                          << " a2=0x" << target
++                          << " a3=0x" << getRegU32(ctx, 7)
++                          << " ret=0x" << returned
++                          << " outcome=" << (foundMatch ? "hit" : "miss")
++                          << " caller_pc=0x" << callerPc
++                          << " caller_ra=0x" << getRegU32(ctx, 31)
++                          << " scanned=" << std::dec << scannedWords
++                          << std::endl;
++            }
++        }
++
 +        // Return convention.
 +        //
 +        // Sources, in order of authority:
@@ -231,6 +295,32 @@ index 9614016..6641944 100644
 +        // Returning the end of the window is the narrowest behaviour consistent with the one
 +        // authoritative implementation we have. If a future source contradicts it, this is the
 +        // single line to change.
++        // Address family of the result.
++        //
++        // Gran Turismo 4 checks that its two syscall overrides actually landed in the console
++        // kernel's syscall table. The trace (goal G1.3b) shows exactly how, and the arithmetic
++        // closes only if the returned address is canonical:
++        //
++        //     s1 = s3 - 0x20C     0x20C == 0x83 * 4     (0x83 = FindAddress)
++        //     s0 = s2 - 0x168     0x168 == 0x5A * 4     (0x5A = Copy)
++        //     loop until s1 == s0
++        //
++        // ps2SDK's own ee/kernel/src/libosd.c puts the table base at 0x80011F80, so the slots
++        // are 0x80011F80 + 0x83*4 = 0x8001218C and 0x80011F80 + 0x5A*4 = 0x800120E8 -- exactly
++        // 0xA4 apart, which is the constant the loop is hunting.
++        //
++        // The host is the problem: the PS2 address space aliases one physical word many ways,
++        // so the same word can be reported as 0x1218C or as 0x8001218C depending on the window
++        // the caller happened to pass. GT4 searched one with a low start and one with a KSEG1
++        // start, got 0x1218C and 0x800120E8 back, and could never make the two bases agree.
++        //
++        // So the result is canonicalised into the KSEG1 (uncached) window, which is the only
++        // family in which the syscall-table arithmetic the real game performs is well defined.
++        constexpr uint32_t kKseg1Base = 0x80000000u;
++        if (foundMatch)
++        {
++            resultAddr = kKseg1Base | (resultAddr & PS2_RAM_MASK);
++        }
 +        setReturnU32(ctx, foundMatch ? resultAddr : end);
      }
  
@@ -324,10 +414,10 @@ index 40a68b1..8d2e30f 100644
      std::cout.flush();
 diff --git a/ps2xTest/src/ps2_find_address_tests.cpp b/ps2xTest/src/ps2_find_address_tests.cpp
 new file mode 100644
-index 0000000..9126c3c
+index 0000000..2e7885c
 --- /dev/null
 +++ b/ps2xTest/src/ps2_find_address_tests.cpp
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,146 @@
 +// ps2_find_address_tests.cpp - unit tests for the SCE 0x83 FindAddress kernel syscall.
 +//
 +// WHY THIS EXISTS (goal G1.3)
@@ -401,8 +491,8 @@ index 0000000..9126c3c
 +
 +            const uint32_t hit = plant(mem, 0x00018000u, 0x010285F8u);
 +
-+            t.Equals(callFindAddress(mem, kWindowStart, kWindowEnd, 0x010285F8u), hit,
-+                    "should return the address holding the target");
++            t.Equals(callFindAddress(mem, kWindowStart, kWindowEnd, 0x010285F8u), 0x80000000u | hit,
++                    "should return the KSEG1 address holding the target");
 +        });
 +
 +        tc.Run("returns the END of the window when the target is absent, never zero", [](TestCase &t)
@@ -438,10 +528,13 @@ index 0000000..9126c3c
 +            const uint32_t value = 0x010285F8u;
 +            plant(mem, physical, value);
 +
-+            t.Equals(callFindAddress(mem, 0x00010000u, 0x80080000u, value), physical,
-+                     "a KSEG-spanning window finds the word in the low family");
-+            t.Equals(callFindAddress(mem, 0x20010000u, 0x80080000u, value), 0x20010000u,
-+                     "a KSEG0 start yields a KSEG0 result, so the guest can chain it");
++            // The result is ALWAYS reported in the KSEG1 family regardless of the window the
++            // caller passed, so a guest that recovers a table base by subtracting n*4 gets one
++            // consistent answer no matter which alias it searched through.
++            t.Equals(callFindAddress(mem, 0x00010000u, 0x80080000u, value), 0x80000000u | physical,
++                     "a low window still yields a KSEG1 result");
++            t.Equals(callFindAddress(mem, 0x20010000u, 0x80080000u, value), 0x80000000u | physical,
++                     "a KSEG0 start yields the same KSEG1 result, so the two agree");
 +        });
 +
 +        tc.Run("respects the start bound", [](TestCase &t)
@@ -464,18 +557,35 @@ index 0000000..9126c3c
 +            plant(mem, 0x00012000u, 0x010285F8u);
 +            const uint32_t second = plant(mem, 0x00019000u, 0x010285F8u);
 +
-+            t.Equals(callFindAddress(mem, kWindowStart, kWindowEnd, 0x010285F8u), 0x00012000u,
++            t.Equals(callFindAddress(mem, kWindowStart, kWindowEnd, 0x010285F8u), 0x80000000u | 0x00012000u,
 +                     "the first occurrence wins");
-+            t.Equals(callFindAddress(mem, 0x00012004u, kWindowEnd, 0x010285F8u), second,
++            t.Equals(callFindAddress(mem, 0x00012004u, kWindowEnd, 0x010285F8u), 0x80000000u | second,
 +                     "advancing past the first finds the second");
 +        });
 +    });
 +}
 diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
-index 63b12d9..0f9f34b 100644
+index 63b12d9..55f9992 100644
 --- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
 +++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
-@@ -1231,9 +1231,19 @@ void register_ps2_runtime_kernel_tests()
+@@ -1187,9 +1187,14 @@ void register_ps2_runtime_kernel_tests()
+ 
+             t.IsTrue(callSyscall(0x83u, env.rdram.data(), &env.ctx, &env.runtime),
+                      "syscall 0x83 should dispatch");
++            // UPDATED in goal G1.3b: the result is canonicalised into the KSEG1 (uncached)
++            // window, 0x80000000 | physical, so that the syscall-table arithmetic a real guest
++            // performs on it is well defined. GT4 recovers the console kernel's syscall table
++            // base by subtracting n*4 from the address it gets back, and that only closes if
++            // every hit is reported in one family. See docs/FIRST-BOOT.md section 11.
+             t.Equals(static_cast<uint32_t>(getRegS32(env.ctx, 2)),
+-                     kTableBase + 4u,
+-                     "FindAddress should return address of first matching word");
++                     0x80000000u | (kTableBase + 4u),
++                     "FindAddress should return the KSEG1 address of the first matching word");
+         });
+ 
+         tc.Run("numeric syscall 0x83 supports KSEG aliases", [](TestCase &t)
+@@ -1231,9 +1236,19 @@ void register_ps2_runtime_kernel_tests()
  
              t.IsTrue(callSyscall(0x83u, env.rdram.data(), &env.ctx, &env.runtime),
                       "syscall 0x83 should dispatch");
@@ -497,3 +607,12 @@ index 63b12d9..0f9f34b 100644
          });
  
          tc.Run("SetSyscall mirrors guest kernel table entries into low memory", [](TestCase &t)
+@@ -1465,7 +1480,7 @@ void register_ps2_runtime_kernel_tests()
+             env.runtime.eeScheduler().run();
+ 
+             t.Equals(static_cast<uint32_t>(getRegS32(gOverrideResult, 2)),
+-                     kTableBase + 4u,
++                     0x80000000u | (kTableBase + 4u),
+                      "only the recursive call should bypass the active override frame and reach the builtin");
+         });
+ 

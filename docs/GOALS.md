@@ -170,6 +170,32 @@ Eventually the captain's Odin 2. Never an emulator.
 - **UNCHANGED:** `functions_entered` is **3** and the gate wanted **>= 4**. The correction changes
   why, not the outcome.
 
+### 🟡 G1.3b — What is the guest looking for? *(gate NOT met again: functions_entered still 3)*
+- **RESULT (2026-09-29):** ❌ `functions_entered=3` (gate wanted >= 4). The trace is the deliverable.
+- **THE ANSWER, from the trace:** the guest searches `[0x00000004, 0x80080000)` for two pointers to
+  its own code, `0x010285F8` and `0x010285C0` — the two handlers in its syscall-override table at
+  `0x01035350` (`{0x83, sub_010285F8}, {0x5A, sub_010285C0}, {0,0}`). `0x5A` is `Copy` and `0x83` is
+  `FindAddress`, so **it is checking that its two kernel-syscall overrides landed.**
+- **WHY IT RETRIED:** the loop does `s1 = s3 - 0x20C`, `s0 = s2 - 0x168` and spins until they are
+  equal. `0x20C = 0x83*4` and `0x168 = 0x5A*4`, and ps2SDK puts the console kernel's syscall table
+  at `0x80011F80`, so the slots are `0x8001218C` and `0x800120E8`. **We were returning the same
+  physical word in two address families** (`0x800120E8` and `0x1218C`), so the two derived bases
+  differed by `0x80000000` and never matched.
+- **FIXED, MEASURABLE:** canonicalise the result to KSEG1 (`0x80000000 | physical`). The trace now
+  shows `0x8001218C` for slot `0x83`, both slots discoverable, and the enumeration shortened from
+  three calls per pass to two. Unit tests **441/441** (four assertions updated to the new contract
+  with the reason in the commit).
+- **NAMED REMAINING DEPENDENCY, per the brief's decision rule:** the call at `0x010286D4`, which
+  assigns `s3` — the value the loop cannot converge without — **is not in the trace at all**. The
+  guest entered this function at `0x010286DC`, the resume point immediately after it, so that call
+  completed inside the one `EeDispatcherTransfer` before the harness regained control. **Next dish:
+  extend the trace to cover pre-entry calls and read what `s3` actually was.** That is a
+  measurement, not a guess.
+- **CORRECTION TO §10:** §10 retracted the `0xA4` claim. **That retraction was wrong** — `0xA4` is
+  exactly the gap between the two syscall slots. The stride reading was right; the conclusion was
+  not, because the values the guest actually received had never been logged. Three findings in a
+  row came from reasoning about disassembly instead of logging what happened.
+
 ### ⬜ G1.0 — **NO BIOS REQUIRED** *(the captain's bucket-list item, 2026-09-29)*
 - **Captain's words:** *"one thing to add to the bucket list. making it run without a bios."*
 - **DONE WHEN:** Vulcan 4 boots and runs with **no BIOS file anywhere on the machine** — every

@@ -814,3 +814,161 @@ addresses syscall `0x83`, this reading is wrong too — and the way to check it 
 offset in ps2SDK's own `libosd.c`, which the comment there says is
 *"relative to the start of the syscall table, and is in units of 32-bit pointers"*. That is a
 number we can test, not a story.
+
+---
+
+## 11. G1.3b — WHAT is the guest looking for?
+
+The brief for this one was right to insist on the *call* rather than the count. Reconstructing
+intent from disassembly had already been wrong twice in this project, so this time the arguments
+and the value actually returned are logged at the point where they are known.
+
+### The trace
+
+New logging in `ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp` prints, for the first 24 calls and
+afterwards for any previously unseen argument tuple:
+
+```
+[FindAddress] call=3 a0=0x4 a1=0x80080000 a2=0x10285f8 a3=0x1041800 ret=0x1218c
+             outcome=hit caller_pc=0x1028640 caller_ra=0x102871c scanned=8392703
+```
+
+Two things this fixes immediately. The pre-existing diagnostic line printed the **internal**
+`resultAddr`, which is `0` on a miss and is *not* what the guest receives — that mismatch cost a
+whole dish in G1.3. And the caller PC is the same for every call (`0x1028640`) because
+`sub_01028638` is a three-instruction stub (`li $v1,0x83` / `syscall` / `jr $ra`); the *useful*
+call site is `caller_ra`, the return address, and it distinguishes the two call sites in the loop.
+
+### The three answers
+
+**1. What is the guest looking for?**
+
+Two specific 32-bit values, both of which are **pointers to its own code**: `0x010285F8` and
+`0x010285C0`. It searches the guest range `[0x00000004, 0x80080000)` word by word for them,
+repeatedly, advancing its start past each hit.
+
+Those pointers are not a mystery — they are the two handlers in GT4's own syscall-override table,
+at `0x01035350`:
+
+```
+0x01035350:  0x00000083   syscall number 0x83
+0x01035354:  0x010285F8   handler  sub_010285F8
+0x01035358:  0x0000005A   syscall number 0x5A
+0x0103535C:  0x010285C0   handler  sub_010285C0
+0x01035360:  0x00000000   terminator
+```
+
+which is ps2SDK's `struct SyscallData { int syscall_num; void *function; }`. And per the PS2 syscall
+table, **`0x5A` is `Copy` and `0x83` is `FindAddress`** — the guest is installing its own
+replacements for both. `sub_010285C0` is a word-copying routine, which is exactly what `Copy` is.
+
+**So: the guest is trying to find where the console kernel's syscall table holds its two override
+handlers, so it can confirm the overrides landed.**
+
+**2. What do we return?**
+
+The address of the matching word on a hit, and the end of the search window on a miss. From the
+trace: `0x0001218C`, `0x01035354`, `0x800120E8` on hits and `0x80080000` on misses.
+
+**3. Why does it retry?**
+
+Because it is running a check that cannot close. At the loop (`0x01028740`):
+
+```mips
+10286f0:  addiu s1,s3,-524     # s1 = s3 - 0x20C
+10286f8:  addiu s0,s2,-360     # s0 = s2 - 0x168
+1028740:  bne  s1,s0,0x1028708 # loop until they are equal
+```
+
+and those two constants are not arbitrary:
+
+| constant | equals | syscall |
+|---|---|---|
+| `0x20C` | `0x83 * 4` | `FindAddress` |
+| `0x168` | `0x5A * 4` | `Copy` |
+| difference `0xA4` (164) | `0x8001218C - 0x800120E8` | the gap between the two slots |
+
+ps2SDK's own `ee/kernel/src/libosd.c` puts the console kernel's syscall table at **`0x80011F80`**, so
+slot `0x83` is `0x8001218C` and slot `0x5A` is `0x800120E8`. The loop is therefore
+*"subtract n*4 from the address you found, and check both give me the table base."*
+
+**It could not close, because we were reporting the same physical word in two different address
+families.** The trace shows it:
+
+```
+call=1  a2=0x10285c0  ret=0x800120e8   <- KSEG1 family
+call=3  a2=0x10285f8  ret=0x1218c      <- low family, SAME physical word
+```
+
+`0x800120E8 - 0x168 = 0x80011F80` ✓ but `0x1218C - 0x20C = 0x11F80` ✗. Two aliases of one
+32 MB of RAM, two different bases, and the comparison never matches — forever. The guest asked
+with a KSEG1 start for one and a low start for the other, and we faithfully answered in each.
+
+### The fix, and it is measurable
+
+Canonicalise the result into the **KSEG1 (uncached) window**, `0x80000000 | physical`, so every
+hit is reported in one family. One line, in the handler, with the arithmetic in the comment.
+
+The trace after the change:
+
+```
+call=1  a2=0x10285c0  ret=0x800120e8   hit    <- slot for syscall 0x5A
+call=2  a2=0x10285c0  ret=0x80080000   miss
+call=3  a2=0x10285f8  ret=0x8001218c   hit    <- slot for syscall 0x83   (was 0x1218c)
+call=4  a2=0x10285f8  ret=0x80080000   miss
+```
+
+**Both kernel slots are now correctly discoverable**, and the enumeration shortened from three
+calls per pass to two. `SetSyscall` was working all along — the runtime was simply not reporting
+where it had put the handlers in a form the guest could do arithmetic on.
+
+### The decision, and it is the honest one
+
+`functions_entered` is **still 3**, so **the gate is not met again.**
+
+| | G1.3 | G1.3b |
+|---|---|---|
+| `functions_entered` | 3 | **3** |
+| `0x83` calls in the run | 506 | 2-call cycle instead of 3 |
+| `0x83` hit for syscall `0x83`'s slot | reported as `0x1218C` (low) | **`0x8001218C`** (KSEG1) |
+| the guest's base comparison | could never close | both bases now `0x80011F80` |
+| unit tests | 441/441 | **441/441** |
+
+Per the brief's own decision rule, I am **naming the remaining dependency and stopping** rather
+than spending another hour poking. What is left is specific:
+
+> **One call site is untraced, and it is the one that matters.** The trace begins at call 1, whose
+> return address is `0x010286F0` — the `jal` at `0x010286E8`. But `s3`, which the loop's
+> termination depends on, is assigned at `0x010286DC` from a *different* `jal` at `0x010286D4`, and
+> **that call does not appear in the trace at all.** The guest entered this function at exactly
+> `0x010286DC` — the resume point immediately after the `0x010286D4` call — so that call was made
+> and completed during the one `EeDispatcherTransfer` before the harness regained control, outside
+> the traced region.
+>
+> That call is the first thing the guest does on entering this code, it searches for
+> `0x010285F8` over the KSEG1 window, and its result is `s3`, the value the loop cannot converge
+> without. **We do not know what it returned.** At entry, `SetSyscall` has not yet run, so the only
+> copy of that pointer in the KSEG1 window is the static one in the guest's own `.data` at physical
+> `0x35354` → `0x80035354`, which is not the kernel slot and would give the wrong base.
+
+**Next dish, one line of work:** extend the trace to cover the pre-entry calls — either start
+tracing from the first guest instruction rather than the first one the harness loop observes, or
+log the `0x010286D4` call site explicitly. Then read what `s3` actually was. That is a measurement,
+not a guess, and it is the last thing standing between here and the guest moving on.
+
+**Falsifier for this whole section:** if `s3` from the untraced call is already `0x8001218C`, then
+the base comparison should have matched on the first iteration and something else is holding the
+loop — in which case the address-family fix, though correct and measured, is not the blocker.
+
+### Correction to §10, again
+
+§10 retracted my `0xA4` claim. **That retraction was wrong, and this section is the proof.**
+`0xA4` is real: it is exactly the distance between syscall `0x83`'s and `0x5A`'s slots in the
+console kernel's table. What defeated the comparison was not a misread stride — it was that we
+reported the two slots under different address families, so the two derived bases differed by
+exactly `0x80000000`. The stride reading was right; the conclusion drawn from it was not, because
+I had not yet looked at the values the guest actually received.
+
+That is three findings in a row now that came from reasoning about disassembly instead of logging
+what happened. The trace is cheap, it is in the runtime where the values are known, and it should
+have been the first thing built.

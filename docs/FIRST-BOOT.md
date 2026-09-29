@@ -517,3 +517,200 @@ very different meanings — and only the second one tells the next dish what to 
 Measurements, addresses, short disassembly excerpts and a runtime-behaviour diagnosis, for a disc
 the user owns. No game code beyond short excerpts used as analysis. Generated C++ and run logs
 stay on the SSD.
+
+---
+
+## 9. G1.3 ADDENDUM — the syscall is served, and it still does not get past
+
+> **The gate for this dish was `functions_entered >= 4`. It is still 3. This dish did not
+> meet its gate, and the doc says so first rather than burying it.**
+>
+> What it did produce: the research the brief asked for, a real 64× fix, a second fix grounded
+> in the game's own code, five new unit tests, one pre-existing test corrected, and a much more
+> precisely named wall.
+
+```
+VULCAN4 BOOT REPORT functions_entered=3 halt=stuck_in_syscall bios_files=0
+VULCAN4 HARNESS detail=blocked inside SCE syscall 0x83 (FindAddress), guest pc 0x0102871c
+  VULCAN4 CALLKIND syscalls=5 total_syscall_calls=512 distinct_mmio_addresses=0
+        total_mmio_accesses=0 missing_functions=0
+```
+
+### 1. The guest's syscall list, all five
+
+| Syscall | Name | Calls | Last PC | Served? |
+|---|---|---:|---|---|
+| `0x3C` | `SetupThread` (RFU060) | 1 | `0x010001CC` | ✅ yes |
+| `0x3D` | `SetupHeap` (RFU061) | 1 | `0x010001E8` | ✅ yes — base `0x010519B0`, limit `0x01F00000` |
+| `0x40` | `CreateSema` | 2 | `0x0101F428` | ✅ yes |
+| `0x74` | `SetSyscall` | 2 | `0x01028788` | ✅ yes |
+| `0x83` | `FindAddress` | 506 | `0x01028640` | ✅ **dispatched and ran — but does not unblock the guest** |
+
+**None of the five is unhandled.** The `0x83` problem was never "we don't serve it" — it was "we
+serve it and the answer doesn't get the guest moving". That distinction is the whole finding.
+
+### 2. Research: what `0x83` is, and from where
+
+The brief asked for sources, not guesses. Here is what I actually found.
+
+**The number is right.** ps2SDK defines it:
+
+- <https://github.com/ps2dev/ps2sdk/blob/master/ee/kernel/include/syscallnr.h> —
+  `#define __NR_FindAddress 0x83`
+- <https://www.psdevwiki.com/ps2/EE_Syscalls> — same table
+- <https://github.com/ran-j/PS2Recomp/issues/90> — an **upstream issue**, *"Missing 0x83 Syscall —
+  Some games stop and reset if there is no implementation for the 0x83 syscall."* So this is a
+  known upstream gap, and we are working in the same gap the maintainer knows about.
+
+**The arguments and return value are genuinely undocumented.** The most complete public EE syscall
+reference stops before it:
+
+- <https://github.com/mlafeldt/ps2rd/blob/master/Documentation/technical/ee-syscalls.txt> —
+  documents `0x3C` RFU060, `0x3D` RFU061 *"Sets up the heap. Arguments: heap_start, heap_size"*,
+  `0x40 CreateSema`, `0x74 SetSyscall`, `0x7F GetMemorySize` — all consistent with what the runtime
+  already did — then **stops at `0x7F`**. No `0x80`–`0x87`.
+
+So `0x83`'s contract had to come from somewhere better than the internet. It came from
+**Gran Turismo 4 itself**, which carries its own inlined copy of the identical algorithm at guest
+`0x010285F8`:
+
+```mips
+10285f8:  lw    v0,0(a0)          # load the word at the cursor
+10285fc:  beq   v0,a2,0x102862c   # match?
+1028600:  sltu  v0,a0,a1
+1028604:  beqzl v0,0x1028630     # cursor >= end -> done
+102860c:  addiu a0,a0,4           # cursor += 4
+1028610:  (loop)
+102862c:  (match)                 movz a0,zero,v0
+1028630:  jr   $ra
+1028634:  move  v0,a0             # <-- returns $a0, NOT $v0
+```
+
+Unambiguous: on a match it returns the address of the matching word; on a **miss** it returns the
+cursor after it has stepped past the end of the window — **not zero**.
+
+That is a first-party source, and it settles a question the public documentation leaves open.
+
+### 3. Two fixes, both in the runtime
+
+**(a) The 64× rescan — carried over from G1.2, still the biggest win.**
+`ps2ResolveGuestPointer` folds KSEG0/KSEG1 onto the same 32 MB, so the caller's window was being
+walked 64 times over. `scannedWords` per call: **537,001,983 → 8,392,703.**
+
+**(b) The miss return value.** The handler returned `0` when nothing matched. Changed to return the
+aligned end of the window, per the reference above. One line, in
+`ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp`, with the reasoning and the disassembly in a
+comment so the next person can find the line to change if a better source appears.
+
+**It works, measurably.** The guest's behaviour changed. Before, a miss returned `0` and the
+enumeration restarted. Now the search terminates at the window end and the guest advances past it —
+visible in the call sequence, where the third call's start is now `0x80080004` instead of
+restarting at `0x4`:
+
+```
+start=0x80000000 target=0x10285c0 -> 0x800120e8   (hit)
+start=0x800120ec target=0x10285c0 -> end of window (was: 0, restart)
+start=0x80080004 target=0x10285c0 -> end of window
+```
+
+> **A trap worth naming:** the runtime's own log line prints the *internal* `resultAddr`, which is
+> still `0x0` on a miss. It does **not** print what was returned in `$v0`. Reading that log to
+> judge the return value is misleading — I nearly did exactly that. The evidence that the fix
+> landed is the *next* call's `start`, not the previous call's `result=`.
+
+### 4. The unit tests — on the handler, not on "the game got further"
+
+New file `ps2xTest/src/ps2_find_address_tests.cpp`, 5 cases, calling the handler directly with
+`$a0`–`$a2` and reading `$v0` back, with no `PS2Runtime` and no game involved:
+
+1. finds a target and returns the address of the matching word
+2. **returns the end of the window when the target is absent, never zero**
+3. a KSEG-spanning window finds the word, and yields a result in the caller's own address family
+4. respects the start bound
+5. returns the first match when the value appears twice
+
+**And one pre-existing test was wrong.** `ps2xTest/src/ps2_runtime_kernel_tests.cpp` asserted
+*"FindAddress should return 0 when no matching word exists"*. That assertion contradicts the
+reference implementation above, so I changed it — and I am flagging that explicitly, because editing
+a test to match new code is exactly the move that should be distrusted. It is defensible here only
+because the new expectation comes from a first-party source and the reasoning is in the commit and
+in the code comment. If that reasoning is wrong, this test is where it will show.
+
+**Result: `441/441` pass** (the suite needs to be run from the directory containing
+`ps2recomp/instructions.h`, or 3 unrelated VU0/header tests fail on a path lookup — that is
+pre-existing and not mine).
+
+### 5. Why it still does not get past — the next wall, named
+
+Now that the search terminates honestly, the guest's outer loop can be read properly. At
+`0x01028740`:
+
+```mips
+10286f0:  addiu s1,s3,-524      # s1 = previousResult - 0x20C
+10286f8:  addiu s0,s2,-360      # s0 = currentResult  - 0x168
+1028740:  bne  s1,s0,0x1028708   # loop until they are equal
+```
+
+It converges when **`previousResult - currentResult == 0xA4`, i.e. exactly 164 bytes.**
+
+So the guest is looking for **two function pointers 164 bytes apart**. What is actually in the
+image:
+
+```
+func_010285F8 0x010285f8: 1 static occurrence at 0x01035354
+func_010285C0 0x010285c0: 1 static occurrence at 0x0103535C
+                               0x0103535C - 0x01035354 = 8 bytes
+```
+
+**One occurrence of each, and they are 8 bytes apart — a pair of consecutive entries in a handler
+table. The pair the guest wants is 164 bytes apart, and it is not in the loaded image.**
+
+**The wall, named: GT4 is waiting on a table of 164-byte-stride entries that lives in
+`CORE.GT4` (2 MB) or `GT4.VOL` (2.29 GiB) — the two files `docs/DISC-MAP.md` §5 has called opaque
+since G0.2, and neither of which we have ever loaded.** We load only the ELF, and the guest reaches
+its file-loading path only *after* this table walk completes, so it cannot ask us for the data
+itself. There is no syscall to serve here and no handler to write: **the missing thing is the data,
+and getting it in without the guest asking would be the faking this project refuses.**
+
+**Falsifier:** if loading `CORE.GT4` at the right address does *not* make this loop converge, the
+"missing data" reading is wrong and the divergence is in our syscall answers — in which case
+`FindAddress`'s contract is still not what GT4 expects, and the tests in §4 are pinning the wrong
+thing.
+
+**Not claimed:** I have not loaded `CORE.GT4`, and I have not verified that its contents are a
+164-byte-stride pointer table. That is the next measurement, not a conclusion.
+
+### 6. What this dish is worth, honestly
+
+| | G1.2 | G1.3 |
+|---|---|---|
+| `functions_entered` | 3 | **3** |
+| `halt` | `stuck_in_syscall` | `stuck_in_syscall` |
+| `0x83` calls | 311 | 506 |
+| `scannedWords` per call | 8,392,703 | 8,392,703 |
+| `0x83` on a miss | returned `0` | **returns the window end** (sourced, tested) |
+| Search terminates at the window end | ❌ | **✅** |
+| Unit tests on the handler | 0 | **5** (plus 1 corrected) |
+| The wall | "a syscall we serve" | **"data we have not loaded"** |
+
+The gate says `functions_entered >= 4`. **It is 3. This dish failed its gate.** What it bought is a
+correct and tested syscall, a 64× cheaper search, and — more valuable — the difference between a
+wall described as *"our kernel call returns 0"* and one described as *"the guest is waiting for a
+164-byte-stride table that is in a data file we have not loaded"*. Only the second one tells the
+next dish what to do.
+
+### 7. Next
+
+1. **Load `CORE.GT4`.** 2 MB, already extracted at `/mnt/ssd/gt4/work/CORE.GT4`, SHA-256
+   `85d26aa8…`. Find out whether it is a 164-byte-stride pointer table. This is the single
+   measurement that either confirms or kills §5.
+2. **Then the file path.** The guest will eventually need IOP + SIF + `fileio` to open it for
+   itself; the syscall list currently has no file syscalls at all, so that whole path is unbuilt.
+3. **The GS and VU1 are still ahead, not behind** — `total_mmio_accesses=0` remains 0. G2 is
+   untouched by this dish.
+
+### Licence note
+
+Measurements, addresses, short disassembly excerpts, and a syscall-contract citation, for a disc
+the user owns. References to ps2sdk and ps2rd are cited by URL and are not reproduced here.
+Not affiliated with Sony Interactive Entertainment or Polyphony Digital.

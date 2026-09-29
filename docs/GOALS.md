@@ -130,6 +130,35 @@ Eventually the captain's Odin 2. Never an emulator.
   one of them (`FindAddress`) returning a wrong answer rather than no answer. G1.0 needs the
   **right** answer, not merely a present one.
 
+### 🟡 G1.3 — Serve the wall *(gate NOT met: functions_entered is still 3, needed >= 4)*
+- **DONE WHEN:** `functions_entered` rises above 3, no BIOS, and the next wall is named.
+- **RESULT (2026-09-29):** ❌ **did not meet the gate.** `functions_entered=3`,
+  `halt=stuck_in_syscall`, `bios_files=0`, 506 `0x83` calls. Reported as measured.
+- **RESEARCH (cited, not guessed):** `__NR_FindAddress 0x83` is confirmed in ps2sdk's
+  `ee/kernel/include/syscallnr.h`; there is an **upstream issue** (ran-j/PS2Recomp#90, *"Some games
+  stop and reset if there is no implementation for the 0x83 syscall"*). Its arguments and return
+  are **undocumented** — ps2rd's EE syscall reference stops at `0x7F`. The contract was settled from
+  a **first-party source**: GT4 carries its own inlined copy of the identical algorithm at guest
+  `0x010285F8`, which returns `$a0` (`move v0,a0`), i.e. the window end, **not zero**, on a miss.
+- **TWO FIXES, both real, neither faked:** (1) the 64× alias rescan,
+  `scannedWords` 537,001,983 → 8,392,703; (2) the miss return, `0` → the window end, which
+  measurably changed the guest's behaviour (it now advances to the end instead of restarting).
+  Both in `tools/patches/ps2recomp-linux-g1wall.patch`.
+- **TESTS:** 5 new unit tests calling the handler directly (no game, no `PS2Runtime`), and **1
+  pre-existing test corrected** — it asserted the miss returns `0`, which the first-party
+  reference contradicts. That edit is flagged in the doc and the commit as the move to distrust.
+  **441/441 pass.**
+- **THE NEXT WALL, NAMED:** the guest converges two searches only when their results are
+  **164 bytes (0xA4) apart** (`0x20C - 0x168`). The loaded image holds exactly **one** occurrence
+  of each target — `0x010285F8` at `0x01035354` and `0x010285C0` at `0x0103535C` — **8 bytes
+  apart**, a consecutive pair in a handler table. The 164-byte-stride table is not in the ELF.
+  **So the wall is missing *data*, not a missing syscall:** the table lives in `CORE.GT4` (2 MB) or
+  `GT4.VOL`, opaque since G0.2 and never loaded. We cannot inject it without faking, because the
+  guest only reaches its file-loading path *after* this walk completes.
+- **NEXT MEASUREMENT:** load `CORE.GT4` (`85d26aa8…`, 2 MB) and check for a 164-byte-stride
+  pointer table. That either confirms or kills this reading. Then build IOP + SIF + `fileio`, which
+  is entirely unbuilt — the syscall list has no file operations at all.
+
 ### ⬜ G1.0 — **NO BIOS REQUIRED** *(the captain's bucket-list item, 2026-09-29)*
 - **Captain's words:** *"one thing to add to the bucket list. making it run without a bios."*
 - **DONE WHEN:** Vulcan 4 boots and runs with **no BIOS file anywhere on the machine** — every

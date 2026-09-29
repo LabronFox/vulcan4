@@ -31,22 +31,43 @@ Eventually the captain's Odin 2. Never an emulator.
 
 ## G0 — GROUND TRUTH ✅/🟡 *(active)*
 
-### 🟡 G0.1 — The toolchain builds on Linux
-- **DONE WHEN:** `ps2xRecomp` and `ps2xRuntime` configure and build on Linux (measured today:
-  upstream `cmake -S . -B build` **fails** fetching `toml11` — it is an MSVC-first project),
-  and a scratch ELF can be pushed through the recompiler to produce C++.
-- **PROOF:** a build log + generated C++ on disk.
-- **STATUS:** 🟡 after the park of Vulcan 6 this is the first dish fired.
+### ✅ G0.1 — The toolchain builds on Linux
+- **DONE WHEN:** `ps2xRecomp` and `ps2xRuntime` configure and build on Linux, and a scratch ELF
+  can be pushed through the recompiler to produce C++.
+- **PROOF:** `docs/TOOLCHAIN.md` + `ps2_recomp` / `ps2_analyzer` / `ps2EntryRunner` running.
+- **RESULT (2026-09-29):** ✅ `BUILD_EXIT=0` for all three. Two upstream Linux defects fixed with
+  a 24-line patch (`tools/patches/ps2recomp-linux.patch`): toml11's `FetchContent` missing
+  `GIT_SHALLOW`, and the runtime's unguarded SSE4.1 intrinsics. Recorded in `docs/TOOLCHAIN.md`.
 
-### ⬜ G0.2 — GT4's executable is on the slab
-- **DONE WHEN:** we can state, with numbers, what the disc contains: the ISO's volume label,
-  the game's `SCUS_***.**` executable, its sections, its entry point, and a function count
-  from the analyzer — written into `docs/DISC-MAP.md`.
-- **PROOF:** the doc's numbers + the commands that produced them.
+### ✅ G0.2 — GT4's executable is on the slab
+- **DONE WHEN:** the ISO's identity, the executable's SHA-256, sections, entry point and a
+  function count from the analyzer, written into `docs/DISC-MAP.md`.
+- **PROOF:** `docs/DISC-MAP.md` + `/mnt/ssd/gt4/work/gt4.toml`.
+- **RESULT (2026-09-29):** ✅ retail US v2.00, SHA-256 `f8f10823…8019fa`. `SCUS_973.28` is
+  273,020 B, **little-endian** R5900, entry `0x01000008`, `.text` 187,408 B = 46,852 insns,
+  **707 functions**, 336 SCE symbols. **It is not a boot stub.** The bulk of the disc is not
+  code: `GT4.VOL` (2.29 GiB) is an indexed container with an opaque payload, `CORE.GT4` (2 MB)
+  is 7.96 bits/byte with no ELF inside. See §5.6 of that doc for the falsifiable answer.
 
-### ⬜ G0.3 — Read one function as text
-- **DONE WHEN:** a single GT4 function is disassembled *and* appears as generated C++ next to
-  it, so the translation can be read side by side rather than trusted.
+### ✅ G0.3 — Read one function as text
+- **DONE WHEN:** a single GT4 function is disassembled *and* appears as generated C++ next to it.
+- **PROOF:** `docs/FUNCTION-ANATOMY.md` + 8.9 MB of generated C++ on the SSD.
+- **RESULT (2026-09-29):** ✅ `sub_01000558` @ `0x01000558`, 328 B / 82 instructions, called from
+  the entry block at `0x01000210`. Six spot-checks — sign extension, delay slots, branch-target
+  arithmetic, indirect calls, the spin-trap loop — all verified against raw bytes. **The
+  translation is faithful.** But the run **failed**: exit 1, 2 of 721 function bodies lost.
+
+### ⬜ G0.4 — The recompiler drops the tail of its own output
+- **DONE WHEN:** a full `ps2_recomp` run over `SCUS_973.28` exits 0 and writes all 721 function
+  bodies, so the generated `.cpp` links.
+- **WHY IT MATTERS:** G0.3 measured `RECOMP_EXIT=1` —
+  `Internal error: combined output completion queue is missing index 719`. Functions
+  `sub_0102DB98` and `sub_0102DBE8` are declared in the header and defined nowhere, and
+  `register_functions.cpp` / `ps2_recompiled_stubs.h` are never produced. **The translator is
+  correct; the output writer loses the tail.** Blocks linking, so it blocks G1.1.
+- **NOTE:** second time this toolchain reported a clean number (`Unhandled instructions: 0`,
+  `errors: 0` in G0.1's endianness case) while something was wrong. Watch for more.
+
 
 ---
 

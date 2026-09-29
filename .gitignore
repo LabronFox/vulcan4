@@ -1,0 +1,26 @@
+# game data NEVER enters this repo
+*.iso
+*.bin
+*.img
+*.elf
+*.zip
+*.7z
+*.cue
+*.chd
+*.mdf
+*.nrg
+# extracted / decrypted game content
+/dump/
+/extracted/
+/iso/
+# build output
+/build/
+/out/
+target/
+*.o
+*.obj
+*.exe
+# editor / OS
+.vscode/
+.idea/
+.DS_Store

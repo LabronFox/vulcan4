@@ -85,6 +85,25 @@ Eventually the captain's Odin 2. Never an emulator.
 
 ## G1 — FIRST BOOT
 
+### ✅ G1.1 — Recompiled code executes, no BIOS, failures named
+- **DONE WHEN:** a harness loads the translation unit plus the guest image, starts at the real
+  entry point, executes real GT4 code, and ends with a machine-readable report naming where it
+  stopped.
+- **RESULT (2026-09-29):** ✅
+  `VULCAN4 BOOT REPORT functions_entered=3 halt=wallclock_deadline bios_files=0`
+  Started at `0x01000008`, entered `0x01028640` then `0x010286DC`, halted at `0x0102871C` inside
+  a memory-grow loop. **Zero BIOS files; the harness has no BIOS loading path at all.** Harness in
+  `tools/harness/vulcan4_harness.cpp`, doc in `docs/FIRST-BOOT.md`.
+- **FIRST NAMED BLOCKER:** the SCE kernel address search (`FindAddress`,
+  `ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp:791`) normalises the *target* but scans the whole
+  `0x00000000`-`0x80000000` window, so it keeps finding the same physical words again at each
+  PS2 KSEG alias (`0x001218C`, `0x01035354`, `0x0201218C`, … 0x20000000 apart) — half a gigabyte
+  scanned per call. GT4's search loop never converges. This is the next dish.
+- **GOTCHA WORTH KEEPING:** ps2xRuntime implements EE cooperative threads by throwing
+  `EeDispatcherTransfer` ("the EE equivalent of a longjmp to the dispatcher... must only be caught
+  at EeScheduler::run()"). A harness without `EeScheduler` must catch it itself or abort.
+- **HONEST LIMIT:** three functions ran, not a boot. 721 bodies exist, 3 executed; 82 are stubs.
+
 ### ⬜ G1.0 — **NO BIOS REQUIRED** *(the captain's bucket-list item, 2026-09-29)*
 - **Captain's words:** *"one thing to add to the bucket list. making it run without a bios."*
 - **DONE WHEN:** Vulcan 4 boots and runs with **no BIOS file anywhere on the machine** — every

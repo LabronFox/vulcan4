@@ -36,6 +36,11 @@ Between the two walls sits every pixel this project will ever draw. The ladder i
 **M0 — foundations.** The toolchain is being brought up on Linux and GT4's own executable is
 on the slab. Nothing plays yet, and this file will say so until something does.
 
+**Where the work physically lives — read this before building anything:**
+[`docs/WHERE-THINGS-LIVE.md`](docs/WHERE-THINGS-LIVE.md). Code lives on the root filesystem;
+**every build tree, generated file and scratch dump lives on `/mnt/ssd`**. A full root disk on
+this box once masqueraded as a code bug for a whole dish.
+
 ## The rules
 
 - **No game data in this repository, ever.** No ISO, no extracted assets, no disc images.

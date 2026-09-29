@@ -131,10 +131,22 @@ Eventually the captain's Odin 2. Never an emulator.
 
 ## G5 — THE CAPTAIN'S BUILD + POCKET
 
-### ⬜ G5.1 — **Spec II** support
-- The captain plays GT4 **Spec II** (community mod) on the Odin 2. A recomp targets one specific
-  binary, so the retail US release comes first and Spec II is a **second target**, not a
-  distraction.
+### 🟡 G5.1 — **Spec II** support *(parked for later — the captain's call, 2026-09-29:
+"we will figure it out later. first of all lets keep going")*
+- The captain plays GT4 **Spec II** (community mod) on the Odin 2, and wants it.
+- **🔴 FINDING (researched, from the mod author's own pages): Spec II is NOT based on the retail
+  US release.** *"Spec II is based on the NTSC version of **Gran Turismo 4 Online Public Beta**
+  and is distributed as an xDelta patch **requiring this version**."* It reports as serial
+  **`SCUS-97436`** / CRC **`4CE521F2`**, where vanilla US retail is **`SCUS-97328` / `77E61C8A`** —
+  different discs. The patch is downloadable on its own, but it needs that base image
+  (MD5 `3306538778dda2ded87ceaf52c944a98`). Its FAQ also states it changes *"the game's disc image
+  **and executable**"*, and its ELF has 480p + GT3 chase cam + trigger sensitivity + widescreen
+  baked in — so **Spec II patches the executable**, it is not a data-only mod.
+- **CONSEQUENCE (not blocking anything):** recompiling retail `SCUS_973.28` produces *vanilla*
+  GT4, not the captain's build. Spec II support = recompiling the **Online Public Beta** build +
+  its patch — same machinery, different target binary. **That same disc also carries the lost
+  Online mode** (G5.3). Both of the captain's wishes live on one disc, and we will come back to it.
+- **STATUS:** 🟡 later. Vanilla first. Nothing here blocks G0/G1.
 
 ### ⬜ G5.2 — Android / Odin 2
 - **DONE WHEN:** it runs on the Odin 2 at a playable frame rate. Snapdragon only — the

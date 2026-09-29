@@ -315,12 +315,16 @@ vulcan_entry:            # calls vulcan_add(3, 4) -> 107, stores it at 0x0020000
 
 ### Build it and run it
 
+> ⚠️ **Use `-EL`. The PS2 is little-endian (mipsel).** `binutils-mips-linux-gnu-*` defaults
+> `as`/`ld` to **big-endian** for MIPS targets, which produces an ELF the recompiler will read
+> as garbage. Corrected in goal G0.2 — see §5.
+
 ```bash
 sudo apt-get install -y --no-install-recommends binutils-mips-linux-gnu
 
 cd /home/or/vulcan4/tools/scratch
-mips-linux-gnu-as -march=5900 -mabi=32 -o scratch.o scratch.s
-mips-linux-gnu-ld -Ttext=0x00100000 -e vulcan_entry -o scratch.elf scratch.o
+mips-linux-gnu-as -EL -march=5900 -mabi=32 -o scratch.o scratch.s
+mips-linux-gnu-ld -EL -Ttext=0x00100000 -e vulcan_entry -o scratch.elf scratch.o
 mips-linux-gnu-objdump -d scratch.elf
 
 /mnt/ssd/vulcan4-build/ps2xRecomp/ps2_recomp scratch.toml
@@ -360,14 +364,42 @@ Warnings: 0, errors: 0
 
 ---
 
-## 5. FINDING 3 — ⚠️ the recompiler **ignores ELF endianness**. This will bite GT4.
+## 5. FINDING 3 — ~~the recompiler ignores ELF endianness~~ **CORRECTED IN G0.2: the decoder is RIGHT**
 
-**This is the most important thing this dish found, and it is a real defect in upstream — not a
-build problem and not something the patch in §2b can paper over.**
+> **Status: PREMISE WITHDRAWN. Do not "fix" `elf_parser.cpp` — there is no bug to fix here.**
+> This finding was written during G0.1 and its central claim was **wrong**. It is kept below
+> because the correction is the useful part, and because a wrong-but-confident finding that gets
+> retracted on the record is worth more than one that quietly disappears.
+>
+> Correction measured in G0.2 against GT4's real executable, with bytes:
+>
+> ```
+> $ xxd -s 0x1008 -l 4 /mnt/ssd/gt4/work/SCUS_973.28
+> 00001008: 280c 0070
+> $ mips-linux-gnu-objdump -d --start-address=0x1000008 SCUS_973.28
+>   1000008:  70000c28   padduw  at,zero,zero
+> ```
+>
+> Bytes `28 0c 00 70` read **little-endian** are `0x70000c28` = `padduw $at, $zero, $zero`, which is
+> exactly what objdump prints. Read big-endian they would be `0x280c0070` — opcode `0xa`, a
+> reserved slot that is not a real instruction. The recompiler's host-order read matches GT4.
+>
+> **The PS2's R5900 is little-endian (mipsel)**, as is GT4's own `SCUS_973.28`
+> (`Data: 2's complement, little endian`). Retail PS2 games are little-endian. Our host is
+> x86-64, also little-endian. **Host-order reads are therefore correct for our target**, and the
+> decoder is right to do what it does.
+>
+> **What I actually got wrong was my own test fixture.** `binutils-mips-linux-gnu-as` defaults
+> MIPS targets to **big-endian**, so `scratch.elf` was built big-endian — the opposite of a PS2.
+> That single bad default manufactured a "bug" out of a correct decoder. The `-EL` flag in §4 is
+> the real fix, and it is now the documented way to build the scratch ELF.
+>
+> Nothing here blocks G0.2. Nothing in `elf_parser.cpp` should change on the strength of this
+> finding.
 
-The PlayStation 2's R5900 is **big-endian**, and every retail PS2 ELF — GT4's included — is
-`elf32-tradbigmips` with `EI_DATA = ELFDATA2MSB`. `ps2xRecomp`'s ELF reader does a raw host-order
-read of each 32-bit instruction:
+### The one real item, and it is not now
+
+`ps2xRecomp`'s ELF reader does a raw host-order read of each instruction word:
 
 ```cpp
 // ps2xRecomp/src/lib/elf_parser.cpp:1631
@@ -375,35 +407,34 @@ uint32_t raw = 0;
 std::memcpy(&raw, section.data + offset, sizeof(uint32_t));
 ```
 
-There is **no endianness check anywhere in the ELF parser** — `grep` for `endian`, `ELFDATA2MSB`,
-`is_little_endian` across `ps2xRecomp/` returns nothing. So on a little-endian host, a big-endian
-guest's instruction words are silently byte-swapped before decoding.
+It never consults the ELF's `EI_DATA` byte. For every PS2 game we care about that is *the right
+answer by accident* — the host and the guest agree — but it is unverified agreement. If it ever
+disagreed, the tool would emit nonsense while reporting `Unhandled instructions: 0, Warnings: 0,
+errors: 0`. That silence is what violates our house rule: a wrong result must never look clean.
 
-### Evidence — same source, two ELF byte orders, two results
+A **robustness note for a later dish**, not a blocker: read `EI_DATA`, byte-swap when it is
+`ELFDATA2MSB`, and **report a hard error on any byte order not supported** rather than decoding
+silently. Note that `EI_DATA` alone is not sufficient for a fully correct MIPS loader (the
+`.mdebug`/ABI flags matter too), which is a further reason to do it as its own piece of work with
+its own tests. The known raw-read sites, found by `grep` and not exhaustively audited:
 
-The **big-endian** `scratch.elf` (correct for a real PS2) compiles to garbage. The disassembly line
-`100000: 24880064 addiu t0,a0,100` comes out of the recompiler as:
+- `ps2xRecomp/src/lib/elf_parser.cpp:531`, `:868`, `:981`, `:1294`, `:1631`
 
-```cpp
-// 0x100000: 0x64008824  daddiu      $zero, $zero, -0x77DC
-SET_GPR_S64(ctx, 0, (int64_t)GPR_S64(ctx, 0) + (int64_t)(int32_t)4294936612);
-```
+Upstream's own tests synthesise `ELFIO::ELFDATA2LSB` ELFs
+(`ps2xTest/src/ps2_recompiler_tests.cpp`), which is why nobody noticed the field is unread — and
+also why they never caught that the default assembler gives you the wrong byte order.
 
-`0x24880064` became `0x64008824`. That is a clean 4-byte rotation — the signature of a byte swap,
-not a decoding error.
+### The control experiment, re-read correctly
 
-Re-assembling the **identical** source little-endian and recompiling gives the correct translation
-of every single line:
+The same source assembled both ways still shows the decoder tracks byte order exactly, with no
+decoding error of its own. The little-endian build is the one that matches the PS2:
 
 ```bash
 cd /home/or/vulcan4/tools/scratch
-mips-linux-gnu-as -EL -march=5900 -mabi=32 -o scratch_le.o scratch.s
-mips-linux-gnu-ld -EL -Ttext=0x00100000 -e vulcan_entry -o scratch_le.elf scratch_le.o
-/mnt/ssd/vulcan4-build/ps2xRecomp/ps2_recomp scratch_le.toml   # -> out_le/
+mips-linux-gnu-as -EL -march=5900 -mabi=32 -o scratch.o scratch.s
+mips-linux-gnu-ld -EL -Ttext=0x00100000 -e vulcan_entry -o scratch.elf scratch.o
+/mnt/ssd/vulcan4-build/ps2xRecomp/ps2_recomp scratch.toml
 ```
-
-The little-endian ELF is **not a PS2 ELF** — it exists only to isolate the variable. It is the
-control experiment that proves the decoder is fine and only the byte order is wrong.
 
 ```cpp
 // 0x100000: 0x24880064  addiu   $t0, $a0, 0x64
@@ -414,58 +445,9 @@ SET_GPR_S32(ctx, 2, (int32_t)ADD32(GPR_U32(ctx, 8), GPR_U32(ctx, 5))); // $v0=2 
 const uint32_t jumpTarget = GPR_U32(ctx, 31);                        // $ra=31 ✓
 ```
 
-and in the caller, the call, the delay-slot resumption, the `lui` and the store:
-
-```cpp
-// 0x100010: 0x24040003  addiu   $a0, $zero, 0x3
-SET_GPR_S32(ctx, 4, (int32_t)ADD32(GPR_U32(ctx, 0), 3));             // $a0=4 ✓
-// 0x100018: 0xc040000   jal     func_100000
-SET_GPR_U32(ctx, 31, 0x100020u);                                     // $ra = return addr
-runtime->dispatchGuestBranch(rdram, ctx, 0x100000u, 0x100018u, 0x100020u,
-                             PS2Runtime::GuestBranchKind::DirectCall, "JAL");  // ✓
-// 0x100020: 0x3c080020  lui     $t0, 0x20
-SET_GPR_S32(ctx, 8, (int32_t)((uint32_t)32 << 16));                  // $t0=8, 0x20<<16 ✓
-// 0x100024: 0xad020000  sw      $v0, 0x0($t0)
-FAST_WRITE32(0x200000u, GPR_U32(ctx, 2));                            // 0x00200000, $v0=2 ✓
-```
-
-Every line matches `scratch.s`. That is the end-to-end proof this dish asked for.
-
-### Why upstream never noticed
-
-Upstream's own test ELFs are synthesised with `ELFIO::ELFDATA2LSB` — little-endian
-(`ps2xTest/src/ps2_recompiler_tests.cpp`, e.g. `writeMinimalMipsElfWithJalFallbackTarget`). The
-test suite therefore validates only the one byte order the host uses, and the real PS2 byte order
-is **never exercised**.
-
-### Verdict — honest, and deliberately *not* fixed in this dish
-
-The toolchain **builds and runs**, and the recompiler demonstrably translates R5900 to correct C++.
-But **on big-endian guest data it currently produces wrong code, and it does not say so** — it
-reports `Unhandled instructions: 0, Warnings: 0, errors: 0` while emitting nonsense. That silence
-is the dangerous part: it would sail straight through GT4 in the next goal.
-
-Scope call, made deliberately: G0.1's mandate is *the toolchain builds and runs on Linux*, and the
-brief asks for the smallest patch that keeps `git pull` sane. An endianness fix means touching
-**every** instruction-word read in the ELF parser — a behavioural change to the recompiler's
-decoder, with its own test obligations. That is a separate dish with its own gate.
-
-**Recorded here so the next dish starts from measured ground, not from a bad surprise.**
-
-### What the fix has to touch
-
-Every place a 32-bit word leaves guest data needs a byte-order conversion driven by the ELF's
-`EI_DATA` byte. The known sites, all the same `memcpy`-into-`uint32_t` pattern:
-
-- `ps2xRecomp/src/lib/elf_parser.cpp:531`, `:868`, `:981`, `:1294`, `:1631`
-- the same concern will apply to any DWARF/libdwarf and relocation reads in that file.
-
-The clean fix is a single `ReadInstructionWord(const uint8_t*, bool guestIsBigEndian)` helper used
-everywhere, plus at least one **big-endian** case added to the upstream test suite so this can
-never regress silently again.
-
-**Untested claim, flagged as such:** I have not read all 2601 lines of `elf_parser.cpp`, so treat
-":531/:868/:981/:1294/:1631" as the sites found by `grep`, not an exhaustive audit.
+The **big-endian** build of the same source yields the byte-rotated garbage
+(`0x24880064` → `0x64008824`, decoded as `daddiu $zero,$zero,-0x77DC`). That experiment was sound;
+I simply drew the wrong conclusion about which byte order a PS2 uses.
 
 ---
 

@@ -94,15 +94,41 @@ Eventually the captain's Odin 2. Never an emulator.
   Started at `0x01000008`, entered `0x01028640` then `0x010286DC`, halted at `0x0102871C` inside
   a memory-grow loop. **Zero BIOS files; the harness has no BIOS loading path at all.** Harness in
   `tools/harness/vulcan4_harness.cpp`, doc in `docs/FIRST-BOOT.md`.
-- **FIRST NAMED BLOCKER:** the SCE kernel address search (`FindAddress`,
-  `ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp:791`) normalises the *target* but scans the whole
-  `0x00000000`-`0x80000000` window, so it keeps finding the same physical words again at each
-  PS2 KSEG alias (`0x001218C`, `0x01035354`, `0x0201218C`, … 0x20000000 apart) — half a gigabyte
-  scanned per call. GT4's search loop never converges. This is the next dish.
+- **FIRST NAMED BLOCKER — RESOLVED IN G1.2, see below.** It was the SCE kernel address search
+  (`FindAddress`, `ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp:791`): it normalised the
+  *target* but scanned the whole aliased window, 537,001,983 words per call, and GT4's search
+  loop never converged.
 - **GOTCHA WORTH KEEPING:** ps2xRuntime implements EE cooperative threads by throwing
   `EeDispatcherTransfer` ("the EE equivalent of a longjmp to the dispatcher... must only be caught
   at EeScheduler::run()"). A harness without `EeScheduler` must catch it itself or abort.
 - **HONEST LIMIT:** three functions ran, not a boot. 721 bodies exist, 3 executed; 82 are stubs.
+
+### ✅ G1.2 — Name the wall
+- **DONE WHEN:** the harness stops for a **named** guest reason rather than a wall-clock deadline,
+  with the PC and the waiting instruction, and the guest call list is populated.
+- **RESULT (2026-09-29):** ✅
+  `VULCAN4 BOOT REPORT functions_entered=3 halt=stuck_in_syscall bios_files=0`
+  `blocked inside SCE syscall 0x83 (FindAddress), guest pc 0x0102871c`
+  Call list: **5 named syscalls, 317 calls** — `0x83 FindAddress` ×311, `0x74 SetSyscall` ×2,
+  `0x40 CreateSema` ×2, `0x3D SetupHeap` ×1, `0x3C SetupThread` ×1. All served, no BIOS.
+- **THE WALL:** GT4 is waiting on the **kernel address search, `FindAddress` (`0x83`)**, issued at
+  guest PC `0x0102863C` (`syscall`) inside `sub_01028638`. It searches
+  `[0x01035358, 0x80080000)` for the value `0x010285F8` — a pointer to one of its own functions —
+  and after 16 real hits it repeats the identical **failing** search: 103 consecutive misses,
+  forever. `total_mmio_accesses=0` — **the guest never touched hardware**, so the GS/VU1/register
+  walls are ruled out *at this point in the boot* by measurement, not assumption.
+- **BUG FOUND AND FIXED (real win, did not unblock the boot):** `FindAddress` walked the caller's
+  aliased window, so one call re-read the same 32 MB of RAM ~64 times — **537,001,983 words per
+  call**, now **8,392,703** (exactly 64×, the alias factor). Practical effect: **144 calls, still
+  unconverged after 19 min → 317 calls, all completing, in 200 s.**
+  Patch `tools/patches/ps2recomp-linux-g1wall.patch` (6 files, +162, runtime only).
+- **HONEST:** the wall is the *miss*, not the scan cost, so `functions_entered` is still 3. Two
+  readings fit — the data lives in `CORE.GT4`/`GT4.VOL` (never loaded) or the guest's own
+  bookkeeping diverged. Not yet decided; both are stated with falsifiers in
+  `docs/FIRST-BOOT.md` §8.
+- **NEXT:** the no-BIOS backlog is now *populated* — 5 syscalls served with zero BIOS files, and
+  one of them (`FindAddress`) returning a wrong answer rather than no answer. G1.0 needs the
+  **right** answer, not merely a present one.
 
 ### ⬜ G1.0 — **NO BIOS REQUIRED** *(the captain's bucket-list item, 2026-09-29)*
 - **Captain's words:** *"one thing to add to the bucket list. making it run without a bios."*

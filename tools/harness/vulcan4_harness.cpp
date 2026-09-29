@@ -44,6 +44,7 @@
 #include "Stubs/Audio.h"
 #include "Stubs/MPEG.h"
 #include "ps2_log.h"
+#include "runtime/syscall_names.h"
 #include "ps2_recompiled_stubs.h"
 
 #include <ps2_recompiled_functions.h>
@@ -53,6 +54,7 @@
 #include <cstring>
 #include <chrono>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -73,6 +75,8 @@ namespace
     constexpr const char *kHaltDeadline = "wallclock_deadline";
     constexpr const char *kHaltOutOfTable = "pc_outside_generated_table";
     constexpr const char *kHaltReturnedToEntry = "returned_to_entry";
+    constexpr const char *kHaltInSyscall = "stuck_in_syscall";
+    constexpr const char *kHaltSpinningInGuest = "spinning_in_guest_code";
 
     // ---------------------------------------------------------------- budgets
     //
@@ -100,6 +104,20 @@ namespace
     // state that as a measured fact rather than an assurance. It is only ever incremented by a
     // BIOS open, and there is no such call anywhere in this file.
     uint64_t biosFilesOpened = 0;
+
+    // Name a numeric SCE syscall using the table transcribed from the runtime dispatcher by
+    // tools/harness/gen_syscall_names.py. Unknown numbers are reported as such, never guessed.
+    const char *syscallName(uint32_t id)
+    {
+        for (unsigned i = 0; i < kSyscallNameCount; ++i)
+        {
+            if (kSyscallNames[i].id == id)
+            {
+                return kSyscallNames[i].name;
+            }
+        }
+        return "unnamed_syscall";
+    }
 
     std::string toHex(uint64_t value, int width = 8)
     {
@@ -482,9 +500,22 @@ int main(int argc, char *argv[])
             // else that might request a stop, so the report never overstates progress.
             if (watchdogFired.load())
             {
-                haltReason = kHaltDeadline;
-                haltDetail = "guest was still inside a function when the deadline fired; "
-                             "the watchdog asked the guest to yield";
+                // Turn "it timed out" into "it is waiting on THIS". If the runtime says the
+                // guest is inside a syscall, that syscall is the wall, and we name it.
+                const uint32_t active = runtime.activeSyscallId();
+                if (active != PS2Runtime::kNoActiveSyscall)
+                {
+                    haltReason = kHaltInSyscall;
+                    haltDetail = std::string("blocked inside SCE syscall ") + toHex(active, 2)
+                        + " (" + syscallName(active) + "), guest pc " + toHex(ctx.pc)
+                        + " -- this syscall is the wall";
+                }
+                else
+                {
+                    haltReason = kHaltSpinningInGuest;
+                    haltDetail = "no syscall was executing when the deadline fired; the guest "
+                                 "is spinning in recompiled code at pc " + toHex(ctx.pc);
+                }
             }
             else
             {
@@ -526,45 +557,41 @@ int main(int argc, char *argv[])
 
     // ------------------------------------------------------------------ guest call list
     //
-    // THIS IS THE NO-BIOS BACKLOG, and it is the next dish's brief.
+    // THIS IS THE NO-BIOS BACKLOG, and it is the next dish's brief. Everything printed here is
+    // read out of the runtime's own counters -- the counts are incremented where the guest
+    // actually made the call, not reconstructed by the harness.
     //
-    // Two kinds of "call the guest asked for" are collected, from two honest sources:
-    //
-    //  (a) MISSING FUNCTIONS. A guest control transfer to an address the recompiler produced
-    //      no body for. We record the address and, if the analyzer recognised it, its SDK name.
-    //
-    //  (b) SYSCALLS. ps2xRuntime routes every guest `syscall` through handleSyscall(), and every
-    //      handler logs itself into ps2_log's runtime log. We read that log back and keep the
-    //      lines, so what is printed is what the runtime actually did, not a reconstruction.
-    //
-    // Nothing is invented: a call that did not happen is not listed.
-    const auto logEntries = ps2_log::snapshot_runtime_log_entries();
-    std::map<std::string, uint64_t> syscallCounts;
-    uint64_t logLinesScanned = 0;
-    for (const auto &entry : logEntries)
-    {
-        ++logLinesScanned;
-        // The runtime's syscall handlers announce themselves; keep the ones we can attribute.
-        if (entry.text.find("syscall") != std::string::npos
-            || entry.text.find("Syscall") != std::string::npos
-            || entry.text.find("SCE") != std::string::npos)
-        {
-            ++syscallCounts[entry.text];
-        }
-    }
+    //  (a) SYSCALLS the guest issued, by number and name, from PS2Runtime::syscallCounts().
+    //  (b) MMIO the guest touched, from PS2Memory's counters in translateAddress().
+    //  (c) FUNCTIONS with no generated body, which is where a guest transfer would have died.
+    const auto &syscalls = runtime.syscallCounts();
+    const auto &mmio = runtime.memory().mmioCounts();
 
     std::cout << "VULCAN4 GUEST CALL LIST (what the guest asked the runtime for)\n";
-    std::cout << "  VULCAN4 CALLKIND missing_functions=" << missing.size()
-              << " runtime_log_lines_scanned=" << logLinesScanned
-              << " syscall_log_lines=" << syscallCounts.size() << "\n";
+    std::cout << "  VULCAN4 CALLKIND syscalls=" << syscalls.size()
+              << " total_syscall_calls=" << runtime.syscallCallCount()
+              << " distinct_mmio_addresses=" << mmio.size()
+              << " total_mmio_accesses=" << runtime.memory().mmioAccessCount()
+              << " missing_functions=" << missing.size() << "\n";
+
+    for (const auto &entry : syscalls)
+    {
+        std::cout << "  0x" << std::hex << std::setw(2) << std::setfill('0') << entry.first
+                  << std::dec << std::setfill(' ') << " sce_" << syscallName(entry.first)
+                  << " calls=" << entry.second.count
+                  << " last_pc=" << toHex(entry.second.lastPc) << "\n";
+    }
+
+    for (const auto &entry : mmio)
+    {
+        std::cout << "  MMIO 0x" << std::hex << entry.first << std::dec
+                  << " accesses=" << entry.second << "\n";
+    }
+
     for (const auto &entry : missing)
     {
         std::cout << "  VULCAN4 CALL " << toHex(entry.first) << " name=" << entry.second.name
                   << " kind=" << entry.second.kind << " times=" << entry.second.count << "\n";
-    }
-    for (const auto &entry : syscallCounts)
-    {
-        std::cout << "  VULCAN4 SYSCALL times=" << entry.second << " " << entry.first << "\n";
     }
 
     std::cout << "VULCAN4 BIOS none_required=true files_opened=" << biosFilesOpened

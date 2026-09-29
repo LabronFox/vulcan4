@@ -319,3 +319,201 @@ This document contains measurements, addresses, disassembly excerpts and one run
 diagnosis about a disc the user owns. **No game code is reproduced here beyond short disassembly
 excerpts used as analysis**, and the generated C++ stays on the SSD. Not affiliated with Sony
 Interactive Entertainment or Polyphony Digital.
+
+---
+
+## 8. G1.2 ADDENDUM — naming the wall
+
+> Appended, not rewritten. §1–§7 above are the G1.1 record, including its `wallclock_deadline`
+> and its unanswered question. This section is the answer.
+
+### The result
+
+```
+VULCAN4 BOOT REPORT functions_entered=3 halt=stuck_in_syscall bios_files=0
+VULCAN4 HARNESS detail=blocked inside SCE syscall 0x83 (FindAddress), guest pc 0x0102871c
+  -- this syscall is the wall pc=0x0102871c distinct_pcs=3 dispatcher_transfers=1
+  elapsed_ms=200055 entry_budget=20000000 spin_limit=1000000 deadline_s=200
+  VULCAN4 CALLKIND syscalls=5 total_syscall_calls=317 distinct_mmio_addresses=0
+        total_mmio_accesses=0 missing_functions=0
+  0x83 sce_FindAddress calls=311 last_pc=0x01028640
+  0x74 sce_SetSyscall  calls=2   last_pc=0x01028788
+  0x40 sce_CreateSema  calls=2   last_pc=0x0101f428
+  0x3d sce_SetupHeap   calls=1   last_pc=0x010001e8
+  0x3c sce_SetupThread calls=1   last_pc=0x010001cc
+VULCAN4 BIOS none_required=true files_opened=0
+```
+
+`halt` moved from `wallclock_deadline` to `stuck_in_syscall`, and the call list went from empty
+to five named syscalls.
+
+### The question, answered in one sentence
+
+> **The guest is waiting on the console's kernel address-search syscall, `FindAddress`
+> (SCE syscall `0x83`), which it calls from PC `0x0102863C` in a loop that repeats a search it
+> can no longer satisfy — and it never touches hardware at all.**
+
+### It is not hardware. That is measured, not assumed
+
+```
+distinct_mmio_addresses=0  total_mmio_accesses=0
+```
+
+Counted in `PS2Memory::translateAddress()`, which every guest read and write passes through.
+**Zero.** The guest never read or wrote a single console register, DMA channel, timer or vblank
+flag. So the classic "spinning on a hardware bit we don't emulate" explanation is **ruled out by
+measurement**, and so are the GS and VU1 walls — it never got near them.
+
+### It is `FindAddress`, and here is the instruction
+
+The guest PC that keeps recurring is `0x01028640`; the instruction *issuing* the syscall is the
+one before it, in `sub_01028638`:
+
+```mips
+1028638:  24030083  addiu $v1,$zero,0x83    ; $v1 = 0x83 = the syscall number
+102863c:  0000000c  syscall                  ; <-- the wall
+1028640:  03e00008  jr   $ra                ; resume point
+```
+
+and in the generated C++ it is literally `runtime->handleSyscall(rdram, ctx, 0x0u)`, which the
+runtime resolves to `$v1` = `0x83` = `FindAddress` in the dispatcher's switch
+(`ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp:306`).
+
+The guest's loop, at `0x010286DC`:
+
+```mips
+1028714:  jal  0x1028638          ; FindAddress wrapper
+102871c:  move s3,v0
+1028740:  bne  s1,s0,0x1028708     ; keep growing until the two pointers meet
+```
+
+### Why it never finishes: it is repeating a search that can only miss
+
+`FindAddress` takes a guest range and a target value and returns where that value is stored. The
+runtime narrates every call; the run's tally is:
+
+| Outcome | Count |
+|---|---:|
+| `FindAddress:hit` | 16 |
+| `FindAddress:miss` | 103 |
+
+The 16 hits were at guest addresses `0x001218C` and `0x01035354` — both in the low 32 MB heap the
+guest had **written itself**. The guest advances `start` past each hit, searches again, and after
+the last real occurrence every call is identical:
+
+```
+start=0x01035358 end=0x80080000 target=0x010285f8 result=0x0
+```
+
+103 times. **It is searching for the value `0x010285F8` — a pointer to one of its own functions —
+in a range where that value does not exist, and retrying the same failing search forever.**
+
+### A real bug found and fixed on the way: the search scanned 2 GB for 32 MB of RAM
+
+Before blaming the guest, the scan itself was pathological. `ps2ResolveGuestPointer` folds
+KSEG0 (`0x20000000`), KSEG1 (`0x80000000`) and the `0x40000000`–`0x80000000` window onto the same
+**32 MB** of RDRAM, but `FindAddress` walked the caller's window literally. GT4 passes
+`[0x00000004, 0x80080000)`, so one call re-read the same words ~64 times:
+
+| | `scannedWords` per call |
+|---|---:|
+| before | **537,001,983** (≈2 GB) |
+| after | **8,392,703** (≈32 MB) |
+
+Exactly **64×**, the alias factor. And the practical effect, from two identical runs:
+
+| | calls completed | wall clock |
+|---|---:|---|
+| before | 144, **still not converged** | 19 min, killed |
+| after | 317, all completing | 200 s |
+
+**Fix:** one high-water mark on the *physical* offset, so each distinct word is visited once, in
+the same order, returning the same first match. `ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp`,
+28 lines, with the reasoning in the comment. Patch:
+`tools/patches/ps2recomp-linux-g1wall.patch`.
+
+This fixed a real inefficiency but **did not unblock the boot** — because the wall is the *miss*,
+not the cost of the scan. Both things are true, and saying only the first would have been
+flattering.
+
+### What the wall is NOT claiming
+
+The guest is looking for a pointer that is not in memory. Two readings fit the evidence, and I am
+not going to pick one without evidence:
+
+- **(a) The data was never loaded.** The table that pointer belongs to may be populated from
+  `CORE.GT4` (2 MB, 7.96 bits/byte, no ELF inside) or `GT4.VOL` (2.29 GiB, payload compressed by
+  something non-standard) — both opaque since `docs/DISC-MAP.md` §5. We loaded only the ELF.
+- **(b) The guest's own bookkeeping diverged** earlier, so it is scanning for something it
+  believes it wrote but did not.
+
+**Falsifier for the whole section:** if `0x010285F8` turns out to be present in memory once the
+game's data files are loaded, reading (a) wins and the wall moves. If it is present in a
+correctly-running guest's memory at this point, reading (b) wins and the divergence is ours to
+find. Either way the next step is the same: **load what the guest is looking for, or find out why
+it thinks it is there.**
+
+### The no-BIOS backlog, populated
+
+This is the list the next dish needs. Five syscalls, 317 calls, all named, all served, no BIOS:
+
+| Syscall | Name | Calls | Last PC | Status |
+|---|---|---:|---|---|
+| `0x83` | `FindAddress` | 311 | `0x01028640` | ✅ served — **but returns "not found" 103 times** |
+| `0x74` | `SetSyscall` | 2 | `0x01028788` | ✅ served |
+| `0x40` | `CreateSema` | 2 | `0x0101F428` | ✅ served |
+| `0x3D` | `SetupHeap` | 1 | `0x010001E8` | ✅ served — base `0x010519B0`, limit `0x01F00000` |
+| `0x3C` | `SetupThread` | 1 | `0x010001CC` | ✅ served |
+
+**Zero BIOS files.** Every one of these was served by our own runtime. The `0x83` result being
+*wrong* is a different problem from *absent* — and it is the one that matters now.
+
+### The instrumentation, since it will be needed again
+
+The three things this dish was told to watch, and where they are counted:
+
+| Thing | Counted in | Surface |
+|---|---|---|
+| syscalls (number, PC, count) | `PS2Runtime::handleSyscall` | `syscallCallCount()`, `lastSyscallId()`, `syscallCounts()` |
+| which syscall is executing *now* | same, saved/restored around dispatch | `activeSyscallId()` — this is what turns a timeout into a name |
+| MMIO (address, count) | `PS2Memory::translateAddress` | `mmioAccessCount()`, `mmioCounts()`, `lastMmioAddress()` |
+| the yield / dispatch path | the harness driver loop | `functions_entered`, `distinct_pcs`, `dispatcher_transfers` |
+
+Syscall **names** are not in the runtime — a second copy of the dispatch table there would drift.
+They are generated from the dispatcher's own switch by
+`tools/harness/gen_syscall_names.py` into `ps2xRuntime/include/runtime/syscall_names.h`
+(58 names). Regenerate it if the dispatcher changes.
+
+### How "it timed out" became a name
+
+`PS2Runtime::requestStop()` is public and makes `eeCheckpointDue()` return true, so the watchdog
+from G1.1 still causes the guest to yield. The difference is what the harness *does* with that:
+
+```cpp
+const uint32_t active = runtime.activeSyscallId();
+if (active != PS2Runtime::kNoActiveSyscall) {
+    haltReason = kHaltInSyscall;                 // "stuck_in_syscall"
+    haltDetail = "... blocked inside SCE syscall 0x83 (FindAddress), guest pc 0x0102871c ...";
+} else {
+    haltReason = kHaltSpinningInGuest;           // "spinning_in_guest_code"
+}
+```
+
+Before: a clock ran out. After: the runtime says which syscall it is standing in. Same stop, two
+very different meanings — and only the second one tells the next dish what to build.
+
+### Honest limits
+
+- **Still three functions.** The fix made the search 64× cheaper and the syscall completes 317
+  times instead of hanging, but the guest's loop does not terminate, so the count is unchanged.
+- **The two readings in the previous section are hypotheses.** I have not loaded `CORE.GT4` and
+  I have not traced the guest's earlier bookkeeping.
+- **0 MMIO accesses is a statement about this run only.** It rules out the hardware walls *at this
+  point in the boot*, not for the whole game. The GS and VU1 walls are still exactly where
+  `docs/DISC-MAP.md` said they were — ahead of us, not behind.
+
+### Licence note
+
+Measurements, addresses, short disassembly excerpts and a runtime-behaviour diagnosis, for a disc
+the user owns. No game code beyond short excerpts used as analysis. Generated C++ and run logs
+stay on the SSD.

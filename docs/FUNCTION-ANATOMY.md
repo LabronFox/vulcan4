@@ -596,3 +596,163 @@ analysis of a disc the user owns. It is a mechanical derivative of Polyphony Dig
 included for research and preservation. The bulk output stays on the SSD and is not in this
 repository. No ISO, no `core.gt4`, nothing from `GT4.VOL` is present. Not affiliated with Sony
 Interactive Entertainment or Polyphony Digital.
+
+---
+
+## 8. G0.4 ADDENDUM — the run now finishes
+
+> Appended, not rewritten. §1 above is the record of the **failure** and stays as measured.
+> This section is the record of the **fix**, in goal G0.4. Root cause and the patch itself are
+> in `docs/TOOLCHAIN.md` §8.
+
+### The run, re-run after the fix
+
+Same input, same config, default 11 workers — nothing about the workload changed:
+
+```bash
+cd /mnt/ssd/gt4/work
+/mnt/ssd/vulcan4-build/ps2xRecomp/ps2_recomp gt4_recomp.toml
+```
+
+```
+========== PS2Recomp report ==========
+Functions discovered: 707
+Functions processed: 707, recompiled: 625, stubs: 82, skipped: 0, decode failures: 0
+Additional entrypoints: 9056
+Generated functions: 721
+Indirect fallback promotions: 122 (13768 fallback entries)
+Unhandled instructions: 0
+Correctness-critical guest fallbacks: 0, failures: 0
+Warnings: 122, errors: 0
+======================================
+Recompilation completed successfully
+RECOMP_EXIT=0
+```
+
+**`errors: 1` → `errors: 0`. `RECOMP_EXIT=1` → `RECOMP_EXIT=0`.** The 122 warnings are the same
+unresolved-`JR/JALR` promotions described in §1, untouched by this fix.
+
+### The two lost functions are back
+
+`sub_0102DB98` and `sub_0102DBE8` — the ones §1 showed declared and never defined — are now in the
+source, in the header, and in the compiled object:
+
+```
+$ grep -nE "sub_0102DB98|sub_0102DBE8" ps2_recompiled_functions.cpp
+216133:void sub_0102DB98_0x102db98(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+216247:void sub_0102DBE8_0x102dbe8(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+```
+
+### The completeness check, and its command
+
+The command and its output. **The difference is empty.**
+
+```bash
+cd /mnt/ssd/vulcan4-build/recomp
+
+# names declared in the header
+grep -oE "sub_[0-9A-Fa-f]+_0x[0-9a-f]+" ps2_recompiled_functions.h | sort -u > /tmp/h.txt
+# names defined in the source
+grep -oE "^(void|uint32_t|int32_t|int64_t|uint64_t) [A-Za-z_0-9]+_0x[0-9a-f]+\(" \
+     ps2_recompiled_functions.cpp | grep -oE "[A-Za-z_0-9]+_0x[0-9a-f]+" | sort -u > /tmp/c.txt
+comm -23 /tmp/h.txt /tmp/c.txt
+```
+
+```
+header decls: 707 | cpp bodies: 721
+--- declared but NOT defined (MUST be empty) ---
+--- end ---
+```
+
+707 declared, 721 defined (the extra 14 are the synthesized entry points the report calls
+`Additional entrypoints` / `synthesized 14 standalone configured guest entry point(s)`). **Zero
+declared functions lack a body.** For contrast, the same command on the G0.3 run printed:
+
+```
+sub_0102DB98_0x102db98
+sub_0102DBE8_0x102dbe8
+```
+
+### The generated code compiles, and no game symbol is missing
+
+```bash
+R=/home/or/vulcan4/tools/PS2Recomp
+g++ -std=c++20 -c -msse4.1 -I. \
+  -I$R/ps2xRuntime/include -I$R/ps2xRecomp/include \
+  -I$R/ps2xRuntime/src/lib/Kernel -I$R/ps2xIOP/include \
+  -DPS2_RUNTIME_LOGS=1 -DAGRESSIVE_LOGS=1 -DPS2_FUNCTION_LOG_TRACKER=1 \
+  -DPS2X_ENABLE_IOP_RPC_TRACE=1 -DPS2X_HAS_FFMPEG=0 \
+  ps2_recompiled_functions.cpp -o ps2_recompiled_functions.o
+```
+
+```
+OBJ_EXIT=0     ->  ps2_recompiled_functions.o  10,652,680 B
+```
+
+Then the symbol check. **This one is worth reading twice** — the naive version of it lies:
+
+```bash
+# WRONG: nm emits C++-mangled names, so this matches nothing and looks like total failure
+nm --defined-only ps2_recompiled_functions.o | grep -q " sub_0102DB98_0x102db98$"   # -> false
+
+# RIGHT: demangle, then strip the signature
+nm -C --defined-only ps2_recompiled_functions.o | awk '$2=="T"||$2=="t"{print $3}' \
+  | sed 's/(.*//' | sort -u > /tmp/syms.txt
+comm -23 /tmp/names.txt /tmp/syms.txt      # names declared in the .cpp, absent from the object
+```
+
+```
+demangled T/t symbols: 743
+names declared in .cpp: 721
+=== declared in .cpp but ABSENT from the object (MUST be 0) ===
+0
+```
+
+**All 721 translated functions are real, compiled, global symbols in the object file.**
+
+Linking it against nothing but a `main` shows what is still missing — and it is **entirely runtime**:
+
+```
+main
+PS2Runtime::Load8/16/32/64/128, Store8/16/32/64/128
+PS2Runtime::dispatchGuestBranch(...), SignalException(...), eeCheckpointDue(...)
+ps2_stubs::mceGetInfoApdx(...), ps2_stubs::__divdi3(...)
+```
+
+132 unique undefined symbols, **zero of them a GT4 function**:
+
+```bash
+$ nm -u ps2_recompiled_functions.o | grep -cE "sub_[0-9A-F]+_0x"
+0
+```
+
+Every one of them lives in `ps2xRuntime` / `ps2_stubs` and is **G1.1's work** — supplying the
+hardware and SDK handlers. That is exactly the split this project wants: the *translation* is
+complete, the *runtime* is the next problem, and the two are no longer confused.
+
+### What changed, in one table
+
+| | G0.3 (broken) | G0.4 (fixed) |
+|---|---|---|
+| `RECOMP_EXIT` | 1 | **0** |
+| `errors` | 1 | **0** |
+| Function bodies written | 719 / 721 | **721 / 721** |
+| Declared-but-undefined | 2 | **0** |
+| `register_functions.cpp` | never produced | **804,210 B** |
+| `ps2_recompiled_stubs.h` | never produced | **7,055 B** |
+| 11-worker run | hung, 12 threads in futex | **completes** |
+| Generated `.cpp` compiles | not attempted | **yes, 10.6 MB object** |
+
+The fix is `tools/patches/ps2recomp-linux-outputfix.patch` — **1 file, +43/−3**, on top of the G0.1
+Linux patch. Full root-cause analysis in `docs/TOOLCHAIN.md` §8.
+
+### What §6's verdict now rests on
+
+Unchanged: **the translation is faithful.** Re-running it produced 8,899,740 B — byte-identical to
+the single-worker run — so the fix changed *scheduling*, not *output*. The function read in §3/§4
+is still the function the tool emits.
+
+And the falsifiers from §6 are still standing, with one now closed: the generated translation unit
+**compiles**, so "the generated code does not compile at all" is off the table. Everything else
+remains open — most importantly that **none of it has been executed**. G1.1 is still the only thing
+that can say whether this code runs.

@@ -1,0 +1,75 @@
+diff --git a/ps2xRecomp/src/lib/ps2_recompiler.cpp b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+index bb35a7a..2438730 100644
+--- a/ps2xRecomp/src/lib/ps2_recompiler.cpp
++++ b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+@@ -1486,8 +1486,15 @@ namespace ps2recomp
+                         bool scheduledAny = false;
+                         {
+                             std::lock_guard<std::mutex> lock(outputMutex);
++                            // Throttle on in-flight work only. Counting completedCode here as well
++                            // deadlocks: if results arrive out of order, completedCode fills the
++                            // buffer behind a gap, flushCompletedOutput cannot advance without the
++                            // missing index, and the index that would fill it never gets scheduled
++                            // because the throttle now refuses more work. Every thread then waits
++                            // forever. The per-file writer already throttles on outstandingWork
++                            // alone, which is correct; match it.
+                             while (nextFunction < outputFunctions.size() &&
+-                                   outstandingWork + completedCode.size() < maxBufferedOutput &&
++                                   outstandingWork < maxBufferedOutput &&
+                                    !stopWorkers)
+                             {
+                                 pendingWork.push(nextFunction++);
+@@ -1551,18 +1558,51 @@ namespace ps2recomp
+                             flushCompletedOutput();
+                             scheduleAvailableWork();
+ 
++                            // Workers publish into readyCode and decrement outstandingWork in the
++                            // same critical section, so a worker that finishes after the drain above
++                            // leaves outstandingWork == 0 with its body still sitting in readyCode.
++                            // The "missing index" check below used to treat that as lost work and
++                            // aborted the run, dropping the tail of the output. Re-drain and re-flush
++                            // before concluding anything is missing.
++                            {
++                                std::lock_guard<std::mutex> drainLock(outputMutex);
++                                while (!readyCode.empty())
++                                {
++                                    CompletedCode completed = std::move(readyCode.front());
++                                    readyCode.pop();
++                                    completedCode.emplace(completed.outputIndex, std::move(completed.code));
++                                }
++                            }
++
++                            flushCompletedOutput();
++
+                             if (nextOutputIndex >= outputFunctions.size())
+                             {
+                                 break;
+                             }
+ 
+                             std::lock_guard<std::mutex> finalLock(outputMutex);
+-                            if (outstandingWork == 0 && nextFunction >= outputFunctions.size() && completedCode.empty())
++                            if (outstandingWork == 0 && nextFunction >= outputFunctions.size()
++                                && readyCode.empty() && completedCode.empty())
+                             {
+-                                throw std::runtime_error("Internal error: combined output completion queue is missing index " + std::to_string(nextOutputIndex));
++                                // Genuinely lost: name the function so this can never again be a
++                                // bare index number nobody can act on.
++                                throw std::runtime_error(
++                                    std::string("Internal error: combined output completion queue is missing index ")
++                                    + std::to_string(nextOutputIndex)
++                                    + " (function " + outputFunctions[nextOutputIndex]->name + ")");
+                             }
+                         }
+ 
++                        if (nextOutputIndex != outputFunctions.size())
++                        {
++                            throw std::runtime_error(
++                                std::string("Internal error: emitted only ") + std::to_string(nextOutputIndex)
++                                + " of " + std::to_string(outputFunctions.size())
++                                + " function bodies; first missing: "
++                                + outputFunctions[nextOutputIndex]->name);
++                        }
++
+                         stopAndJoinWorkers();
+                     }
+                     catch (...)

@@ -57,16 +57,28 @@ Eventually the captain's Odin 2. Never an emulator.
   arithmetic, indirect calls, the spin-trap loop — all verified against raw bytes. **The
   translation is faithful.** But the run **failed**: exit 1, 2 of 721 function bodies lost.
 
-### ⬜ G0.4 — The recompiler drops the tail of its own output
-- **DONE WHEN:** a full `ps2_recomp` run over `SCUS_973.28` exits 0 and writes all 721 function
-  bodies, so the generated `.cpp` links.
-- **WHY IT MATTERS:** G0.3 measured `RECOMP_EXIT=1` —
-  `Internal error: combined output completion queue is missing index 719`. Functions
-  `sub_0102DB98` and `sub_0102DBE8` are declared in the header and defined nowhere, and
-  `register_functions.cpp` / `ps2_recompiled_stubs.h` are never produced. **The translator is
-  correct; the output writer loses the tail.** Blocks linking, so it blocks G1.1.
-- **NOTE:** second time this toolchain reported a clean number (`Unhandled instructions: 0`,
-  `errors: 0` in G0.1's endianness case) while something was wrong. Watch for more.
+### ✅ G0.4 — The recompiler's output is complete and linkable
+- **DONE WHEN:** a full `ps2_recomp` run over `SCUS_973.28` exits 0, writes all 721 function
+  bodies, produces the artefacts it used to die before writing, and the generated `.cpp` compiles.
+- **RESULT (2026-09-29):** ✅ `RECOMP_EXIT=0`, `errors: 0`, **721/721 bodies**, **0 declared-but-
+  undefined**, all four artefacts written (`functions.cpp` 8,899,740 B, `functions.h`, `stubs.h`,
+  `register_functions.cpp` 804,210 B). Compiles to a 10,652,680 B object; all 721 functions are
+  global symbols in it; the only undefined symbols are `PS2Runtime::`/`ps2_stubs::` — **zero GT4
+  functions** — which is G1.1's work, not a translation gap.
+- **TWO defects, both in the combined-output writer**, fixed in
+  `tools/patches/ps2recomp-linux-outputfix.patch` (1 file, +43/-3):
+  1. **Race on the staging queue.** The termination check tested `completedCode.empty()` but never
+     `readyCode.empty()`, so it declared work lost while finished bodies sat uncollected in
+     `readyCode` — aborting the run and dropping the tail every time. Now re-drains before
+     concluding, and **names the missing function** instead of a bare index.
+  2. **Deadlock in the throttle.** The combined path throttled on
+     `outstandingWork + completedCode.size()`, so out-of-order results filling the buffer behind a
+     gap stopped it scheduling the very index that would fill that gap — 12 threads in `futex_wait`
+     at 0% CPU, stuck at 320/721. Now throttles on `outstandingWork` alone, matching the
+     per-file writer, which was already correct.
+- **NOTE:** third time this toolchain reported a clean number while something was wrong. The
+  third is the most serious — a *silent* truncation would have been worse than G0.3's loud one.
+  Watch for more.
 
 
 ---

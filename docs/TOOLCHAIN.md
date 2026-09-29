@@ -488,18 +488,129 @@ mips-linux-gnu-ld -Ttext=0x00100000 -e vulcan_entry -o scratch.elf scratch.o
 | Exact commands recorded | ✅ §3, §4, §6 |
 | Patch is minimal and `git pull`-safe | ✅ 2 files, +24 lines, no deletions |
 | Scratch R5900 ELF → real C++ | ✅ §4, every instruction accounted for |
-| **Recompiler correct on big-endian guest data** | ❌ **§5 — upstream defect, not fixed here** |
+| **Recompiler correct on little-endian guest data** | ✅ §5a — GT4 is `ELFDATA2LSB`, decoder is right |
 
 **The toolchain builds and runs on Linux. G0.1 is met.**
 
-One defect found and deliberately left for its own dish: the recompiler ignores ELF endianness, so
-it will miscompile GT4's real big-endian executable while reporting no errors. **Do not start G0.2
-(GT4 on the slab) before that is fixed** — a silent miscompile is exactly the "plausible-looking
-lie" this project refuses to ship.
+(The endianness row above is superseded — see §5a. The PS2 is little-endian, the decoder is
+correct, and the retraction is recorded there rather than deleted.)
 
 One minor robustness defect recorded and not fixed: `ps2EntryRunner` segfaults rather than erroring
 when it cannot open a display (§4, Finding 4). Cosmetic by comparison; the recompiler itself is
 unaffected.
+
+---
+
+## 8. PATCH 2 — the output writer lost its tail and then deadlocked (goal G0.4)
+
+`ps2_recomp` translated all 707 GT4 functions without complaint and then **failed writing its own
+output**, and in one configuration **hung forever**. Two separate defects, both in the combined
+(single-file) output path of `ps2xRecomp/src/lib/ps2_recompiler.cpp`, both fixed in
+`tools/patches/ps2recomp-linux-outputfix.patch` (**1 file, +43/-3**).
+
+Apply it on top of `ps2recomp-linux.patch`, or all three patches in order:
+
+```bash
+cd /home/or/vulcan4/tools/PS2Recomp
+git apply ../../tools/patches/ps2recomp-linux.patch          # G0.1: toml11 + SSE4.1
+git apply ../../tools/patches/ps2recomp-linux-outputfix.patch # G0.4: output writer
+```
+
+### Defect 1 — a race on the staging queue ("missing index 719")
+
+Symptom, quoted from G0.3:
+
+```
+  [error] output - Internal error: combined output completion queue is missing index 719
+RECOMP_EXIT=1
+```
+
+with `Unhandled instructions: 0` sitting right next to it. Two function bodies
+(`sub_0102DB98`, `sub_0102DBE8`) declared in the header and defined nowhere.
+
+**Cause.** Results travel through two queues. Workers push into `readyCode` and decrement
+`outstandingWork` *in the same critical section*. The main loop drains `readyCode` into
+`completedCode` **once per iteration**, then releases the lock and does its work. A worker that
+finishes *after* that drain therefore leaves `outstandingWork == 0` with its finished body still
+sitting in `readyCode`.
+
+The termination check never looked at `readyCode`:
+
+```cpp
+// upstream, before the fix
+if (outstandingWork == 0 && nextFunction >= outputFunctions.size() && completedCode.empty())
+    throw std::runtime_error("... missing index " + std::to_string(nextOutputIndex));
+```
+
+All three conditions are true for **successfully completed** work that simply has not been
+collected yet, so the writer threw away a complete result and aborted the run — losing the tail
+every time. That is why it was always the last indices, and why `Unhandled instructions: 0`
+accompanied it.
+
+**Fix:** re-drain `readyCode` and re-flush before concluding anything is missing, and make the
+error **name the function** instead of printing a bare index. A second guard after the loop throws
+if the writer did not emit exactly `outputFunctions.size()` bodies, naming the first missing
+function. Silent loss is now impossible by construction: either every declared function has a body,
+or the tool fails loudly and says which.
+
+### Defect 2 — the throttle could deadlock the writer (found while fixing defect 1)
+
+With defect 1 fixed, a run configured for 11 workers **hung**: 12 threads (1 main + 11 workers) all
+blocked in `futex_wait` at 0% CPU, stuck after 320 of 721 bodies.
+
+**Cause.** The combined path throttled on *completed* entries as well as in-flight ones:
+
+```cpp
+// combined path (deadlocking)
+while (nextFunction < outputFunctions.size() &&
+       outstandingWork + completedCode.size() < maxBufferedOutput && !stopWorkers)
+
+// per-file path (correct, already)
+while (nextFunction < outputFunctions.size() &&
+       outstandingWork < maxBufferedOutput && !stopWorkers)
+```
+
+`flushCompletedOutput()` can only write **contiguous** indices. With 11 workers finishing out of
+order, `completedCode` fills with results sitting *behind* a gap. The throttle then counts those
+toward `maxBufferedOutput` and **refuses to schedule the very index that would fill the gap**. All
+workers go idle, the main thread's wait predicate (`outstandingWork == 0 && nextFunction >= size`)
+is false because work is still unscheduled, and every thread sleeps forever.
+
+**Fix:** throttle on in-flight work only — matching the per-file writer, which was already right.
+Memory is bounded anyway: at most `outputFunctions.size()` strings, ~8.9 MB for GT4.
+
+### Verification
+
+Both fixes, measured on GT4's `SCUS_973.28` with the default 11 workers:
+
+```
+$ /mnt/ssd/vulcan4-build/ps2xRecomp/ps2_recomp gt4_recomp.toml
+Recompilation completed successfully
+RECOMP_EXIT=0
+```
+
+| Artefact | Size (B) |
+|---|---:|
+| `ps2_recompiled_functions.cpp` | 8,899,740 |
+| `ps2_recompiled_functions.h` | 61,468 |
+| `ps2_recompiled_stubs.h` | 7,055 |
+| `register_functions.cpp` | 804,210 |
+
+`Warnings: 122, errors: 0` — was `errors: 1`. The 122 warnings are the honest
+unresolved-`JR/JALR` promotions from G0.3, unrelated to this bug. Output is **byte-identical to the
+single-worker run** (8,899,740 B), which is the strongest evidence the fix changes only scheduling
+and not what gets written.
+
+### Known sibling, deliberately not fixed here
+
+The **per-file** output path (`single_file_output = false`) has the same drain-once-then-check
+shape, but on failure it does `break` rather than throw — so a stall there would be a **silent
+truncation** instead of a loud error. Its throttle is already correct, so it is far less exposed,
+and this project has never exercised it. Recorded, not touched, to keep the patch surface small.
+
+### Licence note
+
+Both patches are diffs of **GPL-3.0** upstream files and inherit that licence.
 
 ### Licence note
 

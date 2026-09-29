@@ -121,6 +121,33 @@ Eventually the captain's Odin 2. Never an emulator.
 
 ---
 
+### ⬜ G5.3 — Regional + special builds
+- **The captain's question (2026-09-29):** *"u think we should get all the different country
+  roms or it dont matter?"*
+- **Answer, measured:** a recompilation is **per build** — each region has its own code addresses
+  and its own differences, so region support means repeating the process against that build, not
+  "one recompile runs all". And the regions are **not** the same game in the details:
+  - the NA/PAL builds carry **~10 cars the JP build does not**, and JP has one the others lack
+  - **prize cars differ** (e.g. an endurance prize is the Sauber in JP, the Auto Union elsewhere)
+  - the S-licence final test uses **a different car** per region
+  - the **AI is more aggressive on its tyres in PAL than in NA** — a real gameplay-code difference
+  - driving missions carry **different handicaps**, and NA has a well-known **100%-completion
+    glitch** if DM1 is not done first
+  - **PAL is a 50 Hz conversion** where NTSC is 60 Hz — timing, and therefore physics and licence
+    targets, genuinely differ
+  These differences are exactly what a recomp lets us **study**: diffing two regional builds is
+  an X-ray of the game's own logic, which is how decompilation communities locate interesting code.
+- **ALSO WORTH KNOWING — `Gran Turismo 4 Online`.** A separate build (US public beta `SCUS-97436`,
+  plus a JP *Online Test Version*) shipped to ~4,700 Japanese and 300 Korean test players, with an
+  **Online mode the retail game never shipped**: Online Home, Quick Race, Tuned Car Race, Private
+  Race, Time Attack. Services ran 2006-06-01 → 2006-09-01 and died. If the lost mode is ever to be
+  studied or restored, **that build is the one to read** — and it is the kind of thing this project
+  exists for.
+- **PLAN:** the **US v2.00 build stays the only target until something boots and draws.** Additional
+  builds get collected **when there is a reason to diff them**, not now. Storage is cheap (~5 GB
+  each), attention is not.
+- **STATUS:** ⬜ none collected beyond US v2.00 (already on `/mnt/ssd/gt4`).
+
 ## The discipline
 
 1. Every dish opens with `GOAL: <id>`; the driver prints it in the banner.

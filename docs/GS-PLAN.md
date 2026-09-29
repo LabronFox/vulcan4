@@ -96,6 +96,19 @@ The GS we have is already the right *shape* for a recompiler:
 Importing a second GS would mean owning two renderers and translating between them. That is the
 worst of both options.
 
+## External evidence (added by goal X1)
+
+[`docs/PRIOR-ART.md`](PRIOR-ART.md) surveyed the projects that shipped first. The survey supports
+this decision independently: **not one of them links an emulator's GPU core into their recompiler.**
+UnleashedRecomp translates draw calls to a modern API, Zelda64Recomp built a dedicated accuracy-first
+core (RT64), PS1Recomp re-implements the PS1's GP0/GP1 command stream and feeds OpenGL, and PSXRecomp
+keeps a software rasteriser as "the reference look". Emulators — Xenia, PCSX2, Ares — are used as
+*reading material* only. PS1Recomp's design doc also states outright that its structure follows
+PS2Recomp's, so we are the upstream in that lineage rather than an outlier.
+
+**Recommendation unchanged: keep and extend the GS in `ps2xRuntime`.** See `PRIOR-ART.md` item 3 for
+why the four known GS defects should be fixed before any new GS code is written.
+
 ## What would change my mind
 
 - The existing GS proves unable to reach correctness on real GT4 frames after G3.x, **and** the

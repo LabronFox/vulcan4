@@ -714,3 +714,103 @@ next dish what to do.
 Measurements, addresses, short disassembly excerpts, and a syscall-contract citation, for a disc
 the user owns. References to ps2sdk and ps2rd are cited by URL and are not reproduced here.
 Not affiliated with Sony Interactive Entertainment or Polyphony Digital.
+
+---
+
+## 10. G1.3 CORRECTION — §5 was wrong, and a full-disc scan proves it
+
+> The previous section ended with *"the wall is missing data: that table lives in `CORE.GT4` or
+> `GT4.VOL`."* **That is false, and I am retracting it before it sends the next dish after a file
+> that provably does not contain the table.**
+
+### The test
+
+§5's claim was falsifiable, so I ran the falsifier. A scan of the **entire disc** — all
+5,314,478,080 bytes — for the two 4-byte little-endian values the guest is hunting for:
+
+```
+scanned 5314478080 bytes
+  func_010285F8  1 occurrence  0x10d354
+  func_010285C0  1 occurrence  0x10d35c
+```
+
+**One occurrence each, on the whole disc, and they are 8 bytes apart.** There is no 164-byte-stride
+table anywhere on this DVD. `CORE.GT4` contains **zero** literal occurrences of either, and only
+3 words in 2 MB that look like in-image code pointers — noise, consistent with its 7.96 bits/byte.
+
+### What is actually at 0x01035350 — the table, in the ELF, all along
+
+Both pointers live in the executable's own `.data`, and reading the words around them gives the
+structure:
+
+```
+0x01035350:  0x00000083   number = 0x83
+0x01035354:  0x010285F8   handler = sub_010285F8
+0x01035358:  0x0000005A   number = 0x5A
+0x0103535C:  0x010285C0   handler = sub_010285C0
+0x01035360:  0x00000000   terminator
+0x01035364:  0x00000000
+```
+
+That is a **syscall-override table** — the `SyscallData { int syscall_num; void *function; }`
+array from ps2SDK's `ee/kernel/src/libosd.c`, the same shape as its `SyscallPatchEntries`:
+
+```c
+struct SyscallData { int syscall_num; void * function; };
+static struct SyscallData SyscallPatchEntries[] = { {0x5A, &kCopy}, {0x5B, ...}, ... };
+```
+
+and it is installed with `setup()`, which is SCE syscall **`0x74 SetSyscall`** — a syscall the guest
+**already called, twice**, at `0x01028788`.
+
+### So the guest is not missing data. It is installing syscall overrides.
+
+The picture now fits everything observed, with no missing file:
+
+1. GT4 boots, sets up a heap (`0x3D`), a thread (`0x3C`), a semaphore (`0x40`).
+2. It holds a table of kernel-call patches: *replace syscall `0x83` with `sub_010285F8`, and
+   syscall `0x5A` with `sub_010285C0`*.
+3. To patch a kernel syscall it must first **locate the slot** in the console's syscall table —
+   which is what `FindAddress` is for, and what ps2SDK calls `GetEntryAddress()`. The console's
+   table base is **`0x80011F80`**, and `PS2Runtime::initializeEeKernelState()` already knows it
+   (`kTableGuestBase`).
+4. The guest searches, and `SetSyscall` is called twice — so the patch path *is* being taken.
+
+**This also explains why the two pointers looked "8 bytes apart" while §5 demanded 164.** The
+`0xA4` figure came from my reading of the loop at `0x01028740`
+(`s1 = s3 - 0x20C`, `s0 = s2 - 0x168`, so `s1 == s0 ⟺ s3 - s2 == 0xA4`). The real table stride is
+**8**. My instruction reading and the actual data disagree, and when they disagree **the data wins**.
+I should not have carried the `0xA4` derivation into a committed finding without checking it
+against the bytes — that is the same mistake as the G0.1 endianness generalisation, and I made it
+again one dish later.
+
+### What survives, and what does not
+
+| §5 claim | Status |
+|---|---|
+| "The two targets are 8 bytes apart" | ✅ **confirmed** — now known to be a `{number, handler}` table |
+| "a 164-byte-stride table is what the guest converges on" | ❌ **retracted** — contradicted by the data |
+| "the table lives in `CORE.GT4` or `GT4.VOL`" | ❌ **retracted** — a full-disc scan finds one occurrence each, both in the ELF |
+| "`FindAddress` is served and now returns the window end on a miss" | ✅ **stands** — sourced, unit-tested, 441/441 |
+| the 64× rescan fix | ✅ **stands** — `scannedWords` 537,001,983 → 8,392,703 |
+| **`functions_entered` = 3, gate not met** | ✅ **stands, unchanged** |
+
+**The gate outcome is unaffected by this correction.** `functions_entered` was 3 before and is 3
+after; the correction changes only *why*, and it changes it in a way that points somewhere real
+instead of somewhere empty.
+
+### Where the wall now points
+
+Not at a missing file. At the **kernel syscall table itself**: the guest wants to patch slots for
+`0x83` and `0x5A`, it is asking our `FindAddress` where those slots are, and our `FindAddress`
+searches guest memory for a *value* — it never consults the kernel table the way
+ps2SDK's `GetEntryAddress()` computes it as `0x80011F80 + n * 4`.
+
+That is a concrete, testable hypothesis for the next dish, and unlike the one it replaces it does
+not require a file we do not have.
+
+**Falsifier for this correction:** if `0x80011F80 + 0x83 * 4` is not how the console kernel
+addresses syscall `0x83`, this reading is wrong too — and the way to check it is the `0xFFFFC402`
+offset in ps2SDK's own `libosd.c`, which the comment there says is
+*"relative to the start of the syscall table, and is in units of 32-bit pointers"*. That is a
+number we can test, not a story.

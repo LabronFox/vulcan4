@@ -148,16 +148,27 @@ Eventually the captain's Odin 2. Never an emulator.
   pre-existing test corrected** — it asserted the miss returns `0`, which the first-party
   reference contradicts. That edit is flagged in the doc and the commit as the move to distrust.
   **441/441 pass.**
-- **THE NEXT WALL, NAMED:** the guest converges two searches only when their results are
-  **164 bytes (0xA4) apart** (`0x20C - 0x168`). The loaded image holds exactly **one** occurrence
-  of each target — `0x010285F8` at `0x01035354` and `0x010285C0` at `0x0103535C` — **8 bytes
-  apart**, a consecutive pair in a handler table. The 164-byte-stride table is not in the ELF.
-  **So the wall is missing *data*, not a missing syscall:** the table lives in `CORE.GT4` (2 MB) or
-  `GT4.VOL`, opaque since G0.2 and never loaded. We cannot inject it without faking, because the
-  guest only reaches its file-loading path *after* this walk completes.
-- **NEXT MEASUREMENT:** load `CORE.GT4` (`85d26aa8…`, 2 MB) and check for a 164-byte-stride
-  pointer table. That either confirms or kills this reading. Then build IOP + SIF + `fileio`, which
-  is entirely unbuilt — the syscall list has no file operations at all.
+- **~~THE NEXT WALL, NAMED (RETRACTED, see below):~~** an earlier version of this entry claimed the
+  guest needed a 164-byte-stride table living in `CORE.GT4`/`GT4.VOL`. **A full 5.3 GB disc scan
+  falsifies it:** each target pointer occurs exactly **once on the whole disc**, and both are in
+  the ELF's own `.data`, 8 bytes apart. `CORE.GT4` contains neither.
+- **THE REAL TABLE — it is in the ELF all along**, at `0x01035350`, and it is a **syscall-override
+  table** in ps2SDK's `SyscallData { int syscall_num; void *function; }` shape:
+  `{0x83, sub_010285F8}, {0x5A, sub_010285C0}, {0,0 terminator}` — installed with `setup()`,
+  which is SCE **`0x74 SetSyscall`**, a syscall GT4 already called twice.
+- **WHERE THE WALL NOW POINTS:** GT4 is trying to **patch the console kernel's syscall table**, and
+  to do that it must locate the slots — which is ps2SDK's `GetEntryAddress()`, i.e.
+  `0x80011F80 + n*4` (`kTableGuestBase`, already known to `initializeEeKernelState`). Our
+  `FindAddress` searches guest memory for a *value* and never consults that table.
+- **MY `0xA4` DERIVATION WAS WRONG.** It came from reading the loop at `0x01028740`; the real table
+  stride is **8**. Where my instruction reading and the actual bytes disagreed, the bytes win. That
+  is the same class of mistake as the G0.1 endianness generalisation, made again one dish later.
+- **NEXT MEASUREMENT (cheap, testable):** check whether `0x80011F80 + 0x83*4` really is the console
+  kernel's address for syscall `0x83`, using ps2SDK's own `libosd.c` comment on the `0xFFFFC402`
+  offset (*"relative to the start of the syscall table, in units of 32-bit pointers"*) as the
+  cross-check. A number to test, not a story.
+- **UNCHANGED:** `functions_entered` is **3** and the gate wanted **>= 4**. The correction changes
+  why, not the outcome.
 
 ### ⬜ G1.0 — **NO BIOS REQUIRED** *(the captain's bucket-list item, 2026-09-29)*
 - **Captain's words:** *"one thing to add to the bucket list. making it run without a bios."*

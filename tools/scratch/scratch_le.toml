@@ -1,0 +1,14 @@
+# scratch.toml - drive ps2_recomp over our own trivial R5900 program.
+#
+# The recompiler discovers functions from the ELF symbol table, so there is no
+# function list here. Only input/output plus the knobs we care about.
+
+[general]
+input  = "/home/or/vulcan4/tools/scratch/scratch_le.elf"
+output = "/home/or/vulcan4/tools/scratch/out_le"
+
+single_file_output = true
+output_worker_thread = 1
+patch_syscalls = true
+patch_cop0 = true
+patch_cache = true

@@ -27,3 +27,11 @@ target/
 
 # upstream clone — never commit another project's tree
 /tools/PS2Recomp/
+# built toolchain binaries — reproducible from tools/patches, never committed
+/tools/bin/
+/tools/scratch/out/
+/tools/scratch/out_le/
+*.o
+
+# build-mode harness bookkeeping (dish queue + driver logs), not project content
+/.auto/

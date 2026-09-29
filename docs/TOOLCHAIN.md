@@ -471,10 +471,15 @@ mkdir -p tools/bin && cp /mnt/ssd/vulcan4-build/ps2xRecomp/ps2_recomp \
 # end-to-end proof (§4)
 sudo apt-get install -y --no-install-recommends binutils-mips-linux-gnu
 cd tools/scratch
-mips-linux-gnu-as -march=5900 -mabi=32 -o scratch.o scratch.s
-mips-linux-gnu-ld -Ttext=0x00100000 -e vulcan_entry -o scratch.elf scratch.o
+mips-linux-gnu-as -EL -march=5900 -mabi=32 -o scratch.o scratch.s
+mips-linux-gnu-ld -EL -Ttext=0x00100000 -e vulcan_entry -o scratch.elf scratch.o
 /mnt/ssd/vulcan4-build/ps2xRecomp/ps2_recomp scratch.toml
 ```
+
+> ⚠️ **`-EL` was missing from this section until G0.5.** §4 and §5a both state that the PS2 is
+> little-endian and that omitting `-EL` builds a big-endian ELF which the recompiler reads as
+> garbage. §6 contradicted them. Corrected above. This is exactly the class of bug the clean-room
+> dish exists to catch: a section nobody had followed since it was written.
 
 ---
 
@@ -618,3 +623,147 @@ Both patches are diffs of **GPL-3.0** upstream files and inherit that licence.
 diff of GPL-3.0 CMake files and inherits their licence. `tools/scratch/scratch.s` is our own
 work. No MIT or otherwise incompatible licence has been added into the GPL tree.
 
+
+---
+
+## 9. Clean-room findings (goal G0.5)
+
+A fresh clone was built into a **new** build root with **no reused objects, no reused `_deps`, and
+no reused generated C++**. The translation unit was **re-run through the recompiler** to prove it
+regenerates, not copied.
+
+**Result: the clean room reproduces the incremental tree exactly.**
+
+| Artefact | Clean room | Incremental tree | |
+|---|---:|---:|---|
+| `ps2_recompiled_functions.cpp` | 8,899,740 B, `a0461ca339e39da11bf3f5132471be49` | 8,899,740 B, same md5 | **byte-identical** |
+| `ps2_recompiled_functions.h` | 61,468 B, `1f084e4b36eb64c69c9a54423ee080f2` | same md5 | **byte-identical** |
+| `ps2_recompiled_stubs.h` | 7,055 B, `5db485fa21beecf69cb3b5d7f5690a6e` | same md5 | **byte-identical** |
+| `register_functions.cpp` | 804,210 B, `5fcbee03f91bf4b64f00b56a90e881c9` | same md5 | **byte-identical** |
+
+Boot report, both trees:
+
+```
+VULCAN4 BOOT REPORT functions_entered=3 halt=stuck_in_syscall bios_files=0
+```
+
+Same shape, same numbers, same halt reason. Transcript: `/mnt/ssd/vulcan4-cleanroom/cleanroom.log`
+(1019 lines). The incremental build root `/mnt/ssd/vulcan4-build` was not read for anything except
+the md5 comparison above, and not modified.
+
+**No stale file, no implicit path, and no undocumented env var was load-bearing.** That is the
+result worth having: everything we had been calling "working" was in fact reproducible from the
+repo. But getting there required fixing the documentation, and the gaps were real.
+
+### Gaps found, and which are fixed
+
+| # | Gap | Severity | Fixed? |
+|---|---|---|---|
+| 1 | **`TOOLCHAIN.md` never mentioned the boot harness at all.** The whole point of the toolchain is booting a guest, and §3 built a runtime that errors out with *"Pass the guest ELF as argv[1]"*. The harness build lived only in `FIRST-BOOT.md` §6. Following `TOOLCHAIN.md` alone gets you a toolchain and no guest. | **blocking** | ✅ §10 added below |
+| 2 | **The third patch was undocumented.** §8's apply order lists `ps2recomp-linux.patch` and `ps2recomp-linux-outputfix.patch`. The repo also ships `ps2recomp-linux-g1wall.patch` (11 files, +361/-9) and it is **required** for the runtime boot path. It applied cleanly but a stranger would never have known to run it. | **blocking** | ✅ §10 |
+| 3 | **The recompile configuration was neither in the repo nor documented.** The working build used `/mnt/ssd/gt4/work/gt4_recomp.toml`, a hand-edited file outside the repo. The *entire* delta from the analyzer's own output is two lines — `output` and `single_file_output = true` — but nothing anywhere said so. | **blocking** | ✅ §10 |
+| 4 | **`ps2_analyzer` emits a relative `input` path** (`input = "SCUS_973.28"`), so the recompiler resolves it against the current directory. Must be made absolute. Undocumented. | high | ✅ §10 |
+| 5 | **§6 omitted `-EL`** while §4/§5a say it is mandatory. A stranger following §6 builds a big-endian ELF and gets garbage with a clean-looking report. | high | ✅ fixed in §6 |
+| 6 | **The harness's 2nd argument (an SDK/symbol-names TOML) has no stated provenance.** It is analyzer output; the docs never said so. | medium | ✅ §10 |
+| 7 | **The pin is fragile.** `--depth 1` then `checkout 75d729c` only works while `75d729c` *is* upstream tip. It is today, by luck. After the next upstream push, §0/§6 fail with "reference is not a tree". | medium | ✅ §10 now fetches the pin explicitly |
+| 8 | **`PS2X_ENABLE_SCCACHE` defaults to `ON`** but `sccache` is not installed here, so it resolves to `PS2X_SCCACHE_PROGRAM-NOTFOUND` and the build silently proceeds without it. Harmless, but a stranger with `sccache` installed would get different timings and might think something else is going on. | low | ✅ noted in §10 |
+| 9 | **`gen_syscall_names.py` is not needed for a clean build.** The G1.3 patch already ships the generated `syscall_names.h`, so running the script would be redundant. Recorded so nobody wonders whether they missed a step. | low | ✅ noted in §10 |
+
+Findings 1–3 were the difference between "reproducible" and "works on my box". They were all
+*missing steps*, not wrong ones — which is the more embarrassing failure mode, because nothing
+errors and nothing looks stale.
+
+---
+
+## 10. THE CLEAN-ROOM RECIPE (end to end, stranger-proof)
+
+This is the sequence a stranger needs. Everything here was executed verbatim in the clean room
+above; the transcript is the evidence. It supersedes §6 for anyone who wants a booting guest.
+
+```bash
+# ---- 0. pick a build root on a big volume. NEVER reuse an existing one.
+export CR=/mnt/ssd/vulcan4-cleanroom
+export REPO=$CR/repo
+export B=$CR/build
+export W=$CR/work
+mkdir -p "$CR"
+
+# ---- 1. fresh clone of VULCAN 4
+git clone /home/or/vulcan4 "$REPO"        # or your own remote
+cd "$REPO"
+
+# ---- 2. upstream toolchain. Fetch the PIN explicitly, not --depth 1, so this
+#         keeps working after upstream moves on (gap 7 above).
+git clone https://github.com/ran-j/PS2Recomp.git tools/PS2Recomp
+git -C tools/PS2Recomp checkout 75d729c
+
+# ---- 3. ALL THREE patches, in order (gap 2 above -- the third is not optional)
+cd tools/PS2Recomp
+git apply ../../tools/patches/ps2recomp-linux.patch          # G0.1 toml11 + SSE4.1
+git apply ../../tools/patches/ps2recomp-linux-outputfix.patch # G0.4 output writer
+git apply ../../tools/patches/ps2recomp-linux-g1wall.patch    # G1.3 runtime + boot report
+cd "$REPO"
+
+# ---- 4. configure + build into a brand-new root
+cmake -S tools/PS2Recomp -B "$B" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF
+cmake --build "$B" -j10
+
+# ---- 5. regenerate the analysis AND the translation unit (never reuse them)
+mkdir -p "$W" && cd "$W"
+"$B/ps2xAnalyzer/ps2_analyzer" /path/to/SCUS_973.28 "$W/gt4.toml"
+# the analyzer writes a RELATIVE input path; make it absolute, point output at the
+# build tree, and turn on combined single-file output (gaps 3 and 4 above):
+sed -i "s|^input = .*|input = \"/path/to/SCUS_973.28\"|"   "$W/gt4.toml"
+sed -i "s|^output = .*|output = \"$W/recomp/\"|"            "$W/gt4.toml"
+sed -i "s|^single_file_output = .*|single_file_output = true|" "$W/gt4.toml"
+"$B/ps2xRecomp/ps2_recomp" "$W/gt4.toml"
+# -> 4 files in $W/recomp, ending "Recompilation completed successfully"
+
+# ---- 6. build the harness (FIRST-BOOT.md section 6, gap 1 above)
+R=$REPO/tools/PS2Recomp
+INC="-I$W/recomp -I$R/ps2xRuntime/include -I$R/ps2xRecomp/include \
+     -I$R/ps2xRuntime/src/lib/Kernel -I$R/ps2xIOP/include"
+DEFS="-DPS2_RUNTIME_LOGS=1 -DAGRESSIVE_LOGS=1 -DPS2_FUNCTION_LOG_TRACKER=1 \
+      -DPS2X_ENABLE_IOP_RPC_TRACE=1 -DPS2X_HAS_FFMPEG=1"
+mkdir -p "$B/run" && cd "$B/run"
+g++ -std=c++20 -O1 -msse4.1 $INC $DEFS -c "$REPO/tools/harness/vulcan4_harness.cpp" -o harness.o
+g++ -std=c++20 -O1 -msse4.1 $INC $DEFS -c "$W/recomp/register_functions.cpp" -o register_functions.o
+g++ -std=c++20 -O0 -msse4.1 $INC $DEFS -c "$W/recomp/ps2_recompiled_functions.cpp" \
+    -o ps2_recompiled_functions.o
+FFMPEG=$(pkg-config --libs libavcodec libavformat libavutil libswresample libswscale)
+g++ -o vulcan4_harness harness.o register_functions.o ps2_recompiled_functions.o \
+  "$B/ps2xRuntime/libps2_runtime.a" "$B/ps2xIOP/libps2_iop.a" \
+  "$B/_deps/raylib-build/raylib/libraylib.a" $FFMPEG -lpthread -ldl -lm -lrt -lX11
+
+# ---- 7. boot. argv: <guest.elf> <names.toml> <max_entries> <max_seconds>
+#         the 2nd argument is the ANALYZER's toml (gap 6 above).
+#         Xvfb because the runtime calls raylib InitWindow() and this box is headless.
+xvfb-run -a -s "-screen 0 640x480x24" ./vulcan4_harness \
+  /path/to/SCUS_973.28 "$W/gt4.toml" 2000000 40
+# expect: VULCAN4 BOOT REPORT functions_entered=3 halt=stuck_in_syscall bios_files=0
+```
+
+**Two optional things you do NOT need to do:**
+
+- `tools/harness/gen_syscall_names.py` — `ps2recomp-linux-g1wall.patch` already ships the
+  generated `syscall_names.h` (gap 9).
+- `tools/gs/build_gs_probe.sh` — self-contained, but it hardcodes `/mnt/ssd/vulcan4-build` for the
+  runtime archives. On a clean-room path either edit the two paths or set up the runtime there
+  first. **This is a known gap: the GS build script is not path-parameterised.**
+
+**`sccache` (gap 8):** `PS2X_ENABLE_SCCACHE` is `ON` by default and sccache is not installed on
+this box, so CMake records `PS2X_SCCACHE_PROGRAM-NOTFOUND` and continues. If you have sccache
+installed you will get different build timings. Nothing else changes; pass
+`-DPS2X_ENABLE_SCCACHE=OFF` for a build that matches these numbers exactly.
+
+### What the clean room does NOT prove
+
+- **It does not prove the guest gets further.** It reaches the same wall: 3 functions, then stuck
+  in a syscall. Reproducing a stall faithfully is not progress on the stall.
+- **It does not cover the GS probe**, which is not wired into §10 (see the gap above).
+- **It assumes a Linux box already meeting the §3 host requirements.** A bare box still needs the
+  `apt-get` line in §3 — notably X11 + GL headers, because raylib builds from source.
+- **The guest image is referenced by path and never copied in.** A stranger needs their own copy
+  of the ELF. Obtaining one is out of scope and not documented anywhere in this repo.

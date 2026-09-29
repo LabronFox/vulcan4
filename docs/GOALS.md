@@ -57,6 +57,41 @@ Eventually the captain's Odin 2. Never an emulator.
   arithmetic, indirect calls, the spin-trap loop — all verified against raw bytes. **The
   translation is faithful.** But the run **failed**: exit 1, 2 of 721 function bodies lost.
 
+### ✅ G0.5 — Clean-room reproducibility: the whole chain, no hidden state
+- **DONE WHEN:** the toolchain and the harness are rebuilt in a **fresh** directory from a **fresh
+  clone**, using only commands written in `docs/TOOLCHAIN.md`, and the guest boots again with the
+  same report shape.
+- **RESULT (2026-09-30):** ✅ exact reproduction. Fresh clone → new build root
+  `/mnt/ssd/vulcan4-cleanroom`, no reused objects, no reused `_deps`, and the translation unit was
+  **re-run through the recompiler** rather than copied. All four generated artefacts are
+  **byte-identical to the incremental tree** (md5: `ps2_recompiled_functions.cpp` 8,899,740 B
+  `a0461ca3…`, `.h`, `stubs.h`, `register_functions.cpp` 804,210 B). Boot report identical:
+  `functions_entered=3 halt=stuck_in_syscall bios_files=0`. Transcript 1019 lines at
+  `/mnt/ssd/vulcan4-cleanroom/cleanroom.log`. The incremental build root was not modified.
+- **Nine documentation gaps found, three of them blocking**, all missing *steps* rather than wrong
+  ones — which is the worse failure mode, because nothing errors and nothing looks stale:
+  1. **`TOOLCHAIN.md` never mentioned the boot harness at all.** Following it end to end yields a
+     runtime that errors with *"Pass the guest ELF as argv[1]"* and no guest. The harness build
+     lived only in `FIRST-BOOT.md` §6.
+  2. **The third patch was undocumented.** `ps2recomp-linux-g1wall.patch` (11 files, +361/-9) is
+     required for the boot report and appeared in no apply-order list.
+  3. **The recompile config was neither in the repo nor documented.** The working build used a
+     hand-edited toml outside the repo; the entire delta from the analyzer's own output is two
+     lines (`output`, `single_file_output = true`).
+  4. `ps2_analyzer` emits a **relative** `input` path; must be made absolute. 5. §6 omitted `-EL`
+  while §4/§5a call it mandatory — a stranger would build a big-endian ELF and get garbage with a
+  clean-looking report. 6. The harness's 2nd argument has no stated provenance (it is analyzer
+  output). 7. The `--depth 1` + `checkout 75d729c` pin works only while the pin *is* upstream tip.
+  8. `PS2X_ENABLE_SCCACHE` defaults `ON` but sccache is absent, so it silently continues.
+  9. `gen_syscall_names.py` is redundant — the patch ships the generated header.
+- **FIXED in this dish:** gaps 1–8, by adding a stranger-proof end-to-end recipe as
+  `TOOLCHAIN.md` §10 and correcting the missing `-EL` in §6. Gap 9 recorded. **Left open:** the GS
+  probe's build script (`tools/gs/build_gs_probe.sh`) hardcodes `/mnt/ssd/vulcan4-build` and is not
+  path-parameterised, so it is not covered by §10.
+- **NOT proved:** the clean room faithfully reproduces the *same wall* — 3 functions, then stuck in
+  a syscall. Reproducing a stall is not progress on the stall. Where a stranger gets the guest ELF
+  is still undocumented and out of scope.
+
 ### ✅ G0.4 — The recompiler's output is complete and linkable
 - **DONE WHEN:** a full `ps2_recomp` run over `SCUS_973.28` exits 0, writes all 721 function
   bodies, produces the artefacts it used to die before writing, and the generated `.cpp` compiles.

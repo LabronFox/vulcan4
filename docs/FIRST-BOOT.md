@@ -1121,3 +1121,107 @@ NEED: the dispatch/resume decision for the transfer that lands the guest at 0x01
   an answer at all.
 - **the cycle detector** — correct but inert for this guest. Keep, with the limitation written down.
 - **the scheduler reset** — faithful to `run()`. Keep; it is one line and it is right.
+
+---
+
+## 13. G1.4 addendum — the STUCK's "NEED" is answered: the transfer is localised
+
+§12 ended with a STUCK whose `NEED` was a specific measurement — *"log the guest PC and the resume PC
+at every `dispatchGuestBranch` yield for `sub_01028680` and compare against the MIPS fall-through."*
+Leaving that undone would not have been finishing the dish, so I took it. **It found the defect.**
+
+### The instrumentation
+
+Three capped traces added to the runtime, all diagnostic, all bounded (400 events each):
+
+- `[Yield]` — every time `dispatchGuestBranch` returns `false` at its checkpoint, with the source
+  PC, the target, the fall-through and `$ra`.
+- `[Dispatch]` — every inter-function transfer *into* a guest function.
+- `[Returned]` — what `ctx->pc` was left holding when that function returned.
+
+### What it shows
+
+```
+[Dispatch] n=7  target=0x1028780 source=0x10286c4 fallthrough=0x10286cc
+[Returned] n=5  ctx_pc=0x10286cc  entry=0x1028780 fallthrough=0x10286cc
+[Dispatch] n=8  target=0x1028638 entry=0x1028638 source=0x10286d4 fallthrough=0x10286dc ra=0x10286dc
+VULCAN4 TRACE entry=2 pc=0x01028640 ra=0x010286dc          <-- control returns at the STUB'S OWN jr $ra
+VULCAN4 TRACE entry=3 pc=0x010286dc                        <-- resumes at the jal's return; s3 = v0 = 0
+[Dispatch] n=9  target=0x1028638 entry=0x1028638 source=0x10286e8 fallthrough=0x10286f0
+```
+
+Three facts, and together they are the bug:
+
+1. **The call at `0x010286D4` *is* dispatched** — `[Dispatch] n=8` exists, targeting the
+   `FindAddress` stub at `0x01028638`, with `$ra = 0x010286DC` and fall-through `0x010286DC`.
+   So the transfer is not dropped before dispatch. That kills the hypothesis in §12.
+2. **The stub's body never runs.** Between that dispatch and the next one there is **no
+   `[FindAddress]` line and no `[Yield]` line** — the stub is three instructions
+   (`addiu $v1,0x83` / `syscall` / `jr $ra`) and its `syscall` is the only thing that calls
+   `FindAddress`. Control comes back at **`0x01028640`, the stub's own `jr $ra`**, with `$ra`
+   still `0x010286DC`.
+3. **So the guest lands on `0x010286DC` having never executed the call's body**, and `s3` is
+   assigned `v0 = 0`. Every downstream measurement follows from that.
+
+**`[Dispatch] n=8` has no matching `[Returned]`.** The stub was entered at `0x01028638` and
+control left the driver at `0x01028640` — the `jr $ra` label — without the function ever reaching
+`handleSyscall`.
+
+### What this is, and what it is not
+
+- **It is not a syscall problem.** `0x83` is served, correctly, 128 times.
+- **It is not a codegen gap.** The `jal` at `0x010286D4` is emitted correctly
+  (`ps2_recompiled_functions.cpp:187146`).
+- **It is a resume-model defect in the interaction between generated code and
+  `PS2Runtime::dispatchGuestBranch`.** Control reaches the *return* point of a call without the
+  callee's body having executed. Note the shape of the generated `jal`:
+
+  ```cpp
+  // 0x10286d4: 0xc40a18e  jal  func_1028638
+  ctx->pc = 0x10286D4u;
+  SET_GPR_U32(ctx, 31, 0x10286DCu);
+  ...  delay slot ...
+  ctx->pc = 0x1028638u;
+  if (!runtime->dispatchGuestBranch(rdram, ctx, 0x1028638u, 0x10286D4u, 0x10286DCu, DirectCall, "JAL")) {
+      return;                                  // <-- on yield, re-entry happens at ctx->pc
+  }
+  ctx->pc = 0x10286DCu;
+  label_10286dc:                               // <-- NO ctx->pc re-entry check here
+  ```
+
+  A `jal` elsewhere in the same file *does* carry a re-entry check
+  (`if (ctx->pc == 0x1000570u) { ... goto label_1000574; }`, at the delay-slot label). This one does
+  not. **Whether that asymmetry is the defect, or merely where it shows up, is not yet established**
+  — and I am not going to claim it is without a test that fails on the current code.
+
+### State of the dish
+
+| | |
+|---|---|
+| `functions_entered` | **3** — unchanged, **gate not met** |
+| `halt` | `stuck_in_syscall` — unchanged |
+| `bios_files` | **0** |
+| unit tests | **441/441** |
+| the KSEG1 `FindAddress` fix | landed, tested, kept |
+| the register trace | landed — it is what found `s3 = 0` |
+| the dispatch/yield/return traces | landed, capped, kept — they localise the defect |
+| the cycle detector | correct, inert for this guest, kept |
+| the scheduler reset | faithful to `run()`, kept |
+
+**The gate for G1.4 is not met, and this addendum does not claim otherwise.** What changed is that
+the STUCK is no longer vague: §12 said *"a control transfer is being resolved to the wrong resume
+point"*. §13 says **which one** — the `jal` at `0x010286D4` into `sub_01028638` — and shows the
+callee's body being skipped. That is a defect a next dish can write a failing test against, which is
+the most useful thing a stuck dish can hand over.
+
+### Next, precisely
+
+1. Write a test that drives `sub_01028638` (or any three-instruction `li/syscall/jr` stub) through
+   `dispatchGuestBranch` and asserts the callee body executes before control reaches the return
+   point. It should fail on today's code.
+2. Only then look at the recompiler's `jal` emission: the asymmetry between a `jal` with a
+   re-entry check and one without is the first thing to check, and the check is cheap once (1) has
+   given a red test to aim at.
+
+**Until that red test exists, any fix is a guess** — and two guesses in this project have already
+been wrong.

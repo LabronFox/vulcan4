@@ -361,10 +361,78 @@ index 37b6a4d..b788ade 100644
      {
          return ps2ScratchpadOffset(virtualAddress);
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..b6c2eb0 100644
+index 45cb9d2..45d9f72 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
-@@ -1469,13 +1469,27 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
+@@ -1358,6 +1358,28 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     // this charge bounds straight-line call chains that have no local loop.
+     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+     {
++        // Goal G1.4: this is a YIELD. The generated caller does `return` when we return false,
++        // and the harness re-enters the guest at whatever ctx->pc is left holding. So this is the
++        // exact place a guest control transfer can be lost, and it is logged rather than
++        // reconstructed afterwards -- the guest arriving somewhere we cannot explain has already
++        // cost this project two wrong findings.
++        {
++            static const uint32_t kMaxYieldTrace = 400;
++            static uint32_t yieldCount = 0;
++            if (yieldCount < kMaxYieldTrace)
++            {
++                ++yieldCount;
++                std::cerr << "[Yield] n=" << yieldCount
++                          << " source_pc=0x" << std::hex << sourcePc
++                          << " target_pc=0x" << targetPc
++                          << " fallthrough_pc=0x" << fallthroughPc
++                          << " kind=" << (isCall ? (kind == GuestBranchKind::IndirectCall ? "IndirectCall"
++                                                                                         : "DirectCall")
++                                                : "Branch")
++                          << " ra=0x" << getRegU32(ctx, 31)
++                          << std::dec << std::endl;
++            }
++        }
+         return false;
+     }
+ 
+@@ -1396,8 +1418,38 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+ 
+     RecompiledFunction targetFn = lookupFunction(targetPc);
+     const uint32_t entryPc = ctx->pc;
++    {
++        static const uint32_t kMaxCallTrace = 400;
++        static uint32_t callCount = 0;
++        if (callCount < kMaxCallTrace)
++        {
++            ++callCount;
++            std::cerr << "[Dispatch] n=" << callCount
++                      << " target_pc=0x" << std::hex << targetPc
++                      << " entry_pc=0x" << entryPc
++                      << " source_pc=0x" << sourcePc
++                      << " fallthrough_pc=0x" << fallthroughPc
++                      << " kind=" << (isCall ? (kind == GuestBranchKind::IndirectCall ? "IndirectCall"
++                                                                                     : "DirectCall")
++                                            : "Branch")
++                      << " ra=0x" << getRegU32(ctx, 31)
++                      << std::dec << std::endl;
++        }
++    }
+     targetFn(rdram, ctx, this);
+ 
++    {
++        static const uint32_t kMaxReturnTrace = 400;
++        static uint32_t returnCount = 0;
++        if (returnCount < kMaxReturnTrace)
++        {
++            ++returnCount;
++            std::cerr << "[Returned] n=" << returnCount << " ctx_pc=0x" << std::hex << ctx->pc
++                      << " entry_pc=0x" << entryPc << " fallthrough_pc=0x" << fallthroughPc
++                      << std::dec << std::endl;
++        }
++    }
++
+     if (isStopRequested() || ctx->pc == 0u)
+     {
+         return false;
+@@ -1469,13 +1521,27 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
                                     ? encodedSyscallId
                                     : getRegU32(ctx, 3); // $v1 / $3 is the EE kernel syscall number
  

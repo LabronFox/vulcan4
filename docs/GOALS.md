@@ -225,6 +225,28 @@ Eventually the captain's Odin 2. Never an emulator.
   identifies which transfer lands the guest at `0x010286DC` instead of executing the `jal`. A
   measurement, not another guess.
 
+### ⬜ G1.4b — Resume-model defect, now localised *(carried out of the G1.4 STUCK)*
+- **RESULT (2026-09-29):** ❌ gate still not met (`functions_entered=3`, `halt` unchanged), but the
+  STUCK's `NEED` is answered and the defect is now specific.
+- **THE DEFECT, at an address:** the `jal` at `0x010286D4` into the `FindAddress` stub
+  `sub_01028638` **is** dispatched (`[Dispatch] n=8 … source_pc=0x10286d4 ra=0x10286dc`), but the
+  stub's body never runs — there is no `FindAddress` and no `Yield` between that dispatch and the
+  next, and **control comes back at `0x01028640`, the stub's own `jr $ra`**. The guest therefore
+  reaches `0x010286DC` (the `jal`'s return point) with the call unexecuted, and `s3 = v0 = 0`.
+  `[Dispatch] n=8` has no matching `[Returned]`.
+- **NOT:** a syscall problem (`0x83` is served correctly 128×), and **not** a codegen gap (the `jal`
+  is emitted correctly, `ps2_recompiled_functions.cpp:187146`).
+- **LEAD, NOT A CONCLUSION:** a `jal` elsewhere in the same file carries a re-entry check
+  (`if (ctx->pc == 0x1000570u) … goto label_1000574;`) and this one does not. Whether that
+  asymmetry is the defect is **not established** and is not claimed.
+- **NEXT, PRECISELY:** (1) write a test that drives a three-instruction `li/syscall/jr` stub through
+  `dispatchGuestBranch` and asserts the callee body runs before control reaches the return point —
+  it should fail today; (2) only then look at the `jal` emission. **Until there is a red test, any
+  fix is a guess, and two guesses in this project have already been wrong.**
+- **Kept in the tree:** the KSEG1 `FindAddress` fix, the register trace, the capped
+  dispatch/yield/return traces, the cycle detector, the scheduler reset. **441/441 tests pass**,
+  `bios_files=0`.
+
 ### ⬜ G1.0 — **NO BIOS REQUIRED** *(the captain's bucket-list item, 2026-09-29)*
 - **Captain's words:** *"one thing to add to the bucket list. making it run without a bios."*
 - **DONE WHEN:** Vulcan 4 boots and runs with **no BIOS file anywhere on the machine** — every

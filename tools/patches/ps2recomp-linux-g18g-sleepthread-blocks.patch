@@ -301,7 +301,7 @@ index 4b9242c..ee71244 100644
      uint32_t m_guestHeapEnd = 0x00100000u;
      uint32_t m_guestHeapLimit = PS2_RAM_SIZE;
 diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
-index f247ff9..bbace61 100644
+index f247ff9..aec46f5 100644
 --- a/ps2xRuntime/include/runtime/ee_scheduler.h
 +++ b/ps2xRuntime/include/runtime/ee_scheduler.h
 @@ -93,6 +93,16 @@ enum class GuestInvocationKind : uint8_t
@@ -321,7 +321,7 @@ index f247ff9..bbace61 100644
  struct GuestInvocation
  {
      GuestInvocationKind kind = GuestInvocationKind::Interrupt;
-@@ -318,6 +328,40 @@ public:
+@@ -318,6 +328,54 @@ public:
      void queueInvocation(GuestInvocation invocation);
      [[noreturn]] void invokeCurrent(GuestInvocation invocation);
      [[noreturn]] void invokeCurrentSequence(std::vector<GuestInvocation> invocations);
@@ -355,6 +355,20 @@ index f247ff9..bbace61 100644
 +    // True when some thread can make progress: one is current, one is Ready, or an invocation is
 +    // queued. False means the guest is genuinely parked and a driver must not re-enter its frame.
 +    [[nodiscard]] bool canDispatchGuest() const noexcept;
++
++    // G1.8g. A driver that is not run() needs to SEE the guest frames that serviceInvocations()
++    // runs on its behalf, and without this it cannot.
++    //
++    // Measured consequence of the gap: a GT4 boot in which the guest's OWN syscall-override
++    // handler ran 59,816 times inside the service call reported `distinct_pcs=4` and
++    // `functions_entered=120180` -- and the handler was not among the four. Every entry count, the
++    // distinct-PC set, the progress detector and the cycle detector were blind to the majority of
++    // the guest's execution, so "the guest is cycling through 4 addresses" and "the guest is
++    // livelocked in its own handler" were indistinguishable from the report alone.
++    //
++    // Called once per guest frame the service path enters, with the live context. A driver sets it
++    // to count, name and track those frames exactly as it does its own.
++    void setServiceFrameObserver(std::function<void(const R5900Context &)> observer);
 +    // Undo an inline attempt that was aborted. Unused now that overrides stay deferred; retained
 +    // because it is the only correct way to restore a thread whose wait was registered by guest
 +    // code that must be re-run, and the next attempt at synchronous overrides will need it.
@@ -362,7 +376,7 @@ index f247ff9..bbace61 100644
      [[nodiscard]] bool hasInvocation(GuestInvocationKind kind, uint64_t tag) const;
      [[nodiscard]] uint32_t invocationStackTop();
  
-@@ -382,8 +426,11 @@ private:
+@@ -382,8 +440,11 @@ private:
      void makeReady(GuestThread &thread, int result, bool interruptSafe);
      void requestPreemptionIfHigher(const GuestThread &readyThread, bool interruptSafe);
      void applyPendingPreemption();
@@ -376,6 +390,14 @@ index f247ff9..bbace61 100644
      void processEvent(const EeEvent &event);
      void finishEventWaiters(EeEventFlag &flag, bool interruptSafe);
      [[nodiscard]] static bool eventCondition(uint32_t current, uint32_t requested, uint32_t mode);
+@@ -448,6 +509,7 @@ private:
+     uint32_t m_gsVSyncCallbackGp = 0;
+     uint32_t m_gsVSyncCallbackSp = 0;
+     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
++    std::function<void(const R5900Context &)> m_serviceFrameObserver;
+     std::atomic<uint64_t> m_nextDeadlineCycle{0};
+ 
+     mutable std::mutex m_snapshotMutex;
 diff --git a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
 index 2012083..1be0520 100644
 --- a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
@@ -529,10 +551,10 @@ index 0000000..4636c5e
 +
 +static const unsigned kSyscallNameCount = 58;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c4..73d418d 100644
+index c5e31c4..6a0ea13 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-@@ -1121,6 +1121,256 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+@@ -1121,6 +1121,265 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
      throw EeDispatcherTransfer{};
  }
  
@@ -715,6 +737,10 @@ index c5e31c4..73d418d 100644
 +        }
 +
 +        PS2Runtime::RecompiledFunction function = m_runtime.lookupFunction(context.pc);
++        if (m_serviceFrameObserver)
++        {
++            m_serviceFrameObserver(context);
++        }
 +        try
 +        {
 +            m_insideInterrupt = !running->invocations.empty() &&
@@ -736,6 +762,11 @@ index c5e31c4..73d418d 100644
 +        result = ranAnything ? EeServiceResult::Ran : EeServiceResult::Blocked;
 +    }
 +    return result;
++}
++
++void EeScheduler::setServiceFrameObserver(std::function<void(const R5900Context &)> observer)
++{
++    m_serviceFrameObserver = std::move(observer);
 +}
 +
 +bool EeScheduler::canDispatchGuest() const noexcept
@@ -789,7 +820,7 @@ index c5e31c4..73d418d 100644
  [[noreturn]] void EeScheduler::invokeCurrentSequence(std::vector<GuestInvocation> invocations)
  {
      assertExecutor();
-@@ -1456,23 +1706,49 @@ uint8_t *EeScheduler::rdram() const noexcept
+@@ -1456,23 +1715,49 @@ uint8_t *EeScheduler::rdram() const noexcept
  
  void EeScheduler::bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram)
  {
@@ -847,7 +878,7 @@ index c5e31c4..73d418d 100644
      }
  }
  
-@@ -1740,10 +2016,10 @@ void EeScheduler::applyPendingPreemption()
+@@ -1740,10 +2025,10 @@ void EeScheduler::applyPendingPreemption()
      m_timeSliceExpired = false;
  }
  
@@ -860,7 +891,7 @@ index c5e31c4..73d418d 100644
      const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
      m_pendingEeTimerInterrupts = 0u;
      for (uint32_t timer = 0u; timer < 4u; ++timer)
-@@ -1773,7 +2049,7 @@ void EeScheduler::processPendingEvents()
+@@ -1773,7 +2058,7 @@ void EeScheduler::processPendingEvents()
      applyPendingPreemption();
  }
  
@@ -869,7 +900,7 @@ index c5e31c4..73d418d 100644
  {
      for (;;)
      {
-@@ -1798,7 +2074,10 @@ void EeScheduler::processDueDeadlines()
+@@ -1798,7 +2083,10 @@ void EeScheduler::processDueDeadlines()
                  return;
              }
  

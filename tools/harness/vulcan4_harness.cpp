@@ -510,6 +510,7 @@ int main(int argc, char *argv[])
     // These two say what the service call actually achieved.
     uint64_t servicedWithProgress = 0;
     uint64_t blockedOnServicing = 0;
+
     const char *haltReason = kHaltEntryBudget;
     uint32_t haltPc = entryPoint;
     std::string haltDetail;
@@ -534,6 +535,36 @@ int main(int argc, char *argv[])
     progress.setHangThreshold(budget.maxCycleRepeats);
     uint64_t progressDistinctPcMark = 0;
     size_t progressMmioMark = 0;
+
+    // ---- G1.8g: the guest frames a service call runs ON OUR BEHALF.
+    //
+    // EeScheduler::serviceInvocations() enters the guest itself, and a driver that only counts
+    // its own loop therefore counts a FRACTION of the guest's execution. Measured: a boot in which
+    // the guest's own syscall-override handler ran 59,816 times inside the service call reported
+    // distinct_pcs=4, and the handler was not among the four -- so the progress detector, the
+    // cycle detector, the entry count and the PC list were all blind to most of the run, and
+    // "the guest cycles through 4 addresses" looked like a diagnosis when it was a blind spot.
+    //
+    // The observer gets the live context of each frame the service path enters, and feeds the SAME
+    // counters the driver loop uses. One accounting, no second opinion.
+    uint64_t serviceFrames = 0;
+    runtime.eeScheduler().setServiceFrameObserver([&](const R5900Context &frame) {
+        ++serviceFrames;
+        if (functionNames.find(frame.pc) == functionNames.end())
+        {
+            std::ostringstream serviceName;
+            serviceName << "func_" << toHex(frame.pc);
+            functionNames.emplace(frame.pc, serviceName.str());
+            pcOrder.push_back(frame.pc);
+            ++distinctPcs;
+            const size_t mmioAddresses = runtime.memory().mmioCounts().size();
+            const bool reachedNewCode = (distinctPcs != progressDistinctPcMark)
+                || (mmioAddresses != progressMmioMark);
+            progressDistinctPcMark = distinctPcs;
+            progressMmioMark = mmioAddresses;
+            progress.observe(frame.pc, reachedNewCode);
+        }
+    });
 
     // Optional tracing, so a run that never reaches the report line can still be diagnosed
     // instead of just timing out. VULCAN4_TRACE=<n> prints the pc of the first n entries and
@@ -1306,6 +1337,7 @@ int main(int argc, char *argv[])
     std::cout << "VULCAN4 HARNESS detail=" << haltDetail << " pc=" << toHex(haltPc)
               << " distinct_pcs=" << distinctPcs << " dispatcher_transfers=" << dispatcherTransfers
               << " serviced_invocations=" << servicedInvocations
+              << " service_frames=" << serviceFrames
               << " serviced_with_progress=" << servicedWithProgress
               << " blocked_on_servicing=" << blockedOnServicing
               << " elapsed_ms=" << elapsed

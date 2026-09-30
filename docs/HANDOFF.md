@@ -543,3 +543,85 @@ MEASURED (artifacts): probes removed and every binary rebuilt clean (`grep -c TP
         is not a CMake target, so its build was four hand-typed g++ lines and `--target ps2xRuntime`
         silently builds nothing, which measures the OLD runtime and reports a fix that is not in
         the binary. It happened once here.
+
+## 2026-09-30 20:10 · (no dish) · **W9a + W9b fell, W10 named. The guest is now multi-threaded and getting 60 Hz.**
+
+WALL:   W9 → W10. The W8 wall's mechanism is fixed and committed (`de2b3dd`). This pass worked
+        the wall W8's fix exposed, which is the honest consequence of fixing W8.
+
+DID:    Two more driver bugs, both found by making the report tell the truth, and both of the
+        same family as the ones before: **the instrument, not the thing measured.**
+
+        1. **The driver advanced the main thread's frame while the scheduler ran another.**
+           The harness bound `R5900Context &ctx = runtime.cpu()` once, outside its loop. That is
+           the MAIN thread's frame. GT4 is genuinely multi-threaded by this point — W8's fix is
+           what let the worker thread survive its own sleeps at all — and the moment the scheduler
+           switched threads, the driver kept entering the old one. The new report fields said
+           exactly that and nothing else:
+           `runnable_threads=tid1@prio3:pc=0x0100d8f8(ready),tid2@prio2:pc=0x0100de58(running)`.
+           Fixed by re-reading `EeScheduler::currentContext()` EVERY iteration. A reference
+           captured outside the loop would be a stale frame wearing the right name, which is worse
+           than the bug. `nameCycle()` now takes the context as a parameter, because it reports the
+           address a loop polls and the value there — read from the wrong context it prints a
+           plausible wrong address.
+        2. **The harness was blind to most of the guest.** `serviceInvocations()` enters the guest
+           itself; the driver only counted its own loop. So `functions_entered`, `distinct_pcs`,
+           the progress detector and the cycle detector all ignored every service-path frame.
+           New `EeScheduler::setServiceFrameObserver()` hands the driver each of those frames with
+           its live context, and the harness feeds the same counters — one accounting, no second
+           opinion.
+
+MEASURED, 120 s budget, before -> after:
+        functions_entered       44578 -> 120180
+        total_syscall_calls       119 -> 59822
+        ee_cycle              9.8 M -> 35,390,188,280
+        vsync_tick                  2 -> 7199        (the guest is now getting 60 Hz)
+        distinct_mmio_addresses   308 -> 0
+        halt  guest_cycle_no_progress -> livelocked_in_syscall
+        service_frames (new)        — -> 5,610,851   (NONE of these were visible before)
+        suite **462/462**, probes removed (`grep -c TPROBE tools/harness/vulcan4_harness.cpp` = 0)
+
+NEXT:   **W10 — the guest's inline `sce_FindAddress` never converges.** This is the wall, and it
+        is now measured rather than inferred:
+        - GT4 installed its own handlers: `[SetSyscall] n=131 → 0x010285F8 @ 0x1218C` and
+          `n=90 → 0x010285C0 @ 0x120E8`, i.e. 164 bytes apart.
+        - A probe over all 512 words of the console kernel's syscall table (physical 0x11F80)
+          found **exactly those two non-zero words and nothing else** — the table is not corrupt.
+        - Measured **at the guest's own handler's entry**, through the new service-frame observer:
+          `a0=0x80000000 a1=0x80080000 a2=0x010285F8`, then `a2=0x010285C0`, with `s3` taking the
+          values `0x8001218C` and `0x800120E8`. **So the guest finds BOTH slots, correctly, 164
+          bytes apart — exactly as designed — and then re-issues the `0x010285C0` search from
+          `0x80000000` with `s2 = 0` forever.** The convergence test is `beq s1,s0` with
+          `s1 = s3 - 0x20C` and `s0 = s2 - 0x168`; `s2` never leaves 0, so the two sides can never
+          be equal. 5.6 M guest frames and 35 billion EE cycles buying nothing.
+        1. **What is `s2` set from, and why is the 0x83 search's result not stored there?** The
+           registers are now visible, so this is one probe: watch `s2` and the two `v0` results
+           across the whole loop and say which instruction is supposed to move the 0x83 result
+           into `s2`. **Do NOT read it off the instruction stream — decoded intent has been wrong
+           THREE times on this loop** (it told me `a2` was 0x00EB5F08 and 0x010285A0, and it told
+           me the loop was unconditional `while(1)`; both were wrong, and the register measurement
+           was right both times). The project's own rule, earned three times.
+        2. **The GS lane left its work half-done and nothing has been compiled since.** `GS` does
+        not yet consume `GifArbiter::drainedPacketCount()`, and the one line in `ps2_runtime.cpp`
+        that wires it is missing. Until both exist, `VULCAN4 FRAME source=guest` **cannot fire
+        from a real boot** — and that string does not exist in the repo at all yet, so the
+        campaign's finish line currently has no instrumentation. That is the next thing after
+        W10's register question, because it is the milestone.
+        3. **`gsWriteCount()` is structurally always 0 for guest traffic.** The counter is only
+        incremented in `writeIORegister()`; the real guest path is `write32`/`write64`, which take
+        the `isGsPrivReg` branch and return without counting. Not fixed — it is in ps2_memory.cpp.
+        4. **`PS2_SCRATCHPAD_ALIAS_BASE = 0xF0000000` is dead code.** `ps2IsScratchpadAddress` only
+        ever tests `addr >= 0x70000000 && addr < 0x70004000` after an `addr & 0x7FFFFFFF` strip, so
+        0xF0000000 is masked *into* the primary test and the constant is never read. A test asserts
+        the alias, so it is asserting a constant nothing consumes. Hardware has no fixed 0xF0000000
+        alias; the scratchpad is reached through a TLB EntryLo.S bit.
+
+        **Do NOT re-chase:** the GS window at 0x70000000 (refuted twice — by an independent
+        research pass and then by GT4's own disassembly, which writes GS at 0x12000000) · the
+        `libgallium` present stall (6 samples of GL context creation) · the syscall table's
+        contents (probed: correct) · W7's copy-loop story.
+
+        **Method, fourth time:** every wall in this project so far has been the instrument.
+        Detector too trigger-happy (W7), watchdog holding the boot open (W8c), driver running the
+        wrong thread (W9a), driver blind to the guest (W9b). **When a number looks wrong, ask what
+        is measuring before asking what is broken.**

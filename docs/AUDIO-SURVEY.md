@@ -94,10 +94,54 @@ the format is UNVERIFIED until a bank is located and its header read.**
 | `vgmstream` | **NO** | BSD-3-clause — GPL-3.0 compatible and would be the natural tool, since it decodes SGDP/ADPCM/VAG |
 | `sfg2vorbis`, `madplay`, `timidity` | no | — |
 
-**The brief states `vgmstream` is "already used on this box for GT6's disc". That is not true of
-this box** — `which vgmstream` returns nothing, and the G0.1/G1.x history in `docs/TOOLCHAIN.md`
-records no such install. Recorded because the next dish would otherwise assume a tool is present
-and waste a cycle. Either it was used on a different machine, or that claim is wrong.
+### 3b. CORRECTION TO §3 — the brief was RIGHT, and this substantially unblocks the STUCK
+
+I claimed `vgmstream` was absent. **It is present, built, and proven** — just not installed
+system-wide, which is why `which vgmstream` found nothing:
+
+```
+$ /mnt/ssd/gt6/tools/vgmstream/build/cli/vgmstream-cli
+vgmstream CLI decoder r2117 (Sep 28 2026)
+```
+
+And the sibling project demonstrates the **whole method end to end**: it unpacked its `.VOL` into
+a tree and fed the containers to that CLI.
+
+```
+$ ls /mnt/ssd/gt6/vol_unpacked
+car  carparts  carsound  character  crowd  crs  database  description  effect  font  game_parameter  icon ...
+$ ls /mnt/ssd/gt6/vol_unpacked/sound_gt/track | head
+0545.sgb  0561.sgb  0454.sgb ...
+$ ls -la /mnt/ssd/gt6/music | head
+GT5_Menu01_Casino_Drive.ogg   40,605,572 B
+GT5_Menu02_Liberty.ogg       48,775,080 B
+```
+
+So the pipeline is: **unpack the VOL → hand each container to `vgmstream-cli` → real audio out.**
+Its own driver script is `/mnt/ssd/gt6/tools/extract_music.py`.
+
+**The one thing that does not transfer:** gt6's unpacker is
+`gt6tools gttools unpack` (`/mnt/ssd/gt6/tools/m0_unpack2.sh`), which targets a **PS3** `GT.VOL` and
+is preceded by a decryption step (`m0_volcrypto.sh`, `disc_decrypted`). **GT4 is PS2**, and its
+volume is a different, simpler container — magic `0xacb990ad`. That tool will not read it.
+
+**How far the PS2 volume format is understood** (measured, partial):
+
+- Header: `magic 0xacb990ad`, then `0x00020002`, two size/offset words, and a **count of 23**
+  top-level entries at `+0x18`.
+- The entry table is a list of **24-byte records**. The first record, at `+0x78`:
+
+  ```
+  +0x00 63 ba 00 01   0x0100BA63   absolute offset, high bit set
+  +0x04 04 00 00 00   type 4
+  +0x08 14 00 00 00   20
+  +0x0C 04 05 00 00   0x504   vol-relative
+  +0x10 14 05 00 00   0x514
+  +0x14 30 05 00 00   0x530
+  ```
+
+  with types 2, 3 and 4 all present. **The record semantics and the name field are not yet
+  decoded**, so a full walk is not yet possible. That is the single remaining piece.
 
 **Our own runtime has no ADPCM decoder.** `grep -rln adpcm ps2xRuntime/src ps2xRuntime/include`
 returns exactly one file, `Kernel/Stubs/MPEG.cpp` — the MDEC/FMV path, not SPU-ADPCM. So there is no
@@ -172,8 +216,12 @@ BLOCKED BY: the audio bank is inside GT4.VOL and the VOL directory format is not
          there is no ADPCM decoder on this box. vgmstream -- the tool that would almost certainly
          do it -- is not installed, and installing it is a decision for the captain, not something
          to do silently in a survey dish.
-NEED:    authorisation to install vgmstream (BSD-3-clause, GPL-compatible), OR a dish that walks
-         the GT4.VOL directory to locate the audio bank. Either one unblocks a real decode. With
-         neither, a further magic-byte survey would be a third consecutive probe that changes
-         nothing, which is exactly what this project has been correcting for.
+NEED:    ONE thing now, not two. A decoder is NO LONGER the blocker: a working
+         vgmstream-cli r2117 exists at
+         /mnt/ssd/gt6/tools/vgmstream/build/cli/vgmstream-cli, and the sibling project has proved
+         the exact pipeline (unpack VOL -> vgmstream-cli -> audio). The sole remaining unknown is
+         the PS2 volume directory format: magic 0xacb990ad, 23 top-level entries, 24-byte records
+         whose type codes and name field are not yet decoded. A dish that finishes that parser
+         should produce a real GT4 sound with the tool already on disk.
+         Note the audio itself is probably NOT .sgb -- GT4 has no SGDP, per section 2.
 ```

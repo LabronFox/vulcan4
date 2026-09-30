@@ -625,3 +625,70 @@ NEXT:   **W10 — the guest's inline `sce_FindAddress` never converges.** This i
         Detector too trigger-happy (W7), watchdog holding the boot open (W8c), driver running the
         wrong thread (W9a), driver blind to the guest (W9b). **When a number looks wrong, ask what
         is measuring before asking what is broken.**
+
+## 2026-09-30 21:05 · (no dish) · **W10 is ONE register. Two of my own claims retracted.**
+
+WALL:   W10 — the guest's inline `sce_FindAddress` convergence loop.
+
+DID:    **No code changed.** Probed, measured, removed every probe, rebuilt clean
+        (`grep -c TPROBE tools/harness/vulcan4_harness.cpp` = 0), suite **462/462**.
+
+MEASURED — the chain, and every link in it is now measured rather than inferred:
+        - `[SetSyscall] n=131 → 0x010285F8 @ 0x1218C`, `n=90 → 0x010285C0 @ 0x120E8`, 164 apart.
+        - A probe over all 512 words of the console kernel's syscall table (physical 0x11F80)
+          finds **exactly those two non-zero words and nothing else.** The table is not corrupt.
+        - A probe over physical `[0, 0x80000)` finds 131,068 zero words, 4 non-zero, `firstZero=0x0`.
+        - The guest's own scan is `sub_010285F8`, emitted correctly, and is
+          `while (a0 < a1) { if (*a0 == a2) return a0; a0 += 4; }` over `[0x80000000, 0x80080000)`.
+          **It works** — the caller ends up holding `s3 = 0x800120E8`, the 0x5A slot, correctly.
+        - **The failure is `$s2` and nothing else.** The convergence test is
+          `beq s1, s0` with `s1 = s3 - 0x20C` and `s0 = s2 - 0x168`, so it needs `s3 - s2 == 0xA4`.
+          `s3` is right. `s2` is **0**, measured at the loop across 24 consecutive entries, with
+          `sp` at the top of the guest stack and `ra = 0`. The two sides can never be equal.
+        - Cost of that one register: **7,602,834 guest frames, 17,695,381,560 EE cycles,
+          3,600 vsync ticks, 6 distinct PCs, zero MMIO accesses.**
+        - **The guest's own bytes in `0x01028500–0x01028780` contain no instruction that writes
+          `$s2` or `$s3` at all** (scanned the whole range for every instruction form that writes
+          a GPR). So they are callee-saved **inputs** from an ancestor frame, and one of them was
+          destroyed between the frame that set it and the frame that reads it.
+
+RETRACTED — do not re-adopt either of these, both mine, both from this pass:
+        1. **"The 64-bit branch comparison is the wall."** Every branch in the loop is emitted as
+           `GPR_U64(a) == GPR_U64(b)` — 2,791 sites, and it looks exactly like the bug. It is not:
+           the operands here are built by `lui a2,0x102` + `addiu`, and `0x0102 << 16` clears the
+           high bit, so no sign extension occurs and the 32- and 64-bit forms agree on the precise
+           instruction the scan's match depends on. Worked out arithmetically rather than assumed,
+           and it lands on the same answer W7 reached for the same class two dishes ago. **The 64-bit
+           compare is still a real hardware-semantics defect and is still unfixed — it is just not
+           this wall, for the third time.**
+        2. **"`lw` is returning 1 for a zero word."** A first probe appeared to show `v0 = 1` while
+           `rdram` held 0 at the same address. It was the probe that was wrong: it sampled at the
+           `lw` with `$a0` already advanced, so it compared one word's value against the next
+           word's address — and `v0 = 1` is the loop's own `sltu a0,a1` result sitting in the
+           previous branch's delay slot. Sampling *after* the load showed the instruction is never
+           re-entered, which is what a resume case looks like. **If a probe disagrees with the
+           code, suspect the probe before the code — twice now.**
+
+NEXT:   1. **One measurement closes W10: watch `$s2` at the `jal` that calls `sub_01028680`, and at
+           that function's entry.** Non-zero at the call, zero at the entry ⇒ a recompiled callee
+           clobbered a callee-saved register across a yield. Zero at both ⇒ the guest's own path
+           never computed it and the hunt moves up one frame. This is now a two-sample probe
+           through `EeScheduler::setServiceFrameObserver`, which already carries the live context.
+        2. **The red test owed since W7 pass 6, finally with a victim:** a recompiled function that
+           yields inside its own epilogue must resume at the restore and leave every callee-saved
+           register (`$s0`–`$s7`, `$fp`, `$ra`) intact. Write it BEFORE the fix, and extend it to
+           every saved register, not just `$fp` — `$fp` was checked once and retracted twice.
+        3. **Then the milestone, which is still far:** the guest has made **zero MMIO accesses** in
+           this state. The GS privileged window at `0x1200xxxx` is never touched, so no amount of GS
+           work reaches `VULCAN4 FRAME source=guest` until the guest gets past this loop. The GS
+           lane's `VULCAN4 FRAME source=guest` emitter is still half-built (`GS` does not consume
+           `GifArbiter::drainedPacketCount()`; the one wiring line in `ps2_runtime.cpp` is missing)
+           and **that string does not exist in the repo at all**, so the campaign's finish line
+           currently has no instrumentation to pass or fail.
+        4. `gsWriteCount()` is still never incremented on the guest `write32`/`write64` path
+           (ps2_memory.cpp), and `PS2_SCRATCHPAD_ALIAS_BASE = 0xF0000000` is still dead code that a
+           test nonetheless asserts. Both cheap; both in files nobody currently owns.
+
+MEASURED (artifacts): `/mnt/ssd/vulcan4-build/run/boot_g18j.log` (60 s, 7.6 M service frames),
+        `boot_g18h.log` (the 120 s before-picture), `boot_g18i.log`. Suite 462/462 from
+        `tools/PS2Recomp/ps2xTest`. No probes in any shipped file.

@@ -566,6 +566,27 @@ Eventually the captain's Odin 2. Never an emulator.
 
 ## G5 — THE CAPTAIN'S BUILD + POCKET
 
+### ⚠️ PLATFORM ORDER — the captain's call, 2026-09-30
+> *"if x86 is the closest let's work on pc builds first before we do arm and even think about psp"*
+> *"We gonna maybe port it to psp soon."*
+
+**1. x86-64 desktop (PC) — now.** The host where the recompiled code is closest to the original
+machine: the R5900's 128-bit integer "multimedia" instructions map almost 1:1 onto **SSE4.1/AVX**,
+which is why the generated code uses `__m128i` (and why we had to patch in `-msse4.1` for GCC).
+
+**2. ARM64 (Odin 2) — second.** Also a **128-bit** SIMD target (NEON), which is why the cross-build
+needed zero portability work. Evidence already banked: goal `G5.2a`.
+
+**3. PSP — third, and with a direction check.**
+- **GT4 *on* a PSP is not feasible**, and the numbers are worth keeping so nobody re-litigates it:
+  GT4's guest RAM alone is **32 MB** (the whole PSP-1000's memory), the disc is **4.95 GB** streamed
+  from a Memory Stick, and the Allegrex is a **32-bit** core where the R5900 is **64-bit with
+  128-bit SIMD** — the recompiler's GPR model assumes 64-bit registers.
+- **The direction that IS real: PSP *games* recompiled to run on PC/Android.** A public toolkit
+  exists — `psprecomp` (Allegrex MIPS → native C), same family as our PS2 tool. The obvious
+  candidate is **GT PSP** (which also has a Spec II career mod).
+- **STATUS:** ⬜ not a parallel track. A second platform is a reward for a running game.
+
 ### 🟡 G5.1 — **Spec II** support *(parked for later — the captain's call, 2026-09-29:
 "we will figure it out later. first of all lets keep going")*
 - The captain plays GT4 **Spec II** (community mod) on the Odin 2, and wants it.

@@ -1894,3 +1894,108 @@ Rules that follow, and they are cheap:
   `git diff <file>`.
 - This incident is also why the patch is checked by md5 in every commit here: it is the artefact that
   makes the nested tree reproducible at all.
+
+## 2026-09-30 — RETRACTION: W13 was wrong. Priority 0 is the HIGHEST and is kernel-reserved. The real bug is one line, and it is `requestPreemptionIfHigher`
+
+`@verifier` did not reach a verdict on the priority convention because there is **no authority for it
+anywhere in this repository** — and it said so plainly, which is the correct thing to have said. I
+had asserted the convention from memory and built a fix, a gating test and a commit message on it.
+Checking external sources, I was wrong and the repository was right.
+
+### The authority
+
+- **ps2sdk**, `ee/kernel`, `thread.initial_priority`: *"Initial priority when using CreateThread().
+  0 - 127 (**lower number is higher priority**, but **0 is reserved by the kernel**)."*
+- **ps2sdk**, `ee/kernel/include/kernel.h`: `#define MAX_PRIORITY 128`
+- **PS2Tek**, *BIOS EE Threading*, `reschedule()`: *"Loop through active thread priority list,
+  **starting from 0 (highest priority)**"*, over *"an array of 128 doubly-linked lists"*.
+  *"Threads with lower priority will never run as long as there is an active thread with higher
+  priority."*
+- **PS2Tek**, *BIOS EE Syscalls*, `07h ExecPS2`: *"Creates a thread with **priority 0** (main
+  thread)."*
+
+This runtime already uses that convention correctly. `ps2xTest/src/ps2_runtime_kernel_tests.cpp`
+creates a thread with priority **20** and calls it `low`, and one with priority **5** and calls it
+`high`, and `hasReadyAtOrAbovePriority` scanning `0 .. priority` is scanning from the **highest**
+priority down — exactly right. So were my other two "inversions".
+
+### What I broke
+
+`EeScheduler::changePriority` read `priority < 1` and I changed it to `priority < 0`, on the claim
+that "0 is the PS2's lowest legal priority". In fact **0 is the highest and the kernel reserves it**,
+so `KE_ILLEGAL_PRIORITY` (-403) was the correct answer and I removed a correct guard.
+
+What it did to the product is the part worth keeping. GT4's main loop calls
+`sceChangeThreadPriority(id=1, priority=0)` in a tight loop:
+
+- **Refused (correct):** the thread stays at `prio1` and spins.
+- **Allowed (my bug):** it takes **priority 0 — the highest priority in the system** — and the boot
+  report duly showed `tid1@prio0:...(running),tid2@prio2:...(ready)`.
+
+The spin did not stop and the product did not improve. It *looked* like progress because a number in
+the report changed. That is the most dangerous shape a wrong fix can have.
+
+**Reverted.** `priority < 1` is restored, and the test that used to assert 0 must be settable now
+asserts the opposite — that 0 is refused with -403, that 1 is the highest a user thread may take,
+and that 127 (`kPriorityCount - 1`) is accepted. That is the test that would have caught the bad fix.
+Suite 466/466.
+
+### The real W13, in one line, with the authority now in hand
+
+`runnable_threads=tid1@prio1:pc=0x0101f2b8(running),tid2@prio2:pc=0x0101f348(ready)`
+
+Under the correct convention, `tid2` at **2** has **higher** priority than `tid1` at **1**, `tid2` is
+ready, and `tid1` is still running. The scheduler is not switching. And only one of the three places
+I flagged is actually wrong:
+
+```cpp
+void EeScheduler::requestPreemptionIfHigher(const GuestThread &readyThread, bool interruptSafe)
+{
+    const GuestThread *running = currentThread();
+    if (!running || readyThread.currentPriority >= running->currentPriority)
+        return;                       // <-- INVERTED
+    m_rescheduleRequested = true;
+    ...
+}
+```
+
+With lower numbers meaning higher priority, `>=` refuses to preempt exactly when the newly Ready
+thread **outranks** the running one — `readyThread=2`, `running=1` → `2 >= 1` → return. It is the
+only one of the three that is wrong: `hasReadyAtOrAbovePriority`'s downward scan and
+`changePriority`'s `for (p = 0; p < currentPriority; ++p)` are both correct under this convention,
+because both are scanning *upwards in importance* from 0.
+
+The fix is `<=` in place of `>=`. **I have deliberately not applied it**, for two reasons worth
+stating rather than hiding:
+
+1. I tried this exact change earlier, together with two changes that turned out to be wrong, and it
+   broke three passing tests — "starting a strictly higher-priority thread preempts immediately",
+   and the FIFO ordering in the semaphore and event-flag waiter tests. With the other two reverted,
+   a single `>=` → `<=` may well be clean, but **that has to be measured, not assumed**, and this is
+   not the moment to be changing thread scheduling on a hunch.
+2. The FIFO waiter failures are unexplained under any hypothesis I have. If a one-character change
+   can reorder semaphore waiters, something else in that area is wrong and nobody knows what yet.
+   Fixing it blind is how W13 happened.
+
+So the next dish owns this, and it should open by changing **only** that one comparison and running
+the full suite. If the three tests stay green, the fix stands on its own. If they do not, the FIFO
+reordering is a second bug and it now has a reproducer.
+
+### And the question this wall is really asking
+
+GT4 asks for **priority 0**, three million times, on hardware where 0 is reserved by the kernel and
+unreachable from user code. A game does not do that on a console. So the value being read as
+"priority" is probably not the priority.
+
+`changePriorityImpl` reads `id` from `$a0` and `priority` from `$a1`. The PS2's syscall ABI is not
+uniform across kernels — the EE syscall entry takes arguments in `$t0, $t1, $a2` in some ABIs and
+`$a0, $a1, $a2` in others — and **which one the recompiled guest is actually using has not been
+established in this project.** If the guest passes the priority in a register we are not reading, we
+read garbage, and refusing it looked like a bug in our validation when it was a bug in our
+argument mapping.
+
+That is a much better-founded W14 than the one I was chasing, and it is checkable before anything is
+changed: dump `$a0..$a3` and `$t0..$t3` at the `sceChangeThreadPriority` call site, compare them
+with what the caller's own `jal`/argument setup put there, and find out which register the guest
+means. `sce_GetThreadId` taking **3,004,970** calls with no arguments at all is the same smell from
+the other side, and worth dumping in the same pass.

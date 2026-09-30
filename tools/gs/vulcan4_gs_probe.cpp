@@ -377,6 +377,10 @@ int main(int argc, char *argv[])
     regs.csr.store(0, std::memory_order_release);
 
     GS gs;
+    // The GS keeps its register trace paused by default (GS::m_debugHistoryPaused = true) because
+    // it costs memory on a long run. Unpause it so the trace we print below is the GS's own record
+    // of what was written, not a list this program maintains about itself.
+    gs.setDebugHistoryPaused(false);
     gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
     gs.setRasterBackend(std::make_unique<GSCpuBackend>());
     std::cout << "VULCAN4 GS init ok, display=" << kFrameWidth << "x" << kFrameHeight << " psm=PSMCT32\n";
@@ -502,6 +506,53 @@ int main(int argc, char *argv[])
     if (!writePng(outPath, pixels, width, height))
     {
         return 1;
+    }
+
+    // ---- 4. The register trace, read back out of the GS's own debug history.
+    //
+    // Derived from the run rather than hand-maintained in a doc, so it cannot drift from what the
+    // code actually does. This is the surface area the next dish inherits.
+    {
+        const auto history = gs.getDebugHistory();
+        std::vector<std::pair<uint8_t, uint64_t>> regLast;
+        uint64_t gifPackets = 0;
+        uint64_t drawEvents = 0;
+        for (const auto &entry : history)
+        {
+            if (entry.kind == GSDebugEventKind::Register)
+            {
+                bool seen = false;
+                for (auto &r : regLast)
+                {
+                    if (r.first == entry.reg)
+                    {
+                        r.second = entry.regValue;
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen)
+                {
+                    regLast.emplace_back(entry.reg, entry.regValue);
+                }
+            }
+            else if (entry.kind == GSDebugEventKind::GifTag)
+            {
+                ++gifPackets;
+            }
+            else if (entry.kind == GSDebugEventKind::Draw)
+            {
+                ++drawEvents;
+            }
+        }
+        std::cout << "VULCAN4 GS REGTRAKE gif_packets=" << gifPackets
+                  << " draw_events=" << drawEvents << " registers_written=" << regLast.size()
+                  << "\n";
+        for (const auto &r : regLast)
+        {
+            std::cout << "VULCAN4 GS REG 0x" << std::hex << static_cast<uint32_t>(r.first)
+                      << std::dec << " = 0x" << std::hex << r.second << std::dec << "\n";
+        }
     }
 
     const uint64_t sum = checksumRgba(pixels);

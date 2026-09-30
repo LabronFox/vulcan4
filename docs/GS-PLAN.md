@@ -190,17 +190,42 @@ format `0` is PSMCT32. Note `TRXREG` puts H at bit 32, not 12 — that is not th
 form: it writes those four registers and then feeds the image data, which is what a guest's
 `D_UTEXTURE`-style upload does. `GSCpuBackend::UploadImage` is what actually writes VRAM.
 
-### Register surface actually touched by the skeleton (G2.1)
+### Register surface actually touched by the skeleton (G2.1, measured)
 
-Fourteen registers, all written, none read back by us:
+The probe now prints this itself, read out of the GS's own debug history rather than maintained
+by hand, so it cannot drift from the code:
 
-`0x1C` TEXCLUP/TEXCLUT · `0x3B` TEXA · `0x40`/`0x41` SCISSOR_1/2 · `0x42`/`0x43` ALPHA_1/2 ·
-`0x47`/`0x48` TEST_1/2 · `0x4C`/`0x4D` FRAME_1/2 · `0x50` BITBLTBUF · `0x51` TRXPOS ·
-`0x52` TRXREG · `0x53` TRXDIR
+```
+VULCAN4 GS REGTRAKE gif_packets=0 draw_events=0 registers_written=15
+```
 
-The sweep from `PRMODECONT` (0x1A) to `ZBUF_1` (0x4E) is written explicitly so nothing keeps a
-reset value, which is why the trace shows a contiguous block. **Nothing in 0x00–0x0F is written**,
-so `PRIM`/`RGBAQ`/`XYZF2`/`XYZ2` — the primitive path — is entirely untouched today.
+Fifteen distinct registers, with the last value written to each:
+
+```
+0x1C TEXCLUT  0x3B TEXA     0x40 SCISSOR_1  0x41 SCISSOR_2   0x42 ALPHA_1
+0x43 ALPHA_2  0x47 TEST_1   0x48 TEST_2    0x4C FRAME_1     0x4D FRAME_2
+0x4E ZBUF_1   0x50 BITBLTBUF 0x51 TRXPOS   0x52 TRXREG      0x53 TRXDIR
+```
+
+Two honest qualifications, because "15" understates it in one direction and overstates it in
+another:
+
+- **Fifteen is a subset.** The GS's own register recorder whitelists which registers it logs
+  (`GS::recordRegisterDebugEventUnlocked`, `gs_frontend.cpp:368`). The skeleton additionally writes
+  the **whole sweep from `PRMODECONT` (0x1A) to `ZBUF_1` (0x4E)** so that nothing keeps a reset
+  value — 53 registers in total, of which 15 are traced. The trace is a floor, not a census.
+- **The GS's history is paused by default** (`m_debugHistoryPaused = true`, for memory reasons on a
+  long run). The probe calls `setDebugHistoryPaused(false)` to get a real trace.
+
+**`draw_events=0` and `gif_packets=0` are both true and both matter.** No primitive was drawn, which
+is the known rasteriser gap. And the transfer did **not** travel as a GIF packet: it used the native
+entry point `GS::uploadImageNative`, which writes the four transfer registers and feeds the image
+data directly. A real guest would send a GIF packet containing an `IMAGE` transfer, so
+`gif_packets=0` means the *GIF image-transfer* route is still unproven even though the underlying
+transfer, and the VRAM write it performs, are real.
+
+**Nothing in 0x00–0x0F is written**, so `PRIM`/`RGBAQ`/`XYZF2`/`XYZ2` — the whole primitive path —
+remains untouched today.
 
 ### Sync / present points
 

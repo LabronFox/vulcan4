@@ -97,6 +97,13 @@ around 1, 2 and 3; defect 4 is unsolved.
   path and encoded by our own PNG writer. In-count and out-count match exactly. What is missing is
   the **rasteriser**: no primitive of any kind is drawn. Nothing from Gran Turismo 4 has been
   rendered, and the guest still has `total_mmio_accesses=0`.
+- **The GS image transfer has not been proven through a GIF packet.** G2.1 fills the framebuffer
+  via the native entry point `GS::uploadImageNative`, which writes `BITBLTBUF`/`TRXPOS`/`TRXREG`/
+  `TRXDIR` and feeds the image data straight to the backend. The probe reports `gif_packets=0`. A
+  real guest sends a GIF packet containing an `IMAGE` transfer, and **G2.0's hard blocker makes
+  that impossible today** — the GIFTAG register field is 4 bits, so the destination registers a
+  GIF transfer needs cannot be named. So the transfer *mechanism* is proven and the GIF *route* to
+  it is not.
 - **The vblank/CSR sync primitive is host-driven and says so.** The skeleton advances a monotonic
   vblank tick counter from the host and raises CSR bit 0 (SIGNAL) after FINISH. It **does not**
   model vblank timing, deliver a vblank interrupt to the EE, provide DMA/AD interrupts, or emulate

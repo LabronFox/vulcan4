@@ -101,6 +101,68 @@ reads `docs/HANDOFF.md` first, then `docs/CAMPAIGN.md`, then works.
 
 ---
 
+## REPLAN — 2026-09-30, after mining a finished PS2 decomp (`docs/DC-MINING.md`)
+
+Six findings from the Dark Cloud decompilation changed what we *know* about the road. None of them
+change the destination; three of them replace a guess with a fact.
+
+**1. G2 is an SDK, not a driver. → the GS lane gets a defined surface.**
+A finished PS2 game touches **raw MMIO exactly once** (EE Timer0, 4 hits in 151k lines). Everything
+else goes through SDK calls. So "write a GS renderer" becomes **"implement the `sceGs*` calls GT4
+actually makes"** — a finite, enumerable list instead of "the GS in general".
+- **Next for the GS lane:** produce the **`sceGs*` call inventory** from the boot logs and the ELF,
+  ranked by call frequency, and implement in that order.
+- **`sceGsSetDBuff` FIRST.** Its defaults are load-bearing — the game inherits TEST/ZBUF state from it,
+  and guessing them makes **every** draw wrong. (This is W8's neighbourhood: our depth test was
+  deleting GT4's triangles.)
+
+**2. G10 gets a new law: BUILD TWICE.**
+MWCC matching compiles are **not reproducible** — the same command can emit different bytes, so
+"a matching build may be matching by accident". Any ownership claim that says *byte-exact* must
+compare **two clean builds**, not one against a memory of one.
+
+**3. Byte-exactness is compared SECTION-WISE, not symbol-wise.**
+Verified today: **GT4's `SCUS_973.28` is stripped** — no `.symtab`, no `.dynstr`, no `.strtab`
+(section check: `.shstrtab` only). So the `@<n>` float-literal question cannot be answered from its
+symbols, our own function names are *ours* (analysis-derived, not read off the disc), and matching
+proof must compare **`.text` and data sections** — which is exactly how DCDecomp proves it.
+
+**4. The no-BIOS backlog is FINITE: nine IRX modules.**
+Not "197 SCE functions with no handler" (fuzzy) — **nine modules**, all recoverable **in full** from
+`init_all()`. Turn it into a work-list and tick them off.
+
+**5. Audio: the IOP heap RESETS on every init.**
+Outstanding pointers go stale. The audio lane must assume nothing survives an init.
+
+**6. G10's shipping mechanism is `mwccgap`.**
+MWCC emits a unit as one contiguous `.text`, so a hole cannot be filled from outside: compile twice
+and patch nops. **That is how partial ownership ships without breaking the image.**
+
+### THE GUARD RAIL (this is the anti-bad-practice register the captain asked for)
+
+`docs/DC-MINING.md` §5 is a **do-not-carry list** — 12 Dark Cloud specifics (its nine IRX module
+names, `My_dma_start0`, `Vu_prog0`, the `name_counter` values, `262`) that must **never** become GT4
+rules. §4.8 lists **nine things mining did NOT establish**, so silence is never read as a negative.
+
+**And the honest ceiling:** a byte-exact build is **not** evidence the source is understood. That
+matching project ships a wrong-shaped `CDebugFont` stand-in *with a TODO committed*, and **310
+functions carry `@unknownret`**. Matching proves *shape*; it does not prove *meaning*. Our `VERIFY:`
+gates must test **behaviour**, never just "it compiled identically".
+
+### WHAT DOES NOT CHANGE
+
+Stage 1's order (boot → frame → 3D → input → race → audio), one controller per lane, red-test-first,
+no faking, no game data in the repo, `-j4`/`-j2` + nice, commits as the captain, no pushes.
+
+### THE TOP THREE, IN ORDER
+
+1. **Boot keeps moving** — dish 35 (`sce_SleepThread` must block). The road to a frame runs through it.
+2. **GS: the `sceGs*` inventory, then `sceGsSetDBuff` defaults.** The drawing path is now defined.
+3. **Write the stripped-ELF consequence into the G10 gate** (section-wise compare, build twice) before
+   any ownership work starts, so the first claim we make is a claim we can defend.
+
+---
+
 ## WHY THIS EXISTS (the captain's words, 2026-09-30)
 
 > *"i need u to make me a longer term goal. untill we get it working. we cant just make a goal and make

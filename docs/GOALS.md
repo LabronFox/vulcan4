@@ -922,6 +922,45 @@ needed zero portability work. Evidence already banked: goal `G5.2a`.
   rather than a port.
 - **STATUS:** ⬜ post-playability, same lane as G4.3/G6.1. Registry entry only — do not dispatch.
 
+### ⬜ G6.3 — **THE MERCY SKIP** *(skip a driving-school lesson you have failed too many times — and get mocked for it, 2026-09-30)*
+- **The captain, 2026-09-30:** *"the abilty to skip a lesson in a course at the drivign school if u fail
+  it too much. and maybe mock the player for doing it."*
+- **What it is, and why it is a genuinely good feature:** GT4's licence school and Driving Missions can
+  hard-stop a player — one lesson, one gold-less wall, forever. Every other sim of the era had an
+  escape hatch; GT4 has none. **This is an accessibility fix first** and a joke second: the game should
+  not be able to end a player's evening.
+- **Why a recomp can do it:** the lesson's result path is our C++ now. GT4 *already* has the shape of
+  this feature — the retry flow — so we are not inventing a system, we are **extending one the game
+  already runs**: count consecutive failures per lesson, and when the count crosses a threshold, offer a
+  third option beside `RETRY` / `EXIT`.
+- **Mechanism, in order:**
+  1. **Find the lesson-outcome site:** where the game stores the result of a licence test / mission
+     attempt (result code, the retry menu's state, the lesson id). Prefer the *logic* commit site over
+     the results screen (same rule as `G6.2` — hook the cause, not the redraw).
+  2. **Count failures in OUR state, not the save.** A per-lesson counter kept at runtime keeps this
+     save-safe by construction. Persisting it is a *separate* decision, and it must be additive —
+     never a rewrite of the game's own save fields (`G6.0a` is the same class of problem: the game's
+     tables and saves are fixed-shape).
+  3. **The skip must be honest to the game's own model.** Two ways, and we pick after reading the code:
+     either complete the lesson in GT4's own completion fields, or unlock the next lesson without
+     claiming a medal. **Never counterfeit a gold** — a faked medal would poison the licence
+     progression, prize cars and event eligibility downstream. The skip says *"moved on"*, not
+     *"you earned this"*.
+  4. **The mock lines are ours, so they are shippable** (strings we write, in our code — no game text
+     needed, no asset, `G7.0` clean). They should mock the *situation*, in the game's own dry voice —
+     a licence examiner would be rude about it, not a chatbot. Punch down at the player's pride for
+     skipping, never at the player for struggling.
+- **Honest limits:** needs playability (G4) and the licence flow actually reachable in our runtime;
+  the threshold and the wording are the captain's calls — these are his feature, so they get built with
+  a knob, not baked in.
+- **DONE WHEN:** after N consecutive failures on one lesson the game offers a skip, taking it advances
+  the licence progression without a counterfeit medal, and the player is insulted appropriately — with
+  the result-site named (function + address) so the hook is real and not a heuristic on frames.
+- **Why it is registered now:** it is the smallest *logic* sibling of `G6.2` — a hook on a moment the
+  game already has — and together they are the demo reel for `G10`: a sound that never existed and a
+  button that never existed, both in a twenty-year-old game, neither one a hack.
+- **STATUS:** ⬜ post-playability, same lane as G4/G6.1/G6.2. Registry entry only — do not dispatch.
+
 ### ⬜ G7.0 — **DISTRIBUTION: code only. Assets come from the user's disc.** *(the captain's rule)*
 - **The captain, 2026-09-30:** *"We don't publish anything. Just the code. People have to bring their
   own iso file of the game — that's where we take assets."*

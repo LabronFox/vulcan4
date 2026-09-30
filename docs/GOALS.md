@@ -189,10 +189,17 @@ Eventually the captain's Odin 2. Never an emulator.
 - **⭐ THE G2.2 LEAD, and it is strong.** While adding the swizzle test I read the neighbouring
   case at `ps2_gs_tests.cpp:829-849`: it submits primitives with `GS::writeRegister` and **asserts
   correct rasterised pixels**, and it **passes**, with `[gs:prim]` showing `v0=(6,0) v1=(0,6)
-  v2=(6,6)` — all three vertices populated, which my probe never achieved. **So the rasteriser
-  works, the vertex queue works, and the fault is in the G2.2 skeleton's GIF REGLIST submission
-  path.** G2.2 goes from "undiagnosed runtime bug" to "our submission path is wrong", and the next
-  experiment is one line: submit the same primitives via `writeRegister`.
+  v2=(6,6)` — all three vertices populated, which my probe never achieved.
+  **⚠️ CORRECTION, MEASURED: I then ran the proposed experiment and that conclusion was WRONG.**
+  Submitting via `writeRegister` instead of a GIF REGLIST produces the **identical** defect
+  (`v0=(48,48) v1=(464,96) v2=(0,0)` both ways), so the REGLIST encoder is **exonerated**. What
+  the experiments really established: **(a)** the defect is specific to `GS_PRIM_TRIANGLE` — the
+  same vertices as a **TRISTRIP** give a **correct** batch `v0=(48,48) v1=(464,96) v2=(200,240)`,
+  and the only difference is the post-submit reset in `vertexKick` (`TRIANGLE: m_vtxCount = 0` vs
+  `TRISTRIP: slide and keep 2`); and **(b)** there is a **second, independent blocker**, because even
+  the correct TRISTRIP batch writes nothing. Ruled out by measurement: the scissor (correct — I had
+  misread my own log) and `TEST_1` (`0x30000` changed nothing, so `classifyAlphaTest` is not
+  rejecting writes). **G2.2 is two bugs, not one.**
 - **Register sequence documented** in `docs/GS-PLAN.md`: transfer (BITBLTBUF/TRXPOS/TRXREG/TRXDIR),
   CLUT upload + TEXCLUT, TEX0_1 binding, TEXFLUSH, then PRIM with TME (bit 4) and per-vertex
   RGBAQ/UV/XYZ2. Formats done vs not, stated in a table.

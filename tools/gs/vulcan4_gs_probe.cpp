@@ -382,6 +382,33 @@ namespace
         uint8_t r, g, b, a;
     };
 
+    // The same triangle, submitted through GS::writeRegister instead of a GIF REGLIST.
+    //
+    // G2.3 turned up that the runtime's own test suite draws correct pixels using exactly this
+    // route (ps2_gs_tests.cpp:829-849, asserting readReferencePSMCT32Pixel). If this path
+    // rasterises and the REGLIST path does not, the fault is in our packet encoder, not in the GS.
+    void submitTriangleDirect(GS &gs, bool gouraud, const GSVertexSpec *v, const char *label,
+                              uint64_t primType = kPrimTriangle)
+    {
+        gs.writeRegister(static_cast<uint8_t>(kRegPrim), primType | (gouraud ? kPrimIipBit : 0u));
+        for (int vi = 0; vi < 3; ++vi)
+        {
+            const GSVertexSpec &vert = v[vi];
+            gs.writeRegister(static_cast<uint8_t>(kRegRgbaq),
+                             static_cast<uint64_t>(vert.r) | (static_cast<uint64_t>(vert.g) << 8)
+                                 | (static_cast<uint64_t>(vert.b) << 16)
+                                 | (static_cast<uint64_t>(vert.a) << 24)
+                                 | (0x3F800000ull << 32));
+            gs.writeRegister(static_cast<uint8_t>(kRegUv), 0ull);
+            gs.writeRegister(static_cast<uint8_t>(kRegXyz2),
+                             (static_cast<uint64_t>(vert.x) << 4) | (static_cast<uint64_t>(vert.y) << 20)
+                                 | (static_cast<uint64_t>(0x3FFFFu) << 36));
+        }
+        std::cout << "VULCAN4 GS DRAW " << label << " [DIRECT writeRegister path] verts=(" << v[0].x
+                  << "," << v[0].y << ") (" << v[1].x << "," << v[1].y << ") (" << v[2].x << ","
+                  << v[2].y << ")\n";
+    }
+
     void submitTriangle(GS &gs, bool gouraud, const GSVertexSpec *v, const char *label)
     {
         std::vector<std::pair<uint8_t, uint64_t>> writes;
@@ -522,7 +549,14 @@ int main(int argc, char *argv[])
             {464, 96, 220, 40, 40, 255},
             {200, 240, 220, 40, 40, 255},
         };
-        submitTriangle(gs, /*gouraud*/ false, flat, "flat-triangle");
+        submitTriangle(gs, /*gouraud*/ false, flat, "flat-triangle-via-REGLIST");
+        // Same triangle, same frame, different submission route. Whichever lands is the answer.
+        submitTriangleDirect(gs, /*gouraud*/ false, flat, "flat-triangle");
+        // The runtime's own suite draws a PASSING TRISTRIP via writeRegister
+        // (ps2_gs_tests.cpp:834). TRISTRIP is the one topology proven to work there, so try it
+        // here: if it rasterises and TRIANGLE does not, the fault is the triangle path.
+        submitTriangleDirect(gs, /*gouraud*/ false, flat, "flat-triangle-as-TRISTRIP",
+                             /*primType*/ 3u);
 
         // 2. A gouraud quad, submitted the way hardware does it: as TWO triangles sharing an edge,
         //    with four different corner colours. Interpolation across the interior is what makes

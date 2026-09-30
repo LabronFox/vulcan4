@@ -3092,10 +3092,10 @@ index 7242e65..4d8de05 100644
  }
 diff --git a/ps2xTest/src/ps2_thread_block_tests.cpp b/ps2xTest/src/ps2_thread_block_tests.cpp
 new file mode 100644
-index 0000000..5b299fe
+index 0000000..3df116b
 --- /dev/null
 +++ b/ps2xTest/src/ps2_thread_block_tests.cpp
-@@ -0,0 +1,613 @@
+@@ -0,0 +1,679 @@
 +#include "MiniTest.h"
 +#include "ps2_runtime.h"
 +#include "ps2_runtime_macros.h"
@@ -3668,6 +3668,72 @@ index 0000000..5b299fe
 +            t.IsTrue(std::find(gTrace.begin(), gTrace.end(), TRACE_MAIN_AFTER_SLEEP) != gTrace.end(),
 +                     "after the wake the thread must run the post-sleep frame, not nothing");
 +        });
++        tc.Run("G1.8g: EE time crossing a VBlank deadline must tell the driver to come back", [](TestCase &t)
++        {
++            // W12. On hardware the EE clock is the wall clock: a VBlank happens because time
++            // passed, not because the program cooperated.
++            //
++            // This runtime charges EE time at guest call boundaries -- kGuestDispatchCycles, 8
++            // cycles a transfer, from dispatchGuestBranch(). The ONLY other caller of
++            // accountCycles() is waitForEvent(), which only EeScheduler::run() reaches, and only
++            // on the branch where it has nothing to dispatch.
++            //
++            // So for a driver that does not call run(), time turns into events in exactly one
++            // place: checkpointDue() noticing that m_eeCycle just passed m_nextDeadlineCycle. That
++            // check does not exist. m_checkpointPending is only computed inside
++            // processPendingEvents(), and processPendingEvents() only runs when the driver has
++            // ALREADY come back to service a transfer. So the driver is never told to come back for
++            // time, never comes back, and time never becomes events. Circular.
++            //
++            // Measured on SCUS_973.28: 20,000,000 guest entries, 4111 serviced service frames and
++            // vsync_tick=1 after 54 SECONDS of wall clock, with ee_cycle=98,464,696 sitting ten
++            // VBlank periods past next_event_cycle=9,830,598. GT4 spends its idle loop waiting for
++            // the next frame, the frame never arrives, and it spins instead: 798,251 calls to
++            // sce_ChangeThreadPriority and 1,064,347 to syscall 0x2f.
++            //
++            // This test deliberately NEVER calls serviceInvocations(). A version that services its
++            // own yield passes while the product is broken, which is exactly what the first
++            // version of this test did.
++            BlockEnv env;
++            env.arm();
++            env.runtime.eeScheduler().setDriverAdvancesSchedulerContext(true);
++
++            EeScheduler &ee = env.runtime.eeScheduler();
++            const uint64_t firstTick = ee.currentVSyncTick();
++
++            // One VBlank period, computed the way EeScheduler computes it, so this cannot rot
++            // silently if the clock or the period ever changes.
++            const uint64_t vBlankPeriodCycles = (16667ull * EeScheduler::kEeClockHz + 999999ull) / 1000000ull;
++
++            uint64_t charged = 0u;
++            uint32_t yields = 0u;
++            const uint64_t target = 4ull * vBlankPeriodCycles;
++            while (charged < target)
++            {
++                // This is the guest running: one function call's worth of EE time. Nothing else.
++                charged += EeScheduler::kGuestDispatchCycles;
++                if (ee.checkpointDue(EeScheduler::kGuestDispatchCycles))
++                {
++                    ++yields;
++                }
++            }
++
++            t.IsTrue(yields > 0,
++                     "MECHANISM: charging four VBlank periods of EE time must make checkpointDue() "
++                     "report a checkpoint, because m_eeCycle passed m_nextDeadlineCycle. Only "
++                     "waitForEvent() -- which only run() calls, and only when idle -- accounts for "
++                     "that pass today, so a driver is never told to come back and VBlank never "
++                     "fires: vsync_tick=1 after 54 s while ee_cycle sat ten periods past the "
++                     "deadline. That is W12");
++
++            // And once the driver does come back, the VBlank it was owed must actually be there.
++            std::this_thread::sleep_for(std::chrono::milliseconds(20));
++            ee.serviceInvocations();
++            t.IsTrue(ee.currentVSyncTick() > firstTick,
++                     "servicing the owed checkpoint must advance VBlank, so a guest waiting for the "
++                     "next frame can finish waiting instead of spinning on sce_ChangeThreadPriority");
++        });
++
 +        tc.Run("G1.8g: a deferred syscall must not rewind the CALLER's registers", [](TestCase &t)
 +        {
 +            // W10, on the caller's frame rather than on a count. A guest function seeds $s2, $s3

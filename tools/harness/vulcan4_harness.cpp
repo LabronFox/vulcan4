@@ -514,6 +514,7 @@ int main(int argc, char *argv[])
     uint64_t functionsEntered = 0;
     uint64_t distinctPcs = 0;
     uint64_t dispatcherTransfers = 0;
+    std::size_t checkpointServiced = 0;
     uint64_t servicedInvocations = 0;
     // G1.8g. servicedInvocations counted every catch as progress, which is how a boot that did
     // nothing at all could report 15/15 "serviced" next to 119 syscalls in 20 million entries.
@@ -1016,6 +1017,43 @@ int main(int argc, char *argv[])
             }
         }
 
+        // ---- G1.8h / W12: a YIELD is not a TRANSFER, and it still owes the scheduler a turn.
+        //
+        // The catch above is the ONLY path that called serviceInvocations(), and it fires only
+        // when the guest queued an invocation. But dispatchGuestBranch() has a second way out: when
+        // checkpointDue() says EE time or pending work needs attention, it returns FALSE, the
+        // generated function does `return`, and NO exception is thrown. The guest has yielded --
+        // it is mid-frame with its registers live and it has stopped on purpose -- and this loop
+        // simply carried on into it again.
+        //
+        // That is why VBlank never happened. VBlank is delivered by processPendingEvents(), which
+        // only serviceInvocations() calls, so on a yield-only run the event queue was never
+        // drained and time never became events. Measured on SCUS_973.28: 20,000,000 guest entries
+        // with dispatcher_transfers=16 -- sixteen services against twenty million entries -- and
+        // vsync_tick=1 after 54 seconds, with ee_cycle=98,464,696 sitting ten VBlank periods past
+        // next_event_cycle=9,830,598. GT4 waits for the next frame in its idle loop, the frame
+        // never arrives, and it spins: 798,251 calls to sce_ChangeThreadPriority, 1,064,347 to
+        // syscall 0x2f, against only 223 distinct guest PCs.
+        //
+        // So the driver asks the scheduler whether it is owed a turn after EVERY guest return, not
+        // only after a transfer. checkpointDue(0) is the query the generated code already uses at
+        // every guest branch, and 0 cycles makes it a pure question: accountCycles() charges
+        // nothing and mutates no clock, so this cannot skew the EE timeline it is asking about.
+        if (runtime.eeScheduler().checkpointDue(0u))
+        {
+            const EeServiceResult serviced = runtime.eeScheduler().serviceInvocations();
+            ++servicedInvocations;
+            ++checkpointServiced;
+            if (serviced == EeServiceResult::Ran || serviced == EeServiceResult::RanNothing)
+            {
+                ++servicedWithProgress;
+            }
+            else if (serviced == EeServiceResult::Blocked)
+            {
+                ++blockedOnServicing;
+            }
+        }
+
         if (runtime.isStopRequested())
         {
             // The watchdog sets this when the deadline passes. Distinguish it from anything
@@ -1364,7 +1402,7 @@ int main(int argc, char *argv[])
               << " bios_files=" << biosFilesOpened << "\n";
 
     std::cout << "VULCAN4 HARNESS detail=" << haltDetail << " pc=" << toHex(haltPc)
-              << " distinct_pcs=" << distinctPcs << " dispatcher_transfers=" << dispatcherTransfers
+              << " distinct_pcs=" << distinctPcs << " checkpoint_serviced=" << checkpointServiced << " dispatcher_transfers=" << dispatcherTransfers
               << " serviced_invocations=" << servicedInvocations
               << " service_frames=" << serviceFrames
               << " serviced_with_progress=" << servicedWithProgress

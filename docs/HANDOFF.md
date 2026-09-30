@@ -1667,3 +1667,117 @@ A red-then-green test is only evidence if the red was produced **by reverting th
 "it was red when I wrote it" is not a check anyone can repeat, and this time it was simply wrong: I
 watched four assertions go red against a real defect and still shipped a test that could not fail.
 From here: revert the fix, rebuild, watch it go red, then restore it. That is the whole ritual.
+
+## 2026-09-30 — W12 FELL: a yield is not a transfer, and VBlank was only reachable through a transfer
+
+**Suite 465/465. Product: vsync_tick 1 → 54.**
+
+### The symptom
+
+After W11 the guest stopped spinning in one place and started doing real work: 223 distinct guest PCs,
+20,000,000 guest entries, 1.86 M syscalls. But it ran to the **entry budget** in 54 seconds rather
+than finishing, and two numbers made no sense together:
+
+```
+ee_cycle=98464696  next_event_cycle=9830598  vsync_tick=1  dispatcher_transfers=16
+```
+
+`next_event_cycle` is exactly **two** VBlank periods (`16667us * 294.912MHz = 4,915,299`), so VBlank
+had fired once and rescheduled. `ee_cycle` was **ten periods past** that deadline — overdue, sitting
+in the queue, unfired. And **16 dispatcher transfers against 20,000,000 guest entries.**
+
+### The bug, and it was in the driver, not the runtime
+
+`serviceInvocations()` was reachable from exactly one place in the harness: the `catch` for
+`EeDispatcherTransfer`, which is thrown when the guest queues an *invocation* — a syscall override,
+an interrupt callback.
+
+`dispatchGuestBranch()` has a **second** exit. When `checkpointDue()` reports that EE time or pending
+work needs attention it returns **false**, the generated function does `return`, and **no exception
+is thrown.** The guest has yielded — mid-frame, registers live, stopped on purpose — and the loop
+carried straight on into it again.
+
+VBlank is delivered by `processPendingEvents()`, which only `serviceInvocations()` calls. On a
+yield-only run the event queue was therefore never drained and time never became events.
+
+Measured inside the loop at call 3000, with the guest running:
+
+```
+[LOOP] eeCycle=7165376 nextDeadline=9830598 pacingSet=0 deadlines=1 mayWait=0
+       entries=[{type=1 cyc=9830598 hostIn=-307ms}]
+```
+
+The VBlankStart was right there with its host deadline **307 ms in the past**, and `pacingSet=0`
+only because `eeCycle` had not reached its cycle deadline yet. Correct, so far. The problem was that
+`processDueDeadlines` was reached only on those 16 transfer-driven calls, so EE time climbed to 98 M
+cycles between them with nobody converting it into events.
+
+### Two wrong turns, recorded so nobody repeats them
+
+1. **I blamed the runtime first.** "EE time crossing a deadline never tells the driver to come back"
+   sounds right and is wrong: `checkpointDue()` already reports it, and a unit test driving
+   `accountCycles` + `serviceInvocations` passed.
+2. **The first version of the red test passed while the product was broken**, because it called
+   `serviceInvocations()` itself. A driver that services its own yield proves nothing about a driver
+   that does not. Same lesson as the W10 test, third time now: a test must exercise the path the
+   product uses, or it is decoration.
+
+The instrumentation lied twice as well: a diagnostic placed *after* the `for(;;)` loop never ran,
+because that loop `return`s early, and a counter capped at 4 was already exhausted by earlier tests.
+Both looked like evidence while reporting nothing.
+
+### The fix
+
+`tools/harness/vulcan4_harness.cpp` asks the scheduler whether it is owed a turn after **every**
+guest return, not only after a transfer:
+
+```cpp
+if (runtime.eeScheduler().checkpointDue(0u))
+{
+    const EeServiceResult serviced = runtime.eeScheduler().serviceInvocations();
+    ...
+}
+```
+
+`checkpointDue(0)` is the query the generated code already makes at every guest branch, and a zero
+cycle count makes it a pure question — `accountCycles()` charges nothing and moves no clock, so the
+check cannot skew the timeline it asks about. A new `checkpoint_serviced` counter makes the volume
+visible in the boot report instead of invisible.
+
+### Measured, 90 s budget, before → after
+
+| | before | after |
+|---|---|---|
+| **`vsync_tick`** | **1** | **54** |
+| `service_frames` | 4,111 | 219,667 |
+| `ee_cycle` | 98,464,696 | 268,430,243 |
+| `total_syscall_calls` | 1,862,701 | 5,258,779 |
+| `total_mmio_accesses` | 463 | 1,116 |
+| `halt` | entry_budget_exhausted | wallclock_deadline |
+
+`next_event_cycle=270341445` now sits just ahead of `ee_cycle`, which is what a healthy queue looks
+like. Suite 465/465, no probes left in shipped files.
+
+### W13, already measured: the guest loops but never renders
+
+With VBlank firing, almost all of the guest's syscall traffic is two calls at two adjacent PCs:
+
+```
+0x29 sce_ChangeThreadPriority calls=2,253,727  last_pc=0x0101f2b8
+0x2f sce_GetThreadId          calls=3,004,970  last_pc=0x0101f318
+```
+
+5,258,697 of 5,258,779 syscalls — **99.9998 %**. `0x2f` is `GetThreadId` per
+`ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp:114`. **`sce_SleepThread` was called once.**
+
+The thread is running at **`prio1`** (it was prio3 at W11): GT4 has lowered its own priority and is
+then spinning, which is a cooperative scheduler asking to be preempted by something higher-priority.
+`tid2` is `status=2`, Waiting. **There is no GS activity in the log at all**, and the guest still
+touches only 241 MMIO addresses.
+
+So the next question is narrow, and it should be answered from the scheduler and the harness before
+anything is guessed: **what is supposed to preempt that thread, and does it exist?** On a console the
+main loop drops to priority 1 and a VBlank handler or render thread runs. Here either nothing sits at
+a higher priority, or `applyPendingPreemption()` is not switching. `GetThreadId` being called three
+million times also smells like the loop testing "am I the thread that owns the frame", so its return
+value is worth reading.

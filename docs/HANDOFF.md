@@ -65,3 +65,32 @@ NEXT:   **W7 — the guest spins in a byte-store loop to the GS window.** At `0x
         already writing to GS memory. Dish: `33-g18d-gs-store-loop`.
         Also open: the SYSTABLE for `0x5A` now reads `handler=0x102aa38` (was `0x10285c0`) — the
         override pointer differs between cycles; worth a look but not the current wall.
+
+## 2026-09-30 15:55 · 33-g18d-gs-store-loop (investigation only) · **W7 named, no fix yet**
+
+WALL:   W7 — the guest spins in a byte-store loop at `0x0100f800`. Still open; this entry is the
+        measurement that names it.
+DID:    **No code changed.** Instrumented the generated translation unit in the build tree, measured,
+        then removed every probe and rebuilt clean. What I got:
+        - `[W7] outer t1=0x01051A45 t4=0x01051A3F s1=0x01051A44 s2=0x01051A4B` — **`$t4` never
+          changes, `$t1` climbs by one and runs away from it.**
+        - The one store pair sets BOTH slots to the same value: `store 0x24(t4)=0x01051A3F`,
+          `store 0x20(t1)=0x01051A3F`. **Start == end.** But the loop *starts* 6 bytes past the end,
+          so it wraps the whole 32-bit space instead of exiting.
+        - Verified against the ELF bytes (`0x0100f7ac` / `0x0100f7b0` in SCUS_973.28), not just our
+          recompile, because three findings in this project came from trusting the translation.
+        - **Frozen, not slow:** 10 s / 30 s / 120 s all give `functions_entered=95 distinct_pcs=50`.
+        - `sub_0100F390` is entered 30× and never returns; the last 20 entries in `ps2_log.txt` are
+          all `>> sub_0100F390 enter`.
+MEASURED:  `functions_entered=95 halt=guest_cycle_no_progress` (unchanged — correct, nothing was
+        fixed). Suite **450/450** still green from `tools/PS2Recomp/ps2xTest`.
+        `distinct_mmio_addresses=228`, guest GS writes present: `[gs:gif] nloop=7`, `PRMODE=0x8005`,
+        `PRIM=3` (a triangle).
+NEXT:   W7's open question, now sharp: **why is `$t1` `0x01051A45` when `$t4` was just stored as
+        `0x01051A3F` into the same structure?** Start and end are written equal; something adds 6 to
+        the start between the store and the loop. Look at the address arithmetic at the `0x100f864`
+        outer head — and MEASURE it, do not read it off the instruction stream.
+        **False lead, do not re-chase:** `sub_0100D308` ×16,368 is a **PRNG** (`multu`/`mflo`/`mfhi`
+        recombined) driving `buffer[i] ^= random()` for a hardcoded `0x3FF0` iterations. That is
+        legitimate guest work which returns cleanly. It is NOT the wall, and it cost a detour.
+        Addendum with all of the above is in `.auto/queue/33-g18d-gs-store-loop.txt`.

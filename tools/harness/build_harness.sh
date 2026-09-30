@@ -35,7 +35,14 @@ done
 
 # The generated unit is the biggest translation unit in the project; -O0 keeps the
 # build inside a sane time and costs nothing at 20M guest entries a second.
-if [ ! -f ps2_recompiled_functions.o ] || [ "$G/ps2_recompiled_functions.cpp" -nt ps2_recompiled_functions.o ]; then
+#
+# G1.8h, and it is the SAME trap this script was written to kill, one level deeper: the .cpp is
+# not the only input. Every READ32/READ64/WRITE32 expands a macro from
+# ps2xRuntime/include/ps2_runtime_macros.h, so changing that header changes the generated code's
+# MEANING without changing the .cpp's mtime. A timestamp check on the .cpp alone silently keeps the
+# old object, and a probe built into the macros then never fires -- which reads exactly like "the
+# guest never does the thing", which is the most expensive kind of wrong.
+if [ ! -f ps2_recompiled_functions.o ] || [ "$G/ps2_recompiled_functions.cpp" -nt ps2_recompiled_functions.o ] || [ "$R/ps2xRuntime/include/ps2_runtime_macros.h" -nt ps2_recompiled_functions.o ] || [ "$R/ps2xRuntime/include/ps2_runtime.h" -nt ps2_recompiled_functions.o ]; then
     nice -n 10 g++ -std=c++20 -O0 -msse4.1 $INC $DEFS -c "$G/ps2_recompiled_functions.cpp" -o ps2_recompiled_functions.o
 fi
 

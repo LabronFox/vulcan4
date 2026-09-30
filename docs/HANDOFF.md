@@ -969,3 +969,88 @@ NEXT:   1. **Sample inside the loop, not at its edges — and in the runtime, no
 MEASURED (final, from clean): suite **462/462**; 60 s boot `functions_entered=60089`
         `service_frames=7433490  total_syscall_calls=29914  distinct_mmio_addresses=0`
         `elapsed_ms=60010  harness_tail_ms=8`. Artefact `/mnt/ssd/vulcan4-build/run/boot_final.log`.
+
+## 2026-09-30 23:50 · G1.8h · **the guest's scan is CORRECT. The hook that proved it is now permanent.**
+
+WALL:   W10, and this pass **removes the last false suspect** and names the real shape.
+
+DID:    **Added the hook that was missing, in the runtime, and a build trap it exposed.**
+
+        1. `ps2TraceGuestWrite` is called by every `WRITE*` macro and every `PS2Runtime::StoreN`, and
+           was a **no-op stub**. It is now a real observer: `PS2GuestStoreObserver` +
+           `ps2SetGuestStoreObserver()`, a plain function pointer, null-checked, one predictable
+           branch per store. **It lives in the header the generated code already includes, so it
+           survives a regeneration** — which the hand-injected `[BR864]` `fprintf` did not, and
+           which the verifier caught shipping.
+        2. Its symmetric partner, because the read side is the one that mattered: `ps2TraceGuestRead`
+           + `PS2GuestLoadObserver`, called from the fast path of `READ8/16/32/64`. A "special"
+           address already reports through `PS2Runtime::LoadN`, so both paths are covered.
+        3. **`tools/harness/build_harness.sh` had the same class of trap one level deeper, and it
+           cost a whole measurement pass.** It rebuilt `ps2_recompiled_functions.o` when the `.cpp`
+           was newer — but that object is compiled from macros in `ps2_runtime_macros.h`, so
+           changing a header changes the generated code's MEANING without changing the `.cpp`'s
+           mtime. The observer was installed, fired **zero times**, and that reads exactly like
+           "the guest never does the thing", which is the most expensive kind of wrong. The script
+           now also rebuilds when either `ps2_runtime_macros.h` or `ps2_runtime.h` is newer.
+
+        With the store hook alone: **zero guest stores to physical `0x120E0`–`0x121A0` in the entire
+        run.** With the load hook, the decisive 20 lines:
+
+        ```
+        LOAD pc=0x1028610 phys=0x120e8 value=0x010285C0  a2=0x010285F8    (search for 0x83 handler)
+        LOAD pc=0x1028610 phys=0x1218c value=0x010285F8  a2=0x010285F8    -> MATCH, correct
+        LOAD pc=0x1028610 phys=0x120e8 value=0x010285C0  a2=0x010285C0    (search for 0x5A handler)
+        LOAD pc=0x1028610 phys=0x120e8 value=0x010285C0  a2=0x010285C0    -> MATCH, correct, x∞
+        ```
+
+        **THE GUEST'S SCAN IS CORRECT.** It reads the word, compares it to the target, and stops on
+        the match. The table is right. The compare is right. The recompile is right (694/707
+        functions clean on save/restore). **All three of my standing suspects are dead, and each died
+        to a measurement rather than an argument.**
+
+        Also measured, and it closes the frame inventory: over a whole run the service path executes
+        **exactly two PCs** — `0x01028610` (1,488,551 frames) and `0x010285f8` (5,982) — and the
+        driver's own loop executes six. **`0x010286F0`, `0x01028708`, `0x0102871C` and `0x01028738`
+        are never entered at all**, though they are resume cases. The retry half of the convergence
+        loop therefore runs entirely INLINE inside one service frame and cannot be sampled by any
+        driver. That is a property of the guest's code shape, and it is why six probes failed.
+
+MEASURED (this pass, 60 s, from clean): suite **462/462**; `functions_entered=60088`
+        `service_frames=7461176  total_syscall_calls=29914  distinct_mmio_addresses=0`
+        `elapsed_ms=60010  harness_tail_ms=8`. No probes in any shipped file.
+        Boot: `/mnt/ssd/vulcan4-build/run/boot_g18m.log`.
+
+RETRACTED, standing list, all mine: (a) "the guest's bytes never write `$s2`/`$s3`" — decoder error;
+        (b) "a callee clobbers `$s3`" — follows from (a); (c) "`0x0080102d` is `daddu $s0`" — it is
+        `daddu $v0`; (d) "the syscall table is exonerated" — the probe sampled the wrong rate; (e)
+        "the 64-bit branch compare is the wall" — unproven, `lui 0x102` clears the high bit.
+        **(f) NEW: "the search returns the wrong slot" — also false.** The load hook shows the search
+        returning the RIGHT slot every time. What differs between the first call and the rest is not
+        the answer but which code path produced it, and that is the next question, not this one.
+
+NEXT:   1. **The one thing left, and it is now a single question:** on the first pass the guest's
+           own handler answers `v0 = 0x8001218C`, which is correct. On every later pass `v0` is
+           `0x800120E8`, which is the answer to a *different* question. **Something changes which
+           code runs between the two.** The strongest candidate, and it is W5's `hasInvocation()`
+           latch in a new costume: `sub_010285F8` yields by **returning** at
+           `runtime->eeCheckpointDue()`, not by throwing `EeDispatcherTransfer`. `serviceInvocations`
+           gives a call `stepBudget` (4096) steps and then **returns with the invocation still on the
+           thread**. `hasInvocation(SyscallOverride, 0x83)` is then true forever, so every later
+           `sce_FindAddress` takes `return false` at System.cpp:426 and **falls through to our
+           builtin** — which is a plain loop with no checkpoint and answers immediately. **Test it by
+           printing `runtime.findEeSyscallOverride(0x83, …)` reachability, or simply by raising
+           `stepBudget` and seeing whether the first-pass behaviour becomes permanent.** If it does,
+           the fix is that **the step budget must not be able to strand an invocation** — enforce it
+           at invocation boundaries, or make an unfinished invocation resume rather than leak.
+        2. **A red test is owed for that, and it is the same shape as W5's:** a guest invocation
+           whose callee needs more steps than the budget must still complete, and after it
+           completes `hasInvocation()` must be false. Written before the fix.
+        3. **The milestone, still blocked and still uninstrumented.** Zero MMIO accesses; the GS
+           window at `0x1200xxxx` untouched; nothing prints `VULCAN4 FRAME source=guest`. The GS
+           lane's emitter is still half-built (`GS` must consume `GifArbiter::drainedPacketCount()`;
+           `ps2_runtime.cpp` needs `m_gifArbiter.setDeliveryObserver(...)` after `m_gs.init(...)`).
+
+        **Two permanent tools came out of this session's failures and should not be lost:** the
+        store/load observers (in the runtime header, so they survive regeneration) and the
+        header-aware rebuild rule in `build_harness.sh`. Both were written because a probe was
+        invisible, and "invisible" is the failure mode this project keeps paying for.

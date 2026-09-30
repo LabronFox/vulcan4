@@ -304,3 +304,40 @@ NEXT:   **This is now a control-flow question, not a data question.**
 MEASURED (suite): **450/450**. MEASURED (boot): `functions_entered=95 halt=guest_cycle_no_progress
         bios_files=0`. **Campaign goal NOT reached — `VULCAN4 FRAME source=guest` never printed.**
         Addenda 1–8 in `.auto/queue/33-g18d-gs-store-loop.txt`.
+
+## 2026-09-30 19:55 · 33-g18d-gs-store-loop (investigation, 9th pass) · **W7: struct is NOT half-written**
+
+WALL:   W7. Addendum 8's leading hypothesis is now tested and **refuted**.
+MEASURED:
+        ```
+        [FILL] 0x0=0x2FE07A5F 0x8=0x00000001 0xc=0x01036E28 0x10=0x01036D7F 0x18=0 0x20=0x01051A40 0x24=0x01051A3F | s7=0x01051A40 fp=0x01051A3F
+        [FILL] 0x0=0x328F2794 0x8=0x00000015 0xc=0x010380C8 0x10=0x01036D7F 0x18=0 0x20=0x01056478 0x24=0x01051A3F | s7=0x01056478 fp=0x01051A3F
+        [FILL] 0x0=0x265D71E6 0x8=0x00000008 0xc=0x010394B8 0x10=0x01036D7F 0x18=0 0x20=0x0105CB32 0x24=0x01051A3F | s7=0x0105CB32 fp=0x01051A3F
+        ```
+        - **The struct is filled completely and freshly every call.** `0x0` (a PRNG word), `0x8` (a
+          count) and `0xc` (a pointer) all change; `0x10` is a constant base; `0x18` is zero; `0x20` is
+          the start; `0x24` is the end. **Nothing is half-written, and the `jal` returns normally.**
+          Addendum 8's "a transfer between the two stores" hypothesis is **REFUTED**.
+        - **What is left, exactly:** `$fp` already holds `0x01051A3F` on entry, so `sw $fp,0x24($s0)`
+          is faithful but useless. The defect is **strictly upstream of `sub_0100F8C8`**.
+        - Addendum 8's scan still stands and is still the key fact: **the end value appears nowhere
+          in the 707 functions and nowhere in guest data — only on the stack.**
+NEXT:   Two steps, neither of which is more forward-walking:
+        1. **Follow the OTHER moving pointer, not `$fp`.** Slot `0xc` moves `0x01036E28` → `0x010380C8`
+           → `0x010394B8` → `0x0103A8F4` against a constant base `0x01036D7F` at `0x10`; the offset
+           grows +0xA9, +0x134F, +0x2739, +0x3B75. **That is a second cursor advancing through the
+           same data the start cursor is in, and the copy's end bound is probably derivable from it.**
+           One probe, and it is the most informative thing left.
+        2. **Find who last WROTE `$fp`, not who reads it.** Passes 6–7 chased the read side and the
+           save/restore, both fruitless. `sub_0100EDC8` is entered with `$fp` already wrong *and* its
+           `ld $fp` restores the wrong value, so it was clobbered above `sub_0100F8C8`. Extend
+           `W7SCAN` to report the `$fp`-save slot (currently `0x01FFC870`) and scan for writes to it —
+           the same one-shot trick that just worked.
+        **The red test is still owed:** a transfer thrown between two stores into one struct must be
+        *reported*, not silently left half-written. Note pass 9 shows that path is NOT what is
+        happening here, so the test is worth writing for robustness but is **not** the fix.
+        **Method, third time:** passes 1–7 walked forward and found no writer; pass 8 scanned and
+        closed it; pass 9 tested the claim and refuted half of it cheaply. **Scan, test, never walk.**
+MEASURED (suite): **450/450**. MEASURED (boot): `functions_entered=95 halt=guest_cycle_no_progress
+        bios_files=0`, `W7SCAN total start=2 end=2`. **Campaign goal NOT reached — `VULCAN4 FRAME
+        source=guest` never printed.** Artifact rebuilt clean (0 `fprintf`). Addenda 1–9 on file.

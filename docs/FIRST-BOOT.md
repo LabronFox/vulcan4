@@ -1497,3 +1497,86 @@ waiting for and who writes it.** It has been the answer three times out of three
 re-reads the guest's own RDRAM through a syscall. The MMIO counter is not blind here; there is
 simply nothing on the bus. Recorded because "the counter says zero" invited the opposite
 conclusion for several dishes.
+
+
+---
+
+## 10. G1.8 — ACTED ON: the KSEG0 half is REFUTED, the record shape is narrowed to one unrun test
+
+G1.7 named two blockers. This resolves one and narrows the other.
+
+### 10.1 KSEG0 translation: REFUTED with evidence. It is correct.
+
+The strongest possible evidence is behavioural, not a code read. From the G1.7 run:
+
+```
+$ grep -c "FindAddress:hit" boot.log
+16
+$ grep -oE "FindAddress:hit.*" boot.log | head -2
+FindAddress:hit] pc=0x1028640 start=0x80000000
+FindAddress:hit] pc=0x1028640 start=0x80000000
+```
+
+**The guest searched starting at KSEG0 `0x80000000` and the runtime FOUND the value, sixteen
+times.** The search window is the KSEG0 alias and the hits prove the alias resolves onto the very
+bytes the loader wrote. The code path agrees:
+
+```cpp
+// ps2_memory.cpp:596-598
+if (Ps2IsKseg01Address(virtualAddress))
+{
+    return Ps2DirectMappedPhysicalAddress(virtualAddress);
+}
+```
+
+`translateAddress` is the single funnel for **every** guest read and write
+(`ps2_memory.cpp:568-580`), so one correctly-handled branch covers both directions — this is not
+a read-only path with a separate write path that could diverge. **Blocker 1 is refuted: the KSEG0
+half was never broken.** The G1.6 user-segment fix already made the two aliases agree, and the
+sixteen hits are that fix working.
+
+### 10.2 The record shape: what the guest wants vs what is there
+
+Measured, from the same run's harness probe:
+
+```
+VULCAN4 PROBE2 rdram[0x35354..0x35363] = 0x10285f8 0x5a 0x10285c0 0x0  <-- BOTH PRESENT
+VULCAN4 PROBE3 0x010285F8 at RAM offset 0x35354, 0x010285C0 at RAM offset 0x3535c
+```
+
+- **What the guest wants:** `hit(W2) - hit(W1) == 0x20C - 0x168 == 0xA4 == 164` bytes.
+- **What is there:** one record at `0x35354` holding `{0x010285F8, 0x5A, 0x010285C0, 0x00000000}`
+  — the two pointers **8 bytes** apart.
+- **Consequence:** `s1 = hit(W1) - 0x20C` and `s0 = hit(W2) - 0x168` can never be equal, so the
+  `beq s1,s0` exit at `0x010286FC` is never taken, the walk advances past the only record, and
+  `FindAddress` returns 0 for the rest of the window. That is the livelock, exactly.
+
+**Is the shape wrong, or the data?** In `SCUS_973.28` itself, the answer is **the data**: a direct
+search of the 273,020-byte executable finds **exactly one** occurrence of each pointer, at file
+offsets `0x36354` and `0x3635c` — 8 bytes apart. There is no second copy to form a 164-byte pair.
+
+**⚠️ The honest gap, and it is one unrun measurement.** `VULCAN4 PROBE3` records only the **first**
+occurrence of each pointer in RDRAM. RDRAM is the executable **plus** the second `PT_LOAD` data
+segment, so **a 164-byte-apart pair in the data segment has not been excluded.** I attempted to
+answer it offline by reconstructing RDRAM from the ISO, and my reconstruction disagreed with the
+runtime's own probe (it found the record at a different offset), which means **my reconstruction
+arithmetic is wrong and I am discarding my own result rather than reporting it.** The runtime's
+measured output wins. The single unrun test is: extend `PROBE3` to search RDRAM for *all*
+occurrences of both pointers and report every separation. If a 164-byte pair exists, the guest's
+walk should already find it — and since it does not, the pair almost certainly does not exist, but
+that is inference, not measurement.
+
+### 10.3 What would actually satisfy the guest
+
+A record in RDRAM containing `0x010285F8` and `0x010285C0` **exactly 164 bytes apart**. Nothing in
+the loaded image produces one, and nothing in the runtime has ever written one. **Who should write
+it remains UNVERIFIED.** The candidates are unchanged from G1.7: the console's module / export-table
+machinery, which `docs/G3.0` already records as absent, or a guest-side table built by an
+initialisation routine that has not run — and the guest is demonstrably still in initialisation,
+having touched **no hardware at all** (`total_mmio_accesses=0`).
+
+**This is the third instance of the same pattern** and it is now sharper than before: the guest is
+not waiting on hardware, not on a dispatcher, and not on a pointer that is misplaced. **It is
+waiting on a table entry that no code we have ever run writes.** The loader bug (G1.6) was one
+writer that had not run; the module table is another. Both are the same class, and the class is:
+**"a value the guest expects to exist, and nothing in the system produces it."**

@@ -870,6 +870,32 @@ int main(int argc, char *argv[])
                              std::chrono::steady_clock::now() - start)
                              .count();
 
+    // ------------------------------------------------------------------ syscall table probe
+    //
+    // GT4 registers two of its own syscall handlers (0x83 and 0x5A) and then scans low RDRAM for
+    // them, because the console's real syscall dispatch table is a flat array of 32-bit function
+    // pointers indexed by syscall number at 0x80011F80. Two slots 164 bytes apart is the proof
+    // that both registrations landed. Print the two slots at the deadline, whatever the halt was.
+    //
+    // G1.8: this probe is what showed the map bug. Before the fix it read `handler=0x0` for 0x83
+    // (the guest's override table was invisible because .data had been biased 16MB down) and after
+    // it reads the guest's own handlers back at both slots. It is kept because the guest's
+    // convergence loop depends on these two words and nothing else reports them.
+    {
+        constexpr uint32_t kTableBase = 0x00011F80u;
+        for (const uint32_t num : {0x83u, 0x5Au})
+        {
+            const uint32_t slot = kTableBase + num * 4u;
+            uint32_t word = 0u;
+            if (slot + 4u <= PS2_RAM_SIZE)
+            {
+                std::memcpy(&word, rdram + slot, sizeof(word));
+            }
+            std::cout << "VULCAN4 SYSTABLE n=0x" << std::hex << num << " slot=0x" << slot
+                      << " handler=0x" << word << std::dec << "\n";
+        }
+    }
+
     // ------------------------------------------------------------------ the report
     //
     // Machine-readable, exactly one line, exactly this shape. The gate greps for it.

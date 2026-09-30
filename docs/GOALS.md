@@ -270,6 +270,77 @@ or is explicitly a Stage 2/3 preparation. **If a dish serves none of them, it do
   plan: before instrumenting the CPU path again, ask what the guest is waiting for and who writes
   it. It has been the answer three times out of three.
 - **No regression test:** nothing was implemented, only diagnosed. `docs/FIRST-BOOT.md` §9.
+- **🚨 THIS ENTRY'S CENTRAL CLAIM IS WRONG AND IS RETRACTED BY G1.8.** The `-0x01000000` bias
+  described above was not a fix; it was the bug. It relocated the guest's `.data` into the very
+  window the guest searches and so **created** the decoy this entry called "the missing writer,
+  found and fixed." The premise ("0x01000000 is the user segment") is false — it is a physical
+  address the kernel loads at. Left in place deliberately: **a record of a plausible fix that made
+  things worse is worth more than a clean one**, and three goals' findings have to be re-read
+  against it. The code was changed in G1.8, not here.
+
+### ✅ G1.8 — The G1.6 "fix" was the bug; it manufactured the decoy *(gate NOT met: still 3, but
+### the wall is now correct and the next one is named)*
+
+- **DONE WHEN:** GT4's two syscall overrides land in the kernel syscall table so the guest's
+  convergence loop closes; `functions_entered` above 3.
+- **RESULT (2026-09-30):** ❌ **the gate is not met** — `functions_entered=3`, unchanged from the
+  high-water mark, `halt=livelocked_in_syscall`, `bios_files=0`. Reported as measured.
+  **But the memory that gate is waiting on is now correct, and that was ours to fix.**
+- **🎯 THE ROOT CAUSE, FOUND BY MEASUREMENT: G1.6's `-0x01000000` bias was never correct, and it
+  manufactured the wall three goals then chased.**
+  - **The premise was false.** G1.6 stated "the kernel loads a game at 0x01000000, so a guest
+    address in [0x01000000, 0x02000000) is RDRAM at `vaddr - 0x01000000`". 0x01000000 is not a
+    segment base needing translation — it is an ordinary **physical** RDRAM address the kernel
+    happens to load a game at, inside the identity-mapped low window. The kernel copies each
+    `PT_LOAD` straight to `p_vaddr`.
+  - **Four things in our own tree already assumed identity, and that rule was the only dissenter:**
+    `Ps2PhysicalAddress()` in `runtime/ps2_address.h` returns `addr` unchanged below `0x80000000`;
+    the console kernel syscall table is at **physical** `0x11F80` while ps2SDK's `GetEntryAddress()`
+    returns its **KSEG0 alias** `0x80011F80` — one word only if the low window is identity mapped;
+    RDRAM is 32 MB, so `0x01035350` is in range as-is; the ELF's `memsz` ends at `0x010519AC`, also
+    in range as-is.
+  - **Why it survived:** it was self-consistent. The loader calls the same `translateAddress()`, so
+    loader and guest both shifted down together, code kept running, and **nothing crashed**.
+  - **What it did:** relocated the guest's whole `.data` 16 MB down, from physical `0x0102DC80` to
+    `0x0002DC80` — which dragged the ELF's own 16-byte descriptor `{0x83, 0x010285F8, 0x5A,
+    0x010285C0}` into the KSEG0 window `[0x80000000, 0x80080000)` the guest searches, at physical
+    `0x35354`, where its two handler pointers sit **8 bytes apart**. **That decoy is G1.6's "the
+    missing writer, found and fixed", G1.7's "the wait is now an address", and G1.3's "the 16
+    hits".** On real hardware the descriptor sits at physical `0x01035350`, safely outside the
+    sweep, and the guest instead finds its two handlers where the console kernel really keeps them.
+  - **So the bias did not merely fail to help — it created the wall.**
+- **REMOVED,** with the reasoning above left in `ps2_memory.cpp`, and pinned by a **new test**,
+  `"the 0x01000000 window is identity mapped, not biased by -0x01000000"` (5 assertions, and
+  **proven to have teeth**: reintroducing the bias fails 5 of them).
+- **✅ WHAT THE FIX ACTUALLY DELIVERED — measured, not inferred.** Before, the guest's own override
+  table read as all zeros and both `SetSyscall` calls landed as `n=0 handler=0x0`:
+  - before: `[SetSyscall] n=0 handler=0x0 slot=0x11f80 readback=0x0` (×2)
+  - after: `[SetSyscall] n=131 handler=0x10285f8 slot=0x1218c readback=0x10285f8`
+    and `n=90 handler=0x10285c0 slot=0x120e8 readback=0x10285c0`
+  - `VULCAN4 SYSTABLE n=0x83 slot=0x1218c handler=0x10285f8` / `n=0x5a slot=0x120e8
+    handler=0x10285c0` — **the two handlers are now in the kernel syscall table at exactly the
+    164-byte gap the guest's loop waits for.** G1.3b's arithmetic (`0x8001218C - 0x20C ==
+    0x800120E8 - 0x168 == 0x80011F80`) is measured to hold.
+- **✅ G1.4b's OPEN QUESTION IS ANSWERED, and it was not the recompiler.** G1.4b recorded that
+  `[Dispatch] n=8 … source_pc=0x10286d4` has **no matching `[Returned]`**, and left the cause as a
+  lead. **Measured cause:** `targetFn` for that dispatch never returns, because
+  `dispatchSyscallOverride` → `EeScheduler::invokeCurrent` **throws `EeDispatcherTransfer`**
+  (`EeScheduler.cpp:1121`) straight out of the callee's frame — confirmed by a probe printed
+  immediately after `targetFn` that fires for every other dispatch and *not* for this one. So the
+  guest's stub was not skipped by a bad `jal`; the scheduler unwound the frame. **G1.4b's "LEAD, NOT
+  A CONCLUSION" is therefore retired: it was never the `jal` emission.**
+- **THE WALL, RESTATED AND MEASURED AT THE REGISTER LEVEL** (instrumented `label_1028740`, the
+  convergence back-edge). `s2`/`s3` reset to `0` every three iterations, so the pair is never
+  correct at the same instant:
+  `[LOOP18] s0=0xFFFFFE98 s1=0x80011F80 s2=0x0 s3=0x8001218C` — `s3` is right, `s2` is zero —
+  then `s3` walks to the window end, then both are zero again. The syscall-override path is the
+  suspect: `bindMainContextForSyscall` re-runs `reset()` on **every** call because the harness never
+  starts the scheduler's executor thread, `hasInvocation(SyscallOverride, 0x83)` then latches true
+  so later `0x83` calls silently fall through to our handler instead of the guest's, and
+  `onComplete` copies back **only `r[2]`**.
+- **NEXT DISH:** reconcile the scheduler's main-context copy with the harness's `ctx` so an override
+  invocation preserves the guest frame — one test first, and it must be red before any fix.
+- **PATCH:** `tools/patches/ps2recomp-linux-g18-identitymap.patch`. **TESTS: 447/447.**
 
 ### ✅ G1.5 — The body that never ran (it did run)
 - **DONE WHEN:** the `jal` at `0x010286D4` actually runs the body at `0x01028638`, and the boot

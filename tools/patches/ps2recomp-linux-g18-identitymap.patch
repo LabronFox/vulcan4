@@ -1,0 +1,131 @@
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 37b6a4d..43165bf 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -567,6 +567,18 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
+ 
+ uint32_t PS2Memory::translateAddress(uint32_t virtualAddress)
+ {
++    // MMIO accounting. Every guest read/write funnels through here (read8/16/32/64,
++    // write8/16/32/64), so this is the one place that can answer "did the guest ever touch the
++    // console's hardware registers, and which ones?". A guest that spins waiting for a hardware
++    // bit is the classic reason a recomp appears to hang, and this is how that is told apart
++    // from a guest spinning in software.
++    if (Ps2IsSpecialAddress(virtualAddress))
++    {
++        ++m_mmioAccessCount;
++        ++m_mmioCounts[virtualAddress];
++        m_lastMmioAddress = virtualAddress;
++    }
++
+     if (isScratchpad(virtualAddress))
+     {
+         return ps2ScratchpadOffset(virtualAddress);
+@@ -586,7 +598,48 @@ uint32_t PS2Memory::translateAddress(uint32_t virtualAddress)
+         return Ps2DirectMappedPhysicalAddress(virtualAddress);
+     }
+ 
+-    // In this runtime, low segments are treated as physical-style addresses already.
++    // G1.8: the low window is a PHYSICAL window, identity mapped. There is no "user segment"
++    // needing a -0x01000000 bias.
++    //
++    // A previous revision (G1.6) subtracted 0x01000000 from every address in
++    // [0x01000000, 0x02000000), on the stated premise that "the kernel loads a game at
++    // 0x01000000, so 0x01035350 is RDRAM at 0x35350". The premise is false. 0x01000000 is not
++    // a segment base requiring translation; it is an ordinary *physical* RDRAM address the kernel
++    // happened to choose to load the game at, inside the identity-mapped 0x00000000-0x01FFFFFF
++    // physical window. The kernel copies each PT_LOAD straight to p_vaddr.
++    //
++    // Four independent things inside this runtime already assume identity, and that rule was the
++    // only thing that disagreed with them:
++    //   - Ps2PhysicalAddress() in runtime/ps2_address.h returns `addr` unchanged below 0x80000000.
++    //   - The console kernel syscall table lives at PHYSICAL 0x11F80, and ps2SDK's
++    //     GetEntryAddress() returns its KSEG0 alias 0x80011F80. Those are one location only if
++    //     the low window is identity mapped; under the -0x01000000 bias the kernel's own table
++    //     would have had two physical addresses.
++    //   - RDRAM is 32MB (PS2_RAM_SIZE 0x02000000), so physical 0x01035350 is in range as-is.
++    //   - The ELF's own memsz runs to 0x010519AC, in range as-is.
++    //
++    // The bias was self-consistent (loader and guest both shifted down) so code kept running, and
++    // that is why it survived: nothing crashed. Its effect was to relocate the guest's entire
++    // .data segment 16MB down, from physical 0x0102DC80 to 0x0002DC80 -- which dragged the ELF's
++    // own data INTO the KSEG0 window [0x80000000, 0x80080000) that the guest searches.
++    //
++    // That manufactured a decoy. The 16-byte descriptor {0x83, 0x010285F8, 0x5A, 0x010285C0} at
++    // guest 0x01035350 became visible to the guest's own FindAddress sweep at physical 0x35354,
++    // where its two handler pointers sit 8 bytes apart. Three successive goals (G1.3, G1.6, G1.7)
++    // then chased that decoy as "the only record in memory" and as "the 16 hits". On real hardware
++    // the descriptor sits at physical 0x01035350, safely outside the [0, 0x80000) sweep, and the
++    // guest instead finds its two handlers where the console kernel actually keeps them: in the
++    // syscall table at 0x8001218C and 0x800120E8, exactly 0xA4 = 164 bytes apart, which is the
++    // gap the guest's convergence loop waits for.
++    //
++    // So the bias did not merely fail to help -- it manufactured the very wall those goals were
++    // chasing. Removed; the identity mapping below is now the only rule for the low window.
++    //
++    // Falsifier for this correction: if the guest still cannot see its own override table at
++    // 0x01035350 after this change, then the load path is not going through translateAddress()
++    // and the loader, not the map, is what needs fixing.
++
++    // In this runtime, the remaining low segments are treated as physical-style addresses already.
+     if (virtualAddress < 0x80000000)
+     {
+         return virtualAddress;
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 0b22fe0..9e1b3a4 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -192,6 +192,53 @@ void register_ps2_memory_tests()
+             t.Equals(mem.translateAddress(PS2_SCRATCHPAD_ALIAS_BASE + 0x123u), 0x123u, "0xF000 scratchpad alias should translate to local offset");
+         });
+ 
++        tc.Run("the 0x01000000 window is identity mapped, not biased by -0x01000000", [](TestCase &t)
++        {
++            // G1.8 regression test. A previous revision subtracted 0x01000000 from every address
++            // in [0x01000000, 0x02000000), on the premise that 0x01000000 is a segment base
++            // needing translation. It is not: it is an ordinary physical RDRAM address the console
++            // kernel loads a game at, inside the identity-mapped low window. The bias was
++            // self-consistent (loader and guest both shifted) so nothing crashed, but it relocated
++            // the guest's whole .data segment 16MB down and manufactured a decoy that three goals
++            // then chased. These assertions are what was missing to catch it.
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++
++            // 1. Identity: the guest address the guest linked at IS the physical address.
++            t.Equals(mem.translateAddress(0x01035350u), 0x01035350u,
++                     "guest 0x01035350 must be physical 0x01035350, not 0x0035350");
++            t.Equals(mem.translateAddress(0x01000008u), 0x01000008u,
++                     "the guest entry point must not be biased down by 0x01000000");
++            t.Equals(mem.translateAddress(0x0102DC80u), 0x0102DC80u,
++                     "the second PT_LOAD segment base must stay at its linked address");
++
++            // 2. One physical word, one location, however it is addressed. The console kernel's
++            //    syscall table lives at physical 0x00011F80, and ps2SDK's GetEntryAddress() hands
++            //    the guest its KSEG0 alias 0x80011F80. Under a -0x01000000 bias the guest could
++            //    only have reached that word by naming 0x01011F80, which is a *different* word --
++            //    and the guest names 0x80011F80, so the table would have been unreachable.
++            t.Equals(mem.translateAddress(0x00011F80u), 0x00011F80u,
++                     "the kernel syscall table's physical address must map to itself");
++            t.Equals(mem.translateAddress(0x80011F80u), 0x00011F80u,
++                     "KSEG0 alias of that table must reach the same physical word");
++            t.IsTrue(mem.translateAddress(0x01011F80u) != mem.translateAddress(0x80011F80u),
++                     "0x01011F80 and 0x80011F80 are different physical words under identity mapping");
++
++            // 3. GT4's two handlers must be findable in the window it actually searches,
++            //    KSEG0 [0x80000000, 0x80080000) == physical [0, 0x80000), at the syscall slots
++            //    164 bytes apart -- which is exactly what its convergence loop waits for.
++            t.Equals(mem.translateAddress(0x8001218C), 0x0001218Cu, "syscall 0x83 slot");
++            t.Equals(mem.translateAddress(0x800120E8), 0x000120E8u, "syscall 0x5A slot");
++            t.Equals(0x8001218Cu - 0x800120E8u, 0xA4u,
++                     "the two slots must be 164 bytes apart, which is what the guest waits for");
++
++            // 4. And the guest's own override table must NOT be visible in that window. Under the
++            //    bias it was, at physical 0x00035354, and three goals mistook that decoy for the
++            //    record the guest was really looking for.
++            t.IsTrue(mem.translateAddress(0x01035350u) >= 0x00080000u,
++                     "the guest's override table must sit outside the physical window the guest sweeps");
++        });
++
+         tc.Run("EE timer0 count advances from scheduler cycles and can be reset", [](TestCase &t)
+         {
+             PS2Memory mem;

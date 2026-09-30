@@ -25,6 +25,9 @@ target/
 .idea/
 .DS_Store
 
+# opencode plugin state (goal plugin) — runtime, never source
+.opencode/
+
 # upstream clone — never commit another project's tree
 /tools/PS2Recomp/
 # built toolchain binaries — reproducible from tools/patches, never committed

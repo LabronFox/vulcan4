@@ -76,6 +76,11 @@ direction check.
 9. **Never open an image in context.** Report the path; someone outside looks at it. (Reading images
    into a session breaks it permanently — there is a 20-image limit upstream.)
 10. **Commits author as the captain:** `Or Golan <or024662@gmail.com>`. Do not push.
+11. **Do not starve the house.** This box also runs a live Minecraft server that real people play on.
+    Cap builds at **`-j4`** and wrap heavy work in **`nice -n 10` / `ionice -c3`** — never `-j12`.
+    Verified 2026-09-30: a `-j12` compile produced the world's only server stall (`Can't keep up!
+    4824 ms behind`) at the exact minute the compile ran, and the player felt it. `nproc` is 6, not 12:
+    the game gets a core or two, the build gets the rest.
 
 ## HOW YOUR WORK IS JUDGED
 

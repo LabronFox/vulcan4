@@ -6,8 +6,9 @@ that backs it. If a line has no evidence, it is not here.
 
 **TL;DR for a stranger:** the whole toolchain builds from a fresh clone, GT4's own machine code is
 translated ahead of time and **executes** with no BIOS, and the Graphics Synthesizer skeleton moves
-real computed pixels. **No part of the game renders, and no part of it plays.** The wall is
-unchanged since the first hour: the guest cannot get past 3 functions.
+real computed pixels. **No part of the game renders, and no part of it plays.** The wall is still
+at 3 guest functions, but for the first time the memory that wall waits on is **provably correct**
+rather than correct-by-coincidence.
 
 ---
 
@@ -23,12 +24,13 @@ Each line is a claim with its evidence. Commands are runnable as written.
 | **A GT4 function is readable two ways** and the translation is faithful | commit `ffd0519`; `docs/FUNCTION-ANATOMY.md` |
 | **The recompiler runs to completion** on the real 707-function executable, all bodies written | commit `ef3e183`; `ps2_recompiled_functions.cpp` = 8,899,740 B, `RECOMP_EXIT=0` |
 | **GT4's own code executes, with no BIOS anywhere** | commits `4958a83`, `d1dc241`; `/mnt/ssd/vulcan4-build/run/boot.log` → `VULCAN4 BOOT REPORT functions_entered=1 halt=waiting_on_unnamed_value bios_files=0`. The harness contains **no BIOS loading path at all** |
-| **The wall is named, twice over, and both names are measured** | commit `a628419` names the spin: the guest polls `sce_FindAddress` (0x83) over KSEG0 `0x80000000`–`0x80080000` for the code pointers `0x010285F8` and `0x010285C0`, exiting only when the two are **164 bytes apart**. The only record in memory has them **8 bytes apart**, so the walk runs off the end of the window. Commit `4b444be`/`d1dc241` refuted the KSEG0-translation theory by measurement: the search **hits 16 times** from `0x80000000`, so the alias resolves correctly. What is missing is a table entry **nothing in the system writes** |
+| **GT4's two kernel-syscall overrides really land in the kernel's syscall table** | `/mnt/ssd/vulcan4-build/run/boot_final.log` → `[SetSyscall] n=131 handler=0x10285f8 slot=0x1218c readback=0x10285f8` and `n=90 handler=0x10285c0 slot=0x120e8 readback=0x10285c0`; `VULCAN4 SYSTABLE n=0x83 slot=0x1218c handler=0x10285f8`, `n=0x5a slot=0x120e8 handler=0x10285c0` — the two slots **164 bytes apart**, the gap GT4's convergence loop waits for. Test `the 0x01000000 window is identity mapped` pins the mapping this depends on |
+| **The wall is named, three times over, and the third name is a bug of ours that was removed** | commit `a628419` named the spin; commit `4b444be` refuted the KSEG0-translation theory. **G1.8 found that G1.6's own `-0x01000000` memory-map bias was manufacturing the decoy** the first two names were chasing — it dragged the guest's `.data` 16 MB down into the window the guest searches. Removed, with a test that fails 5 assertions if reintroduced |
 | **The GS moves real, computed pixels** | commits `bcb0882`, `ccd9981`; `/mnt/ssd/vulcan4-build/gs/vulcan4_gs_frame.png`, 512×512, 119,302 B, **43,804 distinct colours** (G2.0 produced 1 — a black square) |
 | **The GS decision is made, with reasons and rejected alternatives** | commit `d63a6f2`; `docs/GS-PLAN.md` |
 | **The project cross-compiles to ARM64** | commit `5509151`; `/mnt/ssd/vulcan4-build/android/gs_probe_arm64` (5,263,568 B, ELF64 AArch64) with **707 guest functions** and **0 x86/SSE symbols**; `docs/ANDROID-FEASIBILITY.md` |
 | **Prior art has been read, not guessed** | commit `d467818`; `docs/PRIOR-ART.md`, 14 cited sources |
-| **The test suite is green** | 444/444 (`ps2x_tests`); 3 new entry-vs-resume tests proven to have teeth by mutation |
+| **The test suite is green** | 447/447 (`ps2x_tests`); 3 entry-vs-resume tests proven to have teeth by mutation, plus the new `the 0x01000000 window is identity mapped` test, proven to have teeth the same way |
 
 ### Reproduce the boot yourself
 
@@ -55,14 +57,21 @@ The full end-to-end recipe — fresh clone, patches, build, boot — is
 
 **And the concrete reasons the guest stops:**
 
+- **The boot wall is now named as a scheduler/frame-loss defect, not a value and not a recompiler
+  bug.** GT4's convergence loop needs its two syscall-override hits to be 164 bytes apart. Both
+  are now in the kernel's syscall table and measured to be (`0x8001218C`, `0x800120E8`). But the
+  loop's registers `s2`/`s3` **reset to zero every three iterations**, so the pair is never correct
+  at the same instant. Measured cause: the syscall-override path calls
+  `EeScheduler::invokeCurrent`, which **throws `EeDispatcherTransfer` out of the guest callee's
+  frame**, and `bindMainContextForSyscall` re-runs `reset()` on every call because the harness never
+  starts the scheduler's executor thread. This is the answer to G1.4b's open question — the `jal`
+  emission was never at fault.
 - `total_mmio_accesses=0` and `distinct_mmio_addresses=0`. The guest has **never touched a hardware
   register.** It is still in initialisation.
-- No IRX module has been loaded, and the runtime has no BIOS path, so the function pointer the guest
-  is searching for does not exist anywhere in memory. The `FindAddress` scan is a brute-force
-  heuristic standing in for the hardware's loaded-module export-table lookup.
-- Because that lookup can never succeed, the guest **retries until the deadline**. That is a
-  livelock, not a crash — and it is the reason the report was renamed from the generic
-  `stuck_in_syscall` to `livelocked_in_syscall`.
+- No IRX module has been loaded, and the runtime has no BIOS path. That is unchanged and intended:
+  the runtime serves the console's OS calls itself.
+- Because the override lookup can never satisfy the guest's convergence test, the guest **retries
+  until the deadline**. That is a livelock, not a crash.
 
 **Also not done:** no CD/DVD or disc I/O path has been driven by a guest · no ADPCM audio decode ·
 no input from a real controller · no menus, no save data, no race logic, no 3D · no APK · no NDK or
@@ -86,6 +95,7 @@ The ladder, in order, with the honest state of each rung. Full detail in
 | G1.3 / G1.3b | 🟡 | syscall 0x83 served properly; still did not get past |
 | G1.4 | 🟡 | investigation completed, then **corrected by G1.5** — the premise was wrong |
 | G1.5 | ✅ | proved the stub body ran; found the real wall (a `FindAddress` livelock) |
+| **G1.8** | ✅ (diagnosis) / ❌ (gate) | **our own `-0x01000000` memory-map bias was manufacturing the decoy three goals chased. Removed + tested. Both overrides now really land in the syscall table; the wall is a scheduler frame-loss defect, named at the register level** |
 | **G2.0** | ✅ | GS approach decided and the path proved |
 | **G2.1** | ✅ | the GS computes pixels — 43,804 distinct colours |
 | **G2.2** | ✅ | the guest draw sequence, documented (and the fault it hit localised) |
@@ -112,9 +122,14 @@ mipmaps, blending, a Z test, CLUT animation and the EE→GS DMA path is named in
 real guest (ZTE not honoured, `PRMODE` semantics flattening textured geometry, and texture base
 units 32× off for a genuine guest).
 
-**The next real work is G3.1, the VU1.** A frame on disk that our own code computed is still not a
-rendered game — and nothing from Gran Turismo 4 has ever been through this GS, because the guest has
-not reached it (G1.8). What G2.4 removes is the excuse that the renderer was the blocker.
+**The next real work is the syscall-override frame loss, not the renderer and not the values.**
+G1.8 removed a memory-map bug that had been manufacturing the boot wall since G1.6, so the two
+handler addresses GT4 waits for are now genuinely present and 164 bytes apart, exactly as it
+requires. The loop still cannot converge because the scheduler **throws out of the guest callee's
+frame** on the override path and the guest's registers do not survive it. That is one test and one
+fix, and it is the last thing standing between here and a guest that boots past its own startup.
+After that: **G3.1, the VU1.** A frame on disk that our own code computed is still not a rendered
+game.
 
 ---
 
@@ -150,3 +165,9 @@ foundation and the proof that the foundation is sound — not a game.
 - Two earlier claims were **wrong and are recorded as wrong** rather than quietly deleted: that the
   GS triangle "never submits" (it does — `XYZF2` and `XYZ2` both kick), and that PS2Recomp's author
   says it "does not work properly" (unverifiable; grep of the pinned tree finds nothing).
+- **One earlier *fix* was wrong, and is recorded at greater length than the fix it replaces.** G1.6
+  added a `-0x01000000` bias to `PS2Memory::translateAddress`. It was self-consistent, so nothing
+  crashed, and it read as a careful correction. It was wrong, and it **created** the boot wall that
+  G1.6, G1.7 and G1.3 then investigated as if it were the game's. G1.8 removed it and left the G1.6
+  entry standing with a retraction, because a plausible fix that made things worse is more useful
+  than a tidy history.

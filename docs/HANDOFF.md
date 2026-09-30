@@ -123,3 +123,36 @@ NEXT:   The question is now sharp and is three ordered measurements, in the adde
         **Do not clamp `$t1` to `$t4` and do not special-case `0x100f800`** — that is a fake in the
         same class as a stubbed syscall, and it would hide which of the three is actually true.
         Full numbers in `.auto/queue/33-g18d-gs-store-loop.txt` (addendum 2).
+
+## 2026-09-30 17:25 · 33-g18d-gs-store-loop (investigation only, 3rd pass) · **W7 mechanism found**
+
+WALL:   W7 — still open. This entry is the pass that found its mechanism.
+DID:    **No shipped code changed.** Probed, measured, removed every probe, rebuilt the generated
+        artifact clean (verified 0 `fprintf` left). **I also wrote a red test for my hypothesis and
+        it PASSED, so I deleted it** — a green test with no red behind it proves nothing and
+        shipping it would have been the exact fake this project forbids.
+MEASURED:
+        [V] t1=0x01051A45 t4=0x01051A3F (t1>t4)=1  s0=0x01FFCED0 mem20=0x01051A40 mem24=0x01051A3F
+        - **`$s0 = 0x01FFCED0` is a STACK address** (guest stack is 0x01FFFEA0/0x01FFFF70), so the
+          two slots are pointers *on the stack* whose values are guest RAM addresses.
+        - **The range is INVERTED: start `0x01051A40`, end `0x01051A3F`.** The end is one byte
+          BEHIND the start, and the loop's test is `bne $t1,$t4` — *not-equal*, not less-than — so it
+          walks the entire 32-bit space. It is not infinite by construction; it is a loop over four
+          billion addresses because the predicate can never be satisfied from below.
+        - **`mem20` != `mem24`** (`0x01051A40` vs `0x01051A3F`), which **retracts addendum 2's**
+          claim that the guest sets start == end.
+        - **The recompiler is NOT at fault.** The inner loop has no `eeCheckpointDue()`; the back
+          edge decodes correctly from the raw field (`0x100f80c + (0x16<<2) = 0x100f864`); both
+          branches in the neighbourhood decode correctly.
+NEXT:   **One probe, and the filter that makes it work:** find who writes `0x01051A40` into
+        `$s0+0x20`. Probe every `WRITE32(..., $s0+0x20)` and every `WRITE64(..., $s0)` inside
+        `sub_0100F390` — **but filter on `$s0 == 0x01FFCED0`**, which is what this pass finally
+        produced and which no earlier probe used. That turns 87 candidate sites into one.
+        Then, if the writer is the caller, find who passed an inverted range.
+        **Do NOT clamp `$t1` to `$t4`, do NOT special-case `0x100f800`.** The inverted range is a
+        symptom whose producer is still untraced; clamping hides it and is the same class of fake as
+        a stubbed syscall.
+        Addendum 3 in `.auto/queue/33-g18d-gs-store-loop.txt` has the numbers and the retraction.
+MEASURED (suite):  **450/450** from `tools/PS2Recomp/ps2xTest`, after deleting the meaningless test.
+MEASURED (boot):   `functions_entered=95 halt=guest_cycle_no_progress bios_files=0` — unchanged,
+        which is correct: nothing was fixed. Campaign goal NOT reached.

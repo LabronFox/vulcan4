@@ -258,10 +258,88 @@ index 0000000..68018ac
 +#endif // PS2_GUEST_PROGRESS_H
 \ No newline at end of file
 diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
-index 4b9242c..ee71244 100644
+index 4b9242c..d41002c 100644
 --- a/ps2xRuntime/include/ps2_runtime.h
 +++ b/ps2xRuntime/include/ps2_runtime.h
-@@ -390,6 +390,26 @@ public:
+@@ -237,6 +237,59 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
+     return static_cast<uint8_t>((valueHi >> ((byteIndex - 8u) * 8u)) & 0xFFu);
+ }
+ 
++// G1.8h. A driver that cannot see inside a single guest frame needs a hook that fires on EVERY
++// guest store, because sampling once per driver step cannot see what happens between two steps.
++//
++// ps2TraceGuestWrite is already exactly that hook: every WRITE8/16/32/64/128 macro calls it, and
++// every PS2Runtime::StoreN calls it. It was a no-op stub. Making it the observer means the hook
++// lives in a header the recompiler's generated code already includes, so it SURVIVES a
++// regeneration -- which a probe hand-injected into the generated translation unit does not, and
++// which this project already shipped once and the verifier caught in flight.
++//
++// It is a plain function pointer, not a std::function, and it is checked for null on every store:
++// the null case costs one predictable branch and changes nothing about the hot path.
++using PS2GuestStoreObserver = void (*)(uint32_t guestAddr,
++                                       uint32_t size,
++                                       uint64_t value,
++                                       const R5900Context *ctx);
++
++inline PS2GuestStoreObserver g_ps2GuestStoreObserver = nullptr;
++
++inline void ps2SetGuestStoreObserver(PS2GuestStoreObserver observer)
++{
++    g_ps2GuestStoreObserver = observer;
++}
++
++// G1.8h, the read side of the store hook above, for the same reason: a driver that cannot see
++// inside a guest frame cannot answer "what did the guest READ?", and on GT4 the answer is the
++// whole wall -- the guest's scan returns an address whose contents the driver can prove are
++// different, and only the guest's own load can say what it actually saw.
++//
++// One predictable null check per guest load, and only on the fast path (a "special" address goes
++// through PS2Runtime::LoadN, which reports through the same hook).
++using PS2GuestLoadObserver = void (*)(uint32_t guestAddr,
++                                      uint32_t size,
++                                      uint64_t value,
++                                      const R5900Context *ctx);
++
++inline PS2GuestLoadObserver g_ps2GuestLoadObserver = nullptr;
++
++inline void ps2SetGuestLoadObserver(PS2GuestLoadObserver observer)
++{
++    g_ps2GuestLoadObserver = observer;
++}
++
++inline void ps2TraceGuestRead(uint32_t guestAddr,
++                              uint32_t size,
++                              uint64_t value,
++                              const R5900Context *ctx)
++{
++    if (g_ps2GuestLoadObserver != nullptr)
++    {
++        g_ps2GuestLoadObserver(guestAddr, size, value, ctx);
++    }
++}
++
+ inline void ps2TraceGuestWrite(uint8_t *rdram,
+                                uint32_t guestAddr,
+                                uint32_t size,
+@@ -246,13 +299,12 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
+                                const R5900Context *ctx)
+ {
+     (void)rdram;
+-    (void)guestAddr;
+-    (void)size;
+-    (void)valueLo;
+     (void)valueHi;
+     (void)op;
+-    (void)ctx;
+-    // TODO we dont need this anymore so on next release it will be deleted
++    if (g_ps2GuestStoreObserver != nullptr)
++    {
++        g_ps2GuestStoreObserver(guestAddr, size, valueLo, ctx);
++    }
+ }
+ 
+ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
+@@ -390,6 +442,26 @@ public:
      void requestStop();
      bool isStopRequested() const;
  
@@ -288,7 +366,7 @@ index 4b9242c..ee71244 100644
      EeScheduler &eeScheduler();
      const EeScheduler &eeScheduler() const;
      void postEeEvent(EeEvent event);
-@@ -508,6 +528,11 @@ private:
+@@ -508,6 +580,11 @@ private:
      mutable std::mutex m_guestHeapMutex;
      mutable std::mutex m_asyncCallbackStackMutex;
      std::vector<GuestHeapBlock> m_guestHeapBlocks;
@@ -300,6 +378,58 @@ index 4b9242c..ee71244 100644
      uint32_t m_guestHeapBase = 0x00100000u;
      uint32_t m_guestHeapEnd = 0x00100000u;
      uint32_t m_guestHeapLimit = PS2_RAM_SIZE;
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index 0f19c9f..84c551e 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -325,27 +325,35 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
+ 
+ #define READ8(addr) ([&]() -> uint8_t {                       \
+     uint32_t _addr = (uint32_t)(addr);                        \
+-    return PS2Runtime::isSpecialAddress(_addr)                \
+-        ? runtime->Load8(rdram, ctx, _addr)                   \
+-        : FAST_READ8(_addr); }())
++    if (PS2Runtime::isSpecialAddress(_addr))                  \
++        return runtime->Load8(rdram, ctx, _addr);             \
++    const uint8_t _v = FAST_READ8(_addr);                     \
++    ps2TraceGuestRead(_addr, 1u, _v, ctx);                    \
++    return _v; }())
+ 
+ #define READ16(addr) ([&]() -> uint16_t {                     \
+     uint32_t _addr = (uint32_t)(addr);                        \
+-    return PS2Runtime::isSpecialAddress(_addr)                \
+-        ? runtime->Load16(rdram, ctx, _addr)                  \
+-        : FAST_READ16(_addr); }())
++    if (PS2Runtime::isSpecialAddress(_addr))                  \
++        return runtime->Load16(rdram, ctx, _addr);            \
++    const uint16_t _v = FAST_READ16(_addr);                   \
++    ps2TraceGuestRead(_addr, 2u, _v, ctx);                    \
++    return _v; }())
+ 
+ #define READ32(addr) ([&]() -> uint32_t {                     \
+     uint32_t _addr = (uint32_t)(addr);                        \
+-    return PS2Runtime::isSpecialAddress(_addr)                \
+-        ? runtime->Load32(rdram, ctx, _addr)                  \
+-        : FAST_READ32(_addr); }())
++    if (PS2Runtime::isSpecialAddress(_addr))                  \
++        return runtime->Load32(rdram, ctx, _addr);            \
++    const uint32_t _v = FAST_READ32(_addr);                   \
++    ps2TraceGuestRead(_addr, 4u, _v, ctx);                    \
++    return _v; }())
+ 
+ #define READ64(addr) ([&]() -> uint64_t {                     \
+     uint32_t _addr = (uint32_t)(addr);                        \
+-    return PS2Runtime::isSpecialAddress(_addr)                \
+-        ? runtime->Load64(rdram, ctx, _addr)                  \
+-        : FAST_READ64(_addr); }())
++    if (PS2Runtime::isSpecialAddress(_addr))                  \
++        return runtime->Load64(rdram, ctx, _addr);            \
++    const uint64_t _v = FAST_READ64(_addr);                   \
++    ps2TraceGuestRead(_addr, 8u, _v, ctx);                    \
++    return _v; }())
+ 
+ #define READ128(addr) ([&]() -> __m128i {                     \
+     uint32_t _addr = (uint32_t)(addr);                        \
 diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
 index f247ff9..aec46f5 100644
 --- a/ps2xRuntime/include/runtime/ee_scheduler.h

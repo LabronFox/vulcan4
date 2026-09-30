@@ -1054,3 +1054,103 @@ NEXT:   1. **The one thing left, and it is now a single question:** on the first
         store/load observers (in the runtime header, so they survive regeneration) and the
         header-aware rebuild rule in `build_harness.sh`. Both were written because a probe was
         invisible, and "invisible" is the failure mode this project keeps paying for.
+
+## 2026-10-01 00:20 · (no dish) · **W10 is one fact: the guest's own scan runs ONCE. `hasInvocation()` has latched. W5 all over again.**
+
+WALL:   W10. Down to a single boolean, and the boolean is in our code.
+
+DID:    **No shipped behaviour changed.** Probed, measured, removed every probe, reverted the
+        step-budget experiment (it is refuted — see below), rebuilt clean, suite **462/462**,
+        patch regenerated and byte-identical to the nested tree.
+
+MEASURED — three things, and together they close the wall to one line:
+        1. **THE GUEST'S OWN SCAN RUNS EXACTLY ONCE.** The load observer, watching physical
+           `0x120E0`–`0x121A0` and printing every non-zero word it reads, produces this and nothing
+           else, for the whole run:
+           ```
+           SCAN pc=0x1028610 a0=0x800120e8 a1=0x80080000 a2=0x010285f8 word@0x120e8=0x010285c0 match=0
+           SCAN pc=0x1028610 a0=0x8001218c a1=0x80080000 a2=0x010285f8 word@0x1218c=0x010285f8 match=1
+           SCAN pc=0x1028610 a0=0x800120e8 a1=0x80080000 a2=0x010285c0 word@0x120e8=0x010285c0 match=1
+           SCAN pc=0x1028610 a0=0x800120e8 a1=0x80080000 a2=0x010285c0 word@0x120e8=0x010285c0 match=1
+           ... line 3 repeated to the end of the run
+           ```
+           Line 2 is search #1 finding `0x010285F8` at `0x1218C` — **correct**. Line 3 is search #2
+           finding `0x010285C0` at `0x120E8` — **also correct**. And then line 3, and only line 3,
+           for the rest of the run. **`a2 = 0x010285F8` never appears again.** Whatever answers the
+           guest from the second `sce_FindAddress` onwards does **not execute one instruction of
+           guest code** — a guest search would have had to read `0x120E8` again, and it does.
+        2. **OUR BUILTIN DOES NOT GO THROUGH `READ32`.** `computeBuiltinFindAddressResult()` reads
+           with `getConstMemPtr(rdram, addr)` + `std::memcpy`, so it is invisible to the load
+           observer by construction. **That is why lines 3+ produce no reads: they are not guest
+           code.** And the builtin is a plain loop with no checkpoint, so it answers instantly.
+        3. **THE DRIVER'S ENTRY HISTOGRAM SHOWS WHY THE GUEST NEVER ADVANCES.** Over a 20 s run the
+           driver's own loop enters exactly four addresses:
+           ```
+           0x010286dc  entries=9969     (sub_01028680, the instruction after its FIRST jal)
+           0x01028640  entries=9969     (sub_01028638, `jr ra` after SYSCALL)
+           0x01028638  entries=91       (sub_01028638, fresh entry)
+           0x01000008  entries=1        (the ELF entry -- entered ONCE, so this is NOT W6)
+           ```
+           **`0x010286F0` — the resume point after the caller's SECOND `jal` — is entered ZERO
+           times**, even though it is a declared resume case in the generated switch and the second
+           `jal` publishes exactly it
+           (`dispatchGuestBranch(..., 0x10286E8u, 0x10286F0u, DirectCall, "JAL")`). So the caller
+           never gets past its first `jal`: it is re-entered at `0x010286DC` and re-issues search #1
+           forever. **`0x01028640` and `0x010286DC` are entered the SAME number of times (9,969) —
+           every pass goes syscall → wrapper resume → caller resume, and never once reaches the
+           second search's resume.**
+
+        **THE MECHANISM, named:** `PS2Runtime::handleSyscall` for an overridden syscall does
+        `if (scheduler.hasInvocation(GuestInvocationKind::SyscallOverride, syscallNumber)) return false;`
+        and `return false` means "I did not handle it", so the guest's `syscall` **falls through to
+        our builtin** instead of reaching the guest's own handler. The guest's handler therefore
+        runs once and then never again, and every later call is answered by us. That is
+        **W5's `hasInvocation()` latch, word for word**, and the handoff for W5 already described
+        the consequence: "a stranded invocation makes hasInvocation() latch, so every later call
+        silently falls through to our builtin." The earlier fix made the *driver* service the
+        invocation; it did not make the *syscall path* self-healing.
+
+        **So `s2` is never set** (the caller never reaches the instruction that sets it), `s1` is
+        computed from a stale `s3`, the convergence test can never pass, and the guest spins. The
+        arithmetic that made this look like a decode error — `s1 = s3 - 0x20C` and
+        `s0 = s2 - 0x168` coming out equal — is right, and irrelevant, because the code that sets
+        `s2` is never reached.
+
+EXPERIMENT RUN AND REFUTED, do not re-run: raising `serviceInvocations`' step budget from 4096 to
+        65,536 to 1,000,000 changes **nothing at all** —
+        `total_syscall_calls=12468`, `distinct_pcs=6`, `ee_cycle=7373350984`, identical at all
+        three. So the invocation is not being stranded by the budget; it is stranded by the latch.
+
+MEASURED (final, from clean, 60 s): suite **462/462**; `functions_entered=60091`
+        `service_frames=7481984  total_syscall_calls=29914  distinct_mmio_addresses=0`
+        `elapsed_ms=60009  harness_tail_ms=7  blocked_on_servicing=0`. Boot
+        `/mnt/ssd/vulcan4-build/run/boot_g18n.log`. Patch regenerated, md5 `8c5a177a8b21f212f4845008b8a3c06e`
+        on both sides.
+
+RETRACTED, seventh: **"the search returns the wrong slot."** It does not — the load hook shows the
+        search returning the right slot every time it runs. What is wrong is *how many times it
+        runs*, which no amount of looking at its return value could ever show.
+
+NEXT:   1. **Print it. One line, and it is the wall:** at `System.cpp:426`, when
+           `hasInvocation(SyscallOverride, 0x83)` is true, report which invocation is stranded
+           (`invocationStackTop()`), its `context.pc`, and how old it is. If a `SyscallOverride`
+           invocation for 0x83 is sitting on the thread with a non-zero `pc`, the latch is proven
+           and the fix is whatever failed to pop it.
+        2. **The red test, owed twice now (W5 and again here):** a guest override handler that
+           throws, strands, or is completed out of band must leave `hasInvocation()` FALSE
+           afterwards, and the NEXT call of that syscall must reach the guest's handler. Written
+           before the fix. There is a fixture for exactly this in
+           `ps2_runtime_kernel_tests.cpp` (`driveGuestLikeTheHarness` + the G1.8b override tests),
+           so it is cheap to write and there is no excuse for it not existing.
+        3. **The likely fix, and it must not be a hack:** an invocation is popped when
+           `activeContext().pc == 0`. Something is leaving it with a non-zero `pc` forever. Either a
+           guest function that returns to a `ra` that is not 0 (an invocation whose `ra` is the
+           caller's, so `jr ra` never reaches pc 0), or a resume case that re-enters the function
+           body instead of the epilogue. **Note the first candidate: `sub_010285F8` yields by
+           RETURNING at `eeCheckpointDue()`, and its `jr ra` delay slot sets `$v0`. If the
+           invocation was entered with `ra = 0` that returns pc = 0 correctly — so check the value
+           the invocation actually carries.**
+        4. **Then the milestone.** Zero MMIO accesses; the GS window at `0x1200xxxx` untouched;
+           `VULCAN4 FRAME source=guest` emitted by nothing. The GS lane's emitter is still
+           half-built. **This is the second consecutive wall whose real cost was a latch in our
+           own runtime rather than anything the guest did.**

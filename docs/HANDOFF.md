@@ -916,3 +916,56 @@ MEASURED (this session, final, from clean): suite **462/462**; 60 s boot
         `elapsed_ms=60009  harness_tail_ms=7  total_syscall_calls=29914  distinct_mmio_accesses=0`
         Boot artefacts: `/mnt/ssd/vulcan4-build/run/boot_g18{k,j}.log`, `boot_verify.log`.
         Patch byte-identical to the nested tree (`md5 fc7164f9ba4ce0becd5fc737cfe1b60b`).
+
+## 2026-09-30 23:05 · (no dish) · **last pass on W10: the exits are inline, so one more exoneration falls**
+
+WALL:   W10. Unchanged in substance; this pass **removes** one of the two things I had exonerated.
+
+DID:    **No code changed.** Probed, measured, removed every probe, rebuilt clean, suite 462/462.
+
+MEASURED — two things, one of them a correction to my own previous entry:
+        1. **The scan's exits are INLINE and are therefore not observable.** `0x0102862C` (match),
+           `0x01028630` (`jr ra`) and `0x01028624` (the `a0 >= a1` exit) never appear as entry PCs —
+           not in the harness loop and not through `EeScheduler::setServiceFrameObserver`, because
+           the loop only yields at `0x01028610` (the `eeCheckpointDue()` on the back edge). The
+           whole 131,072-word pass runs inside ONE service frame. **So the one measurement my last
+           entry nominated cannot be made from a driver, at all** — it needs a probe inside the
+           generated scan, and hand-injecting one into the build artefact is exactly what the
+           verifier caught shipping in this session.
+        2. **⟹ MY "the syscall table is exonerated" CLAIM IS RETRACTED.** The slot-watch probe
+           samples physical 0x120E8/0x1218C **once per harness-loop iteration**, and in this livelock
+           there are only ~60,000 such iterations against 7.4 MILLION service frames. It saw two
+           writes because that is all it could see, not because nothing else happens. **A probe that
+           samples one place cannot exonerate another place**, and I used it as if it could.
+           The scan can only return a non-zero `$a0` from its match exit, and it returns
+           `0x800120E8`, so **the word at physical 0x120E8 must equal `a2 = 0x010285F8` at the moment
+           of the match.** Our runtime logged `0x120E8 = 0x010285C0` at install time. Either
+           something rewrites that slot inside the loop, or the guest's scan reads a word it did not
+           write. **Both are open and neither is where the previous entry said it was.**
+
+        Still standing from the previous pass: the recompile of the scan is correct
+        (`while (a0 < a1) { if (*a0 == a2) return a0; a0 += 4; }`, result in `$v0` via the `jr ra`
+        delay slot, caller reads `$v0`), and **694 of 707** generated functions are clean on
+        save/restore discipline.
+
+RETRACTED — one more, added to the three already recorded:
+        4. **"the syscall table is exonerated by a slot-watch probe."** FALSE, for the sampling
+           reason above. The recompiler exoneration stands; the table exoneration does not.
+
+NEXT:   1. **Sample inside the loop, not at its edges — and in the runtime, not the artefact.**
+           `PS2Runtime` already has `ps2TraceGuestWrite` on every guest store path. One bounded
+           watch on physical 0x120E8 (say: first 64 writes, then suppressed) reporting the writing
+           PC, would settle it immediately and is a legitimate permanent diagnostic rather than a
+           hand-injected `fprintf` in generated code. **Put it behind the same discipline the
+           verifier just enforced: no probe survives in a build artefact.**
+        2. **If nothing writes 0x120E8, the compare is the bug** and the 64-bit branch emission
+           (`GPR_U64` at 2,791 sites) becomes the fix — but *only after* point 1 is closed, because
+           the two explanations predict the same probe output otherwise.
+        3. **The milestone is still uninstrumented and still blocked.** Zero MMIO accesses; the GS
+           window at `0x1200xxxx` is never touched; nothing prints `VULCAN4 FRAME source=guest`.
+           Finish the GS lane's emitter (`GS` must consume `GifArbiter::drainedPacketCount()`, and
+           `ps2_runtime.cpp` needs `m_gifArbiter.setDeliveryObserver(...)` after `m_gs.init(...)`).
+
+MEASURED (final, from clean): suite **462/462**; 60 s boot `functions_entered=60089`
+        `service_frames=7433490  total_syscall_calls=29914  distinct_mmio_addresses=0`
+        `elapsed_ms=60010  harness_tail_ms=8`. Artefact `/mnt/ssd/vulcan4-build/run/boot_final.log`.

@@ -692,3 +692,64 @@ NEXT:   1. **One measurement closes W10: watch `$s2` at the `jal` that calls `su
 MEASURED (artifacts): `/mnt/ssd/vulcan4-build/run/boot_g18j.log` (60 s, 7.6 M service frames),
         `boot_g18h.log` (the 120 s before-picture), `boot_g18i.log`. Suite 462/462 from
         `tools/PS2Recomp/ps2xTest`. No probes in any shipped file.
+
+## 2026-09-30 21:40 · (no dish) · **W10 closed to "a callee is clobbering `$s3`". One more pass, then I stopped.**
+
+WALL:   W10. Still open, and now reduced to a property with a name: **callee-saved registers are not
+        surviving the calls inside the guest's own syscall-table verification loop.**
+
+DID:    **No code changed.** Probed, measured, removed every probe, rebuilt clean
+        (`grep -c TPROBE tools/harness/vulcan4_harness.cpp` = 0), suite **462/462**.
+
+MEASURED:
+        ```
+        F1  pc=0x10285f8 s0=0x1035350 s1=0x0 s2=0x0 s3=0x0        sp=0x1fffff0 ra=0x0
+        F2  pc=0x10285f8 s0=0x1035350 s1=0x0 s2=0x0 s3=0x8001218c  sp=0x1fffff0 ra=0x0
+        F3  pc=0x10285f8 s0=0x1035350 s1=0x0 s2=0x0 s3=0x800120e8  sp=0x1fffff0 ra=0x0
+        F4..F40  identical to F3
+        ```
+        Three facts, and together they close the question the last entry left open:
+        1. **`$s3` is being written** — `0x0 → 0x8001218C → 0x800120E8` — and the guest's own bytes
+           in `0x01028500–0x01028780` contain **no instruction that writes `$s2` or `$s3`**. So a
+           callee is writing a callee-saved register, which the ABI forbids.
+        2. `$s2` is 0 in every frame, and the convergence test needs `s3 - s2 == 0xA4`. That is the
+           livelock, unchanged.
+        3. The caller of `sub_01028680` is the bare chain at `0x01028790` —
+           `jal 0x01028540` / `jal 0x01028680` / `jal 0x01028C70` / `jal 0x01028DE8` — with **no
+           register setup at all**, and `dispatchGuestBranch` runs it inline, so **the call site is
+           never a yield point and cannot be sampled.** The chain's inputs are whatever the
+           previous callee left behind, which is exactly what is corrupted.
+
+NEXT:   1. **The red test owed since W7 pass 6, now with a victim:** a recompiled function that
+           yields inside its own epilogue must resume at the restore and leave every callee-saved
+           register intact — `$s0`–`$s7`, `$fp`, `$ra`, not just `$fp`. **Extend it to all of them.**
+           `$fp` was checked once in W7 pass 6 and the claim was retracted twice; a test that names
+           one register finds one register. The bug now demonstrated is that a callee *writes* a
+           saved register, which no existing test covers at all.
+        2. **The scan loop `sub_010285F8` is a leaf with no prologue** and its `jr ra` delay slot
+           is `daddu $s0, $a0, $zero` — it writes `$s0` with nothing saved. `s0 = 0x01035350`
+           (the guest's override-table pointer) is stable across every frame, so whoever wrote it
+           wrote the same value. **Check whether the generated leaf saves and restores `$s0`, and
+           whether it should: on the disc it does not, which is either a guest ABI violation or a
+           sign our recompile of `jr ra` + delay slot drops the delay slot's register write.** The
+           generated code does emit `SET_GPR_S32(ctx, 16, ...)` in the delay slot, so start from
+           the callee side instead: does `sub_010285F8` restore `$s0` on the way out? It has no
+           epilogue that could.
+        3. **I am stopping here deliberately.** W7 took ten measurement passes and the thing it
+           measured turned out to be the detector. This loop has now had four, and the last two
+           moved the wall from "the syscall table is wrong" to "a callee-saved register is not
+           surviving a call" — real progress, but the next step is a **recompiler change** that
+           regenerates all 707 functions, not another probe. Probe exhaustion is the signal to
+           change lane, not to keep probing. `docs/CAMPAIGN.md` W10 carries the state.
+        4. **Still the milestone, and still far:** the guest has made **zero MMIO accesses** in this
+           state, the GS privileged window at `0x1200xxxx` is never touched, and
+           `VULCAN4 FRAME source=guest` **does not exist in the repo**. The GS lane's emitter is
+           half-built (`GS` does not consume `GifArbiter::drainedPacketCount()`; the one wiring line
+           in `ps2_runtime.cpp` is missing). Finishing that is worth more than this loop, because
+           without it the campaign's stop condition cannot be observed even if it happens.
+
+MEASURED (this session, cumulative): suite 456 → **462/462**; boot 120 s budget wall-clock
+        **120.6 s → 1.6 s**; `functions_entered` 44578 → 120180; `vsync_tick` 2 → 7199; `ee_cycle`
+        9.8 M → 35.4 G; `service_frames` 0 (invisible) → 7,602,834 (counted). The guest went from
+        one thread and an idle loop to a real 60 Hz multi-threaded boot that stops at a precisely
+        named register.

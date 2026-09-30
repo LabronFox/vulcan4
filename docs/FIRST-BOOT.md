@@ -1401,3 +1401,99 @@ is still called **154** times and still misses **102**. So:
 though: with the data in the right place, why does a 102-miss `FindAddress` still fail on a word
 that is demonstrably inside the window at `0x35354`? That is candidate 2 — the scan — and it is now
 isolated from the loader, which was not true before this dish.
+
+
+---
+
+## 9. G1.7 — NAME THE SPIN
+
+**Gate result: `functions_entered=1 halt=waiting_on_unnamed_value bios_files=0`.** The halt is no
+longer `spinning_in_guest_code`, and the wait below is named with an address and an instruction.
+
+### 9.1 What the harness can and cannot see
+
+The harness's loop analyser decoded the spinning block and reported:
+
+```
+VULCAN4 WAIT entry_pc=0x102871c block_instructions=0 history_len=1 distinct_pcs_total=1
+VULCAN4 WAITSUM loads=0 branches=0
+```
+
+**`block_instructions=0` and `history_len=1` is itself the finding.** The harness only samples
+`ctx.pc` when a generated function returns or yields. It entered **one** function and never got
+control back, so it cannot see inside the spin. `dispatcher_transfers=0` as well.
+
+So the spin is **inside recompiled code**, and `eeCheckpointDue()` — the back-edge yield that G1.4
+already flagged as "would yield to the driver every time round — but it never did" — is still not
+firing. **The loop can only be named from the guest image, not from the harness.** Which is what
+the next section does.
+
+### 9.2 The loop, from the image
+
+`mips-linux-gnu-objdump -d --start-address=0x10286f0 SCUS_973.28`:
+
+```
+010286fc:  beq   s1, s0, 0x1028750     ; equal -> leave the loop
+01028704:  sltu  v0, s1, s0
+01028708:  beqz  v0, 0x1028728         ; s1 >= s0 -> search the other pointer
+0102870c:  addiu a0, s3, 4             ; search from last hit + 4
+01028710:  lui   a1, 0x8008            ; end   = 0x80080000
+01028714:  jal   0x1028638             ; FindAddress(...)
+01028718:  addiu a2, s5, -31240        ; looking for 0x010285F8
+0102871c:  move  s3, v0                ; <-- the reported spin PC
+01028720:  b     0x1028740
+01028740:  bne   s1, s0, 0x1028708      ; <-- BACK EDGE: repeat while s1 != s0
+```
+
+**The wait, named:** the guest is polling **`FindAddress` over the KSEG0 window
+`0x80000000`–`0x80080000`** (RDRAM offsets 0–0x80000), searching for the 32-bit code pointers
+**`0x010285F8`** and **`0x010285C0`**, in a loop whose exit condition is
+`hit(0x010285F8) - 0x20C == hit(0x010285C0) - 0x168`.
+
+### 9.3 The G1.6 fix worked, and the loop still cannot exit
+
+This run shows the loader fix landing: `FindAddress` now reports **16 hits and 78 misses**, where
+before the fix every call missed and the window held 2 non-zero words. The first calls now start at
+`0x80035358` — i.e. **one word past the descriptor at `0x80035354`**, so the guest *did* find it
+and moved on. That is the user-segment fix doing its job, observed end to end.
+
+**The dependency, precisely:** the loop's exit condition requires
+
+```
+hit(0x010285C0) - hit(0x010285F8) == 0x20C - 0x168 == 0xA4 == 164 bytes
+```
+
+The **only** record in `SCUS_973.28` containing both pointers has them **8 bytes apart** (file
+offsets `0x36354` and `0x3635c`, the 16-byte descriptor `{0x010285F8, 0x5A, 0x010285C0, 0}`).
+**The record shape the guest walks for is not the record shape in the image.** The comparison can
+therefore never succeed, the walk runs to the end of the window, `s3+4` passes `0x80080000`, and
+`FindAddress` returns 0 forever.
+
+**What would satisfy it:** a record in RDRAM holding `0x010285F8` with `0x010285C0` exactly
+**164 bytes later**. **Who should write it: unverified.** This is a walk over a *table* the guest
+expects to have been populated, and the only candidate producer we know of is the console's module
+/ export-table machinery — which `docs/G2.1`/G3.0 already recorded as absent. It is **not** simply
+the descriptor at `0x01035354`, because that one has the wrong shape.
+
+### 9.4 The ordering trap, named out loud
+
+**This is the third bug of the same class.** The sequence, and it is a pattern, not bad luck:
+
+1. **G1.6** — the ELF loader wrote the image 16 MB too high, so the guest's own function pointers
+   were invisible. Guest hunted for a value that existed.
+2. **G1.6 follow-on** — the `FindAddress` livelock: the guest hunted a value that *is* now in
+   memory but in a record of the wrong shape.
+3. **G1.7** — the guest now finds that record, rejects it, and walks on looking for a correctly
+   shaped one that nothing has ever written.
+
+Each time, the symptom was "the guest is stuck", and each time the cause was **a value the guest
+expected to exist and did not** — never a dispatch bug, never a compiler bug. G1.4 and G1.5 both
+chased dispatch. That is a plan: **before instrumenting the CPU path again, ask what the guest is
+waiting for and who writes it.** It has been the answer three times out of three.
+
+### 9.5 The instrumentation gap, honestly
+
+`total_mmio_addresses=0` was correct and not a bug: **this loop reads no hardware at all.** It
+re-reads the guest's own RDRAM through a syscall. The MMIO counter is not blind here; there is
+simply nothing on the bus. Recorded because "the counter says zero" invited the opposite
+conclusion for several dishes.

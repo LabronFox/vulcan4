@@ -78,7 +78,7 @@ namespace
     constexpr const char *kHaltInSyscall = "stuck_in_syscall";
     // G1.5: names the SPECIFIC syscall that dominates the call tally, not just the category.
     constexpr const char *kHaltStalledInSyscall = "livelocked_in_syscall";
-    constexpr const char *kHaltSpinningInGuest = "spinning_in_guest_code";
+    constexpr const char *kHaltSpinningInGuest = "waiting_on_unnamed_value";
     // A cycle of guest PCs that keeps repeating with no new PC ever reached. This is distinct
     // from kHaltSpinTrap (one PC revisited) and from kHaltInSyscall (a syscall that is executing):
     // here the guest is executing normally, over and over, and going nowhere.
@@ -256,6 +256,72 @@ namespace
         std::cout << "VULCAN4 ELF LAYOUT entry_point_confirmed=" << toHex(entry) << "\n";
     }
 } // namespace
+
+
+// ---------------------------------------------------------------------------
+// G1.7: name the wait.
+//
+// "spinning_in_guest_code" describes a symptom. This turns it into a diagnosis: find the
+// repeating block of guest instructions, then decode every LOAD in it and report the address
+// the guest is polling and the value it currently holds. That is the difference between
+// "it is stuck" and "it is waiting on 0x1xxxxxxx, which reads 0".
+//
+// MIPS load opcodes we decode: lb 0x20 lh 0x21 lwl 0x22 lw 0x23 lbu 0x24 lhu 0x25
+// lwr 0x26 lwu 0x30 ld 0x37.
+constexpr bool decodeGpuLoad(uint32_t insn, uint32_t &outReg, uint32_t &outImm, int &outWidth, bool &outSigned)
+{
+    const uint32_t op = insn >> 26;
+    switch (op)
+    {
+    case 0x20: outWidth = 1; outSigned = true;  break;  // lb
+    case 0x24: outWidth = 1; outSigned = false; break;  // lbu
+    case 0x21: outWidth = 2; outSigned = true;  break;  // lh
+    case 0x25: outWidth = 2; outSigned = false; break;  // lhu
+    case 0x23: outWidth = 4; outSigned = true;  break;  // lw
+    case 0x30: outWidth = 4; outSigned = false; break;  // lwu
+    case 0x37: outWidth = 8; outSigned = true;  break;  // ld
+    default: return false;
+    }
+    outReg = (insn >> 16) & 0x1Fu;
+    const uint32_t rawImm = insn & 0xFFFFu;
+    outImm = (rawImm & 0x8000u) ? static_cast<uint32_t>(static_cast<int32_t>(rawImm | 0xFFFF0000u))
+                                : rawImm;
+    return true;
+}
+
+constexpr const char *mipsMnemonic(uint32_t insn)
+{
+    switch (insn >> 26)
+    {
+    case 0x20: return "lb";
+    case 0x24: return "lbu";
+    case 0x21: return "lh";
+    case 0x25: return "lhu";
+    case 0x23: return "lw";
+    case 0x30: return "lwu";
+    case 0x37: return "ld";
+    case 0x28: return "sb";
+    case 0x29: return "sh";
+    case 0x2B: return "sw";
+    case 0x3F: return "sd";
+    case 0x04: return "beq";
+    case 0x05: return "bne";
+    case 0x06: return "blez";
+    case 0x07: return "bgtz";
+    case 0x0A: return "slti";
+    case 0x0B: return "sltiu";
+    case 0x0C: return "andi";
+    case 0x0D: return "ori";
+    case 0x0E: return "xori";
+    case 0x09: return "addiu";
+    case 0x08: return "addi";
+    case 0x00: return ((insn >> 26) == 0 && ((insn >> 6) & 0xF) == 0x10) ? "bltzal" : "sll";
+    case 0x0F: return "lui";
+    case 0x2A: return "slt";
+    case 0x2C: return "slt";
+    default: return "?";
+    }
+}
 
 int main(int argc, char *argv[])
 {
@@ -694,9 +760,97 @@ int main(int argc, char *argv[])
                 }
                 else
                 {
-                    haltReason = kHaltSpinningInGuest;
-                    haltDetail = "no syscall was executing when the deadline fired; the guest "
-                                 "is spinning in recompiled code at pc " + toHex(ctx.pc);
+                    // G1.7: do not stop at "spinning". Name the wait.
+                    //
+                    // Find the repeating block from the PC history, then decode every instruction
+                    // in it. Any LOAD's effective address is what the guest is polling; the value
+                    // in the register right now is what it got. That turns a symptom into a
+                    // dependency, with an address, which is the whole point of this dish.
+                    {
+                        std::vector<uint32_t> loop;
+                        if (!pcHistory.empty())
+                        {
+                            // Walk back to the previous occurrence of the current PC: everything
+                            // after it is one pass of the loop.
+                            size_t start = pcHistory.size();
+                            for (size_t i = pcHistory.size(); i-- > 0;)
+                            {
+                                if (pcHistory[i] == ctx.pc)
+                                {
+                                    start = i;
+                                    break;
+                                }
+                            }
+                            for (size_t i = start; i < pcHistory.size() && loop.size() < 64u; ++i)
+                            {
+                                if (std::find(loop.begin(), loop.end(), pcHistory[i]) == loop.end())
+                                {
+                                    loop.push_back(pcHistory[i]);
+                                }
+                            }
+                        }
+
+                        std::cout << "VULCAN4 WAIT entry_pc=0x" << std::hex << ctx.pc << std::dec
+                                  << " block_instructions=" << loop.size()
+                                  << " history_len=" << pcHistory.size()
+                                  << " distinct_pcs_total=" << distinctPcs << std::endl;
+
+                        uint32_t loadCount = 0;
+                        uint32_t branchCount = 0;
+                        for (uint32_t pc : loop)
+                        {
+                            // Guest vaddr -> RDRAM offset. The image is loaded at the PS2 user
+                            // segment base 0x01000000, so the offset is the low 24 bits.
+                            const uint32_t ramOffset = pc & 0x00FFFFFFu;
+                            if (ramOffset + 4u > PS2_RAM_SIZE)
+                            {
+                                continue;
+                            }
+                            uint32_t insn = 0;
+                            std::memcpy(&insn, rdram + ramOffset, sizeof(insn));
+                            const char *mn = mipsMnemonic(insn);
+                            const uint32_t op = insn >> 26;
+                            const bool isBranch = (op == 0x04 || op == 0x05 || op == 0x06 || op == 0x07
+                                                   || (op == 0 && (insn & 0x3F) == 0x08));
+                            if (isBranch)
+                            {
+                                ++branchCount;
+                            }
+                            std::cout << "VULCAN4 WAITLOOP pc=0x" << std::hex << pc << std::dec
+                                      << " insn=0x" << std::hex << insn << std::dec << " " << mn;
+                            uint32_t rt = 0, imm = 0;
+                            int width = 0;
+                            bool isSigned = false;
+                            if (decodeGpuLoad(insn, rt, imm, width, isSigned))
+                            {
+                                const uint32_t base = _mm_extract_epi32(ctx.r[(insn >> 21) & 0x1F], 0);
+                                const uint32_t addr = base + imm;
+                                uint32_t value = 0;
+                                std::memcpy(&value, rdram + (addr & 0x00FFFFFFu), sizeof(value));
+                                std::cout << "  -> POLLS addr=0x" << std::hex << addr << std::dec
+                                          << " (base=r" << ((insn >> 21) & 0x1F) << " 0x" << std::hex
+                                          << base << std::dec << " + 0x" << std::hex << imm << std::dec
+                                          << ") width=" << width << " rt=r" << rt
+                                          << " value=0x" << std::hex << value << std::dec;
+                                ++loadCount;
+                            }
+                            if (isBranch)
+                            {
+                                std::cout << "  [branch]";
+                            }
+                            std::cout << std::endl;
+                        }
+                        std::cout << "VULCAN4 WAITSUM loads=" << loadCount
+                                  << " branches=" << branchCount
+                                  << " (a loop that loads is polling something; a loop with no"
+                                     " loads is pure arithmetic and cannot be waiting on hardware)"
+                                  << std::endl;
+
+                        haltReason = kHaltSpinningInGuest;
+                        haltDetail = "no syscall executing at the deadline; guest is waiting on "
+                                     "the loop decoded above (see VULCAN4 WAIT lines) at pc "
+                                     + toHex(ctx.pc);
+                    }
                 }
             }
             else

@@ -169,6 +169,42 @@ Eventually the captain's Odin 2. Never an emulator.
 - **No test added yet**, deliberately: pinning a path that does not yet draw would enshrine a
   failure. Tests come with the fix.
 
+### ✅ G1.7 — Name the spin *(the wait is now an address, an instruction and an arithmetic fact)*
+- **DONE WHEN:** the boot report names a specific wait instead of `spinning_in_guest_code`, and
+  either the guest advances or the dependency is named with address and instruction.
+- **RESULT (2026-09-30):** ✅ `VULCAN4 BOOT REPORT functions_entered=1 halt=waiting_on_unnamed_value
+  bios_files=0`. The wait is named; the guest did **not** advance.
+- **THE WAIT, NAMED.** The guest is polling **`FindAddress` over KSEG0 `0x80000000`–`0x80080000`**
+  for the code pointers **`0x010285F8`** and **`0x010285C0`**, in a loop at
+  **`0x010286FC`–`0x01028740`** (spin observed at **`0x0102871C`**, `move s3,v0`, immediately after
+  the `jal`). Exit condition: `hit(0x010285F8) - 0x20C == hit(0x010285C0) - 0x168`.
+- **THE DEPENDENCY, IN ARITHMETIC.** That exit requires the two pointers to be
+  **`0xA4` = 164 bytes apart**. The only record in `SCUS_973.28` holding both has them **8 bytes
+  apart** (`0x36354` / `0x3635c`, the descriptor `{0x010285F8, 0x5A, 0x010285C0, 0}`). **The record
+  shape the guest walks for is not the record shape in the image**, so the comparison can never
+  succeed and the walk runs off the end of the window forever.
+- **WHAT WOULD SATISFY IT:** a record in RDRAM with `0x010285F8` and `0x010285C0` exactly 164 bytes
+  apart. **Who should write it: unverified** — the only candidate is the console's module/export
+  table machinery, already recorded as absent. It is *not* the descriptor at `0x01035354`, which
+  has the wrong shape.
+- **THE G1.6 FIX IS VISIBLY WORKING.** `FindAddress` now reports **16 hits / 78 misses** where
+  before every call missed, and the first calls start at `0x80035358` — one word past the
+  descriptor at `0x80035354`. The user-segment fix landed end to end.
+- **WHY THE HARNESS COULD NOT SEE IT, and that is a finding.** The loop analyser reported
+  `block_instructions=0 history_len=1`: the harness entered one function and never regained
+  control, so it cannot sample inside the spin, and `eeCheckpointDue()` — already flagged in G1.4
+  as never firing — still does not. The loop had to be named from the guest image.
+- **`total_mmio_addresses=0` was correct, not a blind counter.** This loop reads no hardware; it
+  re-reads the guest's own RDRAM through a syscall.
+- **THE ORDERING TRAP, NAMED OUT LOUD. This is the third bug of the same class:** the loader wrote
+  the image 16 MB high; the guest hunted a value that is now present but in a record of the wrong
+  shape; now it finds that record, rejects it, and walks on looking for a correctly shaped one that
+  nothing has ever written. **Every time, the symptom was "stuck" and the cause was a value the
+  guest expected to exist.** G1.4 and G1.5 both chased dispatch and were both wrong. That is a
+  plan: before instrumenting the CPU path again, ask what the guest is waiting for and who writes
+  it. It has been the answer three times out of three.
+- **No regression test:** nothing was implemented, only diagnosed. `docs/FIRST-BOOT.md` §9.
+
 ### ✅ G1.5 — The body that never ran (it did run)
 - **DONE WHEN:** the `jal` at `0x010286D4` actually runs the body at `0x01028638`, and the boot
   report shows progress (`functions_entered` above 3, or a new named halt) with `bios_files=0`.

@@ -835,3 +835,84 @@ NEXT:   Unchanged and stated plainly: **W10 is the wall** (a callee is writing a
         that was really a blind detector's lie. **When a number is surprising, ask what is measuring
         before asking what is broken — and when a subagent disagrees with a commit, the subagent is
         re-running it and the commit is a story.**
+
+## 2026-09-30 22:45 · (no dish) · **W10 restated. THREE of my own decoder errors, all retracted. I am stopping.**
+
+WALL:   W10, and it is now the narrowest it has ever been: **one comparison in the guest's own
+        hand-written table-verification scan matches the wrong word.**
+
+DID:    **No code changed.** Probed, measured, removed every probe, rebuilt clean
+        (`grep -c "TPROBE tools/harness/vulcan4_harness.cpp"` = 0, 0 `fprintf` in the generated
+        unit), suite **462/462**, boot re-measured from clean.
+
+MEASURED:
+        ```
+        pc=0x10286dc  a0=0x80000000 a1=0x80080000 a2=0x010285F8  v0=0x8001218C   (first call)
+        pc=0x10286dc  a0=0x80000000 a1=0x80080000 a2=0x010285F8  v0=0x800120E8   (every call after)
+        ```
+        **The guest searches physical `[0, 0x80000)` for the word `0x010285F8` and gets back
+        `0x800120E8` — the slot that holds `0x010285C0`.** It starts from the beginning of the
+        window every time. `s3` therefore receives the wrong slot, `s2` receives 0, the convergence
+        test (`beq s1,s0` with `s1 = s3 - 0x20C`, `s0 = s2 - 0x168`) can never pass, and the guest
+        spins: **7,616,518 guest frames, 17,695,381,560 EE cycles, 3,600 vsync ticks, 6 distinct
+        PCs, zero MMIO accesses.**
+
+        **The syscall table is exonerated, by a slot-watch probe:** exactly two writes to
+        0x120E8/0x1218C in the whole run, both at `pc=0x01028640` (the two `sce_SetSyscall` calls),
+        and no change afterwards. The slots hold `0x010285C0` and `0x010285F8` for the entire run.
+
+        **The recompile is exonerated too.** The scan is emitted exactly as
+        `while (a0 < a1) { if (*a0 == a2) return a0; a0 += 4; }`, returns its result in `$v0` via
+        the delay slot of `jr ra`, and the caller reads `$v0`. A save/restore audit of **all 707**
+        generated functions finds **694 clean**; the 13 that write `$fp`/`$ra` unsaved are all at
+        function tops or save via a frame-pointer base, which my pattern did not match.
+
+        **So the scan can only return a non-zero `$a0` from its match exit — and it is matching
+        `0x010285C0` against `a2 = 0x010285F8`.** That is the wall, and it is one comparison.
+
+RETRACTED — THREE of my own claims, all decoder errors, all mine:
+        1. **"the guest's own bytes in `0x01028500–0x01028780` never write `$s2` or `$s3`."** FALSE.
+           I mis-split bit 11 of the `rd` field. `0x0040902d` is `daddu $s2, $v0, $zero`, not `$s0`.
+        2. **"a callee is clobbering `$s3`."** FALSE, and it follows from (1). The loop writes `$s3`
+           and `$s2` itself, from the two scan results. The generated unit's own comments say so:
+           `// 0x10286dc: daddu $s3, $v0, $zero`, `// 0x10286f4: daddu $s2, $v0, $zero`.
+        3. **"`0x0080102d` is `daddu $s0, $a0, $zero`."** FALSE — it is `daddu $v0, $a0, $zero`
+           (`// 0x1028634`), which is why the scan returns its result in `$v0` and the caller's
+           `$v0` read is right. I had used this wrong decode to claim the return convention
+           mismatched.
+        Also re-examined and **still not proven**: the 64-bit branch comparison
+        (`GPR_U64(a) == GPR_U64(b)`, 2,791 sites, 0 `GPR_U32`) is the only surviving candidate, but
+        `lui a2,0x102` clears the high bit so the two forms agree on the operands as constructed.
+        **Do not "fix" it on the strength of that.**
+
+        **METHOD, and it is the third time this session: THE GENERATED UNIT'S COMMENTS ARE THE
+        AUTHORITY, NOT A HAND DECODER.** Four separate conclusions this session came from reading
+        the disc myself were wrong — the loop was not unconditional, `a2` was not `0x00EB5F08`,
+        the two `daddu`s did not target `$s0`, and the return convention did not mismatch. Every
+        one was caught only by cross-checking against `// 0x...: 0x... <mnemonic>` comments the
+        recompiler emitted from its own instruction table. **Write the decoder once, correctly,
+        or read those comments. Do not hand-split R5900 fields in a shell one-liner.**
+
+NEXT:   1. **One measurement closes W10.** Print `v0` and `a0` **immediately after** the load at
+           `0x01028610` and **immediately before** the `jr ra` at `0x01028630` — *not* at the load,
+           which samples the previous word against the next address (that mistake cost two probes
+           earlier today). The question is one thing: **at the match exit, what is `a0`, what was
+           the word at `a0`, and what is `a2`?** If the word at `a0` really is `0x010285C0` and
+           `a2` is really `0x010285F8`, the compare is broken and the fix is in the branch
+           emission. That is the one change I would make next.
+        2. **Then the milestone, which this wall blocks and which is still not instrumented.** The
+           guest has made **zero MMIO accesses** in this state and the GS window at `0x1200xxxx` is
+           never touched, so nothing can reach `VULCAN4 FRAME source=guest` — and **nothing prints
+           that string.** The GS lane's emitter is half-built (`GS` does not consume
+           `GifArbiter::drainedPacketCount()`; the one wiring line in `ps2_runtime.cpp` after
+           `m_gs.init(...)` is missing). Finish it while W10 is worked, because a campaign whose
+           stop condition cannot be observed is a campaign that cannot finish.
+        3. `gsWriteCount()` is still never incremented on the guest `write32`/`write64` path, and
+           `PS2_SCRATCHPAD_ALIAS_BASE = 0xF0000000` is still a constant nothing reads that a test
+           nonetheless asserts. Both cheap, both unowned.
+
+MEASURED (this session, final, from clean): suite **462/462**; 60 s boot
+        `functions_entered=60091  service_frames=7616518  ee_cycle=17695381560  vsync_tick=3600`
+        `elapsed_ms=60009  harness_tail_ms=7  total_syscall_calls=29914  distinct_mmio_accesses=0`
+        Boot artefacts: `/mnt/ssd/vulcan4-build/run/boot_g18{k,j}.log`, `boot_verify.log`.
+        Patch byte-identical to the nested tree (`md5 fc7164f9ba4ce0becd5fc737cfe1b60b`).

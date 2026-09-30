@@ -748,8 +748,90 @@ NEXT:   1. **The red test owed since W7 pass 6, now with a victim:** a recompile
            in `ps2_runtime.cpp` is missing). Finishing that is worth more than this loop, because
            without it the campaign's stop condition cannot be observed even if it happens.
 
-MEASURED (this session, cumulative): suite 456 → **462/462**; boot 120 s budget wall-clock
-        **120.6 s → 1.6 s**; `functions_entered` 44578 → 120180; `vsync_tick` 2 → 7199; `ee_cycle`
-        9.8 M → 35.4 G; `service_frames` 0 (invisible) → 7,602,834 (counted). The guest went from
-        one thread and an idle loop to a real 60 Hz multi-threaded boot that stops at a precisely
-        named register.
+MEASURED (this session, cumulative): suite 456 → **462/462**; `functions_entered` 44578 → 120182;
+        `vsync_tick` 2 → 7199; `ee_cycle` 9.8 M → 35.4 G; `service_frames` 0 (invisible) →
+        15,029,344 (counted); `harness_tail_ms` "the rest of the budget" → **0**. The guest went from
+        one thread and an idle loop to a 60 Hz boot that stops at a precisely named register.
+
+        **THREE THINGS THE VERIFIER CAUGHT IN THE ABOVE, all mine, all now corrected in place:**
+
+        1. **"boot wall-clock 120.6 s → 1.6 s" is FALSE and I should not have written it.** The 1.1 s
+           runs were the *blind* driver (W9b) falsely declaring the guest stuck at 44,578 entries.
+           Once service-path frames became visible the guest legitimately consumes its budget: a
+           120 s run now ends `elapsed_ms=120001 guest_phase_ms=120001 harness_tail_ms=0`. The
+           watchdog fix is still real and still worth having — its entire contribution is that the
+           post-loop tail is now 0..18 ms instead of the remaining budget — but "1.6 s" measured a
+           broken instrument. **Fifth time in this project the instrument produced the number, and
+           fifth time it was me who believed it.**
+        2. **"`VULCAN4 FRAME source=guest` does not exist anywhere in the repo" is FALSE as
+           written.** It exists in `docs/CAMPAIGN.md`, in this file, in `docs/FIRST-BOOT.md` and in
+           one source comment. The true claim is that **nothing prints it.**
+        3. **"a real 60 Hz multi-threaded boot" overstates the end state.** Two threads were
+           measured mid-run (`tid1@prio3` ready / `tid2@prio2` running — that is what named W9a), but
+           the 120 s run *ends* with `runnable_threads=tid1@prio0:pc=0x01028610(running)`, one thread.
+           The worker is gone by then.
+
+        Plus one that no grep of the repo could have found: **a hand-injected probe was still
+        shipping.** A `[BR864]` `fprintf` sat at line 77477 of the *generated* translation unit,
+        injected into the artefact by an earlier session and absent from the recompiler source.
+        Dormant — the guest no longer reaches W7's loop — but it was in the binary. **Removed; the
+        unit now has 0 `fprintf` and 0 `BR864`.** A probe in a build artefact is still a probe, and
+        "probes removed" has to mean it in the thing that links.
+
+## 2026-09-30 22:10 · verifier pass · **4 PASS / 4 FAIL, and the 4 FAILs were all mine. Corrected.**
+
+WALL:   none new. This turn exists because **a commit is not proof** and the independent verifier
+        found four claims of mine that do not survive being re-run from scratch.
+
+DID:    Re-ran every gate from scratch, and corrected the record in place rather than defending it.
+
+        - **C1 suite 462/462 — PASS.** Binary was current; no rebuild needed.
+        - **C2 four G1.8g tests present and passing — PASS.**
+        - **C3 "120 s budget returns in ~1.6 s" — FAIL, and the claim is dead.** The verifier measured
+          `real 2m0.466s`. It is right, and so am I, now that I have looked: the fast runs were the
+          **blind** driver (W9b) declaring the guest stuck at 44,578 entries. The watchdog fix is
+          real but its whole contribution is `harness_tail_ms` — "the rest of the budget" → 0..18 ms.
+          Corrected in `docs/CAMPAIGN.md` W8c and above.
+        - **C4 boot numbers — PASS** (`functions_entered=120197`, `total_syscall_calls=59822` exact,
+          `vsync_tick=7199` exact, `ee_cycle=35390196344`, `halt=livelocked_in_syscall` exact,
+          `distinct_mmio_addresses=0` exact). The verifier also caught that my 7,602,834
+          `service_frames` was quoted from a **60 s** run while the surrounding numbers were from a
+          **120 s** one — **two runs conflated in one sentence.** Their ratio is exactly the ratio of
+          the run lengths, which is how it was caught.
+        - **C5 "the finish-line marker does not exist anywhere in the repo" — FAIL.** It exists in
+          `docs/CAMPAIGN.md`, `docs/HANDOFF.md` ×10, `docs/FIRST-BOOT.md` and one source comment.
+          The true claim is that **nothing prints it**, which is worse and more precise: the stop
+          condition cannot be reached *or missed* honestly.
+        - **C6 "no probes remain" — FAIL, and this one mattered.** A `[BR864]` `fprintf` was still in
+          the **generated translation unit** at line 77477, hand-injected into the artefact by an
+          earlier session and absent from the recompiler source — so no `grep` of the repository
+          could ever find it, and every "probes removed, rebuilt clean" line in this log was true of
+          the repo and false of the binary. Removed; the unit now has **0 `fprintf`, 0 `BR864`**,
+          and the harness is relinked.
+        - **C7 patch currency — PASS**, byte-identical to the nested tree's `git diff` (md5 match).
+        - **C8 retractions — the 64-bit branch count is exactly 2,791 with 0 `GPR_U32`, matching the
+          retracted figure, so "real but unfired" stands. The second retraction (`lw` returning 1)
+          was in this file but **not** in `docs/CAMPAIGN.md`; added.**
+
+        Also corrected: **"a real 60 Hz multi-threaded boot"** overstated the end state. Two threads
+        were measured mid-run — that is what named W9a — but a 120 s run *ends* with
+        `runnable_threads=tid1@prio0:pc=0x01028610(running)`, one thread. And the working tree had one
+        uncommitted whitespace deletion in the harness; reverted, so `git status` is clean apart from
+        the audio lane's `tools/audio/`.
+
+MEASURED (post-correction, 120 s, rebuilt from clean):
+        `functions_entered=120182  halt=livelocked_in_syscall  distinct_pcs=6  service_frames=15029344`
+        `elapsed_ms=120001  guest_phase_ms=120001  harness_tail_ms=0  total_syscall_calls=59822`
+        `distinct_mmio_addresses=0  total_mmio_accesses=0  runnable_threads=tid1@prio0:pc=0x01028610(running)`
+
+NEXT:   Unchanged and stated plainly: **W10 is the wall** (a callee is writing a callee-saved
+        register inside the guest's own syscall-table verification loop), and **the campaign's
+        finish-line marker is never emitted**, so the guest reaching a frame cannot currently be
+        observed even if it happens. Those two are the next dishes. Nothing in this pass moved
+        either.
+
+        **The standing lesson, fifth instance, and it is the same one every time:** W7's detector,
+        W8's watchdog, W9a's wrong thread, W9b's blindness, and now a headline wall-clock number
+        that was really a blind detector's lie. **When a number is surprising, ask what is measuring
+        before asking what is broken — and when a subagent disagrees with a commit, the subagent is
+        re-running it and the commit is a story.**

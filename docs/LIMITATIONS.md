@@ -120,6 +120,17 @@ run the thing. **None of these are fixed.** None are hidden either — that is t
   path and encoded by our own PNG writer. In-count and out-count match exactly. What is missing is
   the **rasteriser**: no primitive of any kind is drawn. Nothing from Gran Turismo 4 has been
   rendered, and the guest still has `total_mmio_accesses=0`.
+- **The GS rasteriser has still never written a pixel from a primitive (G2.2).** The draw sequence
+  is issued correctly and the GS acknowledges it, but the batches reaching the rasteriser are
+  degenerate (`v0 == v2 == (0,0)`, zero edge denominator) and the triangle is correctly skipped.
+  The rasteriser's own coverage, scissor-clip and gouraud code looks correct on the data it is
+  given, so the fault is in the primitive stream decoding or the vertex queue. Until this is fixed
+  **no guest geometry can be rendered**, and no amount of background work changes that.
+- **G2.2's own gate is satisfied by the background, not by geometry.** The check needs 1,000+
+  distinct colours and the G2.1 transfer gradient supplies 43,804, so the frame passes a
+  geometric-structure test while containing no drawn shape. A future gate for "the GS draws" should
+  compare against a *known-empty* background, or assert on a structure a gradient cannot produce
+  (e.g. a flat-shaded region with hard edges, or a count of distinct colours in a specific band).
 - **The GS image transfer has not been proven through a GIF packet.** G2.1 fills the framebuffer
   via the native entry point `GS::uploadImageNative`, which writes `BITBLTBUF`/`TRXPOS`/`TRXREG`/
   `TRXDIR` and feeds the image data straight to the backend. The probe reports `gif_packets=0`. A

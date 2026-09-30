@@ -130,6 +130,34 @@ Eventually the captain's Odin 2. Never an emulator.
   `VULCAN4 PROBE2/3/4` in the harness, which fail loudly if the descriptor moves again. Full
   write-up in `docs/FIRST-BOOT.md` §8.
 
+### 🟡 G2.2 — Real geometry *(gate passes on the BACKGROUND; no geometry was drawn)*
+- **DONE WHEN:** the GS accepts a primitive the way a guest submits one, rasterises a triangle and
+  a coloured/interpolated quad, and the PNG shows geometric structure verified programmatically.
+- **RESULT (2026-09-30):** ❌ **not met, and the gate is misleading here.** The frame reports 43,804
+  distinct colours and passes the ≥1000 check — but that is the **G2.1 transfer background**, and
+  the frame checksum is **byte-identical to G2.1's**. **No geometry contributed.** Calling this done
+  would be the fake success this project forbids, so it is recorded as partial.
+- **Two real bugs in my own G2.0 probe, found and fixed:**
+  1. **Screen coordinates are 12.4 fixed point**, so pixel `P` is register value `P << 4`. G2.0
+     passed raw pixel values, producing a 2.5-pixel triangle that covered nothing at all.
+  2. **`XYZF2` and `XYZ2` both queue a vertex AND both kick.** Writing both per vertex doubles the
+     vertex count: three intended vertices arrive as six, every triangle is degenerate. A guest
+     writes one or the other. The probe now writes `XYZ2` only.
+- **What now works:** geometry is submitted the guest way — a GIF REGLIST naming `PRIM` then per
+  vertex `RGBAQ`/`UV`/`XYZ2` — and the GS acknowledges it (`draw_events=8`). A flat triangle, a
+  gouraud quad submitted as two triangles sharing an edge (hardware does quads the same way; the
+  backend has no `QUAD` type), and a triangle straddling the frame edge to exercise the scissor.
+- **What still does not:** the raster writes nothing. The batches arriving are degenerate —
+  `v0 == v2 == (0,0)`, so the edge denominator collapses and the triangle is correctly skipped. The
+  rasteriser's coverage, scissor clip and gouraud interpolation look correct on the data it is
+  given, so **the fault is in the primitive stream decoding or the vertex queue, not the
+  rasteriser.** That is a real narrowing of the G2.0 open question.
+- **The guest draw sequence is now written down** in `docs/GS-PLAN.md` — framebuffer setup,
+  scissor, PRMODECONT, `PRIM` with IIP at bit 3, then the vertex run, with the kick implicit on the
+  third vertex. That is the contract the next dish compares against real GT4 GS traffic.
+- **No test added yet**, deliberately: pinning a path that does not yet draw would enshrine a
+  failure. Tests come with the fix.
+
 ### ✅ G1.5 — The body that never ran (it did run)
 - **DONE WHEN:** the `jal` at `0x010286D4` actually runs the body at `0x01028638`, and the boot
   report shows progress (`functions_entered` above 3, or a new named halt) with `bios_files=0`.

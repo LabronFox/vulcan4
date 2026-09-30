@@ -314,3 +314,43 @@ Gran Turismo 4 has ever been rendered by this GS.**
 A blank frame written by our own encoder is still "our code path", and the gate would pass on it.
 That is exactly why it is written down here as blank. A frame we drew honestly beats a screenshot
 faked politely — but a black PNG described as a working GS would be the fake, just quieter.
+
+
+---
+
+## The guest draw sequence (added G2.2 — documented, and **not yet working**)
+
+This is the sequence a guest performs to get geometry on screen, written down as the contract the
+next dish compares against real GT4 GS traffic. Every step was issued by the skeleton through the
+real register path; **the raster currently rejects it**, so read the status line before trusting
+the rest.
+
+```
+1. FRAME_1  (0x4C)  PSM=0 (PSMCT32), base page, FBW = width/64      -> via writeRegister (see GIF gap)
+2. ZBUF_1   (0x4E)  same shape
+3. SCISSOR_1/_2      whole rect in ONE 64-bit value: X0 0-10, X1 16-26, Y0 32-42, Y1 48-58
+4. PRMODECONT (0x1A) 1, to make PRMODE the attribute source and IIP take effect
+5. PRIM     (0x00)  type = 2 (TRIANGLE), IIP = bit 3   -> via a GIF REGLIST
+6. per vertex, in order: RGBAQ (0x01), UV (0x03), XYZ2 (0x05)      -> via GIF REGLIST
+7. the draw kicks by itself when the third vertex arrives
+```
+
+Two things that are **not** obvious and cost this project real time:
+
+- **Screen coordinates are 12.4 fixed point**, so pixel `P` is the register value `P << 4`. G2.0
+  passed raw pixel values and got a 2.5-pixel triangle that covered nothing.
+- **Write `XYZ2` or `XYZF2`, never both.** Each queues a vertex *and* kicks. Writing both per vertex
+  doubles the vertex count, so three intended vertices arrive as six and every triangle is
+  degenerate. A guest never does this; the G2.0 probe did.
+
+**Status as of G2.2: the sequence is issued and the GS acknowledges it (8 draw events) but the
+raster writes nothing.** The batches arriving at the rasteriser are degenerate — `v0 == v2 ==
+(0,0)`, so the edge denominator collapses to zero and the triangle is correctly skipped. **The
+remaining bug is in the primitive stream decoding or the vertex queue, not in the rasteriser**,
+which is now provably doing correct barycentric coverage, scissor clipping and gouraud
+interpolation on the data it is handed.
+
+**The gate's proxy is weaker than it looks and is reported as such:** G2.2's check requires 1,000+
+distinct colours and 1,000+ unique pixels, and the frame **passes that** — but only on the G2.1
+transfer background. The frame checksum is byte-identical to G2.1's. No geometry contributed. A
+background gradient satisfies the proxy; only a human or a structural check distinguishes them.

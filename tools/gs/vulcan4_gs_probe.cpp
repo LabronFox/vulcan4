@@ -354,6 +354,61 @@ namespace
         return static_cast<uint64_t>(w) | (static_cast<uint64_t>(h) << 32);
     }
 
+
+    // ---------------------------------------------------------------- primitives
+    //
+    // Submitted the way a guest submits them: a GIF REGLIST naming PRIM, then per vertex
+    // RGBAQ / UV / XYZ2, followed by the draw kick that happens when the third vertex arrives.
+    // Registers PRIM(0x00) .. XYZ2(0x05) are all inside the 4-bit GIFTAG address field, so this
+    // route is reachable through the GIF path -- unlike the framebuffer registers above 0x0F.
+    //
+    // Two things G2.0 got wrong, both of which made the rasteriser look broken when it was not:
+    //   1. Screen coordinates are 12.4 fixed point, so a pixel P is the register value P << 4.
+    //      G2.0 passed raw 40 and got a 2.5-pixel triangle, i.e. sub-pixel and covering nothing.
+    //   2. XYZF2 and XYZ2 BOTH queue a vertex and BOTH kick. Writing both per vertex doubled the
+    //      vertex count, so 3 intended vertices became 6 and every triangle was degenerate.
+    //      A guest writes one of them, never both. We write XYZ2 only.
+    constexpr uint32_t kRegPrim = 0x00;
+    constexpr uint32_t kRegRgbaq = 0x01;
+    constexpr uint32_t kRegUv = 0x03;
+    constexpr uint32_t kRegXyz2 = 0x05;
+
+    constexpr uint64_t kPrimTriangle = 2u;
+    constexpr uint64_t kPrimIipBit = 1u << 3; // Gouraud colour interpolation
+
+    struct GSVertexSpec
+    {
+        uint32_t x, y;   // in PIXELS; converted to 12.4 below
+        uint8_t r, g, b, a;
+    };
+
+    void submitTriangle(GS &gs, bool gouraud, const GSVertexSpec *v, const char *label)
+    {
+        std::vector<std::pair<uint8_t, uint64_t>> writes;
+        writes.emplace_back(static_cast<uint8_t>(kRegPrim),
+                            kPrimTriangle | (gouraud ? kPrimIipBit : 0u));
+        for (int vi = 0; vi < 3; ++vi)
+        {
+            const GSVertexSpec &vert = v[vi];
+            const uint64_t rgba = static_cast<uint64_t>(vert.r) | (static_cast<uint64_t>(vert.g) << 8)
+                | (static_cast<uint64_t>(vert.b) << 16) | (static_cast<uint64_t>(vert.a) << 24)
+                | (0x3F800000ull << 32); // Q = 1.0 in 8.8-ish float, as the GS does
+            const uint64_t uv = 0u;
+            const uint64_t xyz = (static_cast<uint64_t>(vert.x) << 4)          // X, 12.4 fixed
+                | (static_cast<uint64_t>(vert.y) << 20)                          // Y, 12.4 fixed
+                | (static_cast<uint64_t>(0x3FFFFu) << 36);                       // Z
+            writes.emplace_back(static_cast<uint8_t>(kRegRgbaq), rgba);
+            writes.emplace_back(static_cast<uint8_t>(kRegUv), uv);
+            writes.emplace_back(static_cast<uint8_t>(kRegXyz2), xyz);
+        }
+        const std::vector<uint8_t> packet = reglistPacket(writes);
+        gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
+        std::cout << "VULCAN4 GS DRAW " << label << " prim=" << kPrimTriangle
+                  << (gouraud ? " iip=1(gouraud)" : " iip=0(flat)")
+                  << " verts=(" << v[0].x << "," << v[0].y << ") (" << v[1].x << "," << v[1].y
+                  << ") (" << v[2].x << "," << v[2].y << ") regs=" << writes.size() << "\n";
+    }
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -453,6 +508,46 @@ int main(int argc, char *argv[])
 
         gs.uploadImageNative(bitbltbuf, trxpos, trxreg, trxdir, pattern.data(),
                              static_cast<uint32_t>(pattern.size()));
+    }
+
+    // ---- 2d. Real geometry, through the register path.
+    //
+    // The background above proves the transfer route. These prove the DRAW route: a guest hands
+    // the GS geometry as GIF packets naming PRIM and the vertex registers, and the GS kicks the
+    // draw when the last vertex arrives. Nothing here touches VRAM directly.
+    {
+        // 1. A flat-shaded triangle: three vertices, one colour, no interpolation.
+        const GSVertexSpec flat[3] = {
+            {48, 48, 220, 40, 40, 255},
+            {464, 96, 220, 40, 40, 255},
+            {200, 240, 220, 40, 40, 255},
+        };
+        submitTriangle(gs, /*gouraud*/ false, flat, "flat-triangle");
+
+        // 2. A gouraud quad, submitted the way hardware does it: as TWO triangles sharing an edge,
+        //    with four different corner colours. Interpolation across the interior is what makes
+        //    this produce structure rather than flat regions.
+        const uint8_t c0[4] = {255, 64, 32, 255};
+        const uint8_t c1[4] = {32, 128, 255, 255};
+        const uint8_t c2[4] = {64, 255, 96, 255};
+        const uint8_t c3[4] = {220, 64, 220, 255};
+        const GSVertexSpec q0 = {48, 272, c0[0], c0[1], c0[2], c0[3]};
+        const GSVertexSpec q1 = {464, 272, c1[0], c1[1], c1[2], c1[3]};
+        const GSVertexSpec q2 = {464, 464, c2[0], c2[1], c2[2], c2[3]};
+        const GSVertexSpec q3 = {48, 464, c3[0], c3[1], c3[2], c3[3]};
+        const GSVertexSpec quadA[3] = {q0, q1, q2};
+        const GSVertexSpec quadB[3] = {q0, q2, q3};
+        submitTriangle(gs, /*gouraud*/ true, quadA, "gouraud-quad-a");
+        submitTriangle(gs, /*gouraud*/ true, quadB, "gouraud-quad-b");
+
+        // 3. A triangle deliberately straddling the frame edge, to exercise the scissor clip.
+        //    It reaches x=700 in a 512-wide frame, so the right third must be discarded.
+        const GSVertexSpec clipped[3] = {
+            {380, 40, 255, 255, 0, 255},
+            {700, 60, 255, 255, 0, 255},
+            {420, 240, 255, 200, 0, 255},
+        };
+        submitTriangle(gs, /*gouraud*/ true, clipped, "clipped-triangle");
     }
 
     // ---- 2c. The sync primitive, and exactly what it does and does not model.

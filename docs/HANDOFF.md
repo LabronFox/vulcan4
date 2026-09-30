@@ -156,3 +156,45 @@ NEXT:   **One probe, and the filter that makes it work:** find who writes `0x010
 MEASURED (suite):  **450/450** from `tools/PS2Recomp/ps2xTest`, after deleting the meaningless test.
 MEASURED (boot):   `functions_entered=95 halt=guest_cycle_no_progress bios_files=0` — unchanged,
         which is correct: nothing was fixed. Campaign goal NOT reached.
+
+## 2026-09-30 18:05 · 33-g18d-gs-store-loop (investigation only, 5th pass) · **W7 loop SOLVED, bad value open**
+
+WALL:   W7 — the loop is now fully explained. The *value* that makes it infinite is not yet sourced.
+DID:    **No shipped code changed.** Probed, measured, removed every probe, rebuilt the generated
+        artifact clean (0 `fprintf`), re-verified the boot at `functions_entered=95`.
+MEASURED:
+        - The callee `sub_0100F390` reads `lw $t1,0x20($s0)` / `lw $t4,0x24($s0)`, and the back edge
+          `bne $t1,$t4` targets `0x100f864` — which is that same `lw`. **`$t1` is reloaded every
+          iteration, so its `+1` is discarded and it is pinned.** `mem20` reads `0x01051A40` on every
+          sample, never moving.
+        - The caller at `0x1010a68` fills the struct. **Decoded from the ELF, correcting addendum 4
+          which mis-decoded these as `$t1`/`$t4`:**
+          `0x1010a60: 0xae170020  sw $s7,0x20($s0)`  → start = `$s7` (r23)
+          `0x1010a6c: 0xae1e0024  sw $fp,0x24($s0)`  → end   = `$fp` (r30)
+        - **At the call site, measured:**
+          `[FIN] s7=0x01051A40 fp=0x01051A3F s7>fp=1` … `s7=0x010632C4 fp=0x01051A3F s7>fp=1`
+          **`$s7` advances every call. `$fp` never moves.** The range is inverted every time.
+        - **Grepping the caller's whole body for a write to `$fp`/r30 finds exactly one instruction:
+          the `sw $fp,0x24($s0)` that CONSUMES it. Nothing there ever ASSIGNS `$fp`.**
+        - **Every instruction involved decodes correctly** and the recompiler emits each to the label
+          its own offset names (verified twice, on `0x100f808` and `0x100f864`). **This is not a
+          codegen bug.** The guest was handed a buffer whose end pointer it never received.
+NEXT:   **Up the call chain, not down into the loop.**
+        1. Find the caller of the function containing `0x1010a68` and check what it passes in `$fp`
+           and `$s7`. `$fp` is callee-saved (r30): **a recompiled callee that fails to save/restore
+           it is the one hypothesis here that would be a real recompiler bug, and it is the one to
+           test first.** Watch `0x1010a5c: lq $t4,0x5E0($sp)` in the same block — a 128-bit load
+           through `$sp` reading the wrong 8 bytes would put a plausible value in the wrong register.
+        2. `$s7` advancing while `$fp` does not is also consistent with an empty/short buffer sized
+           wrong. If the size came from a file header or a memory-card read, **that read may be the
+           real wall** and this loop only its symptom.
+        3. Check whether the frame arrives anyway: `[gs:gif] nloop=7`, `PRIM=3` was already seen, and
+           a GS write is not a function entry, so `functions_entered` being frozen does not prove no
+           frame reached the hardware.
+        **Do NOT clamp `$t1` to `$t4`, do NOT special-case `0x100f800`, do NOT "fix" it by making
+        the store block run.** Every instruction is correct and the value is wrong; patching the loop
+        would hide the only thing that matters.
+        Full chain and all five passes: `.auto/queue/33-g18d-gs-store-loop.txt` addenda 1–5.
+MEASURED (suite): **450/450** from `tools/PS2Recomp/ps2xTest`.
+MEASURED (boot):  `functions_entered=95 halt=guest_cycle_no_progress bios_files=0`. Campaign goal NOT
+        reached — `VULCAN4 FRAME source=guest` has still never been printed.

@@ -592,7 +592,10 @@ int main(int argc, char *argv[])
     // loop), decodes every instruction in the block, and for each LOAD prints the effective
     // address it is polling and the value sitting there. A cycle that loads is waiting on a
     // memory word, and that word now has a name, an address and a current value.
-    auto nameCycle = [&](const char *tag, uint32_t pc)
+    // G1.8g. `frame` is a PARAMETER, not a capture, on purpose. The decoder reports the effective
+    // address a loop is polling and the value sitting there, so reading the wrong context would
+    // print a plausible wrong address -- the exact failure this project keeps paying for.
+    auto nameCycle = [&](const char *tag, uint32_t pc, const R5900Context &frame)
     {
         std::vector<uint32_t> loop;
         if (!progress.history().empty())
@@ -659,7 +662,7 @@ int main(int argc, char *argv[])
             bool isSigned = false;
             if (decodeGpuLoad(insn, rt, imm, width, isSigned))
             {
-                const uint32_t base = _mm_extract_epi32(ctx.r[(insn >> 21) & 0x1F], 0);
+                const uint32_t base = _mm_extract_epi32(frame.r[(insn >> 21) & 0x1F], 0);
                 const uint32_t addr = base + imm;
                 uint32_t value = 0;
                 std::memcpy(&value, rdram + (addr & 0x00FFFFFFu), sizeof(value));
@@ -713,6 +716,26 @@ int main(int argc, char *argv[])
 
     while (!finished)
     {
+        // ---- G1.8g: RUN THE THREAD THE SCHEDULER SAYS IS RUNNING.
+        //
+        // This loop used to enter the guest on `runtime.cpu()`, which is the MAIN thread's frame
+        // and was correct only while the main thread was the one running. The moment the guest's
+        // cooperative scheduler switches threads, the driver kept advancing the main thread's
+        // registers while the scheduler believed some other thread held the CPU. The boot report
+        // showed exactly that contradiction and nothing else:
+        //
+        //   runnable_threads=tid1@prio3:pc=0x0100d8f8(ready),tid2@prio2:pc=0x0100de58(running)
+        //
+        // tid2 running, tid1 ready, and the driver entering tid1's frame. GT4 is genuinely
+        // multi-threaded by this point -- W8's fix is what let the worker survive at all -- and
+        // the driver was reading the wrong thread's program counter the whole time.
+        //
+        // So the frame is re-read from the scheduler EVERY iteration, not bound once. A reference
+        // captured outside the loop would be a stale frame wearing the right name, which is worse
+        // than the bug.
+        R5900Context *const schedulerFrame = runtime.eeScheduler().currentContext();
+        R5900Context &ctx = schedulerFrame != nullptr ? *schedulerFrame : runtime.cpu();
+
         // ---- G1.8g: is the guest actually able to run?
         //
         // This loop advances PS2Runtime::m_cpuContext, which is the MAIN thread's frame. If that
@@ -835,7 +858,7 @@ int main(int argc, char *argv[])
                 haltPc = ctx.pc;
                 // NAME IT. Decode the cycle before stopping, so the report carries the
                 // instructions and any polled address rather than a bare count.
-                const std::vector<uint32_t> cycle = nameCycle("CYCLE", ctx.pc);
+                const std::vector<uint32_t> cycle = nameCycle("CYCLE", ctx.pc, ctx);
                 std::string decoded;
                 for (uint32_t c : cycle)
                 {
@@ -1259,6 +1282,24 @@ int main(int argc, char *argv[])
     // ------------------------------------------------------------------ the report
     //
     // Machine-readable, exactly one line, exactly this shape. The gate greps for it.
+    // The scheduler snapshot is taken ONCE here and used for the clock, the next deadline and the
+    // runnable set, so the report cannot show three different instants of the same run.
+    const EeKernelSnapshot kernelSnapshot = runtime.eeScheduler().snapshot();
+    std::string runnableThreadNames;
+    for (const EeThreadSnapshot &thread : kernelSnapshot.threads)
+    {
+        if (thread.status == EeThreadStatus::Ready || thread.status == EeThreadStatus::Running)
+        {
+            if (!runnableThreadNames.empty())
+            {
+                runnableThreadNames += ",";
+            }
+            runnableThreadNames +=
+                "tid" + std::to_string(thread.id) + "@prio" + std::to_string(thread.currentPriority)
+                + ":pc=" + toHex(thread.pc) + (thread.status == EeThreadStatus::Running ? "(running)"
+                                                                                        : "(ready)");
+        }
+    }
     std::cout << "VULCAN4 BOOT REPORT functions_entered=" << functionsEntered << " halt=" << haltReason
               << " bios_files=" << biosFilesOpened << "\n";
 
@@ -1270,6 +1311,13 @@ int main(int argc, char *argv[])
               << " elapsed_ms=" << elapsed
               << " guest_phase_ms=" << guestElapsed
               << " harness_tail_ms=" << (elapsed - guestElapsed)
+              // G1.8g: the EE clock, and the next thing it is waiting for. Without these two
+              // numbers "the guest stopped progressing" and "the guest's clock never reached the
+              // next interrupt" look identical, and they are different walls.
+              << " ee_cycle=" << kernelSnapshot.eeCycle
+              << " next_event_cycle=" << kernelSnapshot.nextEventCycle
+              << " vsync_tick=" << runtime.eeScheduler().currentVSyncTick()
+              << " runnable_threads=" << runnableThreadNames
               << " entry_budget=" << budget.maxEntries << " spin_limit=" << budget.maxRepeatedPc
               << " deadline_s=" << budget.maxSeconds << "\n";
 

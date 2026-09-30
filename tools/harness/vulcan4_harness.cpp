@@ -63,6 +63,7 @@
 #include <atomic>
 #include <thread>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 namespace
@@ -84,6 +85,12 @@ namespace
     // from kHaltSpinTrap (one PC revisited) and from kHaltInSyscall (a syscall that is executing):
     // here the guest is executing normally, over and over, and going nowhere.
     constexpr const char *kHaltCycleNoProgress = "guest_cycle_no_progress";
+    // G1.8g / W8. The guest asked to sleep (or waited on a kernel object) and NOTHING is runnable:
+    // no other thread to switch to, no invocation queued, no event due. On a console this is where
+    // an interrupt would arrive. Here it is the honest end of the road, and re-entering the parked
+    // frame to "keep going" is precisely the fake this project forbids -- it is what made
+    // sce_SleepThread a no-op and left the guest spinning in the idle loop at 0x01000760.
+    constexpr const char *kHaltGuestBlocked = "guest_blocked";
 
     // ---------------------------------------------------------------- budgets
     //
@@ -498,6 +505,11 @@ int main(int argc, char *argv[])
     uint64_t distinctPcs = 0;
     uint64_t dispatcherTransfers = 0;
     uint64_t servicedInvocations = 0;
+    // G1.8g. servicedInvocations counted every catch as progress, which is how a boot that did
+    // nothing at all could report 15/15 "serviced" next to 119 syscalls in 20 million entries.
+    // These two say what the service call actually achieved.
+    uint64_t servicedWithProgress = 0;
+    uint64_t blockedOnServicing = 0;
     const char *haltReason = kHaltEntryBudget;
     uint32_t haltPc = entryPoint;
     std::string haltDetail;
@@ -544,11 +556,24 @@ int main(int argc, char *argv[])
     // where the stop is detected and reported honestly. This is how the harness guarantees it
     // cannot hang, and it is why the halt is reported as a reason rather than a timeout kill.
     std::atomic<bool> watchdogFired{false};
-    std::thread watchdog([&runtime, &budget, &watchdogFired, start]() {
+    // G1.8g. The watchdog used to sleep out the WHOLE deadline and only then call
+    // requestStop(), so the harness's own `watchdog.join()` after the loop blocked for every
+    // remaining second of the budget. Measured: a 20 s budget produced a 20.3 s process for a
+    // guest phase that takes 1.3 s, and a 120 s budget produced a 120.6 s process for the same
+    // 1.3 s of work. Every wall-clock number in the boot report was therefore the harness
+    // waiting for its own watchdog, not the guest doing anything -- which is the third time in
+    // this project that the instrument, not the thing measured, produced the number.
+    // The watchdog now watches a flag the driver sets when it is done, so joining is prompt.
+    std::atomic<bool> driverFinished{false};
+    std::thread watchdog([&runtime, &budget, &watchdogFired, &driverFinished, start]() {
         const auto deadline = start + std::chrono::seconds(budget.maxSeconds);
         while (std::chrono::steady_clock::now() < deadline)
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (driverFinished.load(std::memory_order_acquire))
+            {
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
         watchdogFired.store(true);
         runtime.requestStop();
@@ -667,8 +692,78 @@ int main(int argc, char *argv[])
         return loop;
     };
 
+    // Which kernel object is a parked thread parked on? EeScheduler::waitObjectId() is private, and
+    // duplicating its logic here is the same class of mistake: two copies of one rule that drift.
+    // So this only names the payload, and says "none" when there is no object to name.
+    auto waitObjectName = [](const GuestThread &thread) -> std::string
+    {
+        return std::visit(
+            [](const auto &payload) -> std::string
+            {
+                using T = std::decay_t<decltype(payload)>;
+                if constexpr (std::is_same_v<T, std::monostate>) { return "none"; }
+                else if constexpr (std::is_same_v<T, EeSemaphoreWait>) { return "sema" + std::to_string(payload.id); }
+                else if constexpr (std::is_same_v<T, EeEventFlagWait>) { return "eventflag" + std::to_string(payload.id); }
+                else if constexpr (std::is_same_v<T, EeVSyncWait>) { return "vsync"; }
+                else if constexpr (std::is_same_v<T, EeExternalWait>) { return "external" + std::to_string(payload.type); }
+                else { return "unknown"; }
+            },
+            thread.wait.payload);
+    };
+
     while (!finished)
     {
+        // ---- G1.8g: is the guest actually able to run?
+        //
+        // This loop advances PS2Runtime::m_cpuContext, which is the MAIN thread's frame. If that
+        // thread has parked itself -- sce_SleepThread, a semaphore wait, an event-flag wait, a
+        // vsync wait -- then entering the guest here would run a frame the scheduler has
+        // explicitly decided must not run, and every count below would be a fiction. Before
+        // G1.8f's honest detector this loop could not tell; now the scheduler can, and it says
+        // so.
+        //
+        // The other half of the check: if the main thread is parked AND nothing else is runnable,
+        // the guest is genuinely blocked. On a console an interrupt or a wakeup would break that
+        // open. Here the run has to stop and say so, because the alternative -- re-entering the
+        // parked frame -- is the exact thing that made sce_SleepThread a no-op (W8).
+        if (!runtime.eeScheduler().canDispatchGuest())
+        {
+            haltReason = kHaltGuestBlocked;
+            haltPc = ctx.pc;
+            const GuestThread *blocked = runtime.eeScheduler().thread(EeScheduler::kMainThreadId);
+            std::string reason = "none";
+            if (blocked)
+            {
+                switch (blocked->wait.reason)
+                {
+                case EeWaitReason::Sleep:      reason = "Sleep"; break;
+                case EeWaitReason::Semaphore:  reason = "Semaphore"; break;
+                case EeWaitReason::EventFlag:  reason = "EventFlag"; break;
+                case EeWaitReason::VSync:      reason = "VSync"; break;
+                case EeWaitReason::External:   reason = "External"; break;
+                case EeWaitReason::Mpeg:       reason = "Mpeg"; break;
+                case EeWaitReason::None:       reason = "none"; break;
+                }
+            }
+            const EeKernelSnapshot snap = runtime.eeScheduler().snapshot();
+            std::string runnable;
+            for (const EeThreadSnapshot &thread : snap.threads)
+            {
+                if (thread.status == EeThreadStatus::Ready
+                    || thread.status == EeThreadStatus::Running)
+                {
+                    runnable += runnable.empty() ? "" : " ";
+                    runnable += "tid=" + std::to_string(thread.id) + "@pc=" + toHex(thread.pc);
+                }
+            }
+            haltDetail = "the main thread is parked in " + reason
+                + " waiting on " + (blocked ? waitObjectName(*blocked) : std::string("none"))
+                + ", and no other thread is runnable, so the guest cannot make progress without an "
+                  "interrupt or a wakeup we do not yet deliver. Runnable frames: "
+                + (runnable.empty() ? std::string("none") : runnable);
+            break;
+        }
+
         // ---- wall clock
         const auto elapsedSeconds = std::chrono::duration_cast<std::chrono::seconds>(
                                    std::chrono::steady_clock::now() - start)
@@ -833,6 +928,11 @@ int main(int argc, char *argv[])
         // So the obligation is discharged here: hand the signal to the scheduler, which runs the
         // invocation to completion and copies the main thread's context back into runtime.cpu() --
         // the same object this loop reads ctx.pc from.
+        //
+        // G1.8g: the RESULT is recorded, not just the fact of the call. "Ran" means the guest
+        // moved. "Blocked" means the scheduler has nothing runnable and this frame must not be
+        // re-entered -- which the top-of-loop check then names as guest_blocked instead of letting
+        // the run grind on a parked thread.
         try
         {
             g_ps2RecompiledFunctionTable[slot](rdram, &ctx, &runtime);
@@ -840,8 +940,16 @@ int main(int argc, char *argv[])
         catch (const EeDispatcherTransfer &)
         {
             ++dispatcherTransfers;
+            const EeServiceResult serviced = runtime.eeScheduler().serviceInvocations();
             ++servicedInvocations;
-            runtime.eeScheduler().serviceInvocations();
+            if (serviced == EeServiceResult::Ran || serviced == EeServiceResult::RanNothing)
+            {
+                ++servicedWithProgress;
+            }
+            else if (serviced == EeServiceResult::Blocked)
+            {
+                ++blockedOnServicing;
+            }
         }
 
         if (runtime.isStopRequested())
@@ -1001,6 +1109,14 @@ int main(int argc, char *argv[])
         }
     }
 
+    // Measured BEFORE the join, because the gap between this and elapsed is the harness
+    // waiting on something of its own making, and a report that only prints the total invites
+    // exactly the misreading that cost this project two dishes (W7's detector, W8's watchdog).
+    const auto guestElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now() - start)
+                                  .count();
+
+    driverFinished.store(true, std::memory_order_release);
     runtime.requestStop(); // tell the watchdog thread to exit its wait loop
     watchdog.join();
 
@@ -1149,7 +1265,11 @@ int main(int argc, char *argv[])
     std::cout << "VULCAN4 HARNESS detail=" << haltDetail << " pc=" << toHex(haltPc)
               << " distinct_pcs=" << distinctPcs << " dispatcher_transfers=" << dispatcherTransfers
               << " serviced_invocations=" << servicedInvocations
+              << " serviced_with_progress=" << servicedWithProgress
+              << " blocked_on_servicing=" << blockedOnServicing
               << " elapsed_ms=" << elapsed
+              << " guest_phase_ms=" << guestElapsed
+              << " harness_tail_ms=" << (elapsed - guestElapsed)
               << " entry_budget=" << budget.maxEntries << " spin_limit=" << budget.maxRepeatedPc
               << " deadline_s=" << budget.maxSeconds << "\n";
 

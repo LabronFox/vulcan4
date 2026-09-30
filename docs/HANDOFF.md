@@ -439,3 +439,107 @@ accesses** across 20M entries. **Campaign goal NOT reached — `VULCAN4 FRAME so
 `sce_SleepThread` is returning immediately instead of blocking the calling thread. The main thread never
 yields, so no other thread ever runs. Next: make it block, and prove it on **thread state**, not on
 function counts. Brief: `.auto/queue/35-g18g-sleepthread-blocks.txt`.
+
+## 2026-09-30 19:40 · 35-g18g-sleepthread-blocks · **W8's mechanism FIXED (3 defects), wall NOT fallen, W9 named**
+
+WALL:   W8 — the guest spins in its idle loop. **The wall did not fall. Its mechanism did, and it
+        was three separate real bugs, not one.** A new wall (W9) is named below.
+
+DID:    Red first, then three fixes, all in the runtime, all proven on THREAD STATE:
+
+        1. **`EeScheduler::serviceInvocations()` resurrected a blocked thread.** It did
+           `main->wait = {}` then `makeRunning(*main)` "so an invocation has somewhere to attach",
+           guarded by `main->status == Ready || main->invocations.empty()`. `invocations.empty()`
+           is true for every plain syscall, so the guard was always true and the thread that had
+           just called `sce_SleepThread` was made Running again in the same call.
+        2. **`EeScheduler::bindMainContextForSyscall()` re-ran `reset()` on EVERY syscall.**
+           It tested `m_executorThread == std::thread::id{}` to mean "not set up yet". That is
+           permanently true for a driver that never calls `run()` — and the harness never does.
+           So every syscall destroyed every thread, semaphore, event flag, alarm and queued event
+           the guest had created, and rebuilt the main thread record as `Ready` before parking it
+           again. **This is the one that actually explains the boot**: `sce_CreateThread calls=1`
+           and `sce_CreateSema calls=7` cannot coexist with eleven `sce_SleepThread` calls on a
+           working kernel. Now the "not set up yet" test is `m_threads.empty()`.
+        3. **`serviceInvocations()` slept on the host clock** — `processPendingEvents()` paces
+           itself to the next VBlank deadline, correct in `run()` and wrong in a service call.
+           Now `processPendingEvents(bool mayWait)`; `run()` passes true, a service call false.
+        4. **The harness's own watchdog held every boot open for the whole budget.** It slept out
+           the deadline then called `requestStop()`, and the harness `join()`ed it. Now it watches
+           a `driverFinished` flag.
+        New API: `EeServiceResult serviceInvocations(int)` (RanNothing/Ran/Blocked/Stopped) and
+        `EeScheduler::canDispatchGuest()`, so a driver never re-enters a parked frame and can tell
+        "the guest moved" from "the guest is parked". The harness halts with a new
+        `halt=guest_blocked` that names the wait reason and the runnable set.
+
+        **4 new tests, `ps2xTest/src/ps2_thread_block_tests.cpp`, all red before the fix:**
+        a thread in `sce_SleepThread` is Waiting/Sleep · a driver that services the transfer does
+        not re-enter the sleeping thread · with the main thread asleep the runnable set must
+        change and the OTHER thread must run · a woken thread resumes at the PC it published.
+
+        Two of my own conclusions were WRONG on the way and are retracted here: (a) I read
+        `perf`'s "99 % libgallium" as a GL present stall — it was 99 % of **6 samples** in GL
+        context creation, and the real block was `pthread_join` on my own watchdog; (b) I tried to
+        add a `canDispatchGuest()` gate to the shared `driveGuestLikeTheHarness` fixture and broke
+        G1.8b/G1.8c, because those tests never call `reset()` and correctly have no threads. The
+        gate belongs to a driver that HAS initialised the scheduler.
+
+MEASURED:
+        suite:  **462/462 passing** (was 456 + 2 pre-existing GS depth failures; the GS lane
+                found those 2 were a stray `ZBUF_1` write in its own test helper, and the depth
+                / ATE / AFail / DATE gate is now genuinely green rather than accidentally green)
+        boot:   `functions_entered=44579→44578` — **UNCHANGED, and honestly so.** The guest
+                reaches the same place it always did; W8 was never what was stopping it.
+        **but the instrument is now trustworthy:** 120 s budget → **1.6 s process**,
+        `elapsed_ms=1143 guest_phase_ms=1125 harness_tail_ms=18`. Before: 120.6 s.
+        guest phase: 44578 entries, distinct_pcs=112, 119 syscalls, 754 MMIO accesses,
+        15 transfers, `blocked_on_servicing=0` (a worker was always runnable — the fix is live).
+
+        **GS lane, by the way, is where this got interesting.** It reported the memory map was
+        wrong (GS should be at 0x70000000, scratchpad at 0x1F800000) and wrote a red test for it.
+        **That was refuted, and the refutation is in the ledger: GT4's own code writes GS
+        registers at 0x12000000 (21 `lui 0x1200`, and a CSR-revision probe at 0x100a444 that reads
+        0x12001000 and shifts right 16), and uses 0x70002000–0x70003030 as a DMA scratch struct.**
+        Our map was already right. The test was removed and the truth pinned by two green tests.
+        *A proposed fix that a measurement refutes gets deleted, not softened.*
+
+NEXT:   **W9 — the guest's own idle loop.** The entire guest phase is 1.13 s; nothing is slow, the
+        guest simply stops progressing at `0x01000760`, which is `while(1) { sub_010027F0(); }`
+        with no syscall, no MMIO and no load in the body. **The boot log contains no write to
+        `0x1200xxxx` at all — the GS window is never touched, so milestone 2 is out of reach
+        until the guest gets past this loop.**
+        1. **What is `sub_010027F0` waiting for?** Decode its body from SCUS_973.28 and find every
+           load it makes. If it polls a memory word, name the address and ask who was supposed to
+           write it — GT4 created exactly one thread (`sce_CreateThread calls=1`) and now that
+           thread survives its sleeps, so check whether the worker is the producer.
+        2. **The harness only delivers events when the guest yields.** `processPendingEvents()` is
+           reached from `run()` and from a service call, and this loop never yields. If
+           `sub_010027F0` is waiting on an EE timer or a vsync interrupt, the driver has to pump
+           the scheduler on a clock of its own — that is a driver obligation, not a guest change.
+        3. **`VULCAN4 FRAME source=guest` does not exist anywhere in the repo** (`grep` over
+           `tools/`: zero hits). The campaign's finish line has no instrumentation, so it cannot
+           be reached or missed honestly. The GS lane has half of it: `GifArbiter` now carries a
+           delivery observer (`drainedPacketCount()`) whose only real feeder is
+           `PS2Memory::submitGifPacket`, which is a genuine guest/synthetic discriminator.
+           `GS` does not consume it yet, and one line is missing in `ps2_runtime.cpp` after
+           `m_gs.init(...)`: `m_gifArbiter.setDeliveryObserver([this]{ m_gs.noteGuestGifTraffic(); })`.
+           **The GS lane ran out of steps mid-change and compiled nothing; the tree was verified
+           building and 462/462 green by hand afterwards.** Finish this before trusting any
+           "no frame" claim.
+        4. **`gsWriteCount()` is structurally always 0 for guest traffic** — the counter is only
+           incremented in `writeIORegister()`, but the real guest path is `write32`/`write64`,
+           which take the `isGsPrivReg` branch and return without counting. `ps2_memory.cpp` is
+           not the GS lane's file and not yet fixed.
+
+        **Do NOT re-chase:** W7's `$t1` / `$fp` / inverted-range story (retracted in G1.8f, and
+        the 0x0100f800 loop is 78 % of entries and converging normally) · the 0x70000000 GS
+        remap (refuted by GT4's own disassembly, above) · the `libgallium` present stall (6
+        samples of GL context creation) · the `sleepCurrent()` code, which was always correct.
+
+MEASURED (artifacts): probes removed and every binary rebuilt clean (`grep -c TPROBE` = 0 in
+        tools/harness/vulcan4_harness.cpp; 0 `fprintf` in the generated unit).
+        Patch: `tools/patches/ps2recomp-linux-g18g-sleepthread-blocks.patch` (22 files, +2234/-25).
+        Boots: `/mnt/ssd/vulcan4-build/run/boot_g18g.log`, `boot_W8_baseline.log` (the 120 s
+        before-picture), `boot_W8_final.log`. New: `tools/harness/build_harness.sh` — the harness
+        is not a CMake target, so its build was four hand-typed g++ lines and `--target ps2xRuntime`
+        silently builds nothing, which measures the OLD runtime and reports a fix that is not in
+        the binary. It happened once here.

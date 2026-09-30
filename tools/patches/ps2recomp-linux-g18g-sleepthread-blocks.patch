@@ -301,10 +301,27 @@ index 4b9242c..ee71244 100644
      uint32_t m_guestHeapEnd = 0x00100000u;
      uint32_t m_guestHeapLimit = PS2_RAM_SIZE;
 diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
-index f247ff9..fcab6e0 100644
+index f247ff9..bbace61 100644
 --- a/ps2xRuntime/include/runtime/ee_scheduler.h
 +++ b/ps2xRuntime/include/runtime/ee_scheduler.h
-@@ -318,6 +318,26 @@ public:
+@@ -93,6 +93,16 @@ enum class GuestInvocationKind : uint8_t
+     SifCommand,
+ };
+ 
++// G1.8g. What a service call actually did, so a driver can tell "the guest moved on" from
++// "the guest is parked and re-entering it would be a lie".
++enum class EeServiceResult : uint8_t
++{
++    RanNothing,  // nothing was dispatched; the guest is exactly where it was
++    Ran,         // at least one guest frame ran
++    Blocked,     // no thread is runnable and nothing is queued: the guest cannot progress
++    Stopped,     // a stop was requested
++};
++
+ struct GuestInvocation
+ {
+     GuestInvocationKind kind = GuestInvocationKind::Interrupt;
+@@ -318,6 +328,40 @@ public:
      void queueInvocation(GuestInvocation invocation);
      [[noreturn]] void invokeCurrent(GuestInvocation invocation);
      [[noreturn]] void invokeCurrentSequence(std::vector<GuestInvocation> invocations);
@@ -318,12 +335,26 @@ index f247ff9..fcab6e0 100644
 +    // hasInvocation() latches so every later call of that syscall silently falls through to the
 +    // builtin. Measured on GT4 as its convergence loop resetting $s2/$s3 every third iteration.
 +    //
-+    // So a non-scheduler driver calls this after catching the signal. It runs the invocation stack
-+    // (and any pending invocations) until nothing can make further progress, then copies the main
-+    // thread's context back into the runtime so the driver's own context is current again.
++    // G1.8g. Two things this must NOT do, both measured on GT4 as W8:
++    //
++    //  1. It must not resurrect a thread that just blocked. EeScheduler::sleepCurrent() correctly
++    //     marks the caller Waiting/Sleep and clears m_currentThreadId. Re-establishing the main
++    //     thread "so an invocation has somewhere to attach" -- which is what this function used
++    //     to do unconditionally -- makes sce_SleepThread a no-op: the main thread never yields, so
++    //     no other thread is ever dispatched and the guest spins in its own idle loop
++    //     (0x01000760: `beq $zero,$zero,0x01000760`). A service call SERVICES; it does not
++    //     reschedule a thread that asked to sleep.
++    //
++    //  2. It must not sleep. processPendingEvents() paces itself to the next VBlank host deadline,
++    //     which is correct in run() -- the dispatcher is the thing that models time -- and wrong
++    //     here, where a single call can burn stepBudget x one VBlank period of wall clock doing no
++    //     work. Measured: a 120 s GT4 boot reached only 44579 guest entries using 0.85 s of CPU.
++    //
 +    // stepBudget bounds it, so a guest that blocks forever cannot hang the driver.
-+    // Returns true if anything was run.
-+    bool serviceInvocations(int stepBudget = 4096);
++    EeServiceResult serviceInvocations(int stepBudget = 4096);
++    // True when some thread can make progress: one is current, one is Ready, or an invocation is
++    // queued. False means the guest is genuinely parked and a driver must not re-enter its frame.
++    [[nodiscard]] bool canDispatchGuest() const noexcept;
 +    // Undo an inline attempt that was aborted. Unused now that overrides stay deferred; retained
 +    // because it is the only correct way to restore a thread whose wait was registered by guest
 +    // code that must be re-run, and the next attempt at synchronous overrides will need it.
@@ -331,6 +362,65 @@ index f247ff9..fcab6e0 100644
      [[nodiscard]] bool hasInvocation(GuestInvocationKind kind, uint64_t tag) const;
      [[nodiscard]] uint32_t invocationStackTop();
  
+@@ -382,8 +426,11 @@ private:
+     void makeReady(GuestThread &thread, int result, bool interruptSafe);
+     void requestPreemptionIfHigher(const GuestThread &readyThread, bool interruptSafe);
+     void applyPendingPreemption();
+-    void processPendingEvents();
+-    void processDueDeadlines();
++    // G1.8g: mayWait is false for a service call. run() is the dispatcher and models time, so
++    // pacing itself to the next VBlank host deadline is correct there; a service call is invoked
++    // from inside a driver's step, and sleeping there burns wall clock without running the guest.
++    void processPendingEvents(bool mayWait = true);
++    void processDueDeadlines(bool mayWait);
+     void processEvent(const EeEvent &event);
+     void finishEventWaiters(EeEventFlag &flag, bool interruptSafe);
+     [[nodiscard]] static bool eventCondition(uint32_t current, uint32_t requested, uint32_t mode);
+diff --git a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
+index 2012083..1be0520 100644
+--- a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
++++ b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
+@@ -1,6 +1,7 @@
+ #ifndef PS2_GIF_ARBITER_H
+ #define PS2_GIF_ARBITER_H
+ 
++#include <atomic>
+ #include <cstdint>
+ #include <functional>
+ #include <vector>
+@@ -24,19 +25,32 @@ class GifArbiter
+ {
+ public:
+     using ProcessPacketFn = std::function<void(const uint8_t *, uint32_t)>;
++    // Called once per packet as it is handed to the process function. This is the ONLY place in
++    // the whole engine that can say "this GIF traffic came from PS2Memory's DMA path", because
++    // the arbiter's only feeder is PS2Memory (see PS2Memory::submitGifPacket) and a test or the
++    // triangle oracle that drives GS::processGIFPacket directly never constructs one. The GS
++    // uses it as guest provenance for the `VULCAN4 FRAME source=guest` finish-line marker.
++    using DeliveryObserverFn = std::function<void()>;
+ 
+     GifArbiter() = default;
+     explicit GifArbiter(ProcessPacketFn processFn);
+ 
+     void setProcessPacketFn(ProcessPacketFn fn) { m_processFn = std::move(fn); }
++    void setDeliveryObserver(DeliveryObserverFn fn) { m_deliveryObserver = std::move(fn); }
+ 
+     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
+ 
+     void drain();
+     bool empty() const { return m_queue.empty(); }
+ 
++    // Monotonic count of packets actually handed off in drain(). 0 means nothing has ever come
++    // through the DMA path into the GS.
++    uint64_t drainedPacketCount() const { return m_drainedPackets.load(std::memory_order_acquire); }
++
+ private:
+     ProcessPacketFn m_processFn;
++    DeliveryObserverFn m_deliveryObserver;
++    std::atomic<uint64_t> m_drainedPackets{0};
+     std::vector<GifArbiterPacket> m_queue;
+ 
+     static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);
 diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
 index ea86a9c..d4fa944 100644
 --- a/ps2xRuntime/include/runtime/ps2_memory.h
@@ -439,17 +529,18 @@ index 0000000..4636c5e
 +
 +static const unsigned kSyscallNameCount = 58;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c4..9a28445 100644
+index c5e31c4..73d418d 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-@@ -1121,6 +1121,182 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+@@ -1121,6 +1121,256 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
      throw EeDispatcherTransfer{};
  }
  
-+bool EeScheduler::serviceInvocations(int stepBudget)
++EeServiceResult EeScheduler::serviceInvocations(int stepBudget)
 +{
 +    assertExecutor();
 +    bool ranAnything = false;
++    EeServiceResult result = EeServiceResult::RanNothing;
 +
 +    // G1.8c: WHO OWNS THE BASE FRAME, decided once, because it changes the copy direction below.
 +    //
@@ -481,39 +572,81 @@ index c5e31c4..9a28445 100644
 +
 +    for (int step = 0; step < stepBudget; ++step)
 +    {
-+        processPendingEvents();
++        // G1.8g. NEVER WAIT. processPendingEvents() paces itself to the next VBlank host
++        // deadline, which is right in run() -- the dispatcher is what models time -- and wrong
++        // here, where this function is called from inside a driver's own step. Measured on GT4:
++        // a 120 s boot reached 44579 guest entries while using 0.85 s of CPU, because every one
++        // of the up-to-4096 steps below was stalling on the host clock to let a VBlank become
++        // due. Events that are already queued are still drained; the clock is simply not used
++        // as a reason to sleep.
++        processPendingEvents(/*mayWait=*/false);
 +        if (m_stopRequested.load(std::memory_order_acquire))
 +        {
++            result = EeServiceResult::Stopped;
 +            break;
 +        }
 +
 +        if (m_currentThreadId == 0)
 +        {
-+            // The signal usually arrives with the running thread still current, but a block inside
-+            // the guest will have cleared it. Re-establish the main thread so an invocation has
-+            // somewhere to attach.
-+            if (GuestThread *main = thread(kMainThreadId))
++            // G1.8g, and this is the wall. The signal usually arrives with the running thread
++            // still current, but a BLOCK inside the guest clears m_currentThreadId, and the two
++            // cases are opposites:
++            //
++            //   - an override/interrupt queued an invocation and the thread is still Ready or
++            //     Running. Re-establishing the main thread is right: the invocation needs an
++            //     owner, and the guest's own frame is it.
++            //
++            //   - the thread called sce_SleepThread (or waited on a semaphore/event/vsync).
++            //     It is Waiting, and putting it back on the run queue makes the sleep a no-op:
++            //     the main thread never yields, no other thread is ever dispatched, and the
++            //     guest spins in its own idle loop. That is W8, measured as 44579 guest
++            //     entries against 119 syscalls and 469 MMIO accesses.
++            //
++            // So the only way the main thread is re-established here is if it is genuinely
++            // runnable. A parked thread is left parked, its wait intact, and whatever else is
++            // runnable gets the CPU instead.
++            GuestThread *next = selectReady();
++            if (next)
++            {
++                makeRunning(*next);
++            }
++            else if (GuestThread *main = thread(kMainThreadId))
 +            {
 +                if (main->status == EeThreadStatus::Ready)
 +                {
 +                    removeReady(*main);
++                    makeRunning(*main);
 +                }
-+                main->wait = {};
-+                if (main->status == EeThreadStatus::Ready || main->invocations.empty())
++                else if (!m_pendingInvocations.empty() && main->invocations.empty())
 +                {
++                    // Nothing else can run, but the guest queued an invocation. It needs an
++                    // owner and the main frame is the only one there is. This is a scheduling
++                    // necessity, not a wake: the thread still runs, and the invocation is what
++                    // it is running for.
 +                    main->status = EeThreadStatus::Ready;
 +                    makeRunning(*main);
 +                }
 +            }
 +            if (m_currentThreadId == 0)
 +            {
-+                break; // nothing is current and nothing can be made current
++                // Nothing is current and nothing can be made current. Say so, rather than
++                // leaving the caller to re-enter a parked frame and call it progress.
++                if (m_stopRequested.load(std::memory_order_acquire))
++                {
++                    result = EeServiceResult::Stopped;
++                }
++                else
++                {
++                    result = ranAnything ? EeServiceResult::Ran : EeServiceResult::Blocked;
++                }
++                break;
 +            }
 +        }
 +
 +        GuestThread *running = currentThread();
 +        if (running == nullptr)
 +        {
++            result = ranAnything ? EeServiceResult::Ran : EeServiceResult::Blocked;
 +            break;
 +        }
 +
@@ -538,6 +671,7 @@ index c5e31c4..9a28445 100644
 +            if (running->invocations.empty())
 +            {
 +                // The base frame is finished; there is no invocation to complete.
++                result = ranAnything ? EeServiceResult::Ran : EeServiceResult::RanNothing;
 +                break;
 +            }
 +            GuestInvocation completed = std::move(running->invocations.back());
@@ -559,6 +693,7 @@ index c5e31c4..9a28445 100644
 +                // exercise. Safe to publish unconditionally: the entry refresh above guaranteed this
 +                // frame is current whether run() or an external driver is driving.
 +                copyMainContextToRuntime();
++                result = EeServiceResult::Ran;
 +                break;
 +            }
 +            continue;
@@ -575,6 +710,7 @@ index c5e31c4..9a28445 100644
 +                                            PS2Runtime::GuestBranchKind::DirectJump,
 +                                            "EE invocation service");
 +            copyMainContextToRuntime();
++            result = EeServiceResult::Ran;
 +            break;
 +        }
 +
@@ -595,7 +731,35 @@ index c5e31c4..9a28445 100644
 +
 +    copyMainContextToRuntime();
 +    publishSnapshot();
-+    return ranAnything;
++    if (result == EeServiceResult::RanNothing)
++    {
++        result = ranAnything ? EeServiceResult::Ran : EeServiceResult::Blocked;
++    }
++    return result;
++}
++
++bool EeScheduler::canDispatchGuest() const noexcept
++{
++    if (m_stopRequested.load(std::memory_order_acquire))
++    {
++        return false;
++    }
++    if (m_currentThreadId != 0)
++    {
++        return true;
++    }
++    if (!m_pendingInvocations.empty())
++    {
++        return true;
++    }
++    for (const auto &queue : m_readyQueues)
++    {
++        if (!queue.empty())
++        {
++            return true;
++        }
++    }
++    return false;
 +}
 +
 +void EeScheduler::rollbackAbortedInlineInvocation(int threadId)
@@ -625,6 +789,98 @@ index c5e31c4..9a28445 100644
  [[noreturn]] void EeScheduler::invokeCurrentSequence(std::vector<GuestInvocation> invocations)
  {
      assertExecutor();
+@@ -1456,23 +1706,49 @@ uint8_t *EeScheduler::rdram() const noexcept
+ 
+ void EeScheduler::bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram)
+ {
+-    if (m_executorThread == std::thread::id{})
++    // G1.8g. This used to test `m_executorThread == std::thread::id{}` to mean "nobody has set the
++    // scheduler up yet, so do it now". That is true for a driver that never calls run() --
++    // tools/harness/vulcan4_harness.cpp is exactly that, and so is every direct-syscall test --
++    // and it stays true for the WHOLE SESSION, because m_executorThread is only assigned inside
++    // run(). So the branch was taken again on every syscall, and each one called reset() again:
++    // every thread, semaphore, event flag, alarm and queued event the guest had created was
++    // destroyed, the main thread record was rebuilt as Ready, and then sleepCurrent() parked it
++    // again. Measured on GT4: sce_SleepThread calls=11 with sce_CreateThread calls=1 and
++    // sce_CreateSema calls=7 in the same run -- the guest's kernel objects did not survive its
++    // own sleeps, and the "sleep" ended in a freshly Ready main thread every time.
++    //
++    // The correct "not set up yet" test is whether there ARE any threads, which reset() makes
++    // non-empty and nothing ever empties again.
++    if (m_threads.empty())
+     {
+         reset(rdram, ctx);
+         GuestThread *main = selectReady();
+         assert(main != nullptr);
+-        makeRunning(*main);
++        if (main != nullptr)
++        {
++            makeRunning(*main);
++        }
+         return;
+     }
+-    assertExecutor();
++    if (m_executorThread != std::thread::id{})
++    {
++        assertExecutor();
++    }
+     m_rdram = rdram;
+     if (m_currentThreadId == 0)
+     {
+-        GuestThread *main = thread(kMainThreadId);
+-        assert(main != nullptr);
+-        assert(main->status == EeThreadStatus::Ready);
+-        removeReady(*main);
+-        makeRunning(*main);
++        // Only a genuinely runnable main thread may be re-established. One that is parked --
++        // Waiting on a sleep, a semaphore, an event flag or a vsync -- stays parked, or the wait
++        // it asked for is void. A driver that reaches here anyway has already lost the plot and
++        // the guest_blocked report in tools/harness/vulcan4_harness.cpp will say so.
++        if (GuestThread *main = thread(kMainThreadId))
++        {
++            if (main->status == EeThreadStatus::Ready)
++            {
++                removeReady(*main);
++                makeRunning(*main);
++            }
++        }
+     }
+ }
+ 
+@@ -1740,10 +2016,10 @@ void EeScheduler::applyPendingPreemption()
+     m_timeSliceExpired = false;
+ }
+ 
+-void EeScheduler::processPendingEvents()
++void EeScheduler::processPendingEvents(bool mayWait)
+ {
+     assertExecutor();
+-    processDueDeadlines();
++    processDueDeadlines(mayWait);
+     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
+     m_pendingEeTimerInterrupts = 0u;
+     for (uint32_t timer = 0u; timer < 4u; ++timer)
+@@ -1773,7 +2049,7 @@ void EeScheduler::processPendingEvents()
+     applyPendingPreemption();
+ }
+ 
+-void EeScheduler::processDueDeadlines()
++void EeScheduler::processDueDeadlines(bool mayWait)
+ {
+     for (;;)
+     {
+@@ -1798,7 +2074,10 @@ void EeScheduler::processDueDeadlines()
+                 return;
+             }
+ 
+-            if (now < pacingDeadline)
++            // G1.8g: mayWait false means "do not sleep". Everything else about this loop is
++            // identical, so a service call still drains whatever is genuinely due -- it just
++            // does not stall the driver's step on the host clock to make more become due.
++            if (mayWait && now < pacingDeadline)
+             {
+                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
+                                      { return !m_events.empty() ||
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
 index 9614016..70ae1ed 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
@@ -840,6 +1096,22 @@ index 9614016..70ae1ed 100644
      }
  
      // QueryBootMode (stub): return 0 for now
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index c289ba0..6eda301 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -56,6 +56,11 @@ void GifArbiter::drain()
+         auto &pkt = m_queue[i];
+         if (!pkt.data.empty())
+         {
++            // Counted BEFORE the handoff so a GS that re-enters present() from inside its
++            // process function still sees the packet as already-delivered guest traffic.
++            m_drainedPackets.fetch_add(1, std::memory_order_acq_rel);
++            if (m_deliveryObserver)
++                m_deliveryObserver();
+             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+         }
+     }
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
 index 37b6a4d..43165bf 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp
@@ -1052,18 +1324,19 @@ index 45cb9d2..21292a8 100644
      {
          m_eeSyscallMirrorAddresses.erase(guestAddress);
 diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
-index 5db04b9..462b34c 100644
+index 5db04b9..d9eeed1 100644
 --- a/ps2xTest/CMakeLists.txt
 +++ b/ps2xTest/CMakeLists.txt
-@@ -27,6 +27,7 @@ add_library(ps2_test_lib STATIC
+@@ -27,6 +27,8 @@ add_library(ps2_test_lib STATIC
      src/pad_input_tests.cpp
      src/ps2_runtime_io_tests.cpp
      src/ps2_runtime_kernel_tests.cpp
 +    src/ps2_runtime_progress_tests.cpp
++    src/ps2_thread_block_tests.cpp
      src/ps2_runtime_interrupt_tests.cpp
      src/ps2_memory_tests.cpp
      src/ps2_vu1_tests.cpp
-@@ -35,6 +36,7 @@ add_library(ps2_test_lib STATIC
+@@ -35,6 +37,7 @@ add_library(ps2_test_lib STATIC
      src/ps2_iop_tests.cpp
      src/ps2_sif_rpc_tests.cpp
      src/ps2_sif_dma_tests.cpp
@@ -1072,18 +1345,19 @@ index 5db04b9..462b34c 100644
      src/ps2_runtime_expansion_tests.cpp
  )
 diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
-index 40a68b1..10e279e 100644
+index 40a68b1..f5b86de 100644
 --- a/ps2xTest/src/main.cpp
 +++ b/ps2xTest/src/main.cpp
-@@ -8,6 +8,7 @@ void register_elf_analyzer_tests();
+@@ -8,6 +8,8 @@ void register_elf_analyzer_tests();
  void register_pad_input_tests();
  void register_ps2_runtime_io_tests();
  void register_ps2_runtime_kernel_tests();
 +void register_ps2_runtime_progress_tests();
++void register_ps2_thread_block_tests();
  void register_ps2_runtime_interrupt_tests();
  void register_ps2_memory_tests();
  void register_ps2_vu1_tests();
-@@ -17,6 +18,7 @@ void register_ps2_iop_tests();
+@@ -17,6 +19,7 @@ void register_ps2_iop_tests();
  void register_ps2_sif_rpc_tests();
  void register_ps2_sif_dma_tests();
  void register_ps2_recompiler_tests();
@@ -1091,15 +1365,16 @@ index 40a68b1..10e279e 100644
  void register_ps2_runtime_expansion_tests();
  void reset_ps2_test_function_table();
  
-@@ -30,6 +32,7 @@ int main()
+@@ -30,6 +33,8 @@ int main()
      register_pad_input_tests();
      register_ps2_runtime_io_tests();
      register_ps2_runtime_kernel_tests();
 +    register_ps2_runtime_progress_tests();
++    register_ps2_thread_block_tests();
      register_ps2_runtime_interrupt_tests();
      register_ps2_memory_tests();
      register_ps2_vu1_tests();
-@@ -39,6 +42,7 @@ int main()
+@@ -39,6 +44,7 @@ int main()
      register_ps2_sif_rpc_tests();
      register_ps2_sif_dma_tests();
      register_ps2_recompiler_tests();
@@ -1260,10 +1535,22 @@ index 0000000..2e7885c
 +    });
 +}
 diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
-index 0458a8c..ae47f7c 100644
+index 0458a8c..65940b8 100644
 --- a/ps2xTest/src/ps2_gs_tests.cpp
 +++ b/ps2xTest/src/ps2_gs_tests.cpp
-@@ -414,6 +414,77 @@ void register_ps2_gs_tests()
+@@ -399,6 +399,11 @@ namespace
+         gs.writeRegister(GS_REG_ZBUF_1, zbuf);
+         gs.writeRegister(GS_REG_SCISSOR_1, 0ull);
+         gs.writeRegister(GS_REG_TEST_1, testReg);
++        // ZBUF_1 was configured above, once, from `zmask`. A second write here of
++        // `(1ull << 32)` -- ZMSK=1 -- overwrote it for EVERY case, so depth writes were
++        // masked off unconditionally: every "depth should update" assertion read back the
++        // initial depth and failed, while every "depth should be preserved" assertion passed
++        // for the wrong reason. Three assertions were red because of this one statement.
+         gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_POINT));
+         gs.writeRegister(GS_REG_RGBAQ, rgbaq);
+         gs.writeRegister(GS_REG_XYZ2, static_cast<uint64_t>(kSourceDepth) << 32);
+@@ -414,6 +419,77 @@ void register_ps2_gs_tests()
  {
      MiniTest::Case("PS2GS", [](TestCase &tc)
      {
@@ -1341,7 +1628,86 @@ index 0458a8c..ae47f7c 100644
          tc.Run("GS CSR/IMR support coherent 64-bit and 32-bit access", [](TestCase &t)
          {
              PS2Memory mem;
-@@ -4617,5 +4688,104 @@ void register_ps2_gs_tests()
+@@ -2091,6 +2167,78 @@ void register_ps2_gs_tests()
+             t.IsTrue(imageOk, "NREG=0 REGLIST should consume 16 data words and keep following tag aligned");
+         });
+ 
++        // G2.6 MAP TRUTH (supersedes the refuted "0x70000000 is the GS window" claim).
++        //
++        // A guest write to 0x70000070/0x70000080 does NOT belong to the GS, and this test used to
++        // assert that it did. That was wrong, and the disc says so. Measured against the ELF the
++        // guest actually runs (/mnt/ssd/gt4/work/SCUS_973.28, ET_EXEC MIPS32 LE, 3 LOAD segments,
++        // text vaddr 0x00100000 at file offset 0x1000):
++        //
++        //   * 21 `lui $r, 0x1200` instructions. Following the pointer arithmetic they address
++        //     SMODE1 0x10, SMODE2 0x20, SRFSH 0x30, SYNCH1 0x40, SYNCH2 0x50, SYNCV 0x60,
++        //     DISPFB1 0x70, DISPLAY1 0x80, DISPFB2 0x90, DISPLAY2 0xA0, EXTBUF 0xB0,
++        //     EXTDATA 0xC0, BGCOLOR 0xE0, CSR 0x1000, IMR 0x1010, BUSDIR 0x1040 -- i.e. the
++        //     ps2SDK gs_privileged.h table, exactly, all 16 of the 18 entries GT4 touches.
++        //   * guest 0x00100a444 is `ori $v0,$v0,0x1000` / `sd $v1,0($v0)` / `lui $a0,0x1200` /
++        //     `ori $a0,$a0,0x1000` / `ld $v0,0($a0)` / `dsrl $v0,$v0,0x10` / `sb $v0,0x98($s2)`
++        //     -- a hardware-revision probe that only lands on CSR at 0x12001000. At 0x00100a468
++        //     the same idiom does `lui $at,0x1200` + `sd $v1,0x10($at)` = IMR at 0x12001010.
++        //   * 63 `lui $r, 0x7000` instructions, and the offsets used off those registers are a
++        //     DMA working struct: word fields at +0x110/+0x114/+0x118, byte fields at +0x99,
++        //     halfwords at +0x94/+0x96. That is the scratchpad, not the GS.
++        //
++        // So PS2_GS_BASE = 0x12000000 with CSR at +0x1000 is CORRECT, and
++        // PS2_SCRATCHPAD_BASE = 0x70000000 / 16KB is CORRECT. The old test would have broken the
++        // GS path AND the guest's scratchpad. This one pins the truth instead.
++        tc.Run("guest MMIO at the GS base 0x12000000 reaches GSRegisters at the ps2SDK offsets", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++
++            // The two registers GT4's own video init writes (lui 0x1200 + ori 0x70 / ori 0x80).
++            const uint64_t dispfb = 0x0000C0E40123ull;  // FBP=0x123, FBW=12, PSM=0, offsets 0
++            const uint64_t display = 0x002B60100AB0ull; // MAGH=3, DW=0x160 (352), DH=0xB0 (176)
++
++            mem.write64(0x12000070u, dispfb);
++            mem.write64(0x12000080u, display);
++
++            t.Equals(mem.gs().dispfb1, dispfb,
++                     "a guest write64 to 0x12000070 (DISPFB1) should land in gs.dispfb1");
++            t.Equals(mem.gs().display1, display,
++                     "a guest write64 to 0x12000080 (DISPLAY1) should land in gs.display1");
++
++            // The revision probe's read: `ld $v0,0($a0)` with $a0 = 0x12001000 must read CSR, and
++            // must not be swallowed by the scratchpad or by rdram.
++            mem.write64(0x12001000u, 0x000000007EAD0000ull);
++            t.Equals(static_cast<uint32_t>(mem.read32(0x12001000u) & 0xFF000000u), 0x7E000000u,
++                     "guest 32-bit read of CSR at 0x12001000 should return the low dword");
++            t.Equals(static_cast<uint32_t>((mem.read64(0x12001000u) >> 16) & 0xFFu), 0xADu,
++                     "the dsrl v0,v0,16 revision byte should read 0xAD from CSR");
++        });
++
++        tc.Run("the scratchpad at 0x70000000 keeps the guest DMA working struct, not the GS", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++
++            // The claim being pinned: 0x7000xxxx is the scratchpad, so a guest DMA channel's
++            // +0x118 word counter lives there. Writing 0x70002118 must NOT disturb any GS
++            // register, and the byte/halfword/word fields must all round-trip.
++            const uint64_t before = mem.gs().dispfb1;
++            mem.write32(0x70002118u, 0x00BEEF01u);
++            t.Equals(mem.read32(0x70002118u), 0x00BEEF01u, "scratchpad +0x118 word counter should round-trip");
++            mem.write8(0x70002099u, 0x7Cu);
++            t.Equals(static_cast<uint32_t>(mem.read8(0x70002099u)), 0x7Cu, "scratchpad +0x99 byte field should round-trip");
++            mem.write16(0x70002094u, 0x0F0Du);
++            t.Equals(static_cast<uint32_t>(mem.read16(0x70002094u)), 0x0F0Du, "scratchpad +0x94 halfword field should round-trip");
++
++            // The 16KB window ends where the ps2SDK/EE map says it does: 0x70004000 is past it.
++            t.IsTrue(mem.read32(0x70004000u) == 0u,
++                     "0x70004000 is outside the 16KB scratchpad window and should not read back our data");
++            t.Equals(mem.gs().dispfb1, before,
++                     "scratchpad traffic must never land in GSRegisters");
++        });
++
+         tc.Run("GS SIGNAL and FINISH set CSR bits that clear by CSR write-one acknowledge", [](TestCase &t)
+         {
+             PS2Memory mem;
+@@ -4617,5 +4765,105 @@ void register_ps2_gs_tests()
              t.IsTrue(pattern2Ok,
                       "second T4HL transfer to a different DBP should be byte-correct, proving the discarded excess bytes from the first transfer did not leak into subsequent transfer state");
          });
@@ -1442,6 +1808,7 @@ index 0458a8c..ae47f7c 100644
 +            // is a further reason a triangle does not land that is NOT the primitive type and
 +            // NOT the vertex queue. Both are now healthy; that is the next thing to chase.
 +        });
++
 +
      });
 +
@@ -1678,10 +2045,10 @@ index 4772f3f..b7031a4 100644
          {
              PS2Runtime runtime;
 diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
-index 63b12d9..8571eb4 100644
+index 63b12d9..8140cd4 100644
 --- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
 +++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
-@@ -543,6 +543,204 @@ namespace
+@@ -543,6 +543,210 @@ namespace
              std::memset(&ctx, 0, sizeof(ctx));
          }
      };
@@ -1865,6 +2232,12 @@ index 63b12d9..8571eb4 100644
 +            {
 +                return true;
 +            }
++            // G1.8g NOTE, and do not "fix" this by adding a canDispatchGuest() gate: the tests
++            // that use this fixture never call EeScheduler::reset(), so the scheduler has no
++            // threads at all and canDispatchGuest() is correctly false. Adding the gate here
++            // fails G1.8b and G1.8c for a reason that has nothing to do with either of them.
++            // The gate belongs to a driver that HAS initialised the scheduler, and it is
++            // asserted in ps2_thread_block_tests.cpp and in tools/harness/vulcan4_harness.cpp.
 +            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(ctx.pc);
 +            if (fn == nullptr)
 +            {
@@ -1886,7 +2259,7 @@ index 63b12d9..8571eb4 100644
  }
  
  void register_ps2_runtime_kernel_tests()
-@@ -1187,9 +1385,14 @@ void register_ps2_runtime_kernel_tests()
+@@ -1187,9 +1391,14 @@ void register_ps2_runtime_kernel_tests()
  
              t.IsTrue(callSyscall(0x83u, env.rdram.data(), &env.ctx, &env.runtime),
                       "syscall 0x83 should dispatch");
@@ -1903,7 +2276,7 @@ index 63b12d9..8571eb4 100644
          });
  
          tc.Run("numeric syscall 0x83 supports KSEG aliases", [](TestCase &t)
-@@ -1231,9 +1434,19 @@ void register_ps2_runtime_kernel_tests()
+@@ -1231,9 +1440,19 @@ void register_ps2_runtime_kernel_tests()
  
              t.IsTrue(callSyscall(0x83u, env.rdram.data(), &env.ctx, &env.runtime),
                       "syscall 0x83 should dispatch");
@@ -1925,7 +2298,7 @@ index 63b12d9..8571eb4 100644
          });
  
          tc.Run("SetSyscall mirrors guest kernel table entries into low memory", [](TestCase &t)
-@@ -1465,7 +1678,7 @@ void register_ps2_runtime_kernel_tests()
+@@ -1465,7 +1684,7 @@ void register_ps2_runtime_kernel_tests()
              env.runtime.eeScheduler().run();
  
              t.Equals(static_cast<uint32_t>(getRegS32(gOverrideResult, 2)),
@@ -1934,7 +2307,7 @@ index 63b12d9..8571eb4 100644
                       "only the recursive call should bypass the active override frame and reach the builtin");
          });
  
-@@ -1494,6 +1707,254 @@ void register_ps2_runtime_kernel_tests()
+@@ -1494,6 +1713,254 @@ void register_ps2_runtime_kernel_tests()
                       "the invocation result should reach the preserved base context after the wait");
          });
  
@@ -2367,5 +2740,434 @@ index 0000000..b08dd30
 +                 "hundreds of times while converging, so a detector that calls that a "
 +                 "hang ends the boot inside the game's normal work.");
 +    });
++    });
++}
+diff --git a/ps2xTest/src/ps2_thread_block_tests.cpp b/ps2xTest/src/ps2_thread_block_tests.cpp
+new file mode 100644
+index 0000000..87a02d4
+--- /dev/null
++++ b/ps2xTest/src/ps2_thread_block_tests.cpp
+@@ -0,0 +1,423 @@
++#include "MiniTest.h"
++#include "ps2_runtime.h"
++#include "ps2_runtime_macros.h"
++#include "ps2_syscalls.h"
++#include "runtime/ee_scheduler.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdint>
++#include <cstring>
++#include <sstream>
++#include <string>
++#include <thread>
++#include <vector>
++
++// ---------------------------------------------------------------------------
++// G1.8g / W8 -- sce_SleepThread must BLOCK the calling cooperative thread.
++//
++// W8 is the first wall in this project that is a real guest-semantics bug rather than a
++// measurement artefact. Measured on GT4 (2026-09-30, 120 s boot under Xvfb, no BIOS):
++//
++//     functions_entered=44579  halt=guest_cycle_no_progress  distinct_pcs=112
++//     dispatcher_transfers=15 serviced_invocations=15
++//     total_syscall_calls=119 total_mmio_accesses=469
++//     0x32 sce_SleepThread calls=11 last_pc=0x0101f348
++//
++// 119 syscalls and 469 hardware accesses, and then the guest enters the same ~112 functions
++// for the rest of the run. Decoded from SCUS_973.28, the code it stands in is a bare idle
++// loop at guest 0x01000760:
++//
++//     0x01000760: 0000282d  move $t0, $zero
++//     0x01000764: 0c409fa6  jal  0x010027F0        ; ra = 0x01000768
++//     0x01000768: 0000302d  move $s0, $zero
++//     0x0100076c: 0440fffc  beq  $zero, $zero, 0x01000760
++//
++// so the main thread calls sce_SleepThread, the call RETURNS, and the thread is straight
++// back in its own idle loop with nothing else scheduled. On a real console the sleep parks
++// the thread and the scheduler runs somebody else; here the "return" is immediate, so the
++// main thread never yields and no other thread ever gets the CPU.
++//
++// MECHANISM, by code reading and then pinned by test. EeScheduler::sleepCurrent() does the
++// right thing: blockCurrent() marks the thread Waiting/Sleep, clears m_currentThreadId and
++// throws EeDispatcherTransfer. The un-blocking is downstream of it, in
++// EeScheduler::serviceInvocations() -- the function a NON-scheduler driver (which is exactly
++// what tools/harness/vulcan4_harness.cpp is) calls after catching the signal:
++//
++//     if (m_currentThreadId == 0) {
++//         if (GuestThread *main = thread(kMainThreadId)) {
++//             if (main->status == EeThreadStatus::Ready) removeReady(*main);
++//             main->wait = {};                        // <-- wipes the Sleep
++//             if (main->status == Ready || main->invocations.empty()) {
++//                 main->status = EeThreadStatus::Ready;
++//                 makeRunning(*main);                // <-- re-runs the thread that just asked to sleep
++//             }
++//         }
++//
++// main->invocations.empty() is true for every plain syscall, so the condition is always
++// true and the thread that called sce_SleepThread is made Running again in the very same
++// call. sce_SleepThread does not sleep. It is a no-op with bookkeeping.
++//
++// WHY THESE TESTS ARE SHAPED THE WAY THEY ARE. The obvious test -- "functions_entered goes
++// up", or "the boot takes longer" -- is the same class of mistake as the W7 detector: it
++// asserts a number instead of a behaviour, and it would have passed while the boot was
++// broken. Every assertion below is on THREAD STATE or on the ORDER frames ran in, which is
++// what "blocked" means:
++//
++//   1. a thread inside sce_SleepThread is Waiting/Sleep, and stays that way across the
++//      driver step that serviced its transfer;
++//   2. the post-sleep code does not run while the thread is asleep;
++//   3. a driver that is not EeScheduler::run() produces the SAME frame order run() does --
++//      which forces the runnable set to change, i.e. some OTHER thread gets to run;
++//   4. a woken thread resumes at the PC it published before it slept.
++// ---------------------------------------------------------------------------
++
++namespace
++{
++    constexpr uint32_t K_SLEEP_SYSCALL = 0x32u; // sce_SleepThread
++
++    constexpr uint32_t K_MAIN = 0x301200u;
++    constexpr uint32_t K_MAIN_RESUME = 0x301208u;
++    constexpr uint32_t K_WORKER = 0x301210u;
++
++    constexpr int TRACE_WORKER = 3;
++    constexpr int TRACE_MAIN_AFTER_SLEEP = 2;
++
++    std::vector<int> gTrace;
++    std::vector<int> *gTraceSink = nullptr;
++    int gWakeTarget = 0;
++    // Set when the fixture could not put a second runnable thread on the EE at all. Without it a
++    // fixture that failed to arm fails the assertions below with a message about sleeps, which
++    // sends the next reader after the wrong bug entirely.
++    bool gArmFailed = false;
++
++    void trace(int id)
++    {
++        (gTraceSink ? *gTraceSink : gTrace).push_back(id);
++    }
++
++    std::string joined(const std::vector<int> &ids)
++    {
++        std::ostringstream out;
++        out << "{";
++        for (std::size_t i = 0; i < ids.size(); ++i)
++        {
++            out << (i == 0 ? "" : " ") << ids[i];
++        }
++        out << "}";
++        return out.str();
++    }
++
++    const EeThreadSnapshot *findThread(const EeKernelSnapshot &snap, int id)
++    {
++        for (const EeThreadSnapshot &thread : snap.threads)
++        {
++            if (thread.id == id)
++            {
++                return &thread;
++            }
++        }
++        return nullptr;
++    }
++
++    // The main thread's first act: publish where it must be re-entered, then sleep.
++    // Everything after the sleep lives in K_MAIN_RESUME, so if the sleep blocks that code
++    // cannot run, and if it does not, it runs immediately. One trace entry separates them.
++    void mainSleeps(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        ctx->pc = K_MAIN_RESUME;
++        runtime->handleSyscall(rdram, ctx, K_SLEEP_SYSCALL);
++        // Unreachable in a correct run. Getting past the call at all means sce_SleepThread
++        // RETURNED instead of blocking, which is the whole wall.
++        trace(-1);
++    }
++
++    void mainAfterSleep(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        trace(TRACE_MAIN_AFTER_SLEEP);
++        ctx->pc = 0u;
++        // End the run deterministically once the real work is done. postEvent (not
++        // requestStop) because requestStop would also stop a serviceInvocations() driver
++        // before it could run this frame, and the point of test 3 is that both dispatchers
++        // run the same frames.
++        runtime->eeScheduler().postEvent(EeEvent{EeEventType::Stop, 0u, 0u});
++    }
++
++    // The other thread. On a real console this is the frame that runs while the main thread
++    // is asleep. It wakes the sleeper and then finishes.
++    void workerRuns(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        trace(TRACE_WORKER);
++        if (gWakeTarget != 0)
++        {
++            runtime->eeScheduler().wakeupThread(gWakeTarget, false);
++            gWakeTarget = 0;
++        }
++        ctx->pc = 0u;
++    }
++
++    struct BlockEnv
++    {
++        std::vector<uint8_t> rdram;
++        PS2Runtime runtime;
++
++        BlockEnv() : rdram(PS2_RAM_SIZE, 0) {}
++
++        void arm()
++        {
++            gTrace.clear();
++            gWakeTarget = 0;
++            gArmFailed = false;
++            runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
++            runtime.registerFunction(K_MAIN, mainSleeps);
++            runtime.registerFunction(K_MAIN_RESUME, mainAfterSleep);
++            runtime.registerFunction(K_WORKER, workerRuns);
++            // The main frame IS PS2Runtime::m_cpuContext, exactly as tools/harness/
++            // vulcan4_harness.cpp sets it up (harness line: R5900Context &ctx = runtime.cpu()).
++            // A driver that advances a private copy is a different bug, and one this test
++            // must not accidentally model.
++            runtime.cpu().pc = K_MAIN;
++            runtime.eeScheduler().reset(rdram.data(), runtime.cpu());
++        }
++
++        // Priority 1, not 0. EeScheduler::createThread rejects anything below 1, because 0 is
++        // the main thread's priority and a second thread at the same priority is not a thing
++        // the PS2 ABI has. 1 is also the LOWEST legal priority, so the worker does not request
++        // preemption of the main thread and the frame order below is not perturbed by a
++        // scheduling decision that has nothing to do with what is under test.
++        void addWorker()
++        {
++            const int worker = runtime.eeScheduler().createThread(
++                EeThreadCreateParams{0u, K_WORKER, 0x20000u, 0x800u, 0u, 1, 0u});
++            const int started = runtime.eeScheduler().startThread(worker, 0u, runtime.cpu(), false);
++            if (started != 0 || worker <= EeScheduler::kMainThreadId)
++            {
++                gArmFailed = true;
++            }
++        }
++
++        EeKernelSnapshot snapshot() const
++        {
++            return runtime.eeScheduler().snapshot();
++        }
++    };
++
++    // The shape tools/harness/vulcan4_harness.cpp uses: the driver owns the loop, catches
++    // EeDispatcherTransfer itself, and services what the guest queued.
++    //
++    // The canDispatchGuest() gate is part of the shape, not an extra. It is how a driver that is
++    // not EeScheduler::run() learns that the frame it is holding belongs to a parked thread --
++    // EeScheduler::canDispatchGuest() is the runtime's answer, so every driver gets the same one
++    // instead of each re-deriving the rule. A driver that omits it re-enters a sleeping frame, and
++    // the test below is what catches that.
++    void driveLikeTheHarness(BlockEnv &env, int stepBudget)
++    {
++        for (int step = 0; step < stepBudget; ++step)
++        {
++            R5900Context &ctx = env.runtime.cpu();
++            if (ctx.pc == 0u || env.runtime.isStopRequested())
++            {
++                return;
++            }
++            if (!env.runtime.eeScheduler().canDispatchGuest())
++            {
++                // Parked, with nothing else runnable. A real driver stops here and says so.
++                env.runtime.eeScheduler().postEvent(EeEvent{EeEventType::Stop, 0u, 0u});
++                return;
++            }
++            PS2Runtime::RecompiledFunction fn = env.runtime.lookupFunction(ctx.pc);
++            if (fn == nullptr)
++            {
++                return;
++            }
++            try
++            {
++                fn(env.rdram.data(), &ctx, &env.runtime);
++            }
++            catch (const EeDispatcherTransfer &)
++            {
++                env.runtime.eeScheduler().serviceInvocations();
++            }
++        }
++    }
++}
++
++void register_ps2_thread_block_tests()
++{
++    MiniTest::Case("PS2ThreadBlock", [](TestCase &tc)
++    {
++        tc.Run("G1.8g: a thread inside sce_SleepThread is Waiting/Sleep, not Ready", [](TestCase &t)
++        {
++            // The floor under everything else: sce_SleepThread has to leave the thread in a
++            // state the scheduler will not pick. If it leaves it Ready, no amount of work
++            // downstream in the driver can make the guest yield.
++            BlockEnv env;
++            env.arm();
++
++            R5900Context &ctx = env.runtime.cpu();
++            PS2Runtime::RecompiledFunction fn = env.runtime.lookupFunction(K_MAIN);
++            bool threw = false;
++            try
++            {
++                fn(env.rdram.data(), &ctx, &env.runtime);
++            }
++            catch (const EeDispatcherTransfer &)
++            {
++                threw = true;
++            }
++
++            t.IsTrue(threw, "sce_SleepThread must hand control back to the dispatcher, not return");
++
++            const EeThreadSnapshot *main = findThread(env.snapshot(), EeScheduler::kMainThreadId);
++            t.IsTrue(main != nullptr, "the main thread must be visible in the snapshot");
++            if (main == nullptr)
++            {
++                return;
++            }
++            t.IsTrue(main->status == EeThreadStatus::Waiting,
++                     "MECHANISM: after sce_SleepThread the calling thread must be Waiting. Ready "
++                     "means the scheduler may dispatch it again immediately, which is a sleep "
++                     "that does not sleep.");
++            t.IsTrue(main->waitReason == EeWaitReason::Sleep,
++                     "the wait must be recorded as a Sleep, so a later wakeupThread knows what it "
++                     "is releasing");
++        });
++
++        tc.Run("G1.8g: a driver servicing the transfer must not re-enter the sleeping thread",
++               [](TestCase &t)
++        {
++            // Exactly what the harness does after catching the signal, and the shape that
++            // made sce_SleepThread a no-op. serviceInvocations() is the only thing between
++            // blockCurrent() and the thread running again, so this is where it has to stop.
++            BlockEnv env;
++            env.arm();
++
++            driveLikeTheHarness(env, 64);
++
++            const EeThreadSnapshot *main = findThread(env.snapshot(), EeScheduler::kMainThreadId);
++            const bool ranAfterSleep =
++                std::find(gTrace.begin(), gTrace.end(), TRACE_MAIN_AFTER_SLEEP) != gTrace.end();
++
++            t.IsTrue(!ranAfterSleep,
++                     "MECHANISM: the code after sce_SleepThread must not run while the thread is "
++                     "asleep. A driver that services the transfer and then re-enters the same "
++                     "frame has turned the sleep into a no-op and the main thread never yields -- "
++                     "which is W8, measured as 44579 guest entries against 119 syscalls");
++            t.IsTrue(!std::count(gTrace.begin(), gTrace.end(), -1),
++                     "the sce_SleepThread call must never RETURN to its caller. Getting past the "
++                     "call at all is the bug, not a detail of it.");
++            t.IsTrue(main != nullptr && main->status == EeThreadStatus::Waiting,
++                     "the sleeping thread must still be Waiting after the driver serviced its "
++                     "transfer; Ready here means it was resurrected");
++        });
++
++        tc.Run("G1.8g: with the main thread asleep, a driver runs the OTHER thread and then the woken one",
++               [](TestCase &t)
++        {
++            // The strongest form of the contract, and the one that cannot be satisfied by
++            // tweaking a counter. Same guest program, two dispatchers, one expected order:
++            //
++            //   main sleeps  ->  worker runs  ->  worker wakes main  ->  main resumes
++            //
++            // For that to happen the runnable set has to change, so a thread OTHER than the
++            // one that called sce_SleepThread must get the CPU. If the sleeping thread is
++            // simply re-run, the worker is never dispatched and the order collapses.
++            //
++            // Why this does not compare against EeScheduler::run() directly: run() is the
++            // console's dispatcher and is DESIGNED never to return, so calling it here either
++            // hangs the suite or needs a detached thread whose runtime would then be destroyed
++            // underneath it. That is not a test, it is a coin toss. What the driver must be
++            // held to is stated behaviourally instead, and the scheduler's own tests already
++            // cover run()'s order directly.
++            //
++            // While the main thread is asleep and the worker is Ready, the runtime must say
++            // "you may dispatch" -- and the only frame it may dispatch is the worker's.
++            BlockEnv viaDriver;
++            viaDriver.arm();
++            viaDriver.addWorker();
++            t.IsTrue(!gArmFailed,
++                     "the fixture must be able to create and start a second runnable thread; if it "
++                     "cannot, every assertion below is measuring the wrong thing");
++            gWakeTarget = EeScheduler::kMainThreadId;
++            R5900Context &driverCtx = viaDriver.runtime.cpu();
++            PS2Runtime::RecompiledFunction sleeper = viaDriver.runtime.lookupFunction(K_MAIN);
++            try
++            {
++                sleeper(viaDriver.rdram.data(), &driverCtx, &viaDriver.runtime);
++            }
++            catch (const EeDispatcherTransfer &)
++            {
++            }
++            t.IsTrue(viaDriver.runtime.eeScheduler().canDispatchGuest(),
++                     "with the main thread asleep and a worker Ready the runtime must still say the "
++                     "guest can be dispatched -- otherwise a driver stops the whole EE the moment "
++                     "one thread sleeps, which is the opposite bug and just as wrong");
++            t.IsTrue(std::find(gTrace.begin(), gTrace.end(), TRACE_WORKER) == gTrace.end(),
++                     "nothing may have run yet: the main thread is still parked");
++
++            // Now let the driver do what the harness does.
++            viaDriver.arm();
++            viaDriver.addWorker();
++            gWakeTarget = EeScheduler::kMainThreadId;
++            driveLikeTheHarness(viaDriver, 256);
++            const std::vector<int> driverOrder = gTrace;
++
++            const std::vector<int> expected{TRACE_WORKER, TRACE_MAIN_AFTER_SLEEP};
++            t.IsTrue(driverOrder == expected,
++                     ("MECHANISM: the frame order a driver that is not run() produces must be "
++                      "worker-then-resumed-main. A sleeping thread that is re-entered instead of "
++                      "left Waiting never lets another thread run, and that is W8. Got "
++                      + joined(driverOrder) + " want " + joined(expected))
++                         .c_str());
++        });
++
++        tc.Run("G1.8g: a woken thread resumes at the PC it published before it slept", [](TestCase &t)
++        {
++            // The other half of the contract, and the one that makes a real sleep/wake pair
++            // work rather than just parking the thread forever: a thread parked by
++            // sce_SleepThread comes back at the instruction after the call, and does not run
++            // anything in between.
++            BlockEnv env;
++            env.arm();
++
++            R5900Context &ctx = env.runtime.cpu();
++            PS2Runtime::RecompiledFunction fn = env.runtime.lookupFunction(K_MAIN);
++            try
++            {
++                fn(env.rdram.data(), &ctx, &env.runtime);
++            }
++            catch (const EeDispatcherTransfer &)
++            {
++            }
++
++            // Exactly what the harness does after catching the signal. It matters here: the
++            // blocked thread's registers live in the driver's live frame until the scheduler
++            // copies them into the thread record, so a test that skips the service step is
++            // asserting about a frame the driver never wrote.
++            env.runtime.eeScheduler().serviceInvocations();
++
++            const GuestThread *parked = env.runtime.eeScheduler().thread(EeScheduler::kMainThreadId);
++            t.IsTrue(parked != nullptr, "the main thread must still exist while it sleeps");
++            if (parked == nullptr)
++            {
++                return;
++            }
++            t.Equals(parked->context.pc, K_MAIN_RESUME,
++                     "the parked frame must hold the PC the guest published before the syscall, or "
++                     "waking the thread resumes it in the wrong place");
++
++            const int woken = env.runtime.eeScheduler().wakeupThread(EeScheduler::kMainThreadId, false);
++            t.Equals(woken, 0, "waking a sleeping thread must succeed");
++            t.IsTrue(env.runtime.eeScheduler().thread(EeScheduler::kMainThreadId)->status
++                         == EeThreadStatus::Ready,
++                     "a woken thread must become Ready so the scheduler can pick it");
++
++            gTrace.clear();
++            env.runtime.cpu().pc = K_MAIN_RESUME;
++            env.runtime.lookupFunction(K_MAIN_RESUME)(env.rdram.data(), &env.runtime.cpu(),
++                                                      &env.runtime);
++            t.IsTrue(std::find(gTrace.begin(), gTrace.end(), TRACE_MAIN_AFTER_SLEEP) != gTrace.end(),
++                     "after the wake the thread must run the post-sleep frame, not nothing");
++        });
 +    });
 +}

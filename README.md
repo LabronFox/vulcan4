@@ -43,8 +43,18 @@ Between the two walls sits every pixel this project will ever draw. The ladder i
 
 ## Status
 
-**M0 — foundations.** The toolchain is being brought up on Linux and GT4's own executable is
-on the slab. Nothing plays yet, and this file will say so until something does.
+**Read [`docs/STATUS.md`](docs/STATUS.md) — it is dated, and it is the honest one.**
+
+Short version, because a stranger should not have to dig: the toolchain builds and reproduces from
+a fresh clone, GT4's own machine code is translated ahead of time and **executes with no BIOS at
+all**, and the Graphics Synthesizer skeleton moves real computed pixels. **Nothing renders and
+nothing plays.** The guest reaches three functions and livelocks in a kernel syscall, and the two
+walls named below — the GS rasteriser and the VU1 — are exactly where they were.
+
+Every claim in `STATUS.md` names the commit, artefact or command that backs it. The ladder and its
+markers are in [`docs/GOALS.md`](docs/GOALS.md); the durable list of what is *not* finished is in
+[`docs/LIMITATIONS.md`](docs/LIMITATIONS.md), which is part of this project's definition of done
+and is never empty.
 
 **Where the work physically lives — read this before building anything:**
 [`docs/WHERE-THINGS-LIVE.md`](docs/WHERE-THINGS-LIVE.md). Code lives on the root filesystem;

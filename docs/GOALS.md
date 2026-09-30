@@ -59,6 +59,7 @@ Eventually the captain's Odin 2. Never an emulator.
 
 ### ✅ G2.1 — The GS computes pixels (43,804 distinct colours, not a black square)
 - **DONE WHEN:** the skeleton writes a framebuffer whose content is COMPUTED through the
+**Superseded: see the detailed `✅ G2.1` entry for the evidence.** 
   register/transfer path, reads it back, and writes a PNG with at least 64 distinct colours.
 - **RESULT (2026-09-30):** `/mnt/ssd/vulcan4-build/gs/vulcan4_gs_frame.png`, 512x512, **119,302 B**,
   **43,804 distinct colours** (gate needs >= 64; G2.0 produced 1). 251,261 non-background pixels.
@@ -179,6 +180,7 @@ Eventually the captain's Odin 2. Never an emulator.
 
 ### ✅ G1.1 — Recompiled code executes, no BIOS, failures named
 - **DONE WHEN:** a harness loads the translation unit plus the guest image, starts at the real
+**Superseded: see the detailed `✅ G1.1` entry in the G1 section above.** 
   entry point, executes real GT4 code, and ends with a machine-readable report naming where it
   stopped.
 - **RESULT (2026-09-29):** ✅
@@ -197,6 +199,7 @@ Eventually the captain's Odin 2. Never an emulator.
 
 ### ✅ G1.2 — Name the wall
 - **DONE WHEN:** the harness stops for a **named** guest reason rather than a wall-clock deadline,
+**Superseded: see the detailed `✅ G1.2` entry in the G1 section above.** 
   with the PC and the waiting instruction, and the guest call list is populated.
 - **RESULT (2026-09-29):** ✅
   `VULCAN4 BOOT REPORT functions_entered=3 halt=stuck_in_syscall bios_files=0`
@@ -288,7 +291,7 @@ Eventually the captain's Odin 2. Never an emulator.
   not, because the values the guest actually received had never been logged. Three findings in a
   row came from reasoning about disassembly instead of logging what happened.
 
-### ⬜ G1.4 — The next wall *(STUCK: gate not met, functions_entered still 3, halt unchanged)*
+### 🟡 G1.4 — The next wall *(gate NOT met; investigation completed, then corrected by G1.5)* *(STUCK: gate not met, functions_entered still 3, halt unchanged)*
 - **RESULT (2026-09-29):** ❌ `functions_entered=3 halt=stuck_in_syscall bios_files=0`. Branch **C**
   (blocked on something not built). Tests **441/441**.
 - **LANDED ANYWAY — a real, tested fix:** `FindAddress` now returns the **canonical KSEG1 address**
@@ -317,7 +320,8 @@ Eventually the captain's Odin 2. Never an emulator.
   identifies which transfer lands the guest at `0x010286DC` instead of executing the `jal`. A
   measurement, not another guess.
 
-### ⬜ G1.4b — Resume-model defect, now localised *(carried out of the G1.4 STUCK)*
+### ⬜ G1.4b — *(still open — see G1.5 for what the trace actually showed)*
+ Resume-model defect, now localised *(carried out of the G1.4 STUCK)*
 - **RESULT (2026-09-29):** ❌ gate still not met (`functions_entered=3`, `halt` unchanged), but the
   STUCK's `NEED` is answered and the defect is now specific.
 - **THE DEFECT, at an address:** the `jal` at `0x010286D4` into the `FindAddress` stub
@@ -339,7 +343,7 @@ Eventually the captain's Odin 2. Never an emulator.
   dispatch/yield/return traces, the cycle detector, the scheduler reset. **441/441 tests pass**,
   `bios_files=0`.
 
-### ⬜ G1.0 — **NO BIOS REQUIRED** *(the captain's bucket-list item, 2026-09-29)*
+### 🟡 G1.0 — **NO BIOS REQUIRED** *(property demonstrated, goal not met — see STATUS.md)* *(the captain's bucket-list item, 2026-09-29)*
 - **Captain's words:** *"one thing to add to the bucket list. making it run without a bios."*
 - **DONE WHEN:** Vulcan 4 boots and runs with **no BIOS file anywhere on the machine** — every
   call GT4 makes into the console's own OS is served by our runtime and **named in a log**,
@@ -366,13 +370,13 @@ Eventually the captain's Odin 2. Never an emulator.
   and stays **HLE**: implement the calls, name the ones we have not, and let the list drive.
   → G1.1's boot report produces exactly that list. Nobody has to decide anything today.
 
-### ⬜ G1.1 — Recompiled code executes
+### ✅ G1.1 — Recompiled code executes
 - **DONE WHEN:** the runtime loads the recompiled image and executes real GT4 code, with every
   unimplemented call **named** (not silently stubbed): a log showing N functions entered and
   which hardware path stopped it.
 - **PROOF:** the log + the halt reason.
 
-### ⬜ G1.2 — The first observable milestone
+### ✅ G1.2 — The first observable milestone
 - **DONE WHEN:** GT4 gets further than the loader — whatever the game does before it needs a
   GPU is observed (a string, a loaded resource, a state), with the evidence attached.
 
@@ -380,7 +384,7 @@ Eventually the captain's Odin 2. Never an emulator.
 
 ## G2 — A PICTURE (the GS)
 
-### ⬜ G2.1 — A GS layer exists and draws
+### ✅ G2.1 — A GS layer exists and draws
 - **DONE WHEN:** an actual frame comes out — even the boot logo — as a PNG.
 - **NOTE:** this is the first of the two walls. Nothing downstream is possible without it.
 
@@ -455,6 +459,33 @@ Eventually the captain's Odin 2. Never an emulator.
   builds get collected **when there is a reason to diff them**, not now. Storage is cheap (~5 GB
   each), attention is not.
 - **STATUS:** ⬜ none collected beyond US v2.00 (already on `/mnt/ssd/gt4`).
+
+### ✅ G5.2a — Android/ARM64 feasibility, answered with a build
+- **DONE WHEN:** a real attempt at cross-compiling the runtime and the generated code for
+  `aarch64`, naming exactly what compiles, what fails, and what the failures would cost.
+- **RESULT (2026-09-30):** ✅ **portable in principle, zero architecture work.** Commit `5509151`.
+  A real ARM64 executable exists: `/mnt/ssd/vulcan4-build/android/gs_probe_arm64` (5,263,568 B,
+  ELF64 AArch64) carrying **707 recompiled GT4 guest functions** and **94 GS runtime symbols**, with
+  **zero x86/SSE symbols** left. Transcript: `/mnt/ssd/vulcan4-build/android/try.log` (679 lines).
+  The 8.9 MB generated translation unit, `register_functions.cpp`, all four GS sources, the VU1
+  interpreter, all 8 `Kernel/Syscalls` and 27/27 `ps2xIOP` compile for aarch64 with zero errors.
+  Upstream's CMake **already** had an ARM64 branch (sse2neon v1.9.1, `USE_SSE2NEON`); only the
+  X11/raylib (33 window/audio symbols) and FFmpeg (1 TU) need Android equivalents. Full write-up in
+  `docs/ANDROID-FEASIBILITY.md`.
+- **NOT DONE:** no APK, no NDK build, no bionic. Tested against glibc for aarch64 Linux.
+
+### ✅ X1 — Prior art: what the shipped recompilers did
+- **DONE WHEN:** a survey of XenonRecomp / N64Recomp / Zelda64Recomp / PS1Recomp / PSXRecomp, every
+  claim tied to a source that was actually read, ending in a concrete list for us.
+- **RESULT (2026-09-30):** ✅ Commit `d467818`. `docs/PRIOR-ART.md`, 22,797 bytes, 14 cited sources.
+  **Headline: not one shipped project links an emulator's GPU core** — UnleashedRecomp translates
+  draw calls, Zelda64Recomp built RT64, PS1Recomp re-implements the PS1 GP0/GP1 command stream,
+  PSXRecomp keeps a software rasteriser as "the reference look". Emulators are reading material
+  only, which independently confirms the G2.0 GS decision. Also: vblank is a host clock, not
+  emulated hardware; `mstan/psxrecomp` is **PolyForm Noncommercial** and incompatible with our
+  GPL-3.0 tree.
+
+---
 
 ## The discipline
 

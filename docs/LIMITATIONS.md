@@ -83,6 +83,29 @@ around 1, 2 and 3; defect 4 is unsolved.
   the call tally, and the guest PC. Previously `stuck_in_syscall` said only "a syscall", which is
   what sent G1.4 hunting for a bug in the wrong place.
 
+## What every one of these means for a player
+
+The list above is written for engineers. This is the same set translated for the person who would
+run the thing. **None of these are fixed.** None are hidden either — that is the point of the file.
+
+| Limitation | What a player would experience |
+|---|---|
+| GS rasteriser produces no pixels | **No 3D, ever, until this is fixed.** The car's shape, the track, the sky — all of it goes through the triangle rasteriser. This is the blocker. |
+| VU1 never driven by a guest | **No vertex maths**, so no 3D even if the rasteriser worked. Independent second wall. |
+| Guest reaches 3 functions, then livelocks | **Nothing past the opening.** No logo animation, no menu, no race. The game does not start. |
+| `total_mmio_accesses=0` | The guest has never spoken to the console's hardware. Nothing it asks for has been answered by anything real. |
+| No IRX modules loaded, no BIOS | The kernel cannot resolve functions, because the table it searches was never populated. The direct cause of the livelock. |
+| GS image transfer not proven through GIF packets | The mechanism works; the route a real guest uses does not. Would only matter once a guest is drawing. |
+| Vblank is a host clock, no interrupts modelled | A guest waiting on vblank would be released by a host thread, not by the console. **Timing would be wrong** — races would not behave like the original. |
+| No texture sampling, CLUT, blending, alpha, Z-test | No textures, no transparency, no depth sorting. Even with a working rasteriser, the picture would be flat and wrong. |
+| GS debug history paused by default | Not a player-facing limit. It cost one wrong register count in a commit; recorded because the mistake is instructive. |
+| No CD/DVD or disc I/O from a guest | **No loading screens, no disc audio, no CD streaming.** |
+| No ADPCM decode | No music, no engine noise, no effects. |
+| No real controller input | Not playable even if it rendered. |
+| No menus, saves, or race logic | No game. |
+| No NDK/bionic build, no APK | Runs on desktop x86-64 only. **The AYN Odin 2 is not a target yet**, despite the ARM64 build working. |
+| No regional/special build support (G5.1, G5.3) | Retail US v2.00 only. **Spec II, which the captain plays, is not supported** — it is not based on the retail disc. |
+
 ## Project-level
 
 - **Nothing from Gran Turismo 4 has ever been rendered by this GS.** The guest has not reached

@@ -588,10 +588,11 @@ int main(int argc, char *argv[])
                  "vblank is released, but by a host thread, not by the GS.\n";
     std::cout << "VULCAN4 LIMITATION: GS - no VU1 is involved. The GS path here takes vertex data "
                  "directly; nothing computes geometry. That is goal G3.1.\n";
-    std::cout << "VULCAN4 LIMITATION: GS - the EE->GS GIF DMA is not exercised. This probe hands "
-                 "packets to GS::processGIFPacket directly; GifArbiter and the DMAC are unproven.\n";
-    std::cout << "VULCAN4 LIMITATION: GS - no vblank, no CSR signalling, no FINISH-driven present "
-                 "event. The frame was latched on demand.\n";
+    std::cout << "VULCAN4 LIMITATION: GS - the transfer did NOT travel as a GIF packet "
+                 "(gif_packets=0); it used the native GS::uploadImageNative entry point. A guest "
+                 "sends a GIF packet containing an IMAGE transfer, and the 4-bit GIFTAG register "
+                 "field makes that impossible today. So the transfer MECHANISM is proven and the "
+                 "GIF ROUTE to it is not. GifArbiter and the DMAC remain unproven.\n";
     std::cout << "VULCAN4 LIMITATION: GS - Z-buffering is allocated but not written by this probe, "
                  "because nothing tests it yet.\n";
     std::cout << "VULCAN4 LIMITATION: GS - nothing from Gran Turismo 4 has been rendered. No guest "

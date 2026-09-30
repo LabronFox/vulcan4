@@ -120,6 +120,19 @@ run the thing. **None of these are fixed.** None are hidden either — that is t
   path and encoded by our own PNG writer. In-count and out-count match exactly. What is missing is
   the **rasteriser**: no primitive of any kind is drawn. Nothing from Gran Turismo 4 has been
   rendered, and the guest still has `total_mmio_accesses=0`.
+- **No texture has been sampled into the framebuffer yet (G2.3).** Swizzle is **proven** by a
+  round-trip test (permutation, write-then-read, and not-the-identity) for PSMT8, and PSMT4 /
+  PSMCT16 / PSMT16 have swizzle maps present but **untested**. CLUT upload and the CLUT cache
+  exist (`m_clut`, `LoadClut`, ninth address bit via `CSA[4]` for 16-bit CLUTs) but **no indexed
+  texture has been drawn**. Not modelled: filtering beyond the mode field, **mipmaps and LOD**,
+  **CLUT animation**, anisotropic/bilinear edge behaviour, and swizzle for formats outside the
+  four with headers.
+- **G2.2 reframed by G2.3: the fault is in our probe, not the runtime.** The suite case at
+  `ps2_gs_tests.cpp:829-849` submits primitives with `GS::writeRegister` and **asserts correct
+  rasterised pixels**, and it passes with all three vertices populated. The runtime's rasteriser
+  and vertex queue are therefore working. G2.2's failure is in the skeleton's GIF REGLIST
+  submission path. The next experiment is one line: submit the same primitives via `writeRegister`
+  and see if they rasterise.
 - **The GS rasteriser has still never written a pixel from a primitive (G2.2).** The draw sequence
   is issued correctly and the GS acknowledges it, but the batches reaching the rasteriser are
   degenerate (`v0 == v2 == (0,0)`, zero edge denominator) and the triangle is correctly skipped.

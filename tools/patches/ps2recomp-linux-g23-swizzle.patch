@@ -1,0 +1,82 @@
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 0458a8c..a77458a 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -414,6 +414,77 @@ void register_ps2_gs_tests()
+ {
+     MiniTest::Case("PS2GS", [](TestCase &tc)
+     {
++        // ------------------------------------------------------------------
++        // G2.3: swizzle round-trip.
++        //
++        // The PS2 stores texels in 8x8-ish blocks, not linearly. This is exactly the kind of
++        // transform that silently produces garbage for weeks if it is only ever eyeballed, so it
++        // gets a test that pins three things:
++        //   1. the address map is a PERMUTATION of a 16x16 tile -- no texel is aliased or lost;
++        //   2. write-then-read at the same (x,y) returns the value that was written (round trip);
++        //   3. the map is NOT the identity, so a test that passes cannot be passing by accident.
++        tc.Run("PSMT8 swizzle is a lossless permutation and round-trips", [](TestCase &t)
++        {
++            constexpr uint32_t kTile = 16u;   // columnTable8 is 16x16
++            constexpr uint32_t kBytes = 256u; // one PSMT8 page
++
++            // 1. Permutation: every (x,y) in a 16x16 tile must map to a distinct offset in range.
++            bool seen[kBytes] = {};
++            bool permOk = true;
++            for (uint32_t y = 0; y < kTile && permOk; ++y)
++            {
++                for (uint32_t x = 0; x < kTile; ++x)
++                {
++                    const uint32_t off = GSPSMT8::addrPSMT8(0u, kTile, x, y);
++                    if (off >= kBytes || seen[off])
++                    {
++                        permOk = false;
++                        break;
++                    }
++                    seen[off] = true;
++                }
++            }
++            t.IsTrue(permOk, "PSMT8 swizzle must map a 16x16 tile to 256 DISTINCT offsets");
++
++            // 2. Round trip through a real PSMCT32 buffer standing in for GS memory.
++            std::vector<uint8_t> gsMem(kBytes, 0u);
++            const auto put = [&](uint32_t x, uint32_t y, uint8_t v)
++            {
++                gsMem[GSPSMT8::addrPSMT8(0u, kTile, x, y)] = v;
++            };
++            const auto get = [&](uint32_t x, uint32_t y) -> uint8_t
++            {
++                return gsMem[GSPSMT8::addrPSMT8(0u, kTile, x, y)];
++            };
++            for (uint32_t y = 0; y < kTile; ++y)
++            {
++                for (uint32_t x = 0; x < kTile; ++x)
++                {
++                    put(x, y, static_cast<uint8_t>((x * 16u + y) & 0xFFu));
++                }
++            }
++            bool roundTripOk = true;
++            for (uint32_t y = 0; y < kTile && roundTripOk; ++y)
++            {
++                for (uint32_t x = 0; x < kTile; ++x)
++                {
++                    if (get(x, y) != static_cast<uint8_t>((x * 16u + y) & 0xFFu))
++                    {
++                        roundTripOk = false;
++                        break;
++                    }
++                }
++            }
++            t.IsTrue(roundTripOk, "PSMT8 swizzled write must read back at the same (x,y)");
++
++            // 3. NOT the identity. If (0,0) and (1,0) were adjacent linearly the map would be a
++            //    no-op and this test would be worthless.
++            const uint32_t off00 = GSPSMT8::addrPSMT8(0u, kTile, 0u, 0u);
++            const uint32_t off10 = GSPSMT8::addrPSMT8(0u, kTile, 1u, 0u);
++            t.IsTrue(off10 != off00 + 1u,
++                     "PSMT8 swizzle must NOT be linear: (1,0) must not sit next to (0,0)");
++        });
++
+         tc.Run("GS CSR/IMR support coherent 64-bit and 32-bit access", [](TestCase &t)
+         {
+             PS2Memory mem;

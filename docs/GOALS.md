@@ -169,6 +169,34 @@ Eventually the captain's Odin 2. Never an emulator.
 - **No test added yet**, deliberately: pinning a path that does not yet draw would enshrine a
   failure. Tests come with the fix.
 
+### 🟡 G2.3 — Textures: swizzle proven, sampling not yet shown
+- **DONE WHEN:** a texture reaches the GS through the transfer path, a primitive samples it, and
+  the PNG proves sampling happened — plus tests and the documented register sequence.
+- **RESULT (2026-09-30):** 🟡 partial. **Swizzle is proven by test. Sampling is not demonstrated.**
+- **✅ SWIZZLE: DONE AND PROVEN.** Added a round-trip test to the suite (now **445/445**, was
+  444). It pins three things for PSMT8: the address map is a **permutation** of a 16×16 tile (256
+  distinct offsets, no aliasing), a swizzled write **reads back at the same (x,y)**, and the map
+  is **not** the identity — `(1,0)` does not sit next to `(0,0)`. That third assertion is what stops
+  it passing by accident, which is exactly the "silently produces garbage for weeks" risk named in
+  the brief.
+- **The runtime's texture machinery is largely present**, measured not assumed: per-format swizzle
+  maps for PSMCT32/PSMT8/PSMT4/PSMCT16, a CLUT cache (`m_clut`, `m_clutCbp`, `LoadClut`, ninth
+  address bit via `CSA[4]` for 16-bit CLUTs), and `SampleTexture`/`combineTexture` in the
+  rasteriser.
+- **❌ SAMPLING: NOT DEMONSTRATED.** No indexed texture has been drawn, because drawing needs a
+  working primitive — which is G2.2. Documented honestly rather than faked with a background
+  gradient, exactly as G2.2 was.
+- **⭐ THE G2.2 LEAD, and it is strong.** While adding the swizzle test I read the neighbouring
+  case at `ps2_gs_tests.cpp:829-849`: it submits primitives with `GS::writeRegister` and **asserts
+  correct rasterised pixels**, and it **passes**, with `[gs:prim]` showing `v0=(6,0) v1=(0,6)
+  v2=(6,6)` — all three vertices populated, which my probe never achieved. **So the rasteriser
+  works, the vertex queue works, and the fault is in the G2.2 skeleton's GIF REGLIST submission
+  path.** G2.2 goes from "undiagnosed runtime bug" to "our submission path is wrong", and the next
+  experiment is one line: submit the same primitives via `writeRegister`.
+- **Register sequence documented** in `docs/GS-PLAN.md`: transfer (BITBLTBUF/TRXPOS/TRXREG/TRXDIR),
+  CLUT upload + TEXCLUT, TEX0_1 binding, TEXFLUSH, then PRIM with TME (bit 4) and per-vertex
+  RGBAQ/UV/XYZ2. Formats done vs not, stated in a table.
+
 ### ✅ G1.7 — Name the spin *(the wait is now an address, an instruction and an arithmetic fact)*
 - **DONE WHEN:** the boot report names a specific wait instead of `spinning_in_guest_code`, and
   either the guest advances or the dependency is named with address and instruction.

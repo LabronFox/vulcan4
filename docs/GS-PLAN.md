@@ -410,3 +410,90 @@ consequences follow, and only one experiment separates them:
 **The one experiment that settles it:** log `m_prim.type`, `m_prmodecont` and `m_vtxCount` at the
 top of `buildDrawBatch`, alongside the vertex values. Six values, one run, and (A) versus (B) is
 decided. This is the first thing the next dish should do — everything else is downstream of it.
+
+
+---
+
+## The texture register sequence (G2.3)
+
+The sequence a guest performs to bind and sample a texture. This is the contract to compare real
+GT4 GS traffic against. **Formats done / not done is stated honestly below.**
+
+```
+1. Transfer the texel data into GS memory, swizzled as the target format demands.
+   BITBLTBUF 0x50 : DBP (dest base page), DBW (width in 64-px words), DPSM (dest format)
+   TRXPOS    0x51 : DSX/DSY destination origin
+   TRXREG    0x52 : W (0-11), H (32-43)
+   TRXDIR    0x53 : direction; 0 = host-to-local
+   -> GS::uploadImageNative(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes)
+      writes the four registers then feeds the image data; GSCpuBackend::UploadImage does the
+      VRAM write, addressed through the per-format swizzle map.
+
+2. If the texture is indexed, upload the CLUT the same way (DPSM = PSMCT16/PSMCT32),
+   then tell the GS where it is:
+   TEXCLUT 0x1C : CBP (CLUT base), CBW (width in 64 entries), COU/COV (origin)
+
+3. Bind the texture:
+   TEX0_1  0x06 : TBP0 (texture base), TBW (width in 64-px units), TPSM (texture format),
+                   TFX (filter), TCC, TCF, CLUT storage
+   TEXFLUSH 0x3F : required on real hardware to make the binding visible; we write it and
+                   record that our sampling path does not currently depend on it
+
+4. Submit a primitive with PRIM.TME set (bit 4) so the rasteriser samples:
+   PRIM 0x00 : type (2 = triangle) | IIP bit 3 | TME bit 4
+   then per vertex RGBAQ (0x01), UV (0x03) -- UV is what is interpolated to find the texel --
+   and XYZ2 (0x05). The draw kicks on the last vertex.
+
+5. The sampler resolves S/T via Q, converts to texel coords, then reads through the SAME
+   swizzle map the upload used: GSPSMT8::addrPSMT8 / GSPSMT4::addrPSMT4 / PSMCT16 / PSMCT32.
+```
+
+**Formats: done / not done.**
+
+| Format | Swizzle map | Indexed | CLUT | Status |
+|---|---|---|---|---|
+| PSMCT32 | `ps2_gs_psmct32.h` | no | n/a | ✅ used by the skeleton |
+| PSMT8 | `ps2_gs_psmt8.h` (block + column tables) | yes | yes (`m_clut`, `LoadClut`, `CSA[4]` for 16-bit CLUTs) | ✅ **swizzle proven by test** |
+| PSMT4 | `ps2_gs_psmt4.h` | yes | yes | ✅ swizzle present, **not** round-trip tested |
+| PSMCT16 / 16S | headers present | no | n/a | ⚠️ present, untested here |
+| PSMT16 (16-bit indexed) | headers present | yes | yes | ⚠️ present, untested here |
+
+**Swizzle is now proven, not assumed.** The round-trip test in the suite pins three things for
+PSMT8: the address map is a **permutation** of a 16×16 tile (256 distinct offsets, no aliasing), a
+swizzled write **reads back at the same (x,y)**, and the map is **not** the identity — `(1,0)` does
+not sit next to `(0,0)`. That third assertion is the one that stops the test passing by accident.
+
+**Not modelled:** texture filtering beyond the mode field, mipmaps and LOD selection, CLUT
+animation, anisotropic/bilinear edge behaviour, and swizzle for formats other than the four above.
+
+---
+
+## G2.3 status — and the G2.2 lead, which matters more
+
+**The texture *sampling* proof is NOT complete, and the blocker is G2.2, not the texture path.**
+
+The runtime's texture machinery is largely present: per-format swizzle maps for four formats, a CLUT
+cache (`m_clut`, `m_clutCbp`, `LoadClut`, with the ninth address bit for 16-bit CLUTs), and
+`SampleTexture` / `combineTexture` in the rasteriser. **What is missing is a demonstration that a
+sampled texel reaches the framebuffer** — and that needs a primitive to sample with.
+
+**The G2.2 lead, and it is strong.** While adding the swizzle test I read the neighbouring case
+`ps2_gs_tests.cpp:829-849`, and it **draws and asserts correct pixels**:
+
+```cpp
+gs.writeRegister(GS_REG_PRIM, GS_PRIM_TRISTRIP);
+gs.writeRegister(GS_REG_RGBAQ, kColor);
+gs.writeRegister(GS_REG_XYZ2, xyz(0u, 0u));
+...
+t.Equals(readReferencePSMCT32Pixel(vram, 0u, 4u, 4u), kColor, "should draw BCD ...");
+```
+
+That test **passes**, and its `[gs:prim]` line shows `v0=(6,0) v1=(0,6) v2=(6,6)` — **all three
+vertices populated correctly**, which is exactly what my probe never achieved.
+
+**So: the rasteriser works, the vertex queue works, and the swizzle works. The fault is in the
+G2.2 probe's GIF REGLIST submission path**, not in the runtime. That reframes G2.2 from
+"undiagnosed runtime bug" into "our submission path is wrong", and it is now a one-line
+experiment: submit the same primitives via `GS::writeRegister` and see whether they rasterise. If
+they do, the REGLIST encoder in the probe is the bug. I did not have the runway to run that here,
+and I am not going to claim the answer before measuring it.

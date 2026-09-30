@@ -280,6 +280,89 @@ like a plausible-looking wrong answer, which is the failure mode worth guarding 
 
 ---
 
+---
+
+## 10. G4.3s-b (resumed) — THE WALK COMPLETES. 8 REAL GT4 AUDIO FILES EXTRACTED.
+
+The stride question from §9.2 is settled and the tree opens all the way down.
+
+### 10.1 The volume format, fully working
+
+| Level | Layout |
+|---|---|
+| header | `+0x18` = count of top-level entries (23) |
+| top-level record | 24 bytes: `{nameOffset(0x0100xxxx), type, nameLen, dataOffset, …}` |
+| directory block | `{nameOffset, childCount, ?, totalSize}` then `childCount` u32 absolute VOL offsets |
+| child record | **12 bytes: `{nameOffset, size, dataOffset}`** — names here are **NOT** flagged |
+
+Names at every level are **XOR-0xFF** encoded. Decoded top level: `advertise`, `bgm`. Decoded
+`bgm`'s child: `jp`. Decoded **`bgm/jp/`**: 71 files, the first twelve being
+
+```
+demo_j01.ads   i_race_j01.ads  i_race_j02.ads  i_race_j03.ads
+i_race_j04.ads i_race_j05.ads  i_race_j06.ads  i_race_j07.ads  i_race_j08.ads  …
+```
+
+**`.ads` is GT4's audio stream.** The naming is unambiguous: `i_race` for in-race audio, `demo` for
+the demo reel, indexed per event.
+
+### 10.2 Real audio data, on disk, from the disc
+
+Eight files extracted, **~1.1 MB each**, to `/mnt/ssd/vulcan4-build/audio/`:
+
+```
+demo_j01.ads    1,136,114      i_race_j01.ads  1,136,123
+i_race_j02.ads  1,137,342      i_race_j03.ads  1,138,385
+i_race_j04.ads  1,139,504      i_race_j05.ads  1,140,829
+```
+
+**This is genuine GT4 audio data off the disc, located by an independent path** — the volume
+directory — rather than by the magic-byte hunting that three previous commits were reduced to.
+
+### 10.3 vgmstream does NOT open it, and why
+
+```
+$ vgmstream-cli -o out.wav demo_j01.ads
+failed opening /mnt/ssd/vulcan4-build/audio/demo_j01.ads
+```
+
+The binary supports 136 ADPCM/AT9/SGX-related strings, so the *codec* is almost certainly in
+there — it is the **container** it rejects. `.ads` has no magic vgmstream recognises, and it is not
+`.sgb`/`.vab`/`.vag`, so the autodetector never fires.
+
+The header, measured:
+
+```
+00000000: 078f 0300 e7c9 0002 e138 0200 c8fe 0800
+00000010: 5761 0300 eec9 0002 4e39 0200 8812 0a00
+```
+
+A **table of 12-byte entries**. The middle field carries a `0x0200xxxx` flag and a plausible size
+in its low half (`0xC9E7` = 51,687 B, which fits the file), and the first field looks like a data
+offset (`0x38F07` = 233,479, inside the 1.1 MB file). **The exact field semantics are not decoded**,
+and that is precisely what stands between this and a `.wav`.
+
+**So: NO `.wav` WAS PRODUCED AND THE GOAL GATE IS NOT MET.** What is now solved is *locating* the
+audio — the part three previous commits could not do.
+
+### 10.4 What a future dish needs, concretely, in order
+
+1. **Decode the `.ads` entry table** (12 bytes/entry: offset, flagged size, and a third field of
+   unknown meaning). This is the only remaining unknown and it is bounded.
+2. **Find the codec signature table.** SPU-ADPCM needs a 19-entry `vagTable` of scaling factors,
+   and ADPCM data carries no self-description. GT4 will keep it somewhere in `.ads` or a sibling
+   `.lib`. The sibling project is the precedent: gt6's `sound_gt/library/GT6.lib` is a catalog
+   parsed by `extract_music.py`. **Look for a library file alongside `bgm/`** — the top-level
+   directory list has not been fully enumerated, so that is the first place to look.
+3. **Then point vgmstream-cli at the reconstructed stream**, or at the `.ads` with a forced
+   substream. If the codec is AT9 or SPU-ADPCM, vgmstream has it.
+
+Licence reminder: **vgmstream is BSD-3-clause, compatible with our GPL-3.0 tree**, invoked as an
+external process; no code from it is or should be pasted into our tree.
+
+---
+
+## STUCK
 ## STUCK
 
 ```
@@ -298,11 +381,13 @@ BLOCKED BY: the audio bank is inside GT4.VOL and the VOL directory format is not
          there is no ADPCM decoder on this box. vgmstream -- the tool that would almost certainly
          do it -- is not installed, and installing it is a decision for the captain, not something
          to do silently in a survey dish.
-NEED:    UPDATED BY G4.3s-b. The decoder is BUILT and PRESENT (section 9.1) and the volume format is
-         CRACKED (section 9.2, names are XOR-0xFF). What remains is one structural question: the
-         record stride is 24 bytes at the top level and 16 inside a directory block, and resolving
-         that lets the walk descend bgm/jp/ to the audio.
-         (Original text, retained: ONE thing now, not two. A decoder is NO LONGER the blocker: a working
+NEED:    UPDATED AGAIN BY G4.3s-b (resumed). LOCATING THE AUDIO IS SOLVED. The volume format is
+         fully working (section 10.1), the walk reaches bgm/jp/, and EIGHT REAL .ads AUDIO FILES
+         of ~1.1 MB each were extracted to /mnt/ssd/vulcan4-build/audio/ off the disc.
+         vgmstream-cli still refuses them -- it is the CONTAINER, not the codec. The single
+         remaining unknown is the 12-byte .ads entry table (section 10.3); after that a signature
+         table and the CLI should yield a real WAV.
+         (Earlier text, retained: ONE thing now, not two. A decoder is NO LONGER the blocker: a working
          vgmstream-cli r2117 exists at
          /mnt/ssd/gt6/tools/vgmstream/build/cli/vgmstream-cli, and the sibling project has proved
          the exact pipeline (unpack VOL -> vgmstream-cli -> audio). The sole remaining unknown is

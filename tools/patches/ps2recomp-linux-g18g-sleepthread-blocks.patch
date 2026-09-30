@@ -26,6 +26,40 @@ index c7c7af5..0a0d5e4 100644
  if(PS2X_BUILD_RECOMP)
      add_subdirectory("ps2xRecomp")
  endif()
+diff --git a/ps2xIOP/src/iop_module_manager.cpp b/ps2xIOP/src/iop_module_manager.cpp
+index 56e4a8f..f53046d 100644
+--- a/ps2xIOP/src/iop_module_manager.cpp
++++ b/ps2xIOP/src/iop_module_manager.cpp
+@@ -34,6 +34,29 @@ namespace ps2x::iop::detail
+             "sio2d",
+             "padman",
+             "xpadman",
++            // MTAPMAN, and it was simply missing while every one of its siblings was here.
++            //
++            // Gran Turismo 4 loads its IOP drivers off the disc in a fixed order and SIO2MAN and
++            // MTAPMAN are the first two. Its caller for the load is `bltz $v0, 0x01000760` around
++            // the sceSifLoadModule stub at guest 0x01027C70 -- a retry-until-it-succeeds loop -- so
++            // a driver that cannot be served is not an error the guest recovers from, it is the end
++            // of the boot. Measured on SCUS_973.28: sio2man loaded, then
++            //
++            //   [IOP:load-failed] module='cdrom0:\IRX\MTAPMAN.IRX;1' no HLE provider accepted the
++            //   module; physical IRX was not loaded
++            //
++            // on every pass, with sceSifLoadModule returning -1 and $v0 = 0xFFFFFFFF each time.
++            // The physical load cannot help: there is no IRX/ directory under the cdrom0: root on a
++            // machine that was only given the game executable, and law 1 means the drivers are never
++            // shipped here. So this table is the mechanism, exactly as it already is for sio2man,
++            // padman, mcman, mcserv, libsd and cdvdman.
++            //
++            // What this buys is precisely that the load succeeds and the guest's loop moves on. It
++            // is NOT a claim that MTAPMAN's RPC surface is emulated. If the game then calls a pad
++            // function nothing serves, that is the next wall and it will be named like any other,
++            // not papered over here.
++            "mtapman",
++            "xmtapman",
+             "mcman",
+             "xmcman",
+             "mcserv",
 diff --git a/ps2xRecomp/CMakeLists.txt b/ps2xRecomp/CMakeLists.txt
 index 857102a..cbf6f07 100644
 --- a/ps2xRecomp/CMakeLists.txt
@@ -3003,6 +3037,59 @@ index 0000000..b08dd30
 +    });
 +    });
 +}
+diff --git a/ps2xTest/src/ps2_sif_rpc_tests.cpp b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+index 7242e65..4d8de05 100644
+--- a/ps2xTest/src/ps2_sif_rpc_tests.cpp
++++ b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+@@ -626,5 +626,48 @@ void register_ps2_sif_rpc_tests()
+                      "recv payload should match stack-selected transfer size");
+         });
+ 
++        tc.Run("the no-BIOS module table supplies MTAPMAN, so the guest's load can succeed", [](TestCase &t)
++        {
++            // W11. Gran Turismo 4 asks for this driver by EXACTLY this path and then retries it
++            // forever when it fails, because its caller is `bltz $v0, 0x01000760` around the
++            // sceSifLoadModule stub at guest 0x01027C70. Measured on SCUS_973.28:
++            //
++            //   SifLoadModule a0=0x1fffe70 a1=0x0 a2=0x0 ra=0x1027eac
++            //             path="cdrom0:\\IRX\\MTAPMAN.IRX;1"   handled=1 moduleId=-1
++            //
++            // `handled` and `moduleId` come back from the same call, which is the tell: the
++            // runtime RECOGNISED the module and still could not supply it. With no IRX/ directory
++            // under the cdrom0: root the physical load cannot work, so the only thing that can
++            // serve this is the no-BIOS module table -- which is already how sio2man, xsio2man,
++            // padman, mcman, mcserv, libsd, cdvdman and the rest are served.
++            //
++            // The path is written out in full, with the device prefix, the backslashes and the
++            // ";1" version suffix, because that is what the guest passes; a test that used a
++            // tidier spelling would not prove the guest's own request is answerable.
++            TestEnv env;
++            const auto cdrom = env.runtime.loadIopModule("cdrom0:\\IRX\\MTAPMAN.IRX;1");
++            t.IsTrue(cdrom.handled,
++                     "the runtime must recognise cdrom0:\\IRX\\MTAPMAN.IRX;1 as a module load whose "
++                     "answer it owns, rather than leaving the guest to retry forever");
++            t.IsTrue(cdrom.moduleId > 0,
++                     "MTAPMAN must be loadable. Without it sceSifLoadModule returns -1 on every "
++                     "pass and Gran Turismo 4 never boots -- this is W11, measured as "
++                     "v0=0xFFFFFFFF with the guest parked in its own retry loop");
++
++            // The console's own spelling of the same driver. ps2PathLeafKey lowercases and drops
++            // ".irx", so both paths must land on the same key -- if they disagree, one of the two
++            // spellings the guest might use is silently unservable.
++            const auto rom0 = env.runtime.loadIopModule("rom0:MTAPMAN");
++            t.IsTrue(rom0.moduleId > 0,
++                     "rom0:MTAPMAN must resolve to the same module as the cdrom0: path");
++
++            // And it must be stoppable, so a guest that unloads it is not left with a module the
++            // runtime will deny ever having loaded.
++            int32_t stopResult = 0x7FFFFFFF;
++            t.IsTrue(env.runtime.stopIopModule(rom0.moduleId, &stopResult),
++                     "stopping MTAPMAN must succeed");
++            t.Equals(static_cast<int32_t>(stopResult), 0, "stopping MTAPMAN must report success");
++        });
++
+     });
+ }
 diff --git a/ps2xTest/src/ps2_thread_block_tests.cpp b/ps2xTest/src/ps2_thread_block_tests.cpp
 new file mode 100644
 index 0000000..5b299fe

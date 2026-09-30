@@ -1076,6 +1076,72 @@ index c5e31c4..b23312d 100644
              {
                  m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                       { return !m_events.empty() ||
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+index 07fcd29..a4213c7 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+@@ -2,6 +2,9 @@
+ #include "RPC.h"
+ #include "../../ps2_iop_transport.h"
+ 
++#include <iostream>
++#include <set>
++
+ namespace ps2_syscalls
+ {
+     namespace
+@@ -187,6 +190,43 @@ namespace ps2_syscalls
+         setReturnS32(ctx, ret);
+     }
+ 
++    // A guest that cannot load an IOP driver does NOT give up: Gran Turismo 4 calls
++    // sceSifLoadModule again immediately, in a loop, with the same path, forever. Measured on
++    // SCUS_973.28 it reached guest 0x01000760 -- `bltz $v0, 0x01000760` around a jal to the
++    // sceSifLoadModule stub at guest 0x01027C70 -- and spun there with $v0 = 0xFFFFFFFF. From the
++    // outside that is indistinguishable from a hang, and the boot report called it
++    // `halt=guest_cycle_no_progress`, which names a symptom and not a cause.
++    //
++    // So the failure is said out loud, once per distinct path. Silently returning -1 and letting
++    // the game spin is exactly the kind of plausible-looking nothing this project refuses to ship.
++    void reportUnserviceableIopModule(const std::string &modulePath, const ps2x::iop::ModuleLoadResult &loaded)
++    {
++        static std::mutex reportMutex;
++        static std::set<std::string> reported;
++        {
++            std::lock_guard<std::mutex> lock(reportMutex);
++            if (!reported.insert(modulePath).second)
++            {
++                return;
++            }
++        }
++
++        const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
++        std::cout << "VULCAN 4 LIMITATION: IOP driver '" << modulePath
++                  << "' cannot be served -- the file is not present under the cdrom0: root '"
++                  << (paths.cdRoot.empty() ? std::string("<unset>") : paths.cdRoot.string())
++                  << "' (handled=" << (loaded.handled ? 1 : 0)
++                  << ", moduleId=" << loaded.moduleId << ")."
++                  << std::endl;
++        std::cout << "VULCAN 4 LIMITATION: the guest will now retry this load forever and make no"
++                     " further progress; this is the boot wall, not a hang in the emulator."
++                  << std::endl;
++        std::cout << "VULCAN 4 LIMITATION: to supply it, put the disc's IRX directory next to the"
++                     " game executable (this path is the cdrom0: root) or point cdRoot at a full"
++                     " extraction of your own disc. The drivers are game data, so they are never"
++                     " shipped here." << std::endl;
++    }
++
+     void SifLoadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         const uint32_t pathAddr = getRegU32(ctx, 4);     // $a0
+@@ -216,6 +256,7 @@ namespace ps2_syscalls
+         const auto loaded = runtime->loadIopModule(modulePath, arguments.empty() ? nullptr : arguments.data(), static_cast<uint32_t>(arguments.size()));
+         if (!loaded.handled || loaded.moduleId <= 0)
+         {
++            reportUnserviceableIopModule(modulePath, loaded);
+             setReturnS32(ctx, -1);
+             return;
+         }
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
 index 9614016..70ae1ed 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp

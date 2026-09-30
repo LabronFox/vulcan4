@@ -1500,3 +1500,90 @@ RETRY pc=0x0100076c  v0=0xFFFFFFFF  a0=0x01FFFE70  a1=0  a2=0  a3=0x01FFFE50  t0
 - "120.6 s → 1.6 s total": false. The watchdog fix only took `harness_tail_ms` to 0–18 ms.
 - **`VULCAN4 FRAME source=guest` is emitted by nothing.** Guest still makes zero frame-emitting MMIO
   accesses. Do not report this milestone until the log contains that line.
+
+## 2026-09-30 — W11 is the disc's IRX drivers, and the runtime now says so out loud
+
+### How it was found
+
+`0x01027C70` — one of the two addresses W11 parks on — is not guest code at all. The generated unit
+has it as a leaf that immediately calls a syscall:
+
+```
+sub_01027C70_0x1027c70:  ctx->pc = getRegU32(ctx, 31);
+                         ps2_syscalls::sceSifLoadModule(rdram, ctx, runtime);
+```
+
+`a0` is a guest stack string, `a1`/`a2` are 0, and `$v0` comes back `0xFFFFFFFF` every single pass.
+So the guest is retrying an **IOP driver load**, and the caller is `bltz $v0, 0x01000760` — the
+`0x01027E98` is a `jal 0x01000764`, not a call to `0x01027E98`.
+
+Instrumenting `SifLoadModule` gave the exact requests:
+
+```
+cdrom0:\IRX\SIO2MAN.IRX;1    -> handled=1, moduleId > 0   (rescued by the HLE module manager)
+cdrom0:\IRX\MTAPMAN.IRX;1    -> handled=1, moduleId = -1   (REJECTED)
+```
+
+and the runtime already had the cause in its own log, once per attempt:
+
+```
+[ps2xIOP:warning] [IOP] failed to open IRX 'cdrom0:\IRX\SIO2MAN.IRX;1'
+[ps2xIOP:warning] [IOP] failed to open IRX 'cdrom0:\IRX\MTAPMAN.IRX;1'
+```
+
+### The chain, end to end
+
+- `SifLoadModule` (`RPC.cpp`) reads the path, then calls `runtime->loadIopModule`.
+- `IopSubsystem::loadModule` tries the **physical** load first for a non-`rom0:` device.
+- `IopEmulator::loadModule` calls `IopModuleLoader::readWholeHostFile`.
+- That calls `host.translateGuestPath` → `vfs().resolveHostPath(path, {hostRoot, cdRoot, mcRoot})`,
+  then `openHostFile` → `fopen`.
+- **`cdRoot` defaults to `elfDirectory`**, i.e. the directory holding the game executable. The
+  runtime expects the disc **extracted as a directory tree**; `cdImage` is a separate raw-sector
+  path used only by `sceCdRead`.
+
+**And the directory has no `IRX/` in it:**
+
+```
+/mnt/ssd/gt4/work/SCUS_973.28   ELF 32-bit LSB executable, MIPS     <- the game executable
+/mnt/ssd/gt4/work/CORE.GT4                                          <- data
+/mnt/ssd/gt4/work/SYSTEM.CNF
+```
+
+`find` for `*.irx` under `/mnt/ssd/gt4`, `/home/or/vulcan4` and `/mnt/ssd/vulcan4-build` returns
+**nothing**, and there is no ISO anywhere on the box. The extraction was incomplete: the game
+executable and data arrived, the `IRX/` driver directory did not.
+
+### What was changed
+
+`SifLoadModule` now calls `reportUnserviceableIopModule`, which prints a `VULCAN 4 LIMITATION:` block
+**once per distinct path**:
+
+```
+VULCAN 4 LIMITATION: IOP driver 'cdrom0:\IRX\MTAPMAN.IRX;1' cannot be served -- the file is not
+present under the cdrom0: root '/mnt/ssd/gt4/work' (handled=1, moduleId=-1).
+VULCAN 4 LIMITATION: the guest will now retry this load forever and make no further progress; this
+is the boot wall, not a hang in the emulator.
+VULCAN 4 LIMITATION: to supply it, put the disc's IRX directory next to the game executable (this
+path is the cdrom0: root) or point cdRoot at a full extraction of your own disc. The drivers are game
+data, so they are never shipped here.
+```
+
+SIO2MAN is deliberately **not** reported: the HLE module manager serves it, so it is not a
+limitation.
+
+This is law #2 being honoured. Before this, `halt=guest_cycle_no_progress` named a symptom and the
+`[IOP] failed to open IRX` warning was on stderr, buried under hundreds of identical lines from a
+guest retrying every few milliseconds. Now the boot says why it stopped, in the product's own voice.
+
+Suite 463/463. Patch md5 `b124c06d573ffa113ffdfeae68088327`.
+
+### What is needed, and it is not code
+
+`IRX/SIO2MAN.IRX`, `IRX/MTAPMAN.IRX` and the rest of GT4's driver directory, from the captain's own
+disc, placed so that `cdrom0:` resolves them. Law #1 forbids shipping them and law #7 says the user
+brings their own disc, so this cannot be done from here. `/mnt/ssd` has 112 GB free, so a full disc
+dump fits if one exists.
+
+**Expect more of these in sequence.** GT4's boot loads its drivers in order, so the next wall will
+be whichever driver comes after MTAPMAN in that list. The new limitation line will name it.

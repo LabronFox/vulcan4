@@ -739,46 +739,10 @@ index 0000000..4636c5e
 +
 +static const unsigned kSyscallNameCount = 58;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c4..92eae1f 100644
+index c5e31c4..b23312d 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-@@ -701,6 +701,35 @@ int EeScheduler::cancelWakeup(int id)
- int EeScheduler::changePriority(int id, int priority, bool interruptSafe, int &oldPriority)
- {
-     assertExecutor();
-+    // W13, RETRACTED. This validation was correct and I changed it wrongly, then shipped the change
-+    // with a gating test and a commit message asserting the opposite. Reverted.
-+    //
-+    // I claimed "priority 0 is the PS2's LOWEST legal priority". It is the HIGHEST, and it is
-+    // reserved by the kernel:
-+    //
-+    //   ps2sdk, ee/kernel, thread.initial_priority: "Initial priority when using CreateThread().
-+    //     0 - 127 (lower number is higher priority, but 0 is reserved by the kernel)."
-+    //   ps2sdk, ee/kernel/include/kernel.h: "#define MAX_PRIORITY 128"
-+    //   PS2Tek, BIOS EE Threading, reschedule(): "Loop through active thread priority list,
-+    //     starting from 0 (highest priority)", over "an array of 128 doubly-linked lists".
-+    //   PS2Tek, BIOS EE Syscalls, 07h ExecPS2: "Creates a thread with priority 0 (main thread)."
-+    //
-+    // So `priority < 1` was right: 0 is the kernel's own, a user thread may not take it, and
-+    // KE_ILLEGAL_PRIORITY (-403) is the correct answer. The repository's own convention and its
-+    // tests agree -- ps2xTest/src/ps2_runtime_kernel_tests.cpp creates a thread with priority 20 and
-+    // calls it "low", and one with priority 5 and calls it "high" -- so I broke a correct runtime.
-+    //
-+    // What the change did to the product: GT4's main loop calls
-+    // sceChangeThreadPriority(id=1, priority=0) in a tight loop. Refused, it spins at prio1. Allowed,
-+    // it took priority 0 -- the HIGHEST priority there is -- and the boot report duly showed
-+    // "tid1@prio0:...(running),tid2@prio2:...(ready)": the top-priority thread holding the CPU and
-+    // everything else waiting behind it. The spin did not stop; it got worse, and it looked like
-+    // progress because the reported priority changed.
-+    //
-+    // The real question this wall actually asks is in the handoff, and it is not about the range at
-+    // all: GT4 is asking for a reserved priority 3,004,970 times, so the value being read as
-+    // "priority" is probably not the priority. Check which register the second argument of
-+    // sceChangeThreadPriority arrives in before touching this validation again.
-     if (priority < 1 || priority >= kPriorityCount)
-     {
-         return KE_ILLEGAL_PRIORITY;
-@@ -1121,6 +1150,275 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+@@ -1121,6 +1121,275 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
      throw EeDispatcherTransfer{};
  }
  
@@ -1054,7 +1018,7 @@ index c5e31c4..92eae1f 100644
  [[noreturn]] void EeScheduler::invokeCurrentSequence(std::vector<GuestInvocation> invocations)
  {
      assertExecutor();
-@@ -1456,23 +1754,49 @@ uint8_t *EeScheduler::rdram() const noexcept
+@@ -1456,23 +1725,49 @@ uint8_t *EeScheduler::rdram() const noexcept
  
  void EeScheduler::bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram)
  {
@@ -1112,7 +1076,7 @@ index c5e31c4..92eae1f 100644
      }
  }
  
-@@ -1740,10 +2064,10 @@ void EeScheduler::applyPendingPreemption()
+@@ -1740,10 +2035,10 @@ void EeScheduler::applyPendingPreemption()
      m_timeSliceExpired = false;
  }
  
@@ -1125,7 +1089,7 @@ index c5e31c4..92eae1f 100644
      const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
      m_pendingEeTimerInterrupts = 0u;
      for (uint32_t timer = 0u; timer < 4u; ++timer)
-@@ -1773,7 +2097,7 @@ void EeScheduler::processPendingEvents()
+@@ -1773,7 +2068,7 @@ void EeScheduler::processPendingEvents()
      applyPendingPreemption();
  }
  
@@ -1134,7 +1098,7 @@ index c5e31c4..92eae1f 100644
  {
      for (;;)
      {
-@@ -1798,7 +2122,10 @@ void EeScheduler::processDueDeadlines()
+@@ -1798,7 +2093,10 @@ void EeScheduler::processDueDeadlines()
                  return;
              }
  
@@ -1428,18 +1392,17 @@ index 9614016..70ae1ed 100644
  
      // QueryBootMode (stub): return 0 for now
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
-index 5110ee2..f4ca7ae 100644
+index 5110ee2..39b7c4b 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
-@@ -112,7 +112,31 @@ namespace ps2_syscalls
+@@ -112,7 +112,30 @@ namespace ps2_syscalls
              const int priority = static_cast<int>(getRegU32(ctx, 5));
              int oldPriority = 0;
              const int result = ee.changePriority(id, priority, interruptSafe, oldPriority);
 -            setReturnS32(ctx, result);
 +            // W13. sceChangeThreadPriority returns the thread's PREVIOUS priority on success, not a
-+            // status code. The console's syscall documents exactly that, and this used to discard
-+            // oldPriority and return `result` (KE_OK) instead -- which is a 0, which is the single
-+            // most damaging thing this handler could return.
++            // status code. This used to discard oldPriority and return `result` (KE_OK), which is a
++            // 0 -- the single most damaging thing this handler could return.
 +            //
 +            // Gran Turismo 4's idle loop, from the generated decode of sub_01011508:
 +            //
@@ -1453,11 +1416,11 @@ index 5110ee2..f4ca7ae 100644
 +            //   01011624  daddu $a1, $s2, $zero (Delay Slot)
 +            //
 +            // It feeds the first call's return straight back in as the second call's PRIORITY. Given
-+            // a 0, the guest restores itself to priority 0 -- which is reserved by the EE kernel and
-+            // refused with KE_ILLEGAL_PRIORITY (-403) -- and does it 2,253,727 times in 90 seconds,
-+            // never yielding, sleeping (sce_SleepThread: one call) or rendering. It looked like the
-+            // game refusing to give up the CPU. It was the game correctly giving it up and us
-+            // answering with the wrong number.
++            // a 0, the guest restores itself to priority 0 -- reserved by the EE kernel and refused
++            // with KE_ILLEGAL_PRIORITY (-403) -- and does it 2,253,727 times in 90 seconds, never
++            // yielding, sleeping (sce_SleepThread: one call) or rendering. It looked like the game
++            // refusing to give up the CPU. It was the game correctly giving it up and us answering
++            // with the wrong number.
 +            //
 +            // Errors still return the negative code; only success changes.
 +            setReturnS32(ctx, result < 0 ? result : oldPriority);

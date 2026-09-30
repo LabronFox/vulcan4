@@ -2080,3 +2080,107 @@ This session I asserted the priority convention from memory and shipped a wrong 
 a syscall ABI from memory and it took one measurement to kill. The difference was only that the
 second time I looked for the evidence **before** writing the fix. That is the whole rule and it costs
 one command.
+
+## 2026-09-30 — W15: the idle loop is a balanced set/restore pair in TWO functions, and the one-character preemption fix fails 3 tests on its own
+
+Suite 467/467. Product re-verified after the recovery below: `distinct_pcs=168`, `vsync_tick=54`,
+`sce_SleepThread=55`, `tid1@prio3`. Patch md5 `aca49a0f0ad579547fa554760e7094fd`, now covering all 28
+changed files.
+
+### What the loop is, read from the generated decode
+
+Probing `changePriorityImpl` with a histogram on `$ra` — which identifies the calling site exactly —
+gave the shape of the whole thing:
+
+```
+[W15] callSite ra=0x0101134c count=200000     <- site 0x01011344, ChangeThreadPriority($s1, 1)
+[W15] callSite ra=0x01011628 count=199999     <- site 0x01011620, ChangeThreadPriority($s3, $s2)
+[W15] callSite ra=0x01000a2c count=1          <- site 0x01000a24, one-off init
+```
+
+**A perfectly balanced 1:1 set/restore pair, 200000 to 199999.** The guest is not failing to yield —
+it is yielding and restoring correctly, forever, and never getting anywhere.
+
+`sub_01011508` in full, which is the readable half:
+
+```
+01011520  addiu $s2, $zero, -0x1      # $s2 = -1, "no saved priority"
+01011538  daddu $s4, $a1, $zero       # $s4 = this function's flag argument
+01011534  jal   func_101F310          # sceGetThreadId()
+01011540  daddu $s3, $v0, $zero       # $s3 = my own thread id
+010115d0  jal   func_101F2B0          # ChangeThreadPriority(me, 1)
+010115d4  addiu $a1, $zero, 0x1 (Delay Slot)
+010115d8  daddu $s5, $v0, $zero       # $s5 = the previous priority we were told
+010115dc  lw    $v0, 0x4($s1)         # walk the node list: node->tid
+010115e0  lw    $s0, 0x0($s1)         #               node->next
+010115f0  jal   func_101F350          # per-node work
+01011604  bnel  $s0, $zero, ->0x10115E0   # loop while node->next
+01011610  movz  $s2, $s5, $v0         # if $s2 == 0, $s2 = what we were told
+01011618  beq   $s2, -1, skip        # -1 means "nothing to restore"
+01011620  jal   func_101F2B0          # ChangeThreadPriority(me, $s2)
+01011624  daddu $a1, $s2, $zero (Delay Slot)
+```
+
+So: **raise myself to priority 1 — the highest a user thread may take — call every node in a list,
+restore.** And `sub_010112E0` at `0x01011328`/`0x01011344` does the same pair, so **two functions are
+each doing raise-then-restore, alternating.** Both are trying to be the one that runs. Neither ever
+gets preempted, because raising yourself to priority 1 means nothing preempts you, and the restore
+happens immediately.
+
+### The experiment, run alone this time
+
+Last time I bundled `requestPreemptionIfHigher`'s guard with two other changes and blamed the others.
+That was wrong. **Changed alone, `<=` instead of `>=`, and it still fails three tests:**
+
+```
+event waiters are FIFO and clear modes apply before testing the next waiter   FAILED
+semaphore waiters are FIFO and signal transfers one token directly            FAILED
+starting a strictly higher-priority thread preempts immediately               FAILED
+467 tests, 463 passed, 4 failed
+```
+
+So the FIFO reordering **comes from this one character**, and now it has a minimal reproducer: one
+comparison in one function. That is a real result and it is worth more than a guess. **Reverted** —
+a fix that breaks three passing tests is not a fix, it is a trade, and I am not making that trade
+without understanding why the tests disagree.
+
+The most likely explanation, offered as a lead and not a conclusion: `EeScheduler::run()` has its own
+scheduling path, and these three tests drive `run()`. If `run()` compensates for the blunt `>=` guard
+somewhere else, then the guard is wrong for a driver that does not call `run()` — which is the
+harness — and right for `run()`, and fixing it properly means fixing both together. The
+`hasReadyAtOrAbovePriority` scan in `transferIfRequested` is the other half of that pair and it was
+left alone this time, so it has not been tested under `<=`.
+
+### The recovery incident, third time, and the fix
+
+`git checkout` in `tools/PS2Recomp` destroyed `EeScheduler.cpp` **again**, and this time the patch
+did not contain it either: the patch had **zero hunks for that file**, because a nested `git add` at
+some point had staged the then-current content into the nested index, so `git diff` (worktree vs
+index) showed nothing for it. The patch is generated from that diff, so it silently omitted the file
+whose work had been staged.
+
+Recovered from `/tmp/opencode/EeScheduler.cpp.good`, the snapshot taken during W10, plus a targeted
+re-apply of the W13 fix. **Everything is verified back: suite 467/467, and the boot reproduces
+`distinct_pcs=168`, `vsync_tick=54`, `sce_SleepThread=55`, `tid1@prio3` exactly.**
+
+Three things are now in place so this cannot recur:
+
+1. **The patch is generated from `git diff --cached`, not `git diff`,** and it is
+   **`git add -A`'d first**, so the nested index always matches the working tree and the patch always
+   contains everything.
+2. **The patch is self-verifying and the check is in the commit ritual:** the number of `^diff --git`
+   headers must equal `git diff --cached --name-only | wc -l`, and the critical files are named
+   explicitly. 28 == 28 today, with `EeScheduler.cpp`, `Thread.cpp`, `iop_module_manager.cpp` and
+   `ps2_thread_block_tests.cpp` all present.
+3. **Never `git checkout` inside `tools/PS2Recomp`.** I wrote that rule in this handoff two entries
+   ago and then broke it twice. It is not optional.
+
+### Next, in order
+
+1. `requestPreemptionIfHigher` with `<=`, **plus** `hasReadyAtOrAbovePriority` scanning upward, as
+   one change — they are a pair, and neither was tested correctly on its own. Red first, and the
+   three failing tests above are the gate: if the pair does not turn them green, the pair is wrong.
+2. If it does, re-run the 90 s boot and expect the set/restore pair to stop dominating
+   `sce_ChangeThreadPriority`. `distinct_pcs` and `sce_SleepThread` are the numbers to watch.
+3. Only after that: why does `sub_01011508` walk a list at all, and what is `func_101F350`? It is
+   called once per node and is the last unexplained thing in the loop.

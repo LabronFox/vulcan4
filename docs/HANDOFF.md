@@ -1304,3 +1304,98 @@ NEXT:   1. **ONE probe, and it is a two-line print:** at the `jr ra` in `sub_010
         every one came from reading a straight-line path and assuming the guest stayed on it. It
         does not — it yields in the middle of a call chain, into a scheduler that copies frames.
         Read `activeContext()` and the invocation stack before reading the guest.**
+
+## 2026-10-01 01:20 · (no dish) · **W10 IS CLOSED. The caller is being rewound to before its own call, on every deferred syscall.**
+
+WALL:   W10. **Found, measured, and the cause is a bug in the W6 fix itself.**
+
+MEASURED — one probe, twelve lines, and the answer is in every field:
+
+        JRRA pc=0x1028640 ra=0x10286dc v0=0x8001218c s2=0x0 s3=0x0 sp=0x1ffff70
+        JRRA pc=0x1028640 ra=0x10286dc v0=0x800120e8 s2=0x0 s3=0x0 sp=0x1ffff70
+        ... identical
+
+        Sampled in the DRIVER's loop at `pc = 0x01028640`, which is `sub_01028638`'s `jr ra` — the
+        resume point its own `SYSCALL` published. **`$ra` is `0x010286DC` on every single pass.**
+        But the dispatch trace proved `jal #2` set `$ra = 0x010286F0` immediately before this. **So
+        `$ra` is reverted between the `jal` and the wrapper's `jr ra`.**
+
+        And look at the rest of the frame: **`s2 = 0`, `s3 = 0`** — while the dispatch trace showed
+        the caller's `s3 = 0x8001218C` at that moment. **`$v0` is the ONLY register that survived
+        (`0x8001218C`, then `0x800120E8`) — and `$v0` is exactly the one register
+        `System.cpp:442`'s `onComplete` writes by hand.** The frame has been rewound to the state
+        it had *before the callee ran*, for every register except the one the runtime deliberately
+        wrote.
+
+DID:    **No shipped code changed yet.** Probed, removed every probe, rebuilt clean, suite
+        **462/462**. This entry is the finding; the fix is the next dish.
+
+THE CAUSE, and it is W6's own fix:
+
+        // EeScheduler::serviceInvocations(), on entry:
+        if (!m_guestExecuting.load(std::memory_order_acquire)) {
+            if (GuestThread *main = thread(kMainThreadId)) {
+                main->context = m_runtime.m_cpuContext;      // <-- HERE
+            }
+        }
+
+        That line was added by G1.8c to stop the scheduler's copy of the main frame going stale
+        during W6. It is guarded on `m_guestExecuting`, which is set true only inside
+        `EeScheduler::run()`'s own dispatch. **The harness never calls `run()` — it has its own
+        loop — so `m_guestExecuting` is ALWAYS false, and this overwrite runs on every single
+        service call.**
+
+        And it overwrites the live frame with a **stale** one, because there are two objects:
+          * `GuestThread::context` — what the driver is actually executing.
+          * `PS2Runtime::m_cpuContext` — updated only by `copyMainContextToRuntime()`.
+        The harness, since the W9a fix, enters the guest at `EeScheduler::currentContext()`, which
+        for the main thread is `main->context`. **So the driver advances `main->context`, and
+        `m_cpuContext` is one publish behind — and every `serviceInvocations` call copies the
+        stale one over the fresh one.**
+
+        The exact sequence for one guest `jal`:
+          1. caller, on `main->context`, does `jal` #2 → `main->context.r[31] = 0x010286F0`
+          2. wrapper's `SYSCALL` throws `EeDispatcherTransfer`
+          3. driver calls `serviceInvocations()` → **the refresh above overwrites
+             `main->context` with `m_cpuContext`, reverting `$ra` to `0x010286DC`** — and also
+             reverting `s3`, `s2` and everything else
+          4. the invocation runs, completes, `onComplete` writes `$v0` into `main->context`
+          5. `copyMainContextToRuntime()` republishes — now carrying only `$v0`'s update
+          6. the driver enters `0x01028640`; `jr ra` goes to `0x010286DC`; `s3 = v0` stores the
+             **previous** search's result; the loop repeats forever.
+
+        **So `s3` gets overwritten with `jal #2`'s answer on the next pass — which is exactly what
+        the dispatch trace measured (`s3` 0x8001218C → 0x800120E8 between n=2 and n=3) — and
+        `s2`, set at `0x010286F4`, is never reached at all because the caller never lands on
+        `0x010286F0`.** The guest's convergence loop is fine. Our scheduler is rewinding it.
+
+        **This also explains why the bug was invisible for eleven dishes:** the rewind only costs
+        anything when a guest function *yields inside a call chain across a deferred syscall*, and
+        until W8 fixed the sleep semantics the guest never got that far. Every measurement before
+        tonight was of a boot that had not yet reached code sensitive to it.
+
+NEXT:   1. **THE RED TEST, and it is four lines of fixture and a contract:**
+        *a guest function that sets `$s2`, `$s3` and `$ra`, calls an overridden syscall, and is
+        resumed must find all three intact and land at the fallthrough PC it published.* It fails
+        today. The fixture is the G1.8b override shape already in `ps2_runtime_kernel_tests.cpp`
+        (`driveGuestLikeTheHarness`), and it is the test the W5 and W10 notes both asked for.
+        Write it BEFORE the fix and watch it go red with exactly the measured signature:
+        `$ra` and `$s3` reverted, `$v0` correct.
+        2. **THE FIX — and it must be decided, not guessed, because the refresh exists for a
+        reason (W6) and cannot simply be deleted.** The refresh is only correct when the driver is
+        NOT the thing advancing the main frame. Since the W9a fix the driver advances
+        `currentContext()`; for the main thread that IS `main->context`, so **there is nothing to
+        refresh.** The honest fix is to make the scheduler's copy authoritative only when it is
+        authoritative: either (a) publish `m_cpuContext` on every guest yield so the two cannot
+        diverge, or (b) guard the refresh on "is the driver driving `main->context` directly",
+        which is now always true for the harness, or (c) have the driver drive `runtime.cpu()` and
+        the scheduler read *that*, restoring the G1.8c contract honestly. **Pick with a test, not
+        with a preference — and note (c) is the one that makes the two-frame design disappear.**
+        3. **Then the milestone.** Zero MMIO accesses; the GS window at `0x1200xxxx` untouched;
+           `VULCAN4 FRAME source=guest` emitted by nothing; the GS lane's emitter still half-built.
+
+        **NINTH correction this session, and the lesson is the one the ledger has been repeating
+        since W7: the guest is innocent in this wall, the instrument is at fault, and the instrument
+        was at fault for a different reason each time.** What finally found it was not a cleverer
+        reading — it was printing the whole register frame at one instruction, where `$v0` was the
+        only survivor, and asking why that one.

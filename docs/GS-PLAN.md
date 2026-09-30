@@ -354,3 +354,59 @@ interpolation on the data it is handed.
 distinct colours and 1,000+ unique pixels, and the frame **passes that** — but only on the G2.1
 transfer background. The frame checksum is byte-identical to G2.1's. No geometry contributed. A
 background gradient satisfies the proxy; only a human or a structural check distinguishes them.
+
+
+### Where the vertex queue goes wrong (G2.2, measured)
+
+The GS's own draw log is the evidence. For the clipped triangle, whose vertices are
+`(380,40)`, `(700,60)`, `(420,240)`, the batches that actually reached the rasteriser were:
+
+```
+[gs:prim] idx=6  v0=(0,0)      v1=(700,60)  v2=(0,0)
+[gs:prim] idx=7  v0=(700,60)   v1=(420,240) v2=(0,0)
+```
+
+Two facts fall straight out:
+
+1. **The batch shifts by one vertex per draw**, and
+2. **the last slot is always `(0,0)`.**
+
+Meanwhile the two functions involved are both straightforward:
+
+```cpp
+// gs_frontend.cpp:1208 -- where a vertex is STORED
+GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+...
+vertexKick(regAddr == GS_REG_XYZ2);
+
+// gs_frontend.cpp:1681 -- how a batch is READ
+for (int i = 0; i < batch.vertexCount; ++i)
+    batch.vertices[static_cast<size_t>(i)] = m_vtxQueue[i];
+```
+
+Store-then-kick, and the read is always slots `[0..n)`. For those to disagree by one slot, the
+first `XYZ2` of a run must be stored while `m_vtxCount != 0`. `GS_REG_PRIM` is what resets it:
+
+```cpp
+case GS_REG_PRIM: { ... m_vtxCount = 0; m_vtxIndex = 0; break; }
+```
+
+**So the prime suspect is that our `PRIM` write is not landing where we think it is.** Two
+consequences follow, and only one experiment separates them:
+
+- **(A)** the `PRIM` REGLIST write never reaches `case GS_REG_PRIM`, leaving `m_vtxCount` and
+  `m_prim.type` at whatever the previous packet left them — which would also explain the **8 draw
+  events for 4 triangles** (two draws per triangle, i.e. `needed` resolving to something other
+  than 3, most likely 1, which is the `GS_PRIM_POINT` reset value), or
+- **(B)** the write lands but `m_prim.type` is overwritten by `PRMODE`, because the frontend only
+  takes the type when `!m_prmodecont`:
+  ```cpp
+  if (m_prmodecont) { m_prim = m_primRegister; } else { m_prim.type = m_primRegister.type; }
+  ```
+  and the framebuffer sweep writes `PRMODECONT = 0`, i.e. AC = 0, which takes the `else` branch and
+  keeps IIP out of `m_prim` entirely. That would leave the gouraud quad flat-shaded even once the
+  queue is fixed.
+
+**The one experiment that settles it:** log `m_prim.type`, `m_prmodecont` and `m_vtxCount` at the
+top of `buildDrawBatch`, alongside the vertex values. Six values, one run, and (A) versus (B) is
+decided. This is the first thing the next dish should do — everything else is downstream of it.

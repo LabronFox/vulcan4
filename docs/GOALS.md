@@ -152,6 +152,17 @@ Eventually the captain's Odin 2. Never an emulator.
   rasteriser's coverage, scissor clip and gouraud interpolation look correct on the data it is
   given, so **the fault is in the primitive stream decoding or the vertex queue, not the
   rasteriser.** That is a real narrowing of the G2.0 open question.
+- **NARROWED FURTHER, from the GS's own draw log.** For the clipped triangle the batches that
+  reached the rasteriser were `v0=(0,0) v1=(700,60) v2=(0,0)` then
+  `v0=(700,60) v1=(420,240) v2=(0,0)` — the batch **shifts one vertex per draw and the last slot
+  is always `(0,0)`.** `buildDrawBatch` always reads `m_vtxQueue[0..n)`, and the store is
+  `m_vtxQueue[m_vtxCount % kMaxVerts]`, so for them to disagree by one the first `XYZ2` of a run
+  must be stored with `m_vtxCount != 0`. The prime suspect is our `PRIM` write not landing — which
+  would also explain 8 draw events for 4 triangles (`needed` resolving to 1, the
+  `GS_PRIM_POINT` reset value). The alternative is that `PRMODECONT = 0` takes the
+  `if (m_prmodecont) ... else { m_prim.type = ... }` branch, which drops IIP entirely.
+  **One experiment decides it: log `m_prim.type`, `m_prmodecont` and `m_vtxCount` at the top of
+  `buildDrawBatch`.** Six values, one run. Written up in `docs/GS-PLAN.md`.
 - **The guest draw sequence is now written down** in `docs/GS-PLAN.md` — framebuffer setup,
   scissor, PRMODECONT, `PRIM` with IIP at bit 3, then the vertex run, with the kick implicit on the
   third vertex. That is the contract the next dish compares against real GT4 GS traffic.

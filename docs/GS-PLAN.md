@@ -736,3 +736,87 @@ running the suite with this dish's test block removed: 445 tests, 444 passed, th
 failure. It asserts on `instructions.h` being readable and on non-empty S1/S2 enum lists, and is
 unrelated to the GS. The docs previously claimed a 444/444 baseline; the measured baseline is
 **444 passed / 1 failed**, and this commit does not change it.
+
+---
+
+## 13. G2.5 — THE TRIANGLE ORACLE: geometry is proven, and the register sequence was wrong in one more place
+
+§12.4 claimed geometry and texture now draw, on the evidence of 37,275 distinct colours in the frame.
+That evidence was worthless: the G2.1 **transfer background** alone supplies 43,804, so a frame full
+of colour bars passes any "many colours" test. Caine looked at the G2.4 frame and reported a test
+pattern, not a triangle. So G2.5 built the check the earlier dishes did not have: **one primitive
+whose pixels can be counted against the geometry.** Full numbers in
+[`GS-TRIANGLE.md`](GS-TRIANGLE.md).
+
+Measured, on an otherwise black 512×512 PSMCT32 framebuffer:
+
+```
+vertices (128,64) (448,96) (192,320)   analytic_area = 39936
+non_background = 39936                 err = 0.000 %   bbox = [128,446]x[64,319]  == predicted
+distinct_colours = 1 (flat)   unexpected_colours = 0
+```
+
+One GIF REGLIST packet, one draw event, three correct vertices at the rasteriser, and **the covered
+pixel count equals the shoelace area exactly** — not within a tolerance, exactly. With a 2-colour
+texture bound through `TEX0_1`, the hard edge lands between columns 287 and 288 and the two counts
+are **27456 / 12480** against predicted **27456 / 12480**.
+
+**What that settles:** the rasteriser, the vertex queue, scissor clipping, flat shading, UV
+interpolation, nearest sampling and the PSMCT32 swizzle are all working on real geometry. The open
+loose end in §12.7 ("a `writeRegister`-submitted triangle still does not land") **did not reproduce**:
+the same triangle through the GIF path, with the Z buffer moved out of the picture, lands exactly
+where the geometry says. The reason it failed there was the Z buffer, below.
+
+### 13.1 The register sequence, corrected again — `ZBUF` is not `FRAME`
+
+`gs_frontend.cpp`, `case GS_REG_ZBUF_1`, decodes:
+
+```
+zbp   = value & 0x1FF          bits 0-8      (NOT bits 4-12, which is FRAME's layout)
+psm   = ((value >> 24) & 0xF) | 0x30
+zmask = (value >> 32) & 1
+```
+
+and the backend addresses it with `framePageBaseToBlock(zbp) = zbp << 5` — an **8 KiB** page. A
+512×512 PSMCT32 framebuffer is 1 MiB, i.e. **128** of those pages. So `ZBUF` base "page 1", the
+obvious choice, is *inside the picture*.
+
+The symptom is worth writing down because it is silent and convincing: the first oracle run drew
+**59,700** pixels in **two** colours with a bounding box reaching `y = 383` when no vertex is below
+`y = 320`. 19,764 of them were `RGB(240,255,63)` — **the depth buffer, visible in the framebuffer**,
+offset from the triangle. An area check alone would have called that a failure with no explanation;
+what named it was counting distinct colours and looking at the bounding box.
+
+Corrected step 3 of §12.6's sequence:
+
+```
+3. ZBUF_1     (0x4E) zbp = 128   (block 4096 = byte 1 MiB), psm field at bit 24, zmask at bit 32
+               -> any zbp below 128 puts the depth buffer inside a 512x512 PSMCT32 framebuffer
+```
+
+**This is the same 8 KiB-vs-256 KiB page defect G2.4 recorded for texture bases**, now measured on
+the framebuffer side as well: real hardware's page is 256 KiB, so a guest's ZBUF base would be read
+**32× too low** here. It is a runtime change and is not made in this dish; it is in
+[`LIMITATIONS.md`](LIMITATIONS.md).
+
+**The G2.4 probe has the same latent defect**: it writes `ZBUF_1 = makeFbp(1, 8)`, i.e. the FRAME
+layout and a base of 1, so a depth-buffer shape is drawn inside its own picture. It is deliberately
+**left untouched** so its recorded checksum (`fnv1a64=0x45c7b19d6eb5fb5a`, §12.4) stays true of the
+frame that was actually produced. The oracle is the frame that proves geometry.
+
+### 13.2 `TFX = 0` (MODULATE) cannot show a 2-colour texture
+
+`combineTexture` computes `(texel * vertex) >> 7` for MODULATE and `texel` for DECAL. With the
+white vertex colour the G2.4 probe used, MODULATE is `texel × 2` clamped: every texel above 127
+saturates, so a 2-colour texture comes back as a tinted gradient and cannot be checked. **Use
+`TFX = 1` (DECAL) for anything whose colour has to be predictable.** That is very likely why §12.4's
+own interior pixel values did not match the texture it had uploaded.
+
+### 13.3 The oracle itself
+
+`tools/gs/vulcan4_gs_triangle.cpp`, built by `tools/gs/build_gs_triangle.sh` and run by
+`tools/gs/run_gs_triangle.sh`. It prints its prediction before it writes a register, judges the run
+against it, exits non-zero on a fail and **names the stage that swallowed the draw** (setup /
+rasteriser / geometry / convention) instead of printing a smaller number. Frames:
+`/mnt/ssd/vulcan4-build/gs/triangle.png` and `triangle-texture.png`. Neither image is reproduced in
+any document; a human looks at the path.

@@ -237,3 +237,56 @@ itself, not gaps in our probe — they will bite the real guest, not us.
 - **No vblank or CSR signalling.** `CSR`/`VIF` interrupt plumbing is untouched; the frame is latched
   on demand, which is correct for a recompiler but means the timing model is absent.
 - **Nothing from Gran Turismo 4 has ever been rendered by this GS.** The guest has not reached it.
+
+---
+
+## GS limitations, as of G2.5 (additions — measured by `tools/gs/vulcan4_gs_triangle.cpp`)
+
+These are appended, not merged: nothing above this line was rewritten.
+
+### New RUNTIME divergences from hardware
+
+- **`ZBUF` is decoded with a different bit layout than `FRAME`, and the page is 8 KiB, so a depth
+  buffer placed at "page 1" lands inside the framebuffer.** `gs_frontend.cpp`, `case GS_REG_ZBUF_1`:
+  `zbp = value & 0x1FF` (bits 0–8), `psm = ((value >> 24) & 0xF) | 0x30`, `zmask = (value >> 32) & 1`
+  — whereas `FRAME_1` puts its base page at bits 4–12 and its PSM at bits 0–2. The backend then
+  addresses both with `framePageBaseToBlock(x) = x << 5`, an **8 KiB** page, while a 512×512 PSMCT32
+  framebuffer is 1 MiB = **128** such pages. **Measured symptom:** a draw with `ZBUF` at base 1
+  produced 19,764 extra pixels in `RGB(240,255,63)` — the depth buffer, visible in the picture,
+  offset from the triangle — and a bounding box reaching `y = 383` when no vertex is below `y = 320`.
+  Any area-only check reads that as an unexplained failure; what identifies it is counting distinct
+  colours and looking at the bounding box. Real hardware's page is 256 KiB, so a guest's ZBUF base
+  would be read **32× too low** here — the same defect G2.4 recorded for texture bases, now on the
+  framebuffer side. *Not fixed: it is a runtime change.*
+  **Work-around used by the oracle:** `ZBUF` base `zbp = 128` (block 4096 = byte 1 MiB), clear of the
+  framebuffer. Note the G2.4 probe still encodes `ZBUF_1` the `FRAME` way at base 1 and therefore
+  carries this shape in its frame; it was left alone so its recorded checksum stays honest.
+
+- **`TFX = 0` (MODULATE) multiplies and saturates, so a sampled texture's colours are not the
+  texture's colours.** `combineTexture` computes `(texel * vertex) >> 7`; with a white vertex colour
+  that is `texel × 2` clamped, so every texel above 127 flattens to 255 and an indexed 2-colour
+  texture returns as a tinted gradient. **Measured consequence:** the G2.4 probe's interior pixel
+  values do not match the texture it uploaded, and no colour-level check of sampling is possible with
+  `TFX = 0`. `TFX = 1` (DECAL) returns the texel unchanged and is what the oracle uses.
+
+### Now proven (was "not done" above)
+
+- **Triangle rasterisation from a guest-shaped primitive stream.** `docs/GS-TRIANGLE.md`: one flat
+  triangle, vertices `(128,64) (448,96) (192,320)`, analytic area **39936**, measured **39936**
+  (0.000 % error), bounding box `[128,446]×[64,319]` exactly as predicted, 1 distinct non-black
+  colour, 0 unexpected colours. Submitted as **one GIF REGLIST packet** (`PRIM` 0x00 … `XYZ2` 0x05),
+  read back through the GS's own presentation path, encoded by the oracle's own PNG writer.
+  **This closes the §12.7 loose end:** a correctly-programmed triangle does land. The G2.4 probe's
+  failure to land one was the Z buffer above, not the primitive type, the vertex queue or the
+  rasteriser.
+- **UV interpolation + nearest sampling + PSMCT32 swizzle, checked by count.** A 64×64 PSMCT32
+  texture split at texel column 32, bound with `TEX0_1`, sampled with S affine in screen x: orange
+  **27456** pixels in columns ≤ 287 and blue **12480** in columns ≥ 288, against predicted
+  **27456 / 12480**, with no mixed column anywhere and no unexpected colour.
+
+### Still absent
+
+Unchanged from the sections above: no VU1, no EE→GS DMA through `GifArbiter`, no indexed texture with
+a CLUT drawn by any test, no blending, no dithering, no mips/LOD, no bilinear edge behaviour, no
+vblank or CSR interrupt plumbing, and **nothing from Gran Turismo 4 has ever been rendered** — the
+guest still has `total_mmio_accesses=0`.

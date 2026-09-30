@@ -995,6 +995,44 @@ needed zero portability work. Evidence already banked: goal `G5.2a`.
   life the original could not have and the player should have had. Accessibility-in-the-shape-of-courtesy.
 - **STATUS:** ⬜ post-playability, same lane as G4/G6.1–G6.3. Registry entry only — do not dispatch.
 
+### ⬜ G6.5 — **THE ENGINE SWAP** *(put an engine somewhere it has no business being, 2026-09-30)*
+- **The captain, 2026-09-30:** *"can u do engine swaps?"* → then, on remembering GT7's version: *"i swear there was
+  a gran turismo game where u could engine swap. i literaly saw an animation of that."* → **"engine swaps is
+  totally something i wanna add."** *(He was right: it is GT7, in GT Auto → Car Maintenance & Service →
+  Engine Swaps, unlocked at Collector Level 50. GT4 never had it. Our version would be a first for GT4.)*
+- **What it is:** take the engine out of car A and make car B run it — power, torque curve, redline,
+  induction, gearing **and its own sound**, the way `G6.2` demands a real cause and not a costume.
+- **The design spec is already proven, and it came free with the captain's memory of GT7:** a swapped car is
+  reported to get a **new sound file and new running characteristics**, not just new numbers. That is the
+  whole shape of the feature stated by the people who built it: **engine = parameter block + sound identity.**
+- **What an engine actually is, in a game we own:** a **parameter block** (power/torque curve, redline,
+  induction type, gear ratios, weight effect) + an **engine sound ID** + a drivetrain linkage. A swap is a
+  transplant of that block between two cars and a re-pointing of the sound ID.
+- **Mechanism, in order — and the hard part is not the transplant, it is the callers:**
+  1. **Find every place the game asks "what engine is this?"** — tach/HUD, gearbox, engine audio, physics
+     tables, AI performance estimates, the tune shop's own menus. The transplant is easy; **the call sites
+     are the work**, and this is exactly the `G10` ownership bill coming due.
+  2. **Start with same-family swaps** (turbo → turbo, NA → NA, similar displacement) so the physics tables
+     are a reference change, not an invention. A rotary into a kei is a **later stage**, not the first dish.
+  3. **Sound is part of the feature, not polish.** A swapped engine with the old engine's voice will read as
+     broken, and the captain will feel it before he can name it (`TASTE-TEST` check #7).
+  4. **Reversible and save-safe by construction.** Record the swap so it can be undone; never rewrite the
+     game's own save fields (`G6.0a`/`G6.3` carry the same rule).
+- **Fence (`G7.0`):** engine sounds come from the user's own disc, or from audio we synthesise ourselves. We
+  ship the mechanism, never the content — same fence as the disc.
+- **Honest limits:** needs `G10`; the torque curve is baked per car so "plausible" is the ceiling, **never
+  parity with the factory engine**; a swap can break the game's own AI/event assumptions (BoP-ish effects) and
+  that is a finding to log, not to hide; and this is **not** GT7's feature — it is our own, built from
+  scratch, and must not be described as a port of it.
+- **Why it belongs in G6:** it is the funniest possible proof that we own this game. GT4 never had swaps, and
+  a Honda **TODAY** with something absurd under the bonnet is exactly the kind of thing the community will
+  screenshot. It is also the natural partner of `G11`: the bridge brings new *cars* in, this changes what is
+  *inside* the ones already there.
+- **DONE WHEN:** two cars swap engines in-game, both still drive and **sound** recognisably like their new
+  engine, the swap can be undone, and the save survives — with the engine-parameter path named (structure +
+  the call sites found), not hand-waved.
+- **STATUS:** ⬜ post-playability. Needs `G10` first. Registry entry only — do not dispatch.
+
 ### ⬜ G7.0 — **DISTRIBUTION: code only. Assets come from the user's disc.** *(the captain's rule)*
 - **The captain, 2026-09-30:** *"We don't publish anything. Just the code. People have to bring their
   own iso file of the game — that's where we take assets."*

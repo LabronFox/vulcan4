@@ -1228,3 +1228,79 @@ EARLIER-PASS NEXT (kept, because step 1 there is still the cheapest way to dispr
            `VULCAN4 FRAME source=guest` emitted by nothing. The GS lane's emitter is still
            half-built. **This is the second consecutive wall whose real cost was a latch in our
            own runtime rather than anything the guest did.**
+
+## 2026-10-01 00:55 · (no dish) · **W10 is one `$ra`. The last measurement, and it is a straight line to the bug.**
+
+WALL:   W10. No shipped behaviour changed. Probed, removed every probe, suite **462/462**.
+
+MEASURED — the dispatch trace, filtered to `targetPc == 0x01028638` (the guest's `sce_FindAddress`
+        wrapper). Twenty-four lines, and they are the whole wall:
+
+        n=1  source=0x10286d4  fallthrough=0x10286dc  ra=0x10286dc  s3=0x0         s2=0x0
+        n=2  source=0x10286e8  fallthrough=0x10286f0  ra=0x10286f0  s3=0x8001218c  s2=0x0
+        n=3  source=0x10286e8  fallthrough=0x10286f0  ra=0x10286f0  s3=0x800120e8  s2=0x0
+        n=4..24  identical to n=3
+
+        Three things, each decisive on its own:
+
+        1. **PASS 1 IS ENTIRELY CORRECT.** `jal #1` (source `0x10286D4`) runs, `s3` becomes
+           `0x8001218C` — the 0x83 slot, found by the guest's own scan. Then `jal #2`
+           (source `0x10286E8`) runs with `ra = 0x10286F0`, exactly as generated code intends.
+           `s2 = 0` at that instant is correct, because `daddu $s2,$v0` is at `0x010286F4`, *after*
+           `0x010286F0`.
+        2. **FROM PASS 2 ONWARD `jal #1` NEVER RUNS AGAIN.** Every subsequent dispatch is
+           `source = 0x10286E8`. Yet the driver's entry histogram says the loop enters
+           `0x010286DC` — **`jal #1`'s fallthrough — 9,969 times, and `0x010286F0` — `jal #2`'s
+           fallthrough — ZERO times.** So the caller is being resumed at `jal #1`'s resume point
+           after `jal #2` has run. **Those two facts cannot both be true of a straight-line path,
+           and this is the contradiction that names the bug.**
+        3. **`s3` CHANGES FROM `0x8001218C` TO `0x800120E8` BETWEEN n=2 AND n=3.** `$s3` is
+           callee-saved (r19) and the only instruction that writes it in this function is
+           `daddu $s3,$v0,$zero` at `0x010286DC`. **`0x800120E8` is `jal #2`'s result.** So the
+           instruction at `0x010286DC` executes again, after `jal #2` already ran, and stores
+           `jal #2`'s answer into `$s3`. **That is why `s1 = s3 - 0x20C` is wrong and the
+           convergence test can never pass** — and it explains, at last, the `s1`/`s0` arithmetic
+           that was correct on paper and never true in the machine.
+
+        **THE MECHANISM, and it is `$ra`:** the caller reaches `0x010286F0` only if
+        `dispatchGuestBranch` RETURNS for `jal #2`. When the callee instead **throws
+        `EeDispatcherTransfer`** (which `sce_FindAddress` does, every time, because the syscall
+        override defers), that assignment — `ctx->pc = 0x10286F0u;` — is skipped. The caller's
+        resume must then come from the wrapper's `jr ra`, via `$ra`, which the generated `jal` set
+        to `0x10286F0`. **So `$ra` is the only thing standing between the caller and the right
+        resume point, and the caller demonstrably lands at `0x010286DC` instead.** Something between
+        the `jal` and the `jr ra` overwrites `$ra` with `0x010286DC` — and the one thing that runs
+        in between and touches the context is **the syscall-override invocation, which executes
+        the guest on a COPY of the frame and copies a result back**.
+
+        `System.cpp:442` copies back only `parent.r[2]`, which is correct and is not the problem.
+        So the overwrite is not in the copy-back. It is in **which frame the invocation is attached
+        to and which frame `activeContext()` returns while it is pending** — `GuestThread::
+        activeContext()` returns `invocations.back().context` while an invocation is queued, so
+        every register the handler touches lands in the COPY, and every resume the handler performs
+        happens on the copy, **not on the caller's frame.** The caller's `$ra` is only safe if
+        nothing ever writes the invocation's copy back except `$v0`. That is the invariant to test.
+
+MEASURED (final, from clean, 60 s): suite **462/462**; `functions_entered=60091`
+        `service_frames=7481984  total_syscall_calls=29914  distinct_mmio_addresses=0`
+        `elapsed_ms=60009  harness_tail_ms=7  thread_state=tid1:status=0:invocations=0`.
+        Boot `/mnt/ssd/vulcan4-build/run/boot_g18n.log`.
+
+NEXT:   1. **ONE probe, and it is a two-line print:** at the `jr ra` in `sub_01028638`
+           (`pc = 0x01028640`), print `$ra` and `ctx->pc`. If `$ra` is `0x010286DC` there, `$ra` was
+           clobbered and the next question is who wrote it; if it is `0x010286F0`, then the `jr ra`
+           dispatched correctly and the caller is being resumed by something else. **One of those
+           two answers ends the wall, and the other moves it one step.**
+        2. **The red test, and it is the right one this time — a contract, not a symptom:**
+           *while a syscall-override invocation is pending, the caller's frame must be untouched
+           except for `$v0`.* Concretely: a caller that sets `$s2`, `$s3` and `$ra`, calls an
+           overridden syscall, and is resumed must find all three intact and must land at the
+           fallthrough PC it published. The fixture is the G1.8b override shape already in
+           `ps2_runtime_kernel_tests.cpp` (`driveGuestLikeTheHarness`), so it is cheap.
+        3. **Then the milestone.** Zero MMIO accesses; the GS window at `0x1200xxxx` untouched;
+           `VULCAN4 FRAME source=guest` emitted by nothing; the GS lane's emitter still half-built.
+
+        **This is the eighth correction in one session, and the shape of all eight is the same:
+        every one came from reading a straight-line path and assuming the guest stayed on it. It
+        does not — it yields in the middle of a call chain, into a scheduler that copies frames.
+        Read `activeContext()` and the invocation stack before reading the guest.**

@@ -3005,10 +3005,10 @@ index 0000000..b08dd30
 +}
 diff --git a/ps2xTest/src/ps2_thread_block_tests.cpp b/ps2xTest/src/ps2_thread_block_tests.cpp
 new file mode 100644
-index 0000000..8b0913d
+index 0000000..5b299fe
 --- /dev/null
 +++ b/ps2xTest/src/ps2_thread_block_tests.cpp
-@@ -0,0 +1,583 @@
+@@ -0,0 +1,613 @@
 +#include "MiniTest.h"
 +#include "ps2_runtime.h"
 +#include "ps2_runtime_macros.h"
@@ -3199,6 +3199,7 @@ index 0000000..8b0913d
 +    constexpr uint32_t K_CHAIN_S2 = 0xAAAA0002u;
 +    constexpr uint32_t K_CHAIN_S3 = 0xBBBB0003u;
 +
++    bool gChainFrameSelectionOk = false;
 +    bool gChainResumeRan = false;
 +    uint32_t gChainS2AtResume = 0u;
 +    uint32_t gChainS3AtResume = 0u;
@@ -3255,11 +3256,23 @@ index 0000000..8b0913d
 +            runtime.setEeSyscallOverride(rdram.data(), K_CHAIN_SYSCALL, K_CHAIN_HANDLER);
 +            runtime.cpu().pc = K_CHAIN_CALLER;
 +            runtime.eeScheduler().reset(rdram.data(), runtime.cpu());
-+            // This fixture drives EeScheduler::currentContext() each iteration, exactly as
-+            // tools/harness/vulcan4_harness.cpp does, so it must also declare it. Without the
-+            // declaration the scheduler refreshes its copy FROM m_cpuContext, the two frames
-+            // diverge, and the test asserts the broken behaviour -- which is the bug it exists to
-+            // catch.
++
++            // reset() leaves m_currentThreadId at 0, which is a SENTINEL, not the main thread --
++            // EeScheduler::kMainThreadId is 1. So currentContext() returns nullptr until some
++            // thread is actually made Running, and a driver that falls back to runtime.cpu() on
++            // nullptr dispatches a DIFFERENT frame than the scheduler chose. That fallback is what
++            // made this test blind: the guest ran on m_cpuContext, the entry refresh then copied
++            // that same live frame over GuestThread::context, and the "rewind" it was supposed to
++            // detect turned into a no-op resync.
++            //
++            // bindMainContextForSyscall is the console's own way of establishing the main thread as
++            // current, so calling it here is using the product, not a back door.
++            runtime.eeScheduler().bindMainContextForSyscall(runtime.cpu(), rdram.data());
++            gChainFrameSelectionOk = runtime.eeScheduler().currentContext() != nullptr;
++
++            // Only now is the driver genuinely in the `true` configuration: every dispatch reads
++            // EeScheduler::currentContext(), so GuestThread::context is the live frame and
++            // m_cpuContext is the stale one.
 +            runtime.eeScheduler().setDriverAdvancesSchedulerContext(true);
 +        }
 +    };
@@ -3272,10 +3285,18 @@ index 0000000..8b0913d
 +    {
 +        for (int step = 0; step < stepBudget; ++step)
 +        {
-+            R5900Context *frame = env.runtime.eeScheduler().currentContext();
++            R5900Context *const frame = env.runtime.eeScheduler().currentContext();
 +            if (frame == nullptr)
 +            {
-+                frame = &env.runtime.cpu();
++                // NO silent fallback. Falling back to runtime.cpu() here would run a different
++                // frame from the one the scheduler selected, which is W9a all over again, and it
++                // would also quietly run this test in the `false` configuration -- the one where
++                // serviceInvocations()'s refresh is a RESYNC and therefore harmless. Measured: with
++                // a fallback in place this fixture dispatched on runtime.cpu(), EeScheduler's
++                // refresh "fixed" nothing because m_cpuContext was the LIVE frame, and the suite
++                // stayed green with the guard reverted. A driver that quietly changes frames is
++                // the bug this whole test exists to catch, so it is a hard stop instead.
++                return;
 +            }
 +            if (frame->pc == 0u || env.runtime.isStopRequested())
 +            {
@@ -3569,6 +3590,15 @@ index 0000000..8b0913d
 +            // is a REWIND, not a lost value.
 +            ChainEnv env;
 +            env.arm();
++
++            // Without this the test asserts nothing. EeScheduler::kMainThreadId is 1 and reset()
++            // leaves m_currentThreadId at the 0 sentinel, so if currentContext() is still null the
++            // driver cannot have been advancing the scheduler's frame, and every assertion below
++            // would pass with the fix reverted. Measured: that is exactly what happened once.
++            t.IsTrue(gChainFrameSelectionOk,
++                     "FIXTURE: currentContext() must resolve after arm(), or this test is not "
++                     "exercising the configuration that breaks. EeScheduler::kMainThreadId is 1, "
++                     "not 0");
 +
 +            driveLikeTheShippedDriver(env, 32);
 +

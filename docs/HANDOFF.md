@@ -1587,3 +1587,83 @@ dump fits if one exists.
 
 **Expect more of these in sequence.** GT4's boot loads its drivers in order, so the next wall will
 be whichever driver comes after MTAPMAN in that list. The new limitation line will name it.
+
+## 2026-09-30 — CORRECTION: the W10 red test did not gate the fix. It does now
+
+`@verifier` was right and I was wrong. Reverting the one-line guard in `EeScheduler.cpp` left the
+suite at **463/463**, and the commit that introduced the test claimed it was red first. It was not,
+in any sense that would have caught the regression.
+
+### Why it was blind
+
+The fixture's driver was:
+
+```cpp
+R5900Context *frame = env.runtime.eeScheduler().currentContext();
+if (frame == nullptr) { frame = &env.runtime.cpu(); }   // <-- this
+```
+
+**`EeScheduler::kMainThreadId` is `1`, and `reset()` leaves `m_currentThreadId` at `0` — which is a
+SENTINEL, not the main thread.** So `currentContext()` returns `nullptr` on the very first dispatch,
+the fallback fired, and the whole scenario ran on `runtime.cpu()` — i.e. in the `false`
+configuration, the one where the entry refresh is a **resync** and not a rewind.
+
+Measured, with the guard reverted:
+
+```
+[DIAG-REFRESH] m_cpuContext.pc=0x301300 main->context.pc=0x301308
+               m_cpu.s2=0x0            main.s2=0xaaaa0002
+```
+
+`m_cpuContext` held the **live** values, because that is where the guest had been running. Copying it
+over `GuestThread::context` was the right thing to do. The test was exercising the fix's *opposite*.
+
+The assertions had a second, independent blindness: they read registers recorded by `chainResume`,
+which runs inside the **invocation's** private frame copy. The rewind never touches that copy.
+
+### The fix to the fix
+
+1. `ChainEnv::arm()` now calls `runtime.eeScheduler().bindMainContextForSyscall(runtime.cpu(),
+   rdram.data())` after `reset()`, so the main thread really is current and `currentContext()`
+   resolves from the first dispatch. That is the console's own way of establishing it, so the test
+   uses the product rather than a back door.
+2. The driver's silent fallback is **gone** — it is a hard `return`. A driver that quietly switches
+   frames is W9a all over again, and it is exactly what hid this for a whole commit.
+3. A new assertion gates the configuration itself:
+   `FIXTURE: currentContext() must resolve after arm(), or this test is not exercising the
+   configuration that breaks. EeScheduler::kMainThreadId is 1, not 0`.
+   If that ever fails again the test reports it instead of quietly passing.
+
+### Proof it now gates
+
+| build | result |
+|---|---|
+| guard reverted (`!m_guestExecuting` only) | **463 tests, 462 passed, 1 FAILED** |
+| guard restored (`&& !m_driverAdvancesSchedulerContext`) | **463 / 463** |
+
+Red signature with the guard reverted, showing the rewind directly:
+
+```
+m_cpuContext.pc=0x301300 (stale)   main->context.pc=0x301308 (live)
+m_cpu.s2=0x0            (stale)   main.s2=0xaaaa0002     (live)
+```
+
+Product unchanged: `distinct_pcs=143`, `service_frames=38`,
+`distinct_mmio_addresses=308`, `elapsed_ms=1063`, no probes in shipped files. Suite 463/463.
+Patch md5 `b215d8e1a6074234d13127c0735be2ef`.
+
+### Known follow-up, deliberately not done here
+
+`driveLikeTheHarness(BlockEnv&, ...)` — used by the W8 "worker-then-resumed-main" test — actually
+drives `runtime.cpu()`, **not** `currentContext()`, so it is NOT like the harness, and `BlockEnv`
+correctly leaves `driverAdvancesSchedulerContext` at `false`. That combination is self-consistent and
+the test is valid, but the name is a lie and it means the W8 coverage is not measuring the harness's
+real frame selection. Worth renaming and re-pointing at `currentContext()` in a dish of its own;
+doing it here would have put W8 coverage at risk for no gain.
+
+### The lesson, written down
+
+A red-then-green test is only evidence if the red was produced **by reverting the fix**. Asserting
+"it was red when I wrote it" is not a check anyone can repeat, and this time it was simply wrong: I
+watched four assertions go red against a real defect and still shipped a test that could not fail.
+From here: revert the fix, rebuild, watch it go red, then restore it. That is the whole ritual.

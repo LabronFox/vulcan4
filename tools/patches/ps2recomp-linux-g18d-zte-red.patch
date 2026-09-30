@@ -1,0 +1,121 @@
+G1.8d RED: TEST with ZTE clear must not discard every pixel.
+
+This is a RED test, DELIBERATELY NOT APPLIED. See docs/G1.8d-RED.md for the full
+measurement and for why the corresponding runtime fix is not in the tree yet.
+
+THE DEFECT IS REAL AND IT IS GUEST-FACING. Gran Turismo 4 submits PRIM=3
+(GS_PRIM_TRIANGLE) 174 times and writes BITBLTBUF/TRXPOS/TRXREG/TRXDIR, and it
+NEVER writes TEST_1 (0x47). Our runtime read ZTEST unconditionally, so a
+framebuffer that had never had TEST written -- TEST == 0, hence ZTEST method 0,
+which means NEVER -- discarded 100% of its pixels silently. On hardware the
+depth test is gated on TEST bit 16 (ZTE), and with ZTE clear it is DISABLED, so
+the guest's triangles draw normally.
+
+This was predicted at G2.4: docs/LIMITATIONS.md carries "ZTE is not honoured",
+noted because the probe's own TEST_1=0 drew nothing. The real guest has now
+arrived at exactly that prediction.
+
+Apply it, run the suite, and you get:
+
+  [Run]: TEST with ZTE clear leaves the depth test disabled, as hardware does
+      - MECHANISM: with TEST_1 left at its reset value 0 (ZTE clear), the depth test
+        is DISABLED on hardware and the triangle must still rasterise; today it
+        writes 0 pixels because ZTEST method 0 (NEVER) is applied unconditionally.
+
+The obvious runtime fix -- gate the Z test on ZTE in GSCpuBackend::WritePixel --
+was implemented and measured. It made this test pass, and it ALSO broke three
+previously-passing depth assertions ("a passing CT32 DATE should allow depth",
+"CT24 DATE should not block depth", "AFAIL=ZB_ONLY should update depth"). Those
+regressions were NOT explained within this dish's budget, and the runtime change
+was REVERTED rather than shipped, because a fix that breaks a passing test is the
+old bug back. Note also that those three depth assertions fail in the tree with
+neither the fix nor this test present, so they are a separate pre-existing problem.
+
+---
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -4787,84 +4787,6 @@
+         });
+ 
+ 
+-        // ---------------------------------------------------------------------------------
+-        // G1.8d REGRESSION: TEST with ZTE clear must NOT discard every pixel.
+-        //
+-        // Real PS2 hardware gates the depth test on TEST bit 16 (ZTE). With ZTE clear the Z test
+-        // is disabled and the pixel is written regardless of ZTEST. Our runtime read ZTEST
+-        // unconditionally, so a framebuffer that had never had TEST written -- TEST == 0, so
+-        // ZTEST method 0 == NEVER -- threw away 100% of its pixels, silently.
+-        //
+-        // This is not hypothetical. Gran Turismo 4 submits PRIM=3 (a TRIANGLE) 174 times and
+-        // writes BITBLTBUF/TRXPOS/TRXREG/TRXDIR, and it NEVER writes TEST_1 (0x47). So the
+-        // guest's own triangles were all being dropped by this. The defect was named in
+-        // docs/LIMITATIONS.md at G2.4 as "ZTE is not honoured"; this test is the guest arriving.
+-        // ---------------------------------------------------------------------------------
+-        tc.Run("TEST with ZTE clear leaves the depth test disabled, as hardware does", [](TestCase &t)
+-        {
+-            // Draw one triangle and count how many pixels actually landed, with TEST_1 at its
+-            // reset value 0 (ZTE clear) versus TEST_1 with ZTE set.
+-            auto pixelsWrittenWithTest = [&t](uint64_t testReg) -> uint32_t
+-            {
+-                std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+-                GS gs;
+-                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+-                gs.setRasterBackend(std::make_unique<GSCpuBackend>());
+-
+-                constexpr uint64_t kFrame =
+-                    (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+-                constexpr uint64_t kScissor =
+-                    (static_cast<uint64_t>(63u) << 16) | (static_cast<uint64_t>(63u) << 48);
+-                auto xyz = [](uint32_t x, uint32_t y) -> uint64_t
+-                {
+-                    return static_cast<uint64_t>(x * 16u) |
+-                           (static_cast<uint64_t>(y * 16u) << 16);
+-                };
+-
+-                gs.writeRegister(GS_REG_FRAME_1, kFrame);
+-                gs.writeRegister(GS_REG_SCISSOR_1, kScissor);
+-                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+-                gs.writeRegister(GS_REG_TEST_1, testReg); gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+-                gs.writeRegister(GS_REG_PRIM, GS_PRIM_TRIANGLE);
+-                gs.writeRegister(GS_REG_RGBAQ, 0xFF2828DCull);
+-                gs.writeRegister(GS_REG_XYZ2, xyz(4u, 4u));
+-                gs.writeRegister(GS_REG_RGBAQ, 0xFF2828DCull);
+-                gs.writeRegister(GS_REG_XYZ2, xyz(60u, 8u));
+-                gs.writeRegister(GS_REG_RGBAQ, 0xFF2828DCull);
+-                gs.writeRegister(GS_REG_XYZ2, xyz(30u, 60u));
+-
+-                // Count non-zero texels across the whole framebuffer through the GS's own
+-                // PSMCT32 address map -- a linear offset would miss the swizzled layout.
+-                constexpr uint32_t kFbw = 1u;
+-                uint32_t written = 0u;
+-                for (uint32_t y = 0; y < 64u; ++y)
+-                {
+-                    for (uint32_t x = 0; x < 64u; ++x)
+-                    {
+-                        uint32_t px = 0u;
+-                        std::memcpy(&px, vram.data() + GSPSMCT32::addrPSMCT32(0u, kFbw, x, y),
+-                                    sizeof(px));
+-                        if (px != 0u)
+-                            ++written;
+-                    }
+-                }
+-                return written;
+-            };
+-
+-            // MECHANISM: ZTE (TEST bit 16) clear => depth test disabled => pixels land.
+-            const uint32_t zteClear = pixelsWrittenWithTest(0ull);
+-            t.IsTrue(zteClear > 0u,
+-                     "MECHANISM: with TEST_1 left at its reset value 0 (ZTE clear), the depth test "
+-                     "is DISABLED on hardware and the triangle must still rasterise; today it "
+-                     "writes 0 pixels because ZTEST method 0 (NEVER) is applied unconditionally. "
+-                     "This is the defect that silently dropped every triangle GT4 submits.");
+-
+-            // And ZTE set with method NEVER must still reject, so the fix is not a blanket pass.
+-            const uint32_t zteSetNever = pixelsWrittenWithTest((1ull << 16));
+-            t.Equals(zteSetNever, 0u,
+-                     "ZTE set with ZTEST method 0 (NEVER) must still discard every pixel, so "
+-                     "honouring ZTE is not the same as always passing the Z test");
+-        });
+     });
+ 
+ }

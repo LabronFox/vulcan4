@@ -520,7 +520,7 @@ int main(int argc, char *argv[])
     // It lives in the runtime (ps2_guest_progress.h) so the behaviour is unit-tested.
     PS2GuestProgress progress;
     progress.setHangThreshold(budget.maxCycleRepeats);
-    uint64_t progressFunctionMark = 0;
+    uint64_t progressDistinctPcMark = 0;
     size_t progressMmioMark = 0;
 
     // Optional tracing, so a run that never reaches the report line can still be diagnosed
@@ -553,6 +553,119 @@ int main(int argc, char *argv[])
         watchdogFired.store(true);
         runtime.requestStop();
     });
+
+    // G1.8d: decode the PC cycle the guest is stuck in, and NAME it.
+    //
+    // Before this existed the cycle detector printed a bare "guest is cycling through 5
+    // addresses ... (first 0x01000760)" and stopped. Five addresses and a first PC is not a
+    // diagnosis: it is the location of one, with the other four withheld. That is why W7 took
+    // ten measurement passes -- the report never said what the guest was doing, only where it
+    // happened to be standing.
+    //
+    // So the decoder that already existed for the deadline path is lifted out and reused here.
+    // It walks back to the previous occurrence of `pc` (everything after that is one pass of the
+    // loop), decodes every instruction in the block, and for each LOAD prints the effective
+    // address it is polling and the value sitting there. A cycle that loads is waiting on a
+    // memory word, and that word now has a name, an address and a current value.
+    auto nameCycle = [&](const char *tag, uint32_t pc)
+    {
+        std::vector<uint32_t> loop;
+        if (!progress.history().empty())
+        {
+            std::size_t start = progress.history().size();
+            for (std::size_t i = progress.history().size(); i-- > 0;)
+            {
+                if (progress.history()[i] == pc)
+                {
+                    start = i;
+                    break;
+                }
+            }
+            for (std::size_t i = start; i < progress.history().size() && loop.size() < 64u; ++i)
+            {
+                if (std::find(loop.begin(), loop.end(), progress.history()[i]) == loop.end())
+                {
+                    loop.push_back(progress.history()[i]);
+                }
+            }
+        }
+
+        std::cout << "VULCAN4 " << tag << " pc=0x" << std::hex << pc << std::dec
+                  << " block_instructions=" << loop.size()
+                  << " history_len=" << progress.history().size() << std::endl;
+
+        uint32_t loadCount = 0;
+        uint32_t branchCount = 0;
+        std::vector<uint32_t> polledAddresses;
+        for (uint32_t loopPc : loop)
+        {
+            const uint32_t ramOffset = loopPc & 0x00FFFFFFu;
+            if (ramOffset + 4u > PS2_RAM_SIZE)
+            {
+                continue;
+            }
+            uint32_t insn = 0;
+            std::memcpy(&insn, rdram + ramOffset, sizeof(insn));
+            const char *mn = mipsMnemonic(insn);
+            const uint32_t op = insn >> 26;
+            const bool isBranch = (op == 0x04 || op == 0x05 || op == 0x06 || op == 0x07
+                                   || (op == 0 && (insn & 0x3F) == 0x08));
+            if (isBranch)
+            {
+                ++branchCount;
+            }
+            std::cout << "VULCAN4 " << tag << "LOOP pc=0x" << std::hex << loopPc << std::dec
+                      << " insn=0x" << std::hex << insn << std::dec << " " << mn;
+            // G1.8d CORRECTION. A zero word here is almost certainly NOT an instruction. The
+            // guest image is a file-backed PT_LOAD at vaddr 0x01000000 / file offset 0x1000, and
+            // this decode indexes the harness's RDRAM by the low 24 bits of the vaddr, which does
+            // not reproduce that mapping -- so it reads zeroed RDRAM for every guest address and
+            // would print "nop" for all of them. That is a plausible-looking wrong answer, which is
+            // the failure mode this project keeps hitting, so the zero case is LABELLED rather
+            // than decoded. Measured against SCUS_973.28: guest 0x01000760 is 0x0000282d (DADDU),
+            // not 0x00000000.
+            if (insn == 0u)
+            {
+                std::cout << "  [UNVERIFIED: rdram lookup returned zero -- this is NOT evidence"
+                             " that the guest executes a nop here; decode from the ELF instead]";
+            }
+            uint32_t rt = 0, imm = 0;
+            int width = 0;
+            bool isSigned = false;
+            if (decodeGpuLoad(insn, rt, imm, width, isSigned))
+            {
+                const uint32_t base = _mm_extract_epi32(ctx.r[(insn >> 21) & 0x1F], 0);
+                const uint32_t addr = base + imm;
+                uint32_t value = 0;
+                std::memcpy(&value, rdram + (addr & 0x00FFFFFFu), sizeof(value));
+                std::cout << "  -> POLLS addr=0x" << std::hex << addr << std::dec
+                          << " (base=r" << ((insn >> 21) & 0x1F) << " 0x" << std::hex << base
+                          << std::dec << " + 0x" << std::hex << imm << std::dec
+                          << ") width=" << width << " rt=r" << rt
+                          << " value=0x" << std::hex << value << std::dec;
+                polledAddresses.push_back(addr);
+                ++loadCount;
+            }
+            if (isBranch)
+            {
+                std::cout << "  [branch]";
+            }
+            std::cout << std::endl;
+        }
+        std::cout << "VULCAN4 " << tag << "SUM loads=" << loadCount << " branches=" << branchCount
+                  << (loadCount
+                          ? " -- the guest is POLLING MEMORY; the POLLS lines name the words"
+                          : " -- no loads: pure arithmetic or a register-only wait, NOT memory")
+                  << std::endl;
+        if (!polledAddresses.empty())
+        {
+            std::cout << "VULCAN4 " << tag << "DEPENDS on:";
+            for (uint32_t a : polledAddresses)
+                std::cout << " 0x" << std::hex << a << std::dec;
+            std::cout << std::endl;
+        }
+        return loop;
+    };
 
     while (!finished)
     {
@@ -603,20 +716,43 @@ int main(int argc, char *argv[])
             // before, or touching hardware it has not touched before. Re-polling a register it
             // already polls deliberately does NOT count, so a guest genuinely waiting on hardware
             // is still caught.
+            // G1.8d FIX. This used to be:
+            //     reachedNewCode = (functionsEntered != progressDistinctPcMark) || (mmio != mark);
+            //     progressDistinctPcMark = functionsEntered;
+            // which is true on EVERY observation, because the mark is assigned the value it is
+            // compared against one line earlier and functionsEntered has advanced by then.
+            // reachedNewCode was therefore a constant `true`, PS2GuestProgress::observe() reset
+            // m_repeats on every single PC, and the cycle detector was DEAD CODE -- it could not
+            // fire no matter what the guest did. Measured: a 20,000,000-entry boot with distinct_pcs
+            // frozen at 112 never produced one VULCAN4 CYCLE line.
+            //
+            // "Reached code it has not run before" means the DISTINCT PC count grew, which this
+            // harness already tracks. Touching new hardware still counts, as before.
             const size_t mmioAddresses = runtime.memory().mmioCounts().size();
-            const bool reachedNewCode = (functionsEntered != progressFunctionMark)
+            const bool reachedNewCode = (distinctPcs != progressDistinctPcMark)
                 || (mmioAddresses != progressMmioMark);
-            progressFunctionMark = functionsEntered;
+            progressDistinctPcMark = distinctPcs;
             progressMmioMark = mmioAddresses;
 
             if (progress.observe(ctx.pc, reachedNewCode))
             {
                 haltReason = kHaltCycleNoProgress;
                 haltPc = ctx.pc;
+                // NAME IT. Decode the cycle before stopping, so the report carries the
+                // instructions and any polled address rather than a bare count.
+                const std::vector<uint32_t> cycle = nameCycle("CYCLE", ctx.pc);
+                std::string decoded;
+                for (uint32_t c : cycle)
+                {
+                    decoded += toHex(c) + " ";
+                }
                 haltDetail = "guest is cycling through " + std::to_string(progress.hangCycleLength())
                     + " addresses and has reached no new code or hardware in "
-                    + std::to_string(progress.hangRepeats()) + " repeats (first "
-                    + toHex(progress.hangFirstPc()) + ")";
+                    + std::to_string(progress.hangRepeats()) + " repeats: [" + decoded
+                    + "] -- decoded on the VULCAN4 CYCLELOOP lines above"
+                    + (progress.hangFirstPc() != ctx.pc
+                           ? " (first address of the cycle " + toHex(progress.hangFirstPc()) + ")"
+                           : "");
                 break;
             }
         }

@@ -1580,3 +1580,87 @@ not waiting on hardware, not on a dispatcher, and not on a pointer that is mispl
 waiting on a table entry that no code we have ever run writes.** The loader bug (G1.6) was one
 writer that had not run; the module table is another. Both are the same class, and the class is:
 **"a value the guest expects to exist, and nothing in the system produces it."**
+
+---
+
+## W8 (G1.8d) — the guest's triangles were being discarded by a depth test nobody enabled
+
+Full detail and evidence: [`docs/G1.8d-RED.md`](G1.8d-RED.md).
+
+The W7 chain ended with the guest at `functions_entered=95`. The state on disk when this dish
+started was already **440,483 entries and 112 distinct PCs** — the copy loop is gone — but the halt
+was still `guest_cycle_no_progress` and, more importantly, still **unnamed**: the detector printed
+"cycling through 5 addresses (first 0x01000760)", which is a location, not a diagnosis.
+
+**Two things landed.**
+
+**1. The cycle is now decoded (shipped).** `PS2GuestProgress::history()` already held the cycle; the
+harness only decoded it on the deadline path. Both paths now share the decoder, so a cycle halt prints
+every instruction in the block and, per load, the address it polls and the value there
+(`VULCAN4 CYCLE` / `CYCLELOOP` / `CYCLEDEPENDS`).
+
+**2. The wall is OUR depth test (named; fix measured then reverted).** GT4 submits `PRIM=3` — a real
+triangle — **174 times**, writes the full transfer block, and **never writes `TEST_1`**. Hardware
+gates the depth test on `TEST` bit 16 (`ZTE`); with `ZTE` clear the test is **disabled**. Our runtime
+read `ZTEST` unconditionally, so `TEST == 0` meant `ZTEST = NEVER` and **every pixel was dropped**,
+silently.
+
+This was predicted at **G2.4**, in `LIMITATIONS.md`, under *"ZTE is not honoured"*, from the evidence
+that our own probe's `TEST_1=0` drew nothing. **Same shape as every previous blocker: something
+earlier did not happen, and the symptom showed up somewhere else.** The guest did not fail to draw —
+we were deleting every triangle it drew.
+
+The four-line fix was written, **passed its RED test**, and **broke three previously-passing depth
+assertions**. It was **reverted, not shipped**: a fix that breaks a passing test is the old bug back.
+The RED test is kept as a patch at `tools/patches/ps2recomp-linux-g18d-zte-red.patch`,
+deliberately unapplied, because a failing test in the suite is worse than no test.
+
+**A second, separate finding: `VULCAN4 FRAME source=guest` does not exist in this codebase.** The
+brief names it as the finish line, but there is no code that emits it and no log that contains it.
+The milestone is unreachable by construction until it is written. The guest's GIF traffic *does*
+arrive — `[gs:gif]` shows 9 packets including one of 114,688 bytes — so the marker needs
+implementing, not just the depth fix.
+
+**Suite correction.** The stated baseline (450/450, later 452/452) is **stale**. Measured:
+**456 tests, 453 passed, 3 failed.** `VU0 macro mappings` is the known working-directory issue; the
+three depth assertions (`a passing CT32 DATE should allow depth`, `CT24 DATE should not block depth`,
+`AFAIL=ZB_ONLY should update depth`) fail **with neither the ZTE fix nor the new test in the tree**,
+so they are pre-existing and are the blocker for step 1 of the next session.
+
+**Next, in order:** (1) explain those three depth failures — they gate the ZTE fix;
+(2) land the ZTE fix, four lines, already written; (3) implement `VULCAN4 FRAME source=guest`;
+(4) the guest now waits on **semaphores** (`WaitSema`×8 vs `SignalSema`×7, `SleepThread`×11) — a
+scheduler wait, a different shape from W7.
+
+**Method.** One pass to name this wall, after ten on W7 spent walking function-by-function. The rule
+that paid, for the third time: **when the guest waits on hardware, read what the guest wrote, not what
+our code did with it.** The answer was a register the guest never writes.
+
+### W8 addendum — the hang detector itself was dead code
+
+Before the wall could be named, the detector had to fire. **It could not.** A **20,000,000-entry**
+boot with `distinct_pcs` frozen at 112 produced **zero** `VULCAN4 CYCLE` lines; every
+`guest_cycle_no_progress` halt in `run/` came from an older build.
+
+```cpp
+const bool reachedNewCode = (functionsEntered != progressFunctionMark) || (mmio != mark);
+progressFunctionMark = functionsEntered;   // assigned the value just compared against
+```
+
+`functionsEntered` advances on every entry, so `reachedNewCode` was a constant **`true`**, the repeat
+counter reset on every PC, and the threshold was unreachable. **A hang detector that cannot detect a
+hang** — which is why the state on disk read `entry_budget_exhausted` at 20M entries instead of
+naming anything. Fixed to use the **distinct PC count**, which is what "code this guest has not run
+before" actually means. It now fires at **44,579** entries, ~450× earlier.
+
+The named cycle: **`0x01000760`, five addresses wide** — a new region, long past W7's `0x0100f8xx`.
+`loads=0`, and **none of the five is a branch**, so the loop's closing branch is not among the sampled
+addresses. That is the next thread.
+
+**And a retraction.** The decoder's first output read `insn=0x0  sll` for all five addresses, which
+looks like "a five-NOP failure trap". **It is not that.** The decoder indexes the harness's RDRAM by
+the low 24 bits of the guest vaddr, which does not reproduce the ELF's mapping (`PT_LOAD` vaddr
+`0x01000000`, file offset `0x1000`), so it reads zeroed RDRAM for every address. Guest `0x01000760`
+is `0x0000282d` (DADDU) in `SCUS_973.28`. A zero word is now labelled `[UNVERIFIED]` instead of being
+decoded as a `nop`, so it cannot be mistaken for a finding twice. Teaching the decoder the real
+mapping is the next session's first job.

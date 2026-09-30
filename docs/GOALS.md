@@ -1033,6 +1033,40 @@ needed zero portability work. Evidence already banked: goal `G5.2a`.
   the call sites found), not hand-waved.
 - **STATUS:** ⬜ post-playability. Needs `G10` first. Registry entry only — do not dispatch.
 
+### ⬜ G6.6 — **THE PIT WALL** *(tune the car without leaving the track, 2026-09-30)*
+- **The captain, 2026-09-30:** *"would also love an option for u to tune a car mid practice race. that way u can test
+  the car instantly after u change its settings"* — i.e. change LSD / suspension / gearing / tyres / aero and
+  **feel it on the very next corner**, instead of: leave the track → menus → tune → reload the track → drive.
+- **Why it is the most *real* feature on this list:** this is what a race engineer actually does. Real racing has
+  a **pit wall**: you come in, the setup changes, you go back out and find out if it was better. GT4 makes you
+  fake the pit stop by *quitting the session entirely*, which destroys the comparison — you lose the reference
+  in your hands between the two laps.
+- **Why it is possible here and impossible in an emulator:** the setup menu and the practice session are both
+  code we own. The physics reads its parameters every frame — so the feature is **re-reading them at a defined
+  moment**, not inventing a system. An emulator cannot add a menu to a session it does not control.
+- **Mechanism, in order — and the safety rule is the whole design:**
+  1. **Never hot-swap a live physics state.** Changing spring rates mid-corner would produce a state the game's
+     own integrator has no reason to be valid in. The correct shape is a **pit stop**: car stationary, clock
+     stopped, setup applied at a clean state, you resume where you are — same track, same reference.
+  2. **Mark the session, not just the lap.** Live tuning invalidates times as comparisons *unless* the change
+     point is recorded. Log the change so a tuned run can never masquerade as a clean one.
+  3. **v1 is practice / test only.** This must **not** reach a race, a championship, or a licence test — the
+     moment it does, every time in the game becomes negotiable. That is a cheat, not a quality of life fix.
+     *(This is the same fence `G6.3` carries: never counterfeit progress.)*
+  4. **The setup screen it opens is the game's own** — same sliders, same values, same effects. We are moving
+     *when* it can be opened, not what it does.
+- **Honest limits:** needs playability (`G4`) plus the tune/setup path working; applying a setup may require a
+  physics re-init that is not instant (measure it — **if a "pit stop" costs five seconds, that is the number we
+  print**, not a claim of "instant"); and if the game caches derived values per session, that cache has to be
+  invalidated deliberately rather than hoped about.
+- **DONE WHEN:** in a practice session the setup menu opens in place, a changed setting is **felt on the next
+  corner**, the change is recorded, and no race or licence time can be produced with live tuning — with the
+  apply-point (function + where it lands) named in the entry.
+- **Why it belongs in G6:** together with `G6.4` this is the pair that makes GT4 a better **test bench** than it
+  ever was a game — thumbnails so you know what you are looking at, and a pit wall so you know what you just
+  changed. Both are frictions the original had no good reason to keep.
+- **STATUS:** ⬜ post-playability, same lane as `G4`/`G6.1`–`G6.5`. Registry entry only — do not dispatch.
+
 ### ⬜ G7.0 — **DISTRIBUTION: code only. Assets come from the user's disc.** *(the captain's rule)*
 - **The captain, 2026-09-30:** *"We don't publish anything. Just the code. People have to bring their
   own iso file of the game — that's where we take assets."*

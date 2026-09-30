@@ -431,7 +431,7 @@ index 0f19c9f..84c551e 100644
  #define READ128(addr) ([&]() -> __m128i {                     \
      uint32_t _addr = (uint32_t)(addr);                        \
 diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
-index f247ff9..aec46f5 100644
+index f247ff9..ddfbfca 100644
 --- a/ps2xRuntime/include/runtime/ee_scheduler.h
 +++ b/ps2xRuntime/include/runtime/ee_scheduler.h
 @@ -93,6 +93,16 @@ enum class GuestInvocationKind : uint8_t
@@ -451,7 +451,7 @@ index f247ff9..aec46f5 100644
  struct GuestInvocation
  {
      GuestInvocationKind kind = GuestInvocationKind::Interrupt;
-@@ -318,6 +328,54 @@ public:
+@@ -318,6 +328,77 @@ public:
      void queueInvocation(GuestInvocation invocation);
      [[noreturn]] void invokeCurrent(GuestInvocation invocation);
      [[noreturn]] void invokeCurrentSequence(std::vector<GuestInvocation> invocations);
@@ -499,6 +499,29 @@ index f247ff9..aec46f5 100644
 +    // Called once per guest frame the service path enters, with the live context. A driver sets it
 +    // to count, name and track those frames exactly as it does its own.
 +    void setServiceFrameObserver(std::function<void(const R5900Context &)> observer);
++
++    // G1.8g / W10. There are TWO frames for the main thread -- GuestThread::context (the
++    // scheduler's) and PS2Runtime::m_cpuContext (the runtime's) -- and only
++    // copyMainContextToRuntime() moves data between them. A driver therefore has to say which one
++    // it advances, because the answer decides which direction serviceInvocations() refreshes.
++    //
++    //   false (default) -- the driver advances runtime.cpu(). m_cpuContext is the live frame and
++    //                      the scheduler's copy is stale, so it is refreshed FROM m_cpuContext.
++    //                      This is what G1.8c added for W6 and what the direct-syscall tests want.
++    //
++    //   true            -- the driver advances EeScheduler::currentContext() each iteration, as
++    //                      tools/harness/vulcan4_harness.cpp does since the W9a fix. For the main
++    //                      thread that IS GuestThread::context, so m_cpuContext is the stale one
++    //                      and must NOT be copied over it.
++    //
++    // Getting this wrong is W10 and it is silent: a service call copies a stale frame over the
++    // live one, so every register a guest set before a call is rewound to before that call --
++    // except $v0, which the runtime writes back by hand and which therefore always looks right.
++    // Measured on GT4: a guest's `jal` -> a deferred syscall -> resume left the caller at the
++    // PREVIOUS call's $ra, with $s2 and $s3 rewound to zero, and the guest spun forever in a
++    // convergence loop that was working perfectly.
++    void setDriverAdvancesSchedulerContext(bool advances) noexcept;
++    [[nodiscard]] bool driverAdvancesSchedulerContext() const noexcept;
 +    // Undo an inline attempt that was aborted. Unused now that overrides stay deferred; retained
 +    // because it is the only correct way to restore a thread whose wait was registered by guest
 +    // code that must be re-run, and the next attempt at synchronous overrides will need it.
@@ -506,7 +529,7 @@ index f247ff9..aec46f5 100644
      [[nodiscard]] bool hasInvocation(GuestInvocationKind kind, uint64_t tag) const;
      [[nodiscard]] uint32_t invocationStackTop();
  
-@@ -382,8 +440,11 @@ private:
+@@ -382,8 +463,11 @@ private:
      void makeReady(GuestThread &thread, int result, bool interruptSafe);
      void requestPreemptionIfHigher(const GuestThread &readyThread, bool interruptSafe);
      void applyPendingPreemption();
@@ -520,11 +543,12 @@ index f247ff9..aec46f5 100644
      void processEvent(const EeEvent &event);
      void finishEventWaiters(EeEventFlag &flag, bool interruptSafe);
      [[nodiscard]] static bool eventCondition(uint32_t current, uint32_t requested, uint32_t mode);
-@@ -448,6 +509,7 @@ private:
+@@ -448,6 +532,8 @@ private:
      uint32_t m_gsVSyncCallbackGp = 0;
      uint32_t m_gsVSyncCallbackSp = 0;
      std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
 +    std::function<void(const R5900Context &)> m_serviceFrameObserver;
++    bool m_driverAdvancesSchedulerContext = false;
      std::atomic<uint64_t> m_nextDeadlineCycle{0};
  
      mutable std::mutex m_snapshotMutex;
@@ -681,10 +705,10 @@ index 0000000..4636c5e
 +
 +static const unsigned kSyscallNameCount = 58;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c4..6a0ea13 100644
+index c5e31c4..b23312d 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-@@ -1121,6 +1121,265 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+@@ -1121,6 +1121,275 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
      throw EeDispatcherTransfer{};
  }
  
@@ -714,7 +738,7 @@ index c5e31c4..6a0ea13 100644
 +    // Guarded on m_guestExecuting, which is true only while run() is between its own steps -- the one
 +    // case where the scheduler's copy is authoritative. Without that guard this rewinds run()'s own
 +    // state and the suite hangs; that was measured, which is why the guard is here.
-+    if (!m_guestExecuting.load(std::memory_order_acquire))
++    if (!m_guestExecuting.load(std::memory_order_acquire) && !m_driverAdvancesSchedulerContext)
 +    {
 +        if (GuestThread *main = thread(kMainThreadId))
 +        {
@@ -899,6 +923,16 @@ index c5e31c4..6a0ea13 100644
 +    m_serviceFrameObserver = std::move(observer);
 +}
 +
++void EeScheduler::setDriverAdvancesSchedulerContext(bool advances) noexcept
++{
++    m_driverAdvancesSchedulerContext = advances;
++}
++
++bool EeScheduler::driverAdvancesSchedulerContext() const noexcept
++{
++    return m_driverAdvancesSchedulerContext;
++}
++
 +bool EeScheduler::canDispatchGuest() const noexcept
 +{
 +    if (m_stopRequested.load(std::memory_order_acquire))
@@ -950,7 +984,7 @@ index c5e31c4..6a0ea13 100644
  [[noreturn]] void EeScheduler::invokeCurrentSequence(std::vector<GuestInvocation> invocations)
  {
      assertExecutor();
-@@ -1456,23 +1715,49 @@ uint8_t *EeScheduler::rdram() const noexcept
+@@ -1456,23 +1725,49 @@ uint8_t *EeScheduler::rdram() const noexcept
  
  void EeScheduler::bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram)
  {
@@ -1008,7 +1042,7 @@ index c5e31c4..6a0ea13 100644
      }
  }
  
-@@ -1740,10 +2025,10 @@ void EeScheduler::applyPendingPreemption()
+@@ -1740,10 +2035,10 @@ void EeScheduler::applyPendingPreemption()
      m_timeSliceExpired = false;
  }
  
@@ -1021,7 +1055,7 @@ index c5e31c4..6a0ea13 100644
      const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
      m_pendingEeTimerInterrupts = 0u;
      for (uint32_t timer = 0u; timer < 4u; ++timer)
-@@ -1773,7 +2058,7 @@ void EeScheduler::processPendingEvents()
+@@ -1773,7 +2068,7 @@ void EeScheduler::processPendingEvents()
      applyPendingPreemption();
  }
  
@@ -1030,7 +1064,7 @@ index c5e31c4..6a0ea13 100644
  {
      for (;;)
      {
-@@ -1798,7 +2083,10 @@ void EeScheduler::processDueDeadlines()
+@@ -1798,7 +2093,10 @@ void EeScheduler::processDueDeadlines()
                  return;
              }
  
@@ -2905,10 +2939,10 @@ index 0000000..b08dd30
 +}
 diff --git a/ps2xTest/src/ps2_thread_block_tests.cpp b/ps2xTest/src/ps2_thread_block_tests.cpp
 new file mode 100644
-index 0000000..87a02d4
+index 0000000..8b0913d
 --- /dev/null
 +++ b/ps2xTest/src/ps2_thread_block_tests.cpp
-@@ -0,0 +1,423 @@
+@@ -0,0 +1,583 @@
 +#include "MiniTest.h"
 +#include "ps2_runtime.h"
 +#include "ps2_runtime_macros.h"
@@ -3065,6 +3099,136 @@ index 0000000..87a02d4
 +            gWakeTarget = 0;
 +        }
 +        ctx->pc = 0u;
++    }
++
++    // ---------------------------------------------------------------- G1.8g, W10
++    //
++    // A driver that yields inside a CALL CHAIN must not rewind the CALLER's registers.
++    //
++    // EeScheduler::serviceInvocations() opens, on entry and when the scheduler is not the one
++    // executing, with:
++    //
++    //     main->context = m_runtime.m_cpuContext;     // G1.8c's refresh
++    //
++    // which was correct when the only driver was EeScheduler::run(). It is not correct for a
++    // driver with its own loop, because such a driver advances EeScheduler::currentContext() --
++    // which for the main thread IS main->context -- while m_cpuContext is only republished by
++    // copyMainContextToRuntime(). The two objects diverge, and the refresh then copies the stale
++    // one over the live one at every service call.
++    //
++    // Measured on GT4 (W10): a guest function that does `jal`; its callee issues a syscall that
++    // DEFERS (so it throws EeDispatcherTransfer); the driver services it and re-enters at the
++    // callee's `jr ra`. At that instant the caller's `$ra` is the value the PREVIOUS `jal` set, its
++    // `$s2` and `$s3` are zero, and only `$v0` -- the one register the runtime writes back by hand
++    // -- is correct. The guest's own convergence loop was fine; the scheduler was rewinding it.
++    //
++    // So the contract is stated on the CALLER's frame, which is the only thing a driver can see:
++    // after a deferred syscall, every register the caller set before the call must still be there.
++
++    constexpr uint32_t K_CHAIN_CALLER = 0x301300u;
++    constexpr uint32_t K_CHAIN_RESUME = 0x301308u;
++    constexpr uint32_t K_CHAIN_HANDLER = 0x301310u;
++    constexpr uint32_t K_CHAIN_SYSCALL = 0x97u;
++    constexpr uint32_t K_CHAIN_RESULT = 0x0BADF00Du;
++    constexpr uint32_t K_CHAIN_S2 = 0xAAAA0002u;
++    constexpr uint32_t K_CHAIN_S3 = 0xBBBB0003u;
++
++    bool gChainResumeRan = false;
++    uint32_t gChainS2AtResume = 0u;
++    uint32_t gChainS3AtResume = 0u;
++    uint32_t gChainV0AtResume = 0u;
++    uint32_t gChainRaAtResume = 0u;
++
++    void chainHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    {
++        setReturnU32(ctx, K_CHAIN_RESULT);
++        ctx->pc = 0u;
++    }
++
++    // Shaped like recompiled code: a `jal` sets $ra, the callee defers, and on resume the caller
++    // carries on at the PC it published. The registers are seeded HERE, before the call, which is
++    // the only place a correct implementation could lose them.
++    void chainCaller(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        SET_GPR_U32(ctx, 18, K_CHAIN_S2);
++        SET_GPR_U32(ctx, 19, K_CHAIN_S3);
++        SET_GPR_U32(ctx, 31, K_CHAIN_RESUME);
++        ctx->pc = K_CHAIN_RESUME;
++        runtime->handleSyscall(rdram, ctx, K_CHAIN_SYSCALL);
++        gChainResumeRan = true; // unreachable in a correct run
++    }
++
++    void chainResume(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    {
++        gChainResumeRan = true;
++        gChainS2AtResume = getRegU32(ctx, 18);
++        gChainS3AtResume = getRegU32(ctx, 19);
++        gChainV0AtResume = getRegU32(ctx, 2);
++        gChainRaAtResume = getRegU32(ctx, 31);
++        ctx->pc = 0u;
++    }
++
++    struct ChainEnv
++    {
++        std::vector<uint8_t> rdram;
++        PS2Runtime runtime;
++
++        ChainEnv() : rdram(PS2_RAM_SIZE, 0) {}
++
++        void arm()
++        {
++            gChainResumeRan = false;
++            gChainS2AtResume = 0u;
++            gChainS3AtResume = 0u;
++            gChainV0AtResume = 0u;
++            gChainRaAtResume = 0u;
++            runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
++            runtime.registerFunction(K_CHAIN_CALLER, chainCaller);
++            runtime.registerFunction(K_CHAIN_RESUME, chainResume);
++            runtime.registerFunction(K_CHAIN_HANDLER, chainHandler);
++            runtime.setEeSyscallOverride(rdram.data(), K_CHAIN_SYSCALL, K_CHAIN_HANDLER);
++            runtime.cpu().pc = K_CHAIN_CALLER;
++            runtime.eeScheduler().reset(rdram.data(), runtime.cpu());
++            // This fixture drives EeScheduler::currentContext() each iteration, exactly as
++            // tools/harness/vulcan4_harness.cpp does, so it must also declare it. Without the
++            // declaration the scheduler refreshes its copy FROM m_cpuContext, the two frames
++            // diverge, and the test asserts the broken behaviour -- which is the bug it exists to
++            // catch.
++            runtime.eeScheduler().setDriverAdvancesSchedulerContext(true);
++        }
++    };
++
++    // The shipped driver pattern, verbatim: the frame is re-read from the scheduler EVERY
++    // iteration, because a reference captured outside the loop is a stale frame wearing the right
++    // name. That re-read is exactly what exposes the rewind, so a test that drives a private copy
++    // instead would assert the broken behaviour and pass.
++    void driveLikeTheShippedDriver(ChainEnv &env, int stepBudget)
++    {
++        for (int step = 0; step < stepBudget; ++step)
++        {
++            R5900Context *frame = env.runtime.eeScheduler().currentContext();
++            if (frame == nullptr)
++            {
++                frame = &env.runtime.cpu();
++            }
++            if (frame->pc == 0u || env.runtime.isStopRequested())
++            {
++                return;
++            }
++            PS2Runtime::RecompiledFunction fn = env.runtime.lookupFunction(frame->pc);
++            if (fn == nullptr)
++            {
++                return;
++            }
++            try
++            {
++                fn(env.rdram.data(), frame, &env.runtime);
++            }
++            catch (const EeDispatcherTransfer &)
++            {
++                env.runtime.eeScheduler().serviceInvocations();
++            }
++        }
 +    }
 +
 +    struct BlockEnv
@@ -3329,6 +3493,36 @@ index 0000000..87a02d4
 +                                                      &env.runtime);
 +            t.IsTrue(std::find(gTrace.begin(), gTrace.end(), TRACE_MAIN_AFTER_SLEEP) != gTrace.end(),
 +                     "after the wake the thread must run the post-sleep frame, not nothing");
++        });
++        tc.Run("G1.8g: a deferred syscall must not rewind the CALLER's registers", [](TestCase &t)
++        {
++            // W10, on the caller's frame rather than on a count. A guest function seeds $s2, $s3
++            // and $ra, calls a callee whose syscall DEFERS, and resumes at the PC it published.
++            // Every one of those registers must survive. $v0 is the control: it is the one the
++            // runtime writes back by hand, so a run where $v0 is right and the rest are reverted
++            // is a REWIND, not a lost value.
++            ChainEnv env;
++            env.arm();
++
++            driveLikeTheShippedDriver(env, 32);
++
++            t.IsTrue(gChainResumeRan, "the caller must resume at the PC it published after the "
++                                     "deferred syscall; the callee's return must carry it there");
++            t.Equals(gChainV0AtResume, K_CHAIN_RESULT,
++                     "$v0 must carry the handler's result -- this is the control, and it is the one "
++                     "register the runtime writes back deliberately");
++            t.Equals(gChainRaAtResume, K_CHAIN_RESUME,
++                     "MECHANISM: $ra must still hold the PC the caller published. If it holds the "
++                     "value an EARLIER call set, then a service call overwrote the caller's frame "
++                     "with a stale one between the call and the return.");
++            t.Equals(gChainS2AtResume, K_CHAIN_S2,
++                     "MECHANISM: a callee-saved register the caller set BEFORE the call must still "
++                     "be set when it resumes. A service call that copies a stale frame over the "
++                     "live one takes it, and that is W10: the guest's own convergence loop was "
++                     "fine and the scheduler was rewinding it.");
++            t.Equals(gChainS3AtResume, K_CHAIN_S3,
++                     "and so must the next one -- the rewind takes every register the runtime does "
++                     "not write back by hand");
 +        });
 +    });
 +}

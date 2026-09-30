@@ -484,6 +484,16 @@ int main(int argc, char *argv[])
     // at all. Both accessors used here are public.
     runtime.eeScheduler().reset(rdram, ctx);
 
+    // G1.8g / W10. This loop advances EeScheduler::currentContext() every iteration, and for the
+    // main thread that IS GuestThread::context -- so m_cpuContext is the STALE one and must not be
+    // copied over it. Without this declaration serviceInvocations() refreshes the scheduler's copy
+    // from m_cpuContext on every service call, which rewinds the caller to before its own call:
+    // measured on GT4 as a guest `jal` -> a deferred syscall -> a resume left $ra holding the
+    // PREVIOUS call's value and $s2/$s3 back at zero, and the guest spun forever in a convergence
+    // loop that was working perfectly. $v0 always looked right, because the runtime writes it back
+    // by hand, which is why this went unnoticed for eleven dishes.
+    runtime.eeScheduler().setDriverAdvancesSchedulerContext(true);
+
     const uint32_t entryPoint = ctx.pc;
     const uint32_t tableBase = g_ps2RecompiledFunctionTableBase;
     const uint32_t tableEnd = g_ps2RecompiledFunctionTableEnd;

@@ -974,3 +974,34 @@ red test first; **verify against the ELF, not our own translation**).
 
 **Done when:** it is published where the next person will look — the recomp/PS2 communities,
 `r/ReverseEngineering`, romhacking — with a running demo as the proof it is not theory.
+
+---
+
+## THE NEXT RECOMP — **VULCAN 5: TEKKEN 5 (+ DARK RESURRECTION)** *(requested 2026-09-30 — registered, NOT scheduled)*
+
+The captain's request, verbatim: *"next recomp will be tekken 5 with the dark resurrection update."*
+
+**A correction that decides the whole project: Dark Resurrection was never released on PS2.** Its
+three real homes, and what each costs us:
+
+| Version | Hardware | Consequence |
+|---|---|---|
+| **Arcade** (Namco **System 256**) | **PS2-class hardware** — System 256 reuses PS2 silicon | ✅ the harness + GS layer we are writing for GT4 are *exactly* what this needs. **Recommended target.** |
+| **PSP** (*Tekken: Dark Resurrection*) | Allegrex MIPS + **GE** GPU | ⚠️ a different console: new runtime, new GPU layer. The *method* transfers (G9), the code mostly does not |
+| **PS3** (PSN digital, 60 fps / 1080p) | Cell + RSX, `EMAIN.SELF` encrypted | 🔴 the hardest of the three — VULCAN 6 territory (SELF decryption) |
+
+**Why the arcade build is the right first target:** same silicon as GT4 means the same EE/GS VU1
+problems, so every wall in the ledger above becomes *already-paid* knowledge instead of a new wall.
+
+**What is different about a fighting game** (worth knowing before we start):
+- Fixed camera, two characters, small stages — **much less geometry than GT4**.
+- **60 fps lock and frame-perfect timing** are the product. That makes the scheduler/context work
+  (W5/W6) *more* important, not less — and it makes a native recomp genuinely better than emulation
+  for input latency, which is the competitive community's whole complaint.
+- Skeletal animation and a hit/hurtbox model replace our car physics — different, not harder.
+
+**Not scheduled**, by the standing rule: *a second game is a reward for a running game.* This entry
+exists so the request cannot drift and so the platform decision is already documented when we start.
+
+**First real task when it opens:** decide the target build (arcade vs PSP) and acquire the ELF for
+mapping — nothing else until that is settled.

@@ -37,3 +37,31 @@ DID:    Committed the chef's blocked G1.8 work (`ba8efe0`) so nothing was left u
 MEASURED: `functions_entered=3 halt=livelocked_in_syscall` at 12:08.
 NEXT:   the campaign itself — `docs/CAMPAIGN.md`. The captain's instruction: one long-term goal that
         does not die with a session.
+
+## 2026-09-30 15:05 · 31-g18c-resume-at-the-right-pc · **wall fell (gate partially met)**
+
+WALL:   W6 — the guest re-entered `0x01000008` (the ELF entry) and re-ran its own CRT init 25 times
+        instead of resuming at the PC each frame published.
+DID:    Fixed the copy direction between the driver's live context and the scheduler's private copy
+        of the base frame. `EeScheduler::serviceInvocations()` now refreshes `main->context` FROM
+        `PS2Runtime::m_cpuContext` on entry when the driver is not `EeScheduler::run()` (guarded on
+        `m_guestExecuting`), and the publish on completion is unconditional again. Red test first:
+        `G1.8c: a frame chain is entered once...` — `docs/G1.8c-RED.md` has the verbatim red text
+        and the probe output that proved the mechanism.
+MEASURED:
+        before: `functions_entered=25  halt=guest_cycle_no_progress  distinct_pcs=1   pc=0x01000008`
+        after:  `functions_entered=95  halt=guest_cycle_no_progress  distinct_pcs=50  pc=0x0100f800`
+        `sce_SetupThread` 25 → **1**, `sce_SetupHeap` 25 → **1**, `sce_FindAddress` 25 → **2**
+        `distinct_mmio_addresses` 0 → **228** (195 in `0x7000xxxx`, the GS/GIF window)
+        suite:  **450/450 passing** (the `VU0 macro mappings` cwd failure is GONE — it was this
+                session's wrong working directory, not a real failure; run the suite from
+                `tools/PS2Recomp/ps2xTest`)
+        `serviced_invocations=5` — still non-zero, G1.8b behaviour intact
+        gate:   **NOT met** (`GATE_EXIT=1`) — `n>25` ✅, `dp>1` ✅, but the halt is still
+                `guest_cycle_no_progress`. The dish's step 5 covers this: the wall MOVED.
+NEXT:   **W7 — the guest spins in a byte-store loop to the GS window.** At `0x0100f800`:
+        `sb $v0,0($t1)` / `addiu $t1,$t1,1` / `bne $t1,$t4` — a memset/copy tail that never
+        terminates. **This is the first wall on the path to milestone 2**, because the guest is
+        already writing to GS memory. Dish: `33-g18d-gs-store-loop`.
+        Also open: the SYSTABLE for `0x5A` now reads `handler=0x102aa38` (was `0x10285c0`) — the
+        override pointer differs between cycles; worth a look but not the current wall.

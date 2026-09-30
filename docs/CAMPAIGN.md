@@ -43,7 +43,8 @@ polish — and this file is rewritten.
 | **W3 — recompiler deadlock** | all 12 threads on futex; `missing index 719`; exit 143 | ✅ fell (G1.5) |
 | **W4 — the syscall overrides never landed** | 197 SCE functions with no runtime handler; GT4's own `0x83`/`0x5A` handlers unreachable | ✅ fell (G1.8b) — **+22 functions entered** |
 | **W5 — the driver never ran what the guest queued** | `EeDispatcherTransfer` caught by the harness, which re-entered the guest **without letting the scheduler service the queued invocation**; then `hasInvocation()` **latched**, so every later `0x83` fell through to our builtin | ✅ fell (G1.8b, commit `cde9992`). **3 → 25 functions entered** |
-| **W6 — the guest restarts from its own entry point** | `pc=0x01000008` `distinct_pcs=1`, 24 repeats; `sce_SetupHeap`/`SetupThread`/`CreateSema` each called **25×** = the guest re-runs its own CRT init; `distinct_mmio_addresses=0` → **not** a hardware wait | 🔴 **OPEN — current wall.** Dish `31-g18c-resume-at-the-right-pc` |
+| **W6 — the guest restarts from its own entry point** | `pc=0x01000008` `distinct_pcs=1`, 24 repeats; `sce_SetupHeap`/`SetupThread`/`CreateSema` each called **25×** = the guest re-runs its own CRT init; `distinct_mmio_addresses=0` → **not** a hardware wait | ✅ fell (G1.8c). **25 → 95 functions, `distinct_pcs` 1 → 50, and the guest now touches 228 hardware registers** — its CRT init runs **once**. `docs/G1.8c-RED.md` |
+| **W7 — the guest spins in a byte-store loop to the GS window** | at `0x0100f800`: `sb $v0,0($t1)` / `addiu $t1,$t1,1` / `bne $t1,$t4` — a memset/copy tail that never terminates. The guest is already writing GS registers (`[gs:gif] nloop=7`, `PRMODE=0x8005`, `PRIM=3`) and 195 distinct `0x7000xxxx` addresses | 🔴 **OPEN — current wall, and the first one on the path to milestone 2.** Dish `33-g18d-gs-store-loop` |
 
 **Reading the ledger is the handoff.** Whoever picks this up starts by reading the last row and the dish
 that owns it.

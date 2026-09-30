@@ -1,0 +1,648 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..9a28445 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1121,6 +1121,182 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+     throw EeDispatcherTransfer{};
+ }
+ 
++bool EeScheduler::serviceInvocations(int stepBudget)
++{
++    assertExecutor();
++    bool ranAnything = false;
++
++    // G1.8c: WHO OWNS THE BASE FRAME, decided once, because it changes the copy direction below.
++    //
++    // GuestThread::context is a COPY of the main frame. EeScheduler::run() keeps it current because
++    // run() is the only thing advancing the guest. A driver that is not run() -- the harness, and
++    // every unit test using driveGuestLikeTheHarness -- advances PS2Runtime::m_cpuContext directly,
++    // so THAT is the live frame and the scheduler's copy is stale from the moment the guest moves.
++    //
++    // W6 was exactly this. Measured with a probe before the fix: 256 consecutive resumes, every one
++    // of them at 0x00300808, the PC the base frame held before the chain ever published a new one.
++    // On GT4 the same shape appears at the ELF entry point 0x01000008, distinct_pcs=1, its own CRT
++    // init re-run 25 times. The stale copy was being published over the live one on completion.
++    //
++    // The refresh happens HERE, on entry, and not after servicing. It has to be before: onComplete
++    // writes the handler's $v0 into the base frame, so refreshing afterwards would discard the very
++    // result being delivered. Refreshing first makes the base frame correct, lets onComplete apply
++    // $v0 to a correct frame, and the unconditional publish at the end then delivers both.
++    //
++    // Guarded on m_guestExecuting, which is true only while run() is between its own steps -- the one
++    // case where the scheduler's copy is authoritative. Without that guard this rewinds run()'s own
++    // state and the suite hangs; that was measured, which is why the guard is here.
++    if (!m_guestExecuting.load(std::memory_order_acquire))
++    {
++        if (GuestThread *main = thread(kMainThreadId))
++        {
++            main->context = m_runtime.m_cpuContext;
++        }
++    }
++
++    for (int step = 0; step < stepBudget; ++step)
++    {
++        processPendingEvents();
++        if (m_stopRequested.load(std::memory_order_acquire))
++        {
++            break;
++        }
++
++        if (m_currentThreadId == 0)
++        {
++            // The signal usually arrives with the running thread still current, but a block inside
++            // the guest will have cleared it. Re-establish the main thread so an invocation has
++            // somewhere to attach.
++            if (GuestThread *main = thread(kMainThreadId))
++            {
++                if (main->status == EeThreadStatus::Ready)
++                {
++                    removeReady(*main);
++                }
++                main->wait = {};
++                if (main->status == EeThreadStatus::Ready || main->invocations.empty())
++                {
++                    main->status = EeThreadStatus::Ready;
++                    makeRunning(*main);
++                }
++            }
++            if (m_currentThreadId == 0)
++            {
++                break; // nothing is current and nothing can be made current
++            }
++        }
++
++        GuestThread *running = currentThread();
++        if (running == nullptr)
++        {
++            break;
++        }
++
++        // A pending invocation outranks the base frame, exactly as in run().
++        if (!m_pendingInvocations.empty() && running->invocations.empty())
++        {
++            GuestInvocation invocation = std::move(m_pendingInvocations.front());
++            m_pendingInvocations.pop_front();
++            if (getRegU32(&invocation.context, 29) == 0u)
++            {
++                SET_GPR_U32(&invocation.context, 29, invocationStackTop());
++            }
++            running->invocations.push_back(std::move(invocation));
++            ranAnything = true;
++            continue;
++        }
++
++        R5900Context &context = running->activeContext();
++
++        if (context.pc == 0u)
++        {
++            if (running->invocations.empty())
++            {
++                // The base frame is finished; there is no invocation to complete.
++                break;
++            }
++            GuestInvocation completed = std::move(running->invocations.back());
++            running->invocations.pop_back();
++            ranAnything = true;
++            if (completed.onComplete)
++            {
++                try
++                {
++                    completed.onComplete(completed.context, running->activeContext());
++                }
++                catch (const EeDispatcherTransfer &)
++                {
++                }
++            }
++            if (running->invocations.empty())
++            {
++                // Back on the base frame. The caller is resumed, which is the point of the whole
++                // exercise. Safe to publish unconditionally: the entry refresh above guaranteed this
++                // frame is current whether run() or an external driver is driving.
++                copyMainContextToRuntime();
++                break;
++            }
++            continue;
++        }
++
++        if (!m_runtime.hasFunction(context.pc))
++        {
++            // A guest that branched somewhere we have no code for. Report it the same way run()
++            // does, then stop rather than spinning on it.
++            m_runtime.reportMissingFunction(m_rdram,
++                                            &context,
++                                            context.pc,
++                                            context.pc,
++                                            PS2Runtime::GuestBranchKind::DirectJump,
++                                            "EE invocation service");
++            copyMainContextToRuntime();
++            break;
++        }
++
++        PS2Runtime::RecompiledFunction function = m_runtime.lookupFunction(context.pc);
++        try
++        {
++            m_insideInterrupt = !running->invocations.empty() &&
++                                running->invocations.back().kind == GuestInvocationKind::Interrupt;
++            function(m_rdram, &context, &m_runtime);
++            m_insideInterrupt = false;
++        }
++        catch (const EeDispatcherTransfer &)
++        {
++            m_insideInterrupt = false;
++        }
++        ranAnything = true;
++    }
++
++    copyMainContextToRuntime();
++    publishSnapshot();
++    return ranAnything;
++}
++
++void EeScheduler::rollbackAbortedInlineInvocation(int threadId)
++{
++    assertExecutor();
++    if (threadId == 0)
++    {
++        return;
++    }
++    GuestThread *aborted = thread(threadId);
++    if (aborted == nullptr)
++    {
++        return;
++    }
++    // The inline attempt ended in a throw, so it never became an invocation and never owned
++    // anything. Undo only what a block changed on this thread: the wait, the status, and the fact
++    // that it stopped being current. Anything else the handler did to OTHER threads stands.
++    aborted->wait = {};
++    aborted->status = EeThreadStatus::Ready;
++    if (m_currentThreadId == 0)
++    {
++        makeRunning(*aborted);
++    }
++    publishSnapshot();
++}
++
+ [[noreturn]] void EeScheduler::invokeCurrentSequence(std::vector<GuestInvocation> invocations)
+ {
+     assertExecutor();
+diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+index 63b12d9..60df265 100644
+--- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+@@ -543,6 +543,204 @@ namespace
+             std::memset(&ctx, 0, sizeof(ctx));
+         }
+     };
++
++    // ---------------------------------------------------------------- G1.8b
++    //
++    // A syscall override is a plain synchronous call on real hardware: the guest issues `syscall`,
++    // the kernel calls the installed handler, the handler returns, and $v0 holds the result. The
++    // guest's caller frame is never unwound, because nothing unwinds it.
++    //
++    // The runtime instead deferred every override to EeScheduler::invokeCurrent, which THROWS
++    // EeDispatcherTransfer. That is the scheduler's control-transfer signal, and it is documented
++    // as "must only be caught at EeScheduler::run()". A driver that is not the scheduler -- which
++    // is exactly what tools/harness/vulcan4_harness.cpp is -- catches it itself, so the throw
++    // leaves the guest's callee frame, the queued invocation is never serviced, and the guest's
++    // own caller-saved registers never get the handler's result. GT4's syscall-override
++    // convergence loop is shaped exactly like the caller below, and its $s2/$s3 were observed
++    // reset to zero every third iteration for this reason.
++    //
++    // These two shapes are the contract any driver step must honour, asserted on the shipped
++    // driver pattern rather than on the scheduler's own loop (which was already correct).
++
++    constexpr uint32_t K_SYNC_OVERRIDE_CALLER = 0x300700u;
++    constexpr uint32_t K_SYNC_OVERRIDE_RESUME = 0x300708u;
++    constexpr uint32_t K_SYNC_OVERRIDE_HANDLER = 0x300710u;
++    constexpr uint32_t K_SYNC_OVERRIDE_SYSCALL = 0x95u;
++    constexpr uint32_t K_SYNC_OVERRIDE_RESULT = 0x1234u;
++    constexpr uint32_t K_SYNC_SENTINEL_S2 = 0xAAAA0002u;
++    constexpr uint32_t K_SYNC_SENTINEL_S3 = 0xBBBB0003u;
++    constexpr uint32_t K_SYNC_UNSET = 0xDEADBEEFu;
++
++    uint32_t gSyncHandlerRan = 0u;
++    uint32_t gSyncEscapedTransfers = 0u;
++    uint32_t gSyncCallerV0 = K_SYNC_UNSET;
++    uint32_t gSyncCallerS2 = K_SYNC_UNSET;
++    uint32_t gSyncCallerS3 = K_SYNC_UNSET;
++    uint32_t gSyncPostSyscallRan = 0u;
++
++    void syncOverrideHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    {
++        ++gSyncHandlerRan;
++        setReturnU32(ctx, K_SYNC_OVERRIDE_RESULT);
++        ctx->pc = getRegU32(ctx, 31); // jr $ra
++    }
++
++    // The caller is GT4's loop, in miniature, and it is shaped the way RECOMPILED code is shaped:
++    // before the call it publishes the address it must be re-entered at, and that address is a
++    // separate resume entry, not the top of the function. Getting this wrong is itself a bug -- a
++    // caller that republishes its own entry gets restarted from the top every time the driver
++    // re-enters it, which is a second way to lose $s2/$s3.
++    void syncOverrideCaller(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        setRegU32(*ctx, 18, K_SYNC_SENTINEL_S2);
++        setRegU32(*ctx, 19, K_SYNC_SENTINEL_S3);
++        ctx->pc = K_SYNC_OVERRIDE_RESUME;
++        runtime->handleSyscall(rdram, ctx, K_SYNC_OVERRIDE_SYSCALL);
++        // Unreachable in a correct run: the driver re-enters at K_SYNC_OVERRIDE_RESUME instead.
++        ++gSyncPostSyscallRan;
++    }
++
++    // The resume entry: everything after the call, which is the part that dies when the frame is
++    // lost.
++    void syncOverrideResume(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    {
++        ++gSyncPostSyscallRan;
++        gSyncCallerV0 = getRegU32(ctx, 2);
++        gSyncCallerS2 = getRegU32(ctx, 18);
++        gSyncCallerS3 = getRegU32(ctx, 19);
++        ctx->pc = 0u;
++    }
++
++    // ---------------------------------------------------------------- G1.8c
++    //
++    // W6, measured on GT4: pc=0x01000008, distinct_pcs=1, 24 repeats, and sce_SetupHeap /
++    // sce_SetupThread / sce_CreateSema called 25 times each. 0x01000008 is the ELF ENTRY POINT, and
++    // a guest loop does not re-initialise its own heap. The guest is being restarted from its entry
++    // instead of resumed at the PC each frame published for itself.
++    //
++    // The shape below is that bug, made deterministic: a chain of frames, each of which publishes
++    // the next resume PC and then makes an overridden syscall. Resume correctly and the entry runs
++    // ONCE. Resume at the entry and it runs once per link, forever -- which is exactly the shape in
++    // the boot log.
++    //
++    // It also asserts WHICH context the resume PC came from, so this is a mechanism test and not a
++    // symptom test: the resume PC must be the one the frame published into the driver's own context,
++    // and GuestThread::context (the scheduler's private copy) must not be the source.
++
++    constexpr uint32_t K_CHAIN_ENTRY = 0x300800u;
++    constexpr uint32_t K_CHAIN_LINK0 = 0x300808u;
++    constexpr uint32_t K_CHAIN_LINK1 = 0x300810u;
++    constexpr uint32_t K_CHAIN_LINK2 = 0x300818u;
++    constexpr uint32_t K_CHAIN_TAIL = 0x300820u;
++    constexpr uint32_t K_CHAIN_SYSCALL = 0x96u;
++    constexpr uint32_t K_CHAIN_RESULT = 0x0BADCAFEu;
++    constexpr int K_CHAIN_LINKS = 3;
++    constexpr uint32_t K_CHAIN_S2_SEED = 0xAAAA0002u;
++    constexpr uint32_t K_CHAIN_S3_SEED = 0xBBBB0003u;
++
++    uint32_t gChainEntryEntries = 0u;
++    uint32_t gChainLinkEntries = 0u;
++    uint32_t gChainTailEntries = 0u;
++    uint32_t gChainHandlerRan = 0u;
++    uint32_t gChainV0s = 0u;
++    std::vector<uint32_t> gChainResumePcs;
++    uint32_t gChainSentinelS2 = 0u;
++    uint32_t gChainSentinelS3 = 0u;
++    uint32_t gChainS2Seed = K_CHAIN_S2_SEED;
++    uint32_t gChainS3Seed = K_CHAIN_S3_SEED;
++
++    void chainOverrideHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    {
++        ++gChainHandlerRan;
++        setReturnU32(ctx, K_CHAIN_RESULT);
++        ctx->pc = getRegU32(ctx, 31); // jr $ra
++    }
++
++    // One link. Every frame in the chain is the same code: publish the next resume PC, make the
++    // overridden syscall, and let the driver re-enter at what was published. The next resume PC is
++    // handed in through $a3, which no part of the chain clobbers, so the chain is data-driven and
++    // there is no per-link copy of this function to go stale.
++    void chainLink(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        ++gChainLinkEntries;
++        const uint32_t nextResume = getRegU32(ctx, 7); // $a3 = where to resume
++        ctx->pc = nextResume;
++        runtime->handleSyscall(rdram, ctx, K_CHAIN_SYSCALL);
++        // Unreachable when the driver honours the published PC. Reaching here at all means the
++        // frame was restarted rather than resumed, which is the wall.
++        gChainResumePcs.push_back(ctx->pc);
++    }
++
++    void chainEntry(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        ++gChainEntryEntries;
++        // Seeded ONCE, here, and never again. The tail proves they survived every subsequent link,
++        // so a frame that lost them mid-chain is caught rather than re-seeding over the evidence.
++        setRegU32(*ctx, 18, K_CHAIN_S2_SEED);
++        setRegU32(*ctx, 19, K_CHAIN_S3_SEED);
++        setRegU32(*ctx, 7, K_CHAIN_LINK0);
++        chainLink(rdram, ctx, runtime);
++    }
++
++    void chainLink0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        setRegU32(*ctx, 7, K_CHAIN_LINK1);
++        chainLink(rdram, ctx, runtime);
++    }
++
++    void chainLink1(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        setRegU32(*ctx, 7, K_CHAIN_LINK2);
++        chainLink(rdram, ctx, runtime);
++    }
++
++    void chainLink2(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        setRegU32(*ctx, 7, K_CHAIN_TAIL);
++        chainLink(rdram, ctx, runtime);
++    }
++
++    void chainTail(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    {
++        ++gChainTailEntries;
++        gChainV0s = getRegU32(ctx, 2);
++        gChainSentinelS2 = getRegU32(ctx, 18);
++        gChainSentinelS3 = getRegU32(ctx, 19);
++        ctx->pc = 0u;
++    }
++
++    // Drives guest code the way a driver that is not EeScheduler::run() has to. The scheduler's
++    // transfer signal is the documented way to reach the dispatcher; the driver's OBLIGATION on
++    // catching it is to let the scheduler service the invocation the guest just queued. Forgetting
++    // that second half is G1.8's wall: the syscall never returns a value, the caller's saved
++    // registers are lost, and hasInvocation() latches so every later call falls through to the
++    // builtin. tools/harness/vulcan4_harness.cpp is such a driver and now calls serviceInvocations.
++    bool driveGuestLikeTheHarness(PS2Runtime &runtime, R5900Context &ctx, uint8_t *rdram, int stepCap)
++    {
++        for (int step = 0; step < stepCap; ++step)
++        {
++            if (ctx.pc == 0u || runtime.isStopRequested())
++            {
++                return true;
++            }
++            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(ctx.pc);
++            if (fn == nullptr)
++            {
++                return false;
++            }
++            try
++            {
++                fn(rdram, &ctx, &runtime);
++            }
++            catch (const EeDispatcherTransfer &)
++            {
++                ++gSyncEscapedTransfers;
++                // The obligation. The signal means "I queued something; come and run it".
++                runtime.eeScheduler().serviceInvocations();
++            }
++        }
++        return false;
++    }
+ }
+ 
+ void register_ps2_runtime_kernel_tests()
+@@ -1187,9 +1385,14 @@ void register_ps2_runtime_kernel_tests()
+ 
+             t.IsTrue(callSyscall(0x83u, env.rdram.data(), &env.ctx, &env.runtime),
+                      "syscall 0x83 should dispatch");
++            // UPDATED in goal G1.3b: the result is canonicalised into the KSEG1 (uncached)
++            // window, 0x80000000 | physical, so that the syscall-table arithmetic a real guest
++            // performs on it is well defined. GT4 recovers the console kernel's syscall table
++            // base by subtracting n*4 from the address it gets back, and that only closes if
++            // every hit is reported in one family. See docs/FIRST-BOOT.md section 11.
+             t.Equals(static_cast<uint32_t>(getRegS32(env.ctx, 2)),
+-                     kTableBase + 4u,
+-                     "FindAddress should return address of first matching word");
++                     0x80000000u | (kTableBase + 4u),
++                     "FindAddress should return the KSEG1 address of the first matching word");
+         });
+ 
+         tc.Run("numeric syscall 0x83 supports KSEG aliases", [](TestCase &t)
+@@ -1231,9 +1434,19 @@ void register_ps2_runtime_kernel_tests()
+ 
+             t.IsTrue(callSyscall(0x83u, env.rdram.data(), &env.ctx, &env.runtime),
+                      "syscall 0x83 should dispatch");
++
++            // UPDATED in goal G1.3. This used to assert 0.
++            //
++            // The miss return value is the END of the search window, not zero. The authority is
++            // the copy of this exact algorithm that Gran Turismo 4 carries inlined at guest
++            // 0x010285F8, which ends with `move v0,a0` after the cursor has stepped past the end
++            // of the window. It is not a matter of taste: GT4 converges two scans with
++            // `while (prev - 0x20C != cur - 0x168)`, and a zero return makes that comparison
++            // unreachable, so the guest re-issued the same failing search forever -- 103 identical
++            // calls in a 200 s run with functions_entered stuck at 3.
+             t.Equals(static_cast<uint32_t>(getRegS32(env.ctx, 2)),
+-                     0u,
+-                     "FindAddress should return 0 when no matching word exists");
++                     kTableBase + static_cast<uint32_t>(sizeof(kValues)),
++                     "FindAddress should return the end of the window when nothing matches");
+         });
+ 
+         tc.Run("SetSyscall mirrors guest kernel table entries into low memory", [](TestCase &t)
+@@ -1465,7 +1678,7 @@ void register_ps2_runtime_kernel_tests()
+             env.runtime.eeScheduler().run();
+ 
+             t.Equals(static_cast<uint32_t>(getRegS32(gOverrideResult, 2)),
+-                     kTableBase + 4u,
++                     0x80000000u | (kTableBase + 4u),
+                      "only the recursive call should bypass the active override frame and reach the builtin");
+         });
+ 
+@@ -1494,6 +1707,203 @@ void register_ps2_runtime_kernel_tests()
+                      "the invocation result should reach the preserved base context after the wait");
+         });
+ 
++        tc.Run("G1.8b: a non-scheduler driver honours an overridden syscall without losing the guest frame",
++               [](TestCase &t)
++        {
++            // The contract, stated exactly. The transfer DOES leave the guest's frame -- that is
++            // the documented signal, and an override is deferred by design because a handler may
++            // block. What must not happen is the driver re-entering the guest WITHOUT letting the
++            // scheduler service the queued invocation. That is what lost GT4's $s2/$s3.
++            TestEnv env;
++            env.runtime.registerFunction(K_SYNC_OVERRIDE_HANDLER, syncOverrideHandler);
++            env.runtime.registerFunction(K_SYNC_OVERRIDE_CALLER, syncOverrideCaller);
++            env.runtime.registerFunction(K_SYNC_OVERRIDE_RESUME, syncOverrideResume);
++            env.runtime.setEeSyscallOverride(env.rdram.data(),
++                                             K_SYNC_OVERRIDE_SYSCALL,
++                                             K_SYNC_OVERRIDE_HANDLER);
++
++            gSyncHandlerRan = 0u;
++            gSyncEscapedTransfers = 0u;
++            gSyncCallerV0 = K_SYNC_UNSET;
++            gSyncCallerS2 = K_SYNC_UNSET;
++            gSyncCallerS3 = K_SYNC_UNSET;
++            gSyncPostSyscallRan = 0u;
++
++            env.runtime.cpu().pc = K_SYNC_OVERRIDE_CALLER;
++            // The driver's context is runtime.cpu(), NOT a private one: that is the object
++            // serviceInvocations() publishes the resumed main thread into, and it is what
++            // tools/harness/vulcan4_harness.cpp drives. A driver holding its own copy is the same
++            // class of bug -- it would read a context nobody ever writes back.
++            const bool drove = driveGuestLikeTheHarness(env.runtime,
++                                                        env.runtime.cpu(),
++                                                        env.rdram.data(),
++                                                        16);
++
++            t.IsTrue(drove, "the driver should reach the caller's completion (ctx.pc == 0)");
++            t.Equals(gSyncHandlerRan, 1u, "the installed override handler should have run exactly once");
++            t.Equals(gSyncPostSyscallRan, 1u,
++                     "the caller must resume after its overridden syscall instead of being unwound");
++            t.Equals(gSyncCallerV0, K_SYNC_OVERRIDE_RESULT,
++                     "the handler's return value must reach the caller in $v0");
++            t.Equals(gSyncCallerS2, K_SYNC_SENTINEL_S2,
++                     "$s2 must survive the overridden syscall (GT4's convergence loop lost it here)");
++            t.Equals(gSyncCallerS3, K_SYNC_SENTINEL_S3,
++                     "$s3 must survive the overridden syscall (GT4's convergence loop lost it here)");
++            t.IsTrue(!env.runtime.eeScheduler().hasInvocation(GuestInvocationKind::SyscallOverride,
++                                                               K_SYNC_OVERRIDE_SYSCALL),
++                     "MECHANISM: the invocation must not be left stranded. A stranded one makes "
++                     "hasInvocation() latch, so every later call of that syscall silently falls "
++                     "through to our builtin instead of the guest's own code.");
++        });
++
++        tc.Run("G1.8b: the guest's s-registers are not reset every third overridden syscall",
++               [](TestCase &t)
++        {
++            // The counter shape, and the one that actually bit. GT4's loop is
++            //   s3 = FindAddress(...); s1 = s3 - 0x20C; s2 = FindAddress(...); s0 = s2 - 0x168;
++            // repeating until s1 == s0. Both pointers have to be live at the same instant or the
++            // loop can never converge. So: make N overridden syscalls from one guest frame and
++            // require the frame to be intact after every one of them.
++            TestEnv env;
++            env.runtime.registerFunction(K_SYNC_OVERRIDE_HANDLER, syncOverrideHandler);
++            env.runtime.registerFunction(K_SYNC_OVERRIDE_CALLER, syncOverrideCaller);
++            env.runtime.registerFunction(K_SYNC_OVERRIDE_RESUME, syncOverrideResume);
++            env.runtime.setEeSyscallOverride(env.rdram.data(),
++                                             K_SYNC_OVERRIDE_SYSCALL,
++                                             K_SYNC_OVERRIDE_HANDLER);
++
++            constexpr int kSyscalls = 6;
++            for (int i = 0; i < kSyscalls; ++i)
++            {
++                gSyncHandlerRan = 0u;
++                gSyncEscapedTransfers = 0u;
++                gSyncCallerV0 = K_SYNC_UNSET;
++                gSyncCallerS2 = K_SYNC_UNSET;
++                gSyncCallerS3 = K_SYNC_UNSET;
++                gSyncPostSyscallRan = 0u;
++
++                env.runtime.cpu().pc = K_SYNC_OVERRIDE_CALLER;
++                const bool drove = driveGuestLikeTheHarness(env.runtime, env.runtime.cpu(), env.rdram.data(), 16);
++
++                std::ostringstream tag;
++                tag << " (call " << (i + 1) << " of " << kSyscalls << ")";
++                const std::string at = tag.str();
++
++                std::ostringstream m1;
++                m1 << "the driver should complete the guest frame" << at;
++                t.IsTrue(drove, m1.str().c_str());
++
++                std::ostringstream m2;
++                m2 << "the override handler must run on every call, not only the first" << at;
++                t.Equals(gSyncHandlerRan, 1u, m2.str().c_str());
++
++                std::ostringstream m3;
++                m3 << "the caller must resume after its overridden syscall" << at;
++                t.Equals(gSyncPostSyscallRan, 1u, m3.str().c_str());
++
++                std::ostringstream m4;
++                m4 << "$v0 must hold the handler result" << at;
++                t.Equals(gSyncCallerV0, K_SYNC_OVERRIDE_RESULT, m4.str().c_str());
++
++                std::ostringstream m5;
++                m5 << "$s2 must survive" << at;
++                t.Equals(gSyncCallerS2, K_SYNC_SENTINEL_S2, m5.str().c_str());
++
++                std::ostringstream m6;
++                m6 << "$s3 must survive" << at;
++                t.Equals(gSyncCallerS3, K_SYNC_SENTINEL_S3, m6.str().c_str());
++
++                std::ostringstream m7;
++                m7 << "no invocation may be left stranded" << at;
++                t.IsTrue(!env.runtime.eeScheduler().hasInvocation(GuestInvocationKind::SyscallOverride,
++                                                                   K_SYNC_OVERRIDE_SYSCALL),
++                         m7.str().c_str());
++            }
++        });
++
++        tc.Run("G1.8c: a frame chain is entered once, and resumes at each frame's own published PC",
++               [](TestCase &t)
++        {
++            // W6. The guest re-enters the ELF entry point instead of resuming, so it re-runs its own
++            // CRT init forever. Asserted here as: the entry runs ONCE across a chain of overridden
++            // syscalls, and each frame resumes at the PC it published -- not at the entry, and not
++            // from the scheduler's private copy of the context.
++            TestEnv env;
++            env.runtime.registerFunction(0x300900u, chainOverrideHandler);
++            env.runtime.registerFunction(K_CHAIN_ENTRY, chainEntry);
++            env.runtime.registerFunction(K_CHAIN_LINK0, chainLink0);
++            env.runtime.registerFunction(K_CHAIN_LINK1, chainLink1);
++            env.runtime.registerFunction(K_CHAIN_LINK2, chainLink2);
++            env.runtime.registerFunction(K_CHAIN_TAIL, chainTail);
++            env.runtime.setEeSyscallOverride(env.rdram.data(), K_CHAIN_SYSCALL, 0x300900u);
++
++            gChainEntryEntries = 0u;
++            gChainLinkEntries = 0u;
++            gChainTailEntries = 0u;
++            gChainHandlerRan = 0u;
++            gChainV0s = 0u;
++            gChainSentinelS2 = 0u;
++            gChainSentinelS3 = 0u;
++            gChainResumePcs.clear();
++
++            env.runtime.cpu().pc = K_CHAIN_ENTRY;
++            const bool drove = driveGuestLikeTheHarness(env.runtime,
++                                                        env.runtime.cpu(),
++                                                        env.rdram.data(),
++                                                        256);
++
++            std::ostringstream detail;
++            detail << "entry=" << gChainEntryEntries
++                   << " links=" << gChainLinkEntries
++                   << " tail=" << gChainTailEntries
++                   << " handler=" << gChainHandlerRan
++                   << " restarted_inside_link=" << gChainResumePcs.size()
++                   << " v0=0x" << std::hex << gChainV0s
++                   << " s2=0x" << gChainSentinelS2
++                   << " s3=0x" << gChainSentinelS3 << std::dec;
++
++            t.IsTrue(drove, ("the driver must reach the end of the chain" + detail.str()).c_str());
++            t.IsTrue(gChainTailEntries == 1u,
++                     ("the chain must run to its tail exactly once" + detail.str()).c_str());
++
++            // THE assertion. Today the entry is entered once per link.
++            t.IsTrue(gChainEntryEntries == 1u,
++                     ("MECHANISM: the entry point must be entered exactly ONCE across a chain of "
++                      "overridden syscalls; being re-entered once per link is GT4 re-running its own "
++                      "CRT init forever"
++                      + detail.str())
++                         .c_str());
++
++            // And the links themselves, once each -- no skipped link, no repeated one.
++            // The entry frame also makes one syscall, so a correct run has K_CHAIN_LINKS + 1.
++            const uint32_t expectedLinks = static_cast<uint32_t>(K_CHAIN_LINKS) + 1u;
++            t.IsTrue(gChainLinkEntries == expectedLinks,
++                     ("each of the " + std::to_string(K_CHAIN_LINKS)
++                      + " links plus the entry must make exactly one syscall each"
++                      + detail.str())
++                         .c_str());
++
++            // Which context the resume PC came from. If the driver re-entered at a PC held in the
++            // scheduler's private copy rather than the one the frame published into
++            // PS2Runtime::m_cpuContext, the entry is what you get.
++            t.IsTrue(gChainResumePcs.empty(),
++                     ("no frame may be restarted from inside a link: a frame that publishes a resume "
++                      "PC and then keeps executing in the same invocation was never resumed"
++                      + detail.str())
++                         .c_str());
++
++            // The value and the registers still have to survive the chain, or the fix bought
++            // correctness of PC with loss of state.
++            t.Equals(gChainHandlerRan, static_cast<uint32_t>(K_CHAIN_LINKS) + 1u,
++                     "the override handler must run once per syscall in the chain");
++            t.Equals(gChainV0s, K_CHAIN_RESULT,
++                     "$v0 must carry the handler result to the tail of the chain");
++            t.Equals(gChainSentinelS2, K_CHAIN_S2_SEED,
++                     "$s2, seeded once at the entry, must survive every link of the chain");
++            t.Equals(gChainSentinelS3, K_CHAIN_S3_SEED,
++                     "$s3, seeded once at the entry, must survive every link of the chain");
++        });
++
+         tc.Run("exit handlers run as ordered invocation frames before the thread becomes dormant", [](TestCase &t)
+         {
+             TestEnv env;

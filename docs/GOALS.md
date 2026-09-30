@@ -961,6 +961,40 @@ needed zero portability work. Evidence already banked: goal `G5.2a`.
   button that never existed, both in a twenty-year-old game, neither one a hack.
 - **STATUS:** ⬜ post-playability, same lane as G4/G6.1/G6.2. Registry entry only — do not dispatch.
 
+### ⬜ G6.4 — **THE SHOWROOM PREVIEW** *(show me the car, not just its name, 2026-09-30)*
+- **The captain, 2026-09-30, looking at his own used-car lot with Cr. 177,904:** *"showing a preview of the
+  cars. bc the game only shows u names. i dont know every cars name by memory lol. ion think anyone does.
+  u hnave to press on it. let it load then see the car only to go back. a waste of time!"*
+- **What it is:** every row in a car list — **used lot, dealership, garage, tune shop** — carries a small
+  thumbnail of the actual car, so a name is not the only way to know what you are looking at.
+- **Why this is possible here and impossible in an emulator:** the list is drawn by code we now own, and
+  the game **already knows how to load and show a car** — that is precisely what the select-and-wait does
+  today. The fix is not new capability, it is **calling an existing path at a better time**. An emulator
+  cannot reorder a menu it does not own; we can.
+- **Mechanism, in order:**
+  1. **Depends on car rendering existing at all** (`G3`/`G4`): if we cannot load and draw a car, there is
+     nothing to preview. This ships *after* a car renders on its own.
+  2. **Offscreen pass, not a new renderer.** Render the model into a small target (128×96 or so), then
+     composite it as a textured quad in the row — the GS layer already does textured quads.
+  3. **It must be async or cached — this is the whole engineering risk.** GT4's menus stream from the
+     disc, and a synchronous model load per row would turn a snappy list into a slideshow. Correct shape:
+     draw the row immediately, load the model in the background, and **cache the thumbnail in the user's
+     own data directory** so the first visit pays and every later visit is instant.
+  4. **One hook, four screens.** The used lot, the dealership, the garage and the tune shop draw their
+     lists the same way — build it once and wire it to all four, not four times.
+- **Fence (G7.0):** thumbnails are **generated at runtime from the user's own disc and cached locally**.
+  They are rendered game content — same class as the disc — so they are **never shipped and never
+  committed**. We ship the code that makes them.
+- **Honest limits:** needs the car path (`G3`/`G4`) first; the thumbnail cache costs VRAM and disk (small,
+  but named); if a list's row geometry is baked into the data rather than drawn, the hook goes on the
+  **draw**, not on the data — the layout is not ours to rewrite.
+- **DONE WHEN:** opening the used-car lot shows recognizable thumbnails of the actual cars, the list does
+  not hitch while they appear, and they survive a restart (cached) — checked against the captain's own
+  eyes, in the field.
+- **Why it belongs in G6:** it is the same deal as the chime and the skip — a small, obvious quality of
+  life the original could not have and the player should have had. Accessibility-in-the-shape-of-courtesy.
+- **STATUS:** ⬜ post-playability, same lane as G4/G6.1–G6.3. Registry entry only — do not dispatch.
+
 ### ⬜ G7.0 — **DISTRIBUTION: code only. Assets come from the user's disc.** *(the captain's rule)*
 - **The captain, 2026-09-30:** *"We don't publish anything. Just the code. People have to bring their
   own iso file of the game — that's where we take assets."*

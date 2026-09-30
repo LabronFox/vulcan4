@@ -1005,3 +1005,32 @@ exists so the request cannot drift and so the platform decision is already docum
 
 **First real task when it opens:** decide the target build (arcade vs PSP) and acquire the ELF for
 mapping — nothing else until that is settled.
+
+---
+
+## G10 — OWNERSHIP: grow native code, function by function *(wants-it-confirmed 2026-09-30)*
+
+The captain, 2026-09-30: *"if a recomp will eventually give us the same freedom as a decomp like
+Dusklight is doing? then yes i want that. also port?"*
+
+**Both: yes — and this is the mechanism.** A recomp does not hand you decomp freedom for free; you
+**grow it**. The model (proven by `psxport`/Tomba2Engine on PS1):
+
+1. **The recomp gets you running** — playable now, not in years.
+2. **The recomp stays as the oracle** — it is the reference for what "correct" means.
+3. **Rewrite what you want to own** in clean native code, one function at a time, verifying each
+   rewrite **byte-exact against the recompiled reference**. Ownership grows where it pays.
+
+**Where ownership pays first for us:** the **car pipeline** (so `add a car` — G6, the most-requested
+GT4 feature ever — becomes a source job instead of binary surgery), then the menus/event logic, then
+whatever the captain wants to change.
+
+**Portability is the same win:** the generated code is plain C++ and the GS/input/audio layers are
+ours, so one codebase targets **PC, Android (Odin 2), iOS and Steam Deck**. Evidence already in hand:
+the ARM64 build produced 707 guest functions with **zero x86/SSE symbols** — portable in principle.
+The CPU rasteriser ports free; the future **Vulkan** backend covers Adreno (Android) and MoltenVK
+(macOS/iOS).
+
+**Done when:** a subsystem the captain names (car pipeline first) is native, byte-exact against the
+recomp, and changing it does not mean editing 8.9 MB of generated C++. **Not scheduled** — Stage 1
+first, then this turns the recomp into the project Dusklight is, at a fraction of the years.

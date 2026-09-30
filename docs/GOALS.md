@@ -643,6 +643,57 @@ Eventually the captain's Odin 2. Never an emulator.
 
 ---
 
+## G6 — MODS & NEW CONTENT *(the captain's plans, registered so they cannot drift)*
+
+> **Why this phase exists:** the captain, 2026-09-30: *"God I have so much plans for this recomp."*
+> Every idea below is a goal, not a wish. None of it starts until the game runs — but writing it down
+> now is how we make sure the runtime we are building can actually carry it.
+
+### ⬜ G6.0 — **NEW CARS** *(the captain's first big question: "can we add new cars?")*
+- **Answer: yes — and a recomp makes it easier than modding the original.** We own the loader, so we
+  are not bound to GT4's own model format: **we can add a reader for any format we choose** (GLB,
+  FBX, a converted Assetto Corsa/Forza model). GT4's own car format was never publicly cracked; we
+  do not have to crack it to add a car.
+- **What a new car actually needs — five pieces:**
+  1. a **SpecDB entry** (the game's own database): CarID, name, maker, power, weight, dimensions,
+     drivetrain, gearbox, tyre sizes — copied in *shape* from a real car
+  2. a **model** carrying the nodes the game expects (`body` + four wheels), because the engine
+     steers, spins and animates them
+  3. **physics data in GT4's own fields** — ⚠️ GT4's *real* physics runs natively here, so it will
+     judge the car: good data feels authentic, lazy data drives like a trolley
+  4. an **engine sound** assignment (a table entry, or borrow an existing car's sample)
+  5. **shop/menu integration** if it should be buyable/winnable: price, thumbnail, event eligibility
+- **Honest limits:** nothing here starts before the game runs; new car IDs must be *additive* (never
+  reuse an existing ID — saves refer to them).
+- **⚠️ HONESTY RULE FOR THIS GOAL:** the model path is ours to choose, but the *car itself* has to
+  satisfy GT4's own systems. A pretty mesh with wrong wheelbase/tread will be positioned wrong and
+  drive wrong. The data is the hard half, not the model.
+- **Community weight:** "add your own car to GT4" is the thing players have wanted for twenty years
+  — a bigger draw than the native port itself.
+  > **The captain, 2026-09-30:** *"This is like the most requested feature EVER. Bc in the original
+  > game u cannot add modded cars."* — and he is right, for a concrete technical reason:
+
+### ⬜ G6.0a — **SWAP vs ADD:** find every place GT4 assumes a fixed car count
+- **Why you cannot add cars to the original:** on real hardware or an emulator, a modder has only
+  bytes — no code. GT4's cars live in a **binary database** (SpecDB) plus models inside `GT4.VOL`,
+  and the game's menus, shop lists, prize tables and event eligibility almost certainly index cars
+  through **fixed-size structures**. A new CarID has nowhere to live. So every existing GT4 car mod is
+  a **SWAP** — replace an existing car's model/specs — and a swap costs you a car. **Add has been
+  impossible**, not for lack of models, but because the engine's tables do not grow.
+- **Why a recomp changes it:** we have the engine's own logic as editable C++, we control the model
+  loader, and we have a hook layer. Growing a table and teaching a lookup to accept the new range is
+  *work* — but it is work on our side of the line, not a wall.
+- **THE ACTUAL BLOCKER TO FIND (this is the dish):** every place the game assumes "there are N cars".
+  Search the recompiled C++ and the data structures for: fixed arrays sized by car count, index
+  tables with a hardcoded upper bound, shop/prize/menu lists built once at init, model-path
+  construction (`car/<maker>/<id>` schemes), and any loop bounded by a constant that matches the
+  known car total. Produce a ranked list: *what breaks first when we add car N+1.*
+- **DONE WHEN:** `docs/NEW-CARS.md` names those sites with addresses/file+line evidence, ranked by
+  what blocks an addition first — the survey that turns "can we add cars?" into a work plan.
+- **STATUS:** ⬜ registers now, executes after playability (G4). It costs nothing to know where the
+  ceiling is, and knowing it shapes how we design the loader **today** — which is why it is written
+  down before the game runs.
+
 ## The discipline
 
 1. Every dish opens with `GOAL: <id>`; the driver prints it in the banner.

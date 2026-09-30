@@ -6,9 +6,8 @@ that backs it. If a line has no evidence, it is not here.
 
 **TL;DR for a stranger:** the whole toolchain builds from a fresh clone, GT4's own machine code is
 translated ahead of time and **executes** with no BIOS, and the Graphics Synthesizer skeleton moves
-real computed pixels. **No part of the game renders, and no part of it plays.** The wall is still
-at 3 guest functions, but for the first time the memory that wall waits on is **provably correct**
-rather than correct-by-coincidence.
+real computed pixels. **No part of the game renders, and no part of it plays.** The boot wall moved
+this week: **3 guest functions → 25**, and the halt is no longer a livelock but a named restart loop.
 
 ---
 
@@ -30,7 +29,9 @@ Each line is a claim with its evidence. Commands are runnable as written.
 | **The GS decision is made, with reasons and rejected alternatives** | commit `d63a6f2`; `docs/GS-PLAN.md` |
 | **The project cross-compiles to ARM64** | commit `5509151`; `/mnt/ssd/vulcan4-build/android/gs_probe_arm64` (5,263,568 B, ELF64 AArch64) with **707 guest functions** and **0 x86/SSE symbols**; `docs/ANDROID-FEASIBILITY.md` |
 | **Prior art has been read, not guessed** | commit `d467818`; `docs/PRIOR-ART.md`, 14 cited sources |
-| **The test suite is green** | 447/447 (`ps2x_tests`); 3 entry-vs-resume tests proven to have teeth by mutation, plus the new `the 0x01000000 window is identity mapped` test, proven to have teeth the same way |
+| **The boot got 8× further, and the halt is no longer a livelock** | `/mnt/ssd/vulcan4-build/run/boot_g18b_final.log` → `VULCAN4 BOOT REPORT functions_entered=25 halt=guest_cycle_no_progress bios_files=0`, `dispatcher_transfers=25 serviced_invocations=25`. Was `functions_entered=3 halt=livelocked_in_syscall` |
+| **The guest never touches hardware — this is our control flow, not the console** | same run → `distinct_mmio_addresses=0 total_mmio_accesses=0` |
+| **The test suite is green** | 449/449 (`ps2x_tests`); 3 entry-vs-resume tests proven to have teeth by mutation, plus `the 0x01000000 window is identity mapped` and two `G1.8b` driver tests, all proven to have teeth the same way |
 
 ### Reproduce the boot yourself
 
@@ -57,15 +58,13 @@ The full end-to-end recipe — fresh clone, patches, build, boot — is
 
 **And the concrete reasons the guest stops:**
 
-- **The boot wall is now named as a scheduler/frame-loss defect, not a value and not a recompiler
-  bug.** GT4's convergence loop needs its two syscall-override hits to be 164 bytes apart. Both
-  are now in the kernel's syscall table and measured to be (`0x8001218C`, `0x800120E8`). But the
-  loop's registers `s2`/`s3` **reset to zero every three iterations**, so the pair is never correct
-  at the same instant. Measured cause: the syscall-override path calls
-  `EeScheduler::invokeCurrent`, which **throws `EeDispatcherTransfer` out of the guest callee's
-  frame**, and `bindMainContextForSyscall` re-runs `reset()` on every call because the harness never
-  starts the scheduler's executor thread. This is the answer to G1.4b's open question — the `jal`
-  emission was never at fault.
+- **The boot wall has MOVED — G1.8b.** It is no longer the syscall-override frame loss. The guest
+  now runs its whole init sequence 25 times and the driver only ever sees **one** PC, `0x01000008`,
+  the CRT0 entry: it is being resumed at its entry point instead of a resume point. Measured cause:
+  `GuestThread::context` is a *copy* of the main frame, and a driver that is not
+  `EeScheduler::run()` advances `m_cpuContext` directly, so that copy goes stale. The invocation is
+  a child of the stale frame, and publishing it back overwrites the live one. A fix was written and
+  **hung the suite, so it was removed rather than shipped half-done**; it is the next dish's work.
 - `total_mmio_accesses=0` and `distinct_mmio_addresses=0`. The guest has **never touched a hardware
   register.** It is still in initialisation.
 - No IRX module has been loaded, and the runtime has no BIOS path. That is unchanged and intended:
@@ -96,6 +95,7 @@ The ladder, in order, with the honest state of each rung. Full detail in
 | G1.4 | 🟡 | investigation completed, then **corrected by G1.5** — the premise was wrong |
 | G1.5 | ✅ | proved the stub body ran; found the real wall (a `FindAddress` livelock) |
 | **G1.8** | ✅ (diagnosis) / ❌ (gate) | **our own `-0x01000000` memory-map bias was manufacturing the decoy three goals chased. Removed + tested. Both overrides now really land in the syscall table; the wall is a scheduler frame-loss defect, named at the register level** |
+| **G1.8b** | ✅ | **the driver was not honouring the guest's queued invocations. Red test first, then `EeScheduler::serviceInvocations()`. Boot: `functions_entered` 3 → 25, halt `livelocked_in_syscall` → `guest_cycle_no_progress`. `docs/G1.8b-RED.md` has the red proof** |
 | **G2.0** | ✅ | GS approach decided and the path proved |
 | **G2.1** | ✅ | the GS computes pixels — 43,804 distinct colours |
 | **G2.2** | ✅ | the guest draw sequence, documented (and the fault it hit localised) |
@@ -122,12 +122,13 @@ mipmaps, blending, a Z test, CLUT animation and the EE→GS DMA path is named in
 real guest (ZTE not honoured, `PRMODE` semantics flattening textured geometry, and texture base
 units 32× off for a genuine guest).
 
-**The next real work is the syscall-override frame loss, not the renderer and not the values.**
-G1.8 removed a memory-map bug that had been manufacturing the boot wall since G1.6, so the two
-handler addresses GT4 waits for are now genuinely present and 164 bytes apart, exactly as it
-requires. The loop still cannot converge because the scheduler **throws out of the guest callee's
-frame** on the override path and the guest's registers do not survive it. That is one test and one
-fix, and it is the last thing standing between here and a guest that boots past its own startup.
+**The next real work is the stale main frame, not the renderer and not the values.** G1.8 removed a
+memory-map bug that had been manufacturing the boot wall; G1.8b removed a second one — the driver
+was catching the scheduler's transfer signal without ever running the invocation the guest had
+queued, so every syscall override silently lost the guest's registers. Together they took the boot
+from 3 functions to 25 and changed the halt from a livelock to a named restart loop. What remains
+is one stale copy: the scheduler's `GuestThread::context` has to be reconciled with the context the
+driver is actually advancing, so the guest resumes at a resume point instead of its entry.
 After that: **G3.1, the VU1.** A frame on disk that our own code computed is still not a rendered
 game.
 
@@ -165,6 +166,11 @@ foundation and the proof that the foundation is sound — not a game.
 - Two earlier claims were **wrong and are recorded as wrong** rather than quietly deleted: that the
   GS triangle "never submits" (it does — `XYZF2` and `XYZ2` both kick), and that PS2Recomp's author
   says it "does not work properly" (unverifiable; grep of the pinned tree finds nothing).
+- **The verifier in the G1.8b ticket was wrong and said "FAIL" about a passing build.** It reads the
+  log with `sorted(..., key=getmtime)[:3]`, which is the three **oldest** logs. Fixed to
+  `reverse=True` it reports the real line. A gate that only ever inspects stale evidence is worse
+  than no gate, and this is the second time a measurement in this project has been the thing that was
+  broken.
 - **One earlier *fix* was wrong, and is recorded at greater length than the fix it replaces.** G1.6
   added a `-0x01000000` bias to `PS2Memory::translateAddress`. It was self-consistent, so nothing
   crashed, and it read as a careful correction. It was wrong, and it **created** the boot wall that

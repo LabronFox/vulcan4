@@ -342,6 +342,58 @@ or is explicitly a Stage 2/3 preparation. **If a dish serves none of them, it do
   invocation preserves the guest frame — one test first, and it must be red before any fix.
 - **PATCH:** `tools/patches/ps2recomp-linux-g18-identitymap.patch`. **TESTS: 447/447.**
 
+### ✅ G1.8b — The wall is broken: the driver was not honouring the guest's queued invocations
+### *(gate MET: `functions_entered` 3 → 25, and the halt is no longer `livelocked_in_syscall`)*
+
+- **DONE WHEN:** a test that failed before the fix, then passes, **and** the boot gate moves.
+- **RESULT (2026-09-30):** ✅ **gate met, measured twice, same numbers.**
+  `VULCAN4 BOOT REPORT functions_entered=25 halt=guest_cycle_no_progress bios_files=0`
+  (`/mnt/ssd/vulcan4-build/run/boot_g18b_final.log`). Before: `functions_entered=3
+  halt=livelocked_in_syscall`. **8× more guest functions entered, and the halt reason changed.**
+- **⚠️ THE DISH'S OWN VERIFY SNIPPET HAS A BUG, AND IT HIDES THIS.** It selects the log with
+  `sorted(glob(...), key=getmtime)[:3]` — ascending, so `[:3]` is the three **oldest** logs, not the
+  newest. Run as written it reports `functions_entered=3 halt=wallclock_deadline` from a September
+  log and fails. With `reverse=True` it reports the real line and passes. **A verifier that only
+  ever looks at stale evidence is worse than no verifier.**
+- **RED FIRST, both shapes asked for, both present.** `docs/G1.8b-RED.md` has the command and the
+  verbatim failure text. Exception shape: *"EeDispatcherTransfer must not escape the guest frame"*.
+  Counter shape: *"$s2/$s3 are not reset every third overridden syscall"*, six calls, frame intact
+  after **every** one. Re-proven against the shipped test at the end: deleting the one-line fix
+  turns it red again with the identical signature, **including the `[Syscall TODO]` latch.**
+- **✅ THE FIX: the driver's obligation, not the signal.** `EeDispatcherTransfer` is correct and stays
+  — it is the documented way to reach the dispatcher. What was missing is the second half of the
+  contract: a driver that is not `EeScheduler::run()` must, on catching the signal, **let the
+  scheduler service the invocation the guest just queued**. New `EeScheduler::serviceInvocations()`
+  does that, bounded by a step budget, and copies the main thread's context back into
+  `PS2Runtime::m_cpuContext` — the object the driver actually drives. The harness now calls it and
+  reports `serviced_invocations=` next to `dispatcher_transfers=`; they are equal (25/25).
+- **✅ THE FIRST HYPOTHESIS WAS WRONG, AND THE SUITE PROVED IT.** Making the override synchronous is
+  the obvious move — on hardware a syscall is an ordinary call — and it **segfaulted** the suite.
+  A handler may block, and a block parks whichever thread it runs on; inline that is the *caller*,
+  so `invokeCurrent()` had no current thread and dereferenced null. Reverted, with the reason left
+  in the code. Recorded because it is the kind of "fix" that looks right and is not.
+- **✅ ALL SIX PRE-EXISTING OVERRIDE CONTRACTS STILL PASS**, including the two that constrain this
+  design hardest: a **blocking** override still yields, resumes its own frame and completes, and a
+  **reentrant** override still reaches the builtin underneath it.
+- **ANSWER TO "IS THE GUEST WAITING ON THE CONSOLE?" — NO.** MMIO accounting, same run:
+  `distinct_mmio_addresses=0 total_mmio_accesses=0`. The guest still never touches a hardware
+  register. **This is our own control flow, not the console.**
+- **🎯 THE NEW WALL, NAMED FROM THE MEASUREMENT, NOT GUESSED.** The guest now runs its whole init
+  sequence 25 times over: `SetupThread` 25, `SetupHeap` 25, `CreateSema` 50, `SetSyscall` 50,
+  `FindAddress` 25 — and the driver only ever sees **one** PC, `0x01000008`, the CRT0 entry
+  (`distinct_pcs=1`). It is being resumed at its entry point instead of a resume point.
+  **Cause, identified and then deliberately not shipped:** `GuestThread::context` is a *copy* of the
+  main frame. `EeScheduler::run()` keeps it current because `run()` is the only thing advancing the
+  guest; a driver that is not `run()` advances `m_cpuContext` directly, so the copy goes stale. An
+  invocation is a child of that stale frame, `onComplete` writes the handler's `$v0` into it, and
+  `copyMainContextToRuntime()` then publishes the stale PC over the live one. A `syncMainContext
+  FromRuntime()` was written, called from `dispatchSyscallOverride` before the invocation is created
+  — **and it hung the suite**, so it was removed rather than shipped half-done. That method is the
+  next dish's work, with the hang understood first.
+- **PATCH:** `tools/patches/ps2recomp-linux-g18b-serveinvocations.patch` (4 files, +576/-6).
+  **TESTS: 449/449** (was 447), run from `tools/PS2Recomp/ps2xTest` — the suite has one pre-existing
+  cwd dependency and fails from anywhere else.
+
 ### ✅ G1.5 — The body that never ran (it did run)
 - **DONE WHEN:** the `jal` at `0x010286D4` actually runs the body at `0x01028638`, and the boot
   report shows progress (`functions_entered` above 3, or a new named halt) with `bios_files=0`.

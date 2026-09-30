@@ -490,6 +490,7 @@ int main(int argc, char *argv[])
     uint64_t functionsEntered = 0;
     uint64_t distinctPcs = 0;
     uint64_t dispatcherTransfers = 0;
+    uint64_t servicedInvocations = 0;
     const char *haltReason = kHaltEntryBudget;
     uint32_t haltPc = entryPoint;
     std::string haltDetail;
@@ -697,6 +698,18 @@ int main(int argc, char *argv[])
         // the loop below is. So catching it here and re-entering at ctx->pc is the faithful
         // translation, not a swallowed error. It is counted and reported so its volume is
         // visible rather than invisible.
+        //
+        // G1.8b: catching it was only HALF the contract, and the half that was missing. The signal
+        // means the guest queued an invocation (a syscall override, an interrupt callback) and is
+        // now mid-frame with its live registers held by the scheduler. Re-entering the guest
+        // WITHOUT letting the scheduler run that invocation is what cost GT4 its convergence loop:
+        // measured 2026-09-30, the loop's $s2/$s3 were reset to zero every third iteration, and
+        // once the stranded invocation existed, hasInvocation() latched true so every later 0x83
+        // silently fell through to our builtin instead of the guest's own code.
+        //
+        // So the obligation is discharged here: hand the signal to the scheduler, which runs the
+        // invocation to completion and copies the main thread's context back into runtime.cpu() --
+        // the same object this loop reads ctx.pc from.
         try
         {
             g_ps2RecompiledFunctionTable[slot](rdram, &ctx, &runtime);
@@ -704,6 +717,8 @@ int main(int argc, char *argv[])
         catch (const EeDispatcherTransfer &)
         {
             ++dispatcherTransfers;
+            ++servicedInvocations;
+            runtime.eeScheduler().serviceInvocations();
         }
 
         if (runtime.isStopRequested())
@@ -904,6 +919,7 @@ int main(int argc, char *argv[])
 
     std::cout << "VULCAN4 HARNESS detail=" << haltDetail << " pc=" << toHex(haltPc)
               << " distinct_pcs=" << distinctPcs << " dispatcher_transfers=" << dispatcherTransfers
+              << " serviced_invocations=" << servicedInvocations
               << " elapsed_ms=" << elapsed
               << " entry_budget=" << budget.maxEntries << " spin_limit=" << budget.maxRepeatedPc
               << " deadline_s=" << budget.maxSeconds << "\n";

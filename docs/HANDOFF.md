@@ -198,3 +198,38 @@ NEXT:   **Up the call chain, not down into the loop.**
 MEASURED (suite): **450/450** from `tools/PS2Recomp/ps2xTest`.
 MEASURED (boot):  `functions_entered=95 halt=guest_cycle_no_progress bios_files=0`. Campaign goal NOT
         reached — `VULCAN4 FRAME source=guest` has still never been printed.
+
+## 2026-09-30 18:40 · 33-g18d-gs-store-loop (investigation only, 6th pass) · **W7: `$fp` provenance gap**
+
+WALL:   W7. The loop is solved. This pass located where the bad value comes from.
+DID:    **No shipped code changed, no boot change.** Two of my own conclusions were **retracted in the
+        same pass** after I checked the emitted code properly, and both retractions are kept below.
+MEASURED:
+        - The end pointer is **`$fp` (r30)**; the start is **`$s7` (r23)**. Set by the caller at
+          `0x1010a60: sw $s7,0x20($s0)` and `0x1010a6c: sw $fp,0x24($s0)`. `$s7` advances every call
+          (`0x01051A40` → `0x010632C4`); `$fp` never moves from `0x01051A3F`.
+        - **RETRACTION 1:** I claimed `sub_0100F8C8` saves `$fp` and never restores it. **Wrong** —
+          `ld $fp,0x5E0($sp)` is emitted (generated unit line 75267). My grep pattern was wrong.
+        - **RETRACTION 2:** same claim about `sub_0100EDC8`. **Also wrong**, same cause; `ld $fp` is
+          emitted at `0x100f380`.
+        - **THE ACTUAL FINDING, not retracted:** that `ld $fp` at `0x100f380` has **no
+          `case 0x100f380u` in the function's resume switch.** `sub_0100EDC8` has 14 resume cases and
+          the epilogue's `$fp` restore is not one of them. **A yield in that epilogue re-enters the
+          function from the top and leaves `$fp` as the body last set it.** `sub_0100EDC8` is called
+          **4×** by `sub_0100F8C8` immediately before the W7 call, and `$fp` is the end pointer.
+        - Scale, measured not guessed: `sub_0100EDC8` has **44 branch/jump source PCs and 14 resume
+          cases**, and the two sets do not correspond.
+NEXT:   1. **Red test first (law 4).** A recompiled function that yields inside its own epilogue must
+        resume at the restore and leave the callee-saved register intact. Shape: `ld $s0..; ld $s1..;
+        ld $fp,..; jr $ra`, checkpoint due between `ld $fp` and `jr $ra`, assert `$fp` holds the saved
+        value after resume. **Must be red before anything changes.**
+        2. Cheap confirmation: one probe printing whether `sub_0100EDC8` is ever entered with
+        `ctx->pc == 0x100f380`. If never, this whole lead is dead and the search goes back up the call
+        chain for whoever should set `$fp`.
+        3. **Do not assume all 30 missing cases are bugs** — a case is only needed where a yield can
+        actually be taken.
+        **Still forbidden:** clamping `$t1` to `$t4`, special-casing `0x100f800`, or making the store
+        block run. On this diagnosis the loop is innocent and the damage is upstream.
+MEASURED (suite): **450/450**. MEASURED (boot): `functions_entered=95 halt=guest_cycle_no_progress
+        bios_files=0`. **Campaign goal NOT reached — `VULCAN4 FRAME source=guest` never printed.**
+        Addenda 1–6 in `.auto/queue/33-g18d-gs-store-loop.txt`.

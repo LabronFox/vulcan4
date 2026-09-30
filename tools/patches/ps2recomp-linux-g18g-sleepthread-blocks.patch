@@ -1427,6 +1427,43 @@ index 9614016..70ae1ed 100644
      }
  
      // QueryBootMode (stub): return 0 for now
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+index 5110ee2..f4ca7ae 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+@@ -112,7 +112,31 @@ namespace ps2_syscalls
+             const int priority = static_cast<int>(getRegU32(ctx, 5));
+             int oldPriority = 0;
+             const int result = ee.changePriority(id, priority, interruptSafe, oldPriority);
+-            setReturnS32(ctx, result);
++            // W13. sceChangeThreadPriority returns the thread's PREVIOUS priority on success, not a
++            // status code. The console's syscall documents exactly that, and this used to discard
++            // oldPriority and return `result` (KE_OK) instead -- which is a 0, which is the single
++            // most damaging thing this handler could return.
++            //
++            // Gran Turismo 4's idle loop, from the generated decode of sub_01011508:
++            //
++            //   010115d0  jal   func_101F2B0                      # ChangeThreadPriority($s3, 1)
++            //   010115d4  addiu $a1, $zero, 0x1 (Delay Slot)
++            //   010115d8  daddu $s5, $v0, $zero                   # $s5 = the return value
++            //   0101160c  nor   $v0, $zero, $s2
++            //   01011610  movz  $s2, $s5, $v0                     # if $s2 == 0, $s2 = $s5
++            //   01011618  beq   $s2, -1, skip                    # -1 means "nothing to restore"
++            //   01011620  jal   func_101F2B0                      # ChangeThreadPriority($s3, $s2)
++            //   01011624  daddu $a1, $s2, $zero (Delay Slot)
++            //
++            // It feeds the first call's return straight back in as the second call's PRIORITY. Given
++            // a 0, the guest restores itself to priority 0 -- which is reserved by the EE kernel and
++            // refused with KE_ILLEGAL_PRIORITY (-403) -- and does it 2,253,727 times in 90 seconds,
++            // never yielding, sleeping (sce_SleepThread: one call) or rendering. It looked like the
++            // game refusing to give up the CPU. It was the game correctly giving it up and us
++            // answering with the wrong number.
++            //
++            // Errors still return the negative code; only success changes.
++            setReturnS32(ctx, result < 0 ? result : oldPriority);
+             ee.transferIfRequested(interruptSafe);
+         }
+ 
 diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
 index c289ba0..6eda301 100644
 --- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
@@ -3128,10 +3165,10 @@ index 7242e65..4d8de05 100644
  }
 diff --git a/ps2xTest/src/ps2_thread_block_tests.cpp b/ps2xTest/src/ps2_thread_block_tests.cpp
 new file mode 100644
-index 0000000..9e64ccf
+index 0000000..484842d
 --- /dev/null
 +++ b/ps2xTest/src/ps2_thread_block_tests.cpp
-@@ -0,0 +1,722 @@
+@@ -0,0 +1,807 @@
 +#include "MiniTest.h"
 +#include "ps2_runtime.h"
 +#include "ps2_runtime_macros.h"
@@ -3704,6 +3741,91 @@ index 0000000..9e64ccf
 +            t.IsTrue(std::find(gTrace.begin(), gTrace.end(), TRACE_MAIN_AFTER_SLEEP) != gTrace.end(),
 +                     "after the wake the thread must run the post-sleep frame, not nothing");
 +        });
++        tc.Run("G1.8i: sceChangeThreadPriority returns the PREVIOUS priority, not 0", [](TestCase &t)
++        {
++            // W13, and this is the actual cause. Gran Turismo 4's idle loop, read from the
++            // generated decode of sub_01011508:
++            //
++            //   010115d0  jal   func_101F2B0                        # sceChangeThreadPriority
++            //   010115d4  addiu $a1, $zero, 0x1   (Delay Slot)      # priority 1  -- wake up
++            //   010115d8  daddu $s5, $v0, $zero                     # $s5 = the RETURN VALUE
++            //   ...
++            //   0101160c  nor   $v0, $zero, $s2
++            //   01011610  movz  $s2, $s5, $v0                       # if $s2 == 0, $s2 = $s5
++            //   01011614  addiu $v0, $zero, -0x1
++            //   01011618  beq   $s2, $v0, skip                      # -1 means "nothing to restore"
++            //   01011620  jal   func_101F2B0                        # sceChangeThreadPriority
++            //   01011624  daddu $a1, $s2, $zero      (Delay Slot)   # priority $s2 -- restore
++            //
++            // The guest takes the return value of the first call and feeds it straight back in as
++            // the next call's PRIORITY. So the return value is not a status code, it is the thread's
++            // previous priority -- which is what the console's syscall actually returns, and it is
++            // how the guest learns what priority to come back to.
++            //
++            // changePriorityImpl() discards it:
++            //
++            //   int oldPriority = 0;
++            //   const int result = ee.changePriority(id, priority, interruptSafe, oldPriority);
++            //   setReturnS32(ctx, result);
++            //
++            // EeScheduler::changePriority() computes oldPriority correctly and then changePriorityImpl
++            // throws it away, so the guest is told 0. The guest then restores itself to priority 0 --
++            // the highest priority in the system and reserved by the kernel -- and is refused with
++            // -403, forever.
++            //
++            // Measured on SCUS_973.28: 2,253,727 calls to sceChangeThreadPriority, essentially all
++            // of them this restore attempt, the thread pinned at prio1, sce_SleepThread called
++            // ONCE in 90 seconds, and no GS activity at all. 99.9998 % of all guest syscalls were
++            // this call and sce_GetThreadId. It looked like the game refusing to yield. It was the
++            // game correctly trying to yield and us answering with the wrong number.
++            // Through the SYSCALL, because that is where the value is thrown away. Calling
++            // EeScheduler::changePriority directly passes: it fills oldPriority in correctly. The
++            // loss is one layer up, in changePriorityImpl:
++            //
++            //   int oldPriority = 0;
++            //   const int result = ee.changePriority(id, priority, interruptSafe, oldPriority);
++            //   setReturnS32(ctx, result);          // <- oldPriority never reaches the guest
++            //
++            // So the test drives sceChangeThreadPriority the way the guest does, with $a0 = thread
++            // id and $a1 = priority, through PS2Runtime::handleSyscall with syscall number 0x29 --
++            // which is exactly what sub_0101F2B0 does: addiu $v1,$zero,0x29; syscall.
++            BlockEnv env;
++            env.arm();
++            EeScheduler &ee = env.runtime.eeScheduler();
++            ee.bindMainContextForSyscall(env.runtime.cpu(), env.rdram.data());
++            const int mainId = EeScheduler::kMainThreadId;
++
++            auto call = [&](uint32_t id, uint32_t priority)
++            {
++                R5900Context ctx = env.runtime.cpu();
++                ctx.pc = 0x0101F2B0u;
++                SET_GPR_U32(&ctx, 4, id);
++                SET_GPR_U32(&ctx, 5, priority);
++                env.runtime.handleSyscall(env.rdram.data(), &ctx, 0x29u);
++                return static_cast<int32_t>(getRegU32(&ctx, 2));
++            };
++
++            // reset() leaves the main thread at priority 0, so 0 is genuinely its previous priority
++            // on the very first call. Asserting that explicitly, because "0 is also the reserved
++            // slot" is exactly the confusion that produced the wrong fix earlier today: here 0 is a
++            // correct RETURN value, and the thing that must never be accepted as a priority argument.
++            t.Equals(call(static_cast<uint32_t>(mainId), 0x40u), 0,
++                     "the first call must report the priority the thread actually had, which "
++                     "reset() leaves at 0 -- not a status code");
++            {
++                const GuestThread *main = ee.thread(mainId);
++                t.IsTrue(main != nullptr && main->currentPriority == 0x40,
++                         "and the thread's priority must really have changed to 0x40");
++            }
++
++            // The round trip the guest actually performs: drop to 1, then restore.
++            t.Equals(call(static_cast<uint32_t>(mainId), 1u), 0x40,
++                     "dropping to priority 1 must report the priority it came from");
++            t.Equals(call(static_cast<uint32_t>(mainId), 0x40u), 1,
++                     "and restoring must report the priority it came from, so the loop is stable "
++                     "instead of walking downwards into the reserved slot");
++        });
++
 +        tc.Run("G1.8i: priority 0 is the kernel's own, and a user thread may not take it", [](TestCase &t)
 +        {
 +            // W13, CORRECTED. An earlier version of this test asserted that sceChangeThreadPriority

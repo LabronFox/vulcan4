@@ -1399,3 +1399,104 @@ NEXT:   1. **THE RED TEST, and it is four lines of fixture and a contract:**
         was at fault for a different reason each time.** What finally found it was not a cleverer
         reading — it was printing the whole register frame at one instruction, where `$v0` was the
         only survivor, and asking why that one.
+
+## 2026-09-30 — W10 FELL. The guest gets past its syscall table, and touches hardware again
+
+**Suite 463/463. Harness rebuilds clean, no probes in shipped files. Root commit `50a38cd`, patch
+md5 `647ceab1ea16a26e94858e5dc0d4270c`.**
+
+### The bug, red first
+
+New test in `ps2_thread_block_tests.cpp` — **G1.8g "a deferred syscall must not rewind the CALLER's
+registers"**. A guest function seeds `$s2`, `$s3` and `$ra`, calls a callee whose syscall
+**defers**, and resumes at the PC it published. It drives `EeScheduler::currentContext()` every
+iteration, exactly as the harness does, because a test that drives a private copy would assert the
+broken behaviour and pass. That is stated in a comment in the fixture, so nobody "simplifies" it
+back later.
+
+All four assertions were red, with precisely the measured signature: `$v0` correct, everything else
+rewound.
+
+### The cause — ours, and silent for eleven dishes
+
+`EeScheduler::serviceInvocations()` opened with
+
+```
+main->context = m_runtime.m_cpuContext;
+```
+
+G1.8c's fix for W6, guarded on `m_guestExecuting`, which is set **only inside `EeScheduler::run()`'s
+dispatch**. The harness never calls `run()`, so it fired on **every** service call. And it copied the
+stale frame over the live one: since the W9a fix the driver advances `currentContext()`, which for
+the main thread **is** `main->context`, while `m_cpuContext` is only republished by
+`copyMainContextToRuntime()`.
+
+So every deferred syscall rewound the caller to before its own call. `$v0` always looked right,
+because the runtime writes it back by hand. That is the whole reason this survived.
+
+### The fix — explicit, not deleted
+
+There are two frames and two legitimate drivers, so the driver now says which one it advances:
+
+```
+EeScheduler::setDriverAdvancesSchedulerContext(bool)
+  false (default)  driver advances runtime.cpu(); m_cpuContext is live, so the scheduler's copy is
+                   refreshed FROM it. Unchanged G1.8c behaviour; what the direct-syscall tests want.
+  true             driver advances currentContext() each iteration, as the harness does since W9a.
+                   main->context is live, so the refresh is skipped entirely.
+```
+
+The harness sets `true`. The new fixture sets `true`, with the comment above.
+
+### Measured, 90 s budget, before → after
+
+| | before | after |
+|---|---|---|
+| `0x010286f0` entered | 0 times | **reached** |
+| `distinct_pcs` | 6 | **143** |
+| `service_frames` | 7,481,984 | **38** |
+| `total_syscall_calls` | 29,914 | 137 |
+| `distinct_mmio_addresses` | 0 | **308** |
+| `total_mmio_accesses` | 0 | **770** |
+| `sce_SetSyscall` calls | 2 | 12 |
+| `sce_SleepThread` calls | 0 | 14 |
+| wall clock | 90 s (budget) | **1.0 s** |
+
+### W11 — where it stops now
+
+A 5-address cycle: `0x01027E98`, `0x01027C70`, `0x01027EAC`, `0x0100076C`, `0x01000760` — the
+`bltz $v0, 0x01000760` retry loop W9 first saw, now reached with 143 distinct PCs and 308 hardware
+addresses instead of 6 and 0.
+
+**Measured at both yield points, identically every pass:**
+
+```
+RETRY pc=0x0100076c  v0=0xFFFFFFFF  a0=0x01FFFE70  a1=0  a2=0  a3=0x01FFFE50  t0=0
+       t1=0x00008000  s3=0x01030000  sp=0x01FFFE50
+```
+
+- `v0 = 0xFFFFFFFF` → `bltz` **always** taken → retry forever.
+- `a0` and `a3` are both **guest stack addresses**. `a1`/`a2`/`t0` are 0.
+- **`t1 = 0x8000` is the one operand that is neither a stack nor a data address.**
+- The callee makes **no fast-path load at all** (`READ32` observer over `0x01027C70..0x01027DA0`
+  returned **zero** hits).
+- **No MMIO address is polled** — all 308 have exactly **1 access each**, so nothing is waited on in
+  memory.
+
+### Next step, in order
+
+1. **`t1 = 0x8000`.** Find what `sub_010027C70` does with it. It is a count, a size or a register
+   offset, and it is the only operand that is not obviously a pointer to guest memory.
+2. **`sub_010027498`** — the function it calls, which returns `-1` with **no memory access
+   whatsoever**. That signature is a call failing on a **register or state** test, not on data. Read
+   its recompiled body; the decode is in the generated unit's comments, which are authoritative.
+3. Only then look at what `-1` means to the caller, i.e. what `0x01027D1D` does on the error path.
+
+### Retractions, still standing — do not re-chase
+
+- GS remap to `0x70000000`: **refuted.** Correct map is GS at `0x12000000`, scratchpad at
+  `0x70000000` / 16 KB.
+- "`libgallium` present stall": six perf samples.
+- "120.6 s → 1.6 s total": false. The watchdog fix only took `harness_tail_ms` to 0–18 ms.
+- **`VULCAN4 FRAME source=guest` is emitted by nothing.** Guest still makes zero frame-emitting MMIO
+  accesses. Do not report this milestone until the log contains that line.

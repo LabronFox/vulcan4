@@ -1781,3 +1781,116 @@ main loop drops to priority 1 and a VBlank handler or render thread runs. Here e
 a higher priority, or `applyPendingPreemption()` is not switching. `GetThreadId` being called three
 million times also smells like the loop testing "am I the thread that owns the frame", so its return
 value is worth reading.
+
+## 2026-09-30 — W14 investigated and NOT fixed: this runtime's priority ordering looks inverted, and I would not ship a fix built on a guess
+
+**Suite 466/466. Product unchanged and re-verified after the recovery below: vsync_tick=54, patch
+matches the tree exactly.**
+
+### What W14 looks like
+
+The same report line that showed W13's fix working also shows this:
+
+```
+runnable_threads=tid1@prio0:pc=0x0101f2b8(running),tid2@prio2:pc=0x0101f348(ready)
+```
+
+`tid2` is **ready at priority 2** while `tid1` is **running at priority 0**. Higher-priority work is
+in the queue and the lowest-priority thread still has the CPU. On a console `tid1` is off the CPU
+within one timeslice.
+
+### Three places that look wrong, all in the same area
+
+1. `EeScheduler::changePriority()`, Running branch:
+
+   ```cpp
+   target->currentPriority = priority;
+   if (target->status == EeThreadStatus::Running)
+       for (int p = 0; p < target->currentPriority; ++p)   // bounded by the NEW priority
+           if (!m_readyQueues[p].empty()) { m_rescheduleRequested = true; break; }
+   ```
+
+   The scan is bounded by the value the thread just chose **in order to get out of the way**. At
+   priority 0 the bound is 0, the body never runs, and no reschedule is requested. It is also
+   inverted: it looks at queues *below* the new priority, and the case that matters — something
+   ready *above* it — is the one missed.
+
+2. `EeScheduler::hasReadyAtOrAbovePriority(int)` scans `for (p = 0; p <= priority; ++p)` — queues at
+   or **below** — while its name and its single caller (`transferIfRequested`, deciding whether the
+   running thread must give up the CPU) both mean at or **above**.
+
+3. `EeScheduler::requestPreemptionIfHigher()` guards with
+   `if (!running || readyThread.currentPriority >= running->currentPriority) return;` — it returns,
+   i.e. does **nothing**, exactly when the newly Ready thread is at or above the running one, which
+   is precisely when preemption is warranted.
+
+### Why I stopped instead of fixing all three
+
+I implemented all three, wrote a test, and it went red on an **assertion I had not expected**: with
+main at priority 5 and a worker ready at priority 1, the CPU went to the **worker**. Three existing
+tests then broke, including one that had been passing:
+
+```
+ps2_runtime_kernel_tests.cpp:1053
+  const int low  = ee.createThread(EeThreadCreateParams{..., 20, 0});   // "low"  thread = 20
+  gSchedulerCreatedId = ee.createThread(EeThreadCreateParams{..., 5, 0}); // "high" thread = 5
+  ...
+  tc.Run("starting a strictly higher-priority thread preempts immediately", ...)
+```
+
+**This runtime treats a SMALLER number as a HIGHER priority.** The PS2 is the other way round: 0 is
+the lowest priority, 0x3F the highest, and GT4 calling `sceChangeThreadPriority(1, 0)` is asking to
+be given up.
+
+So either those tests are wrong, or the whole scheduler is ordered against the hardware, and every
+"fix" above — mine included — was derived from an assumption I could not support. Two of my three
+changes also had a **blast radius beyond this wall**: `hasReadyAtOrAbovePriority`'s downward scan is
+effectively "is anything in the ready queues at all", so the scheduler has been rescheduling
+constantly, and removing that bluntness changed FIFO waiter ordering in two semaphore/event tests.
+That is a real defect worth fixing — but it is a first-order change to thread scheduling, and doing
+it as a side effect of "make GT4 spin less" is how you get a regression nobody can explain later.
+
+**So all three changes are reverted and the W14 test is removed.** The suite is back to 466/466 and
+the boot to `vsync_tick=54`.
+
+### What the next dish should do, in this order
+
+1. **Decide the convention from an authority, not from a test that may itself be wrong.** The
+   hardware is unambiguous: 0 lowest, 63 highest. `ps2sdk`'s `ThreadPriority.h` and the ps2rd
+   documentation both say so. Confirm what `EeThreadCreateParams`' priority field claims to mean in
+   `ps2xRuntime/include/runtime/ee_scheduler.h`, and what every existing test assumes.
+2. **Then fix the three places to match that convention**, one at a time, each with its own red
+   test, in this order: `hasReadyAtOrAbovePriority` (widest blast radius — expect the FIFO waiter
+   tests to need re-examination, not to be "fixed"), then `changePriority`'s Running branch, then
+   `requestPreemptionIfHigher`.
+3. **Only then re-look at GT4.** GT4 lowering itself to 0 and expecting to be preempted is
+   consistent with the hardware convention, so under a corrected scheduler it may behave correctly
+   for the first time — or the spin may move, which is also worth knowing.
+
+### A process incident worth recording, because it nearly cost the whole session
+
+Reverting those three changes with a scripted splice **deleted `rotateReadyQueue()` and the tail of
+`changePriority()`** out of `EeScheduler.cpp`, and the build broke with
+`no declaration matches 'void EeScheduler::processPendingEvents()'`. Recovering then meant:
+
+```
+cd tools/PS2Recomp && git checkout -- .
+rm -f <the five files the patch creates>
+git apply /home/or/vulcan4/tools/patches/ps2recomp-linux-g18g-sleepthread-blocks.patch
+```
+
+**`git checkout` in the nested tree is destructive and the patch file is the only durable record of
+that work.** The outer repository does not track `tools/PS2Recomp`'s sources at all — only
+`tools/harness`, `tools/patches` and `docs` — so an outer `git add` never records them, and the
+nested repo's own index was many dishes stale.
+
+Rules that follow, and they are cheap:
+
+- **Regenerate `tools/patches/ps2recomp-linux-g18g-sleepthread-blocks.patch` after EVERY change to
+  `tools/PS2Recomp`, not at commit time.** It is the backup.
+- **Never `git checkout -- .` or `git checkout <file>` inside `tools/PS2Recomp`.** There is no
+  upstream commit to fall back to.
+- To inspect or undo a change there, copy the file to `/tmp/opencode` and edit the copy, or use
+  `git diff <file>`.
+- This incident is also why the patch is checked by md5 in every commit here: it is the artefact that
+  makes the nested tree reproducible at all.

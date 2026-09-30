@@ -94,3 +94,32 @@ NEXT:   W7's open question, now sharp: **why is `$t1` `0x01051A45` when `$t4` wa
         recombined) driving `buffer[i] ^= random()` for a hardcoded `0x3FF0` iterations. That is
         legitimate guest work which returns cleanly. It is NOT the wall, and it cost a detour.
         Addendum with all of the above is in `.auto/queue/33-g18d-gs-store-loop.txt`.
+
+## 2026-09-30 16:40 · 33-g18d-gs-store-loop (investigation only, 2nd pass) · **W7 characterised**
+
+WALL:   W7 — still open. This entry is the second measurement pass on it.
+DID:    **No code changed.** Probed the generated translation unit again, measured, removed every
+        probe, rebuilt clean (verified: 0 `fprintf` left in the artifact). Both of W7's loops are now
+        characterised:
+        - **The outer loop is fine.** `[S] OUTERHEAD s1=0x01051A45 s2=0x01051A4B` — `s1` walks
+          `…45, …46, …47` toward `s2`. A normal 6-byte copy.
+        - **The inner loop is the wall.** `[S] INNERTEST t1=0x01051A46 t4=0x01051A3F taken=1` forever.
+          `$t1` climbs; `$t4` never changes.
+        - **The guest image writes start == end.** Read the raw ELF bytes, not our translation:
+          `0x0100f7ac: 0xae0c0024 => sw $t4,0x24($s0)` and `0x0100f7b0: 0xae0c0020 => sw $t4,0x20($s0)`.
+          **Both store `$t4`.** Slot `0x20` is the start, `0x24` the end. So the guest sets
+          start == end == `0x01051A3F`, and the inner loop should run **zero** times.
+          Neighbouring instructions decode correctly (`0x100f794` = `sd $a3,0($s0)`, `0x100f778` =
+          `andi $t3,$a0,0x7FFF`), so **this is not a decode error on our side.**
+MEASURED:  Boot unchanged at `functions_entered=95 halt=guest_cycle_no_progress` (correct — nothing
+        was fixed). Suite **450/450** from `tools/PS2Recomp/ps2xTest`.
+NEXT:   The question is now sharp and is three ordered measurements, in the addendum:
+        1. Does `$t1` change between the store pair and the first loop entry? Probe `0x100f7b4`.
+        2. **Most likely:** the store pair is immediately followed by `jalr $v1` — an indirect call
+           through a guest function pointer. If that callee writes `$s0+0x20`, it is the writer, and
+           this is a **guest** bug, not ours.
+        3. Only if 1 and 2 are negative: is our `dispatchGuestBranch` resuming the wrong PC around
+           that `jalr`? That would be W6's disease and would mean the G1.8c fix is incomplete.
+        **Do not clamp `$t1` to `$t4` and do not special-case `0x100f800`** — that is a fake in the
+        same class as a stubbed syscall, and it would hide which of the three is actually true.
+        Full numbers in `.auto/queue/33-g18d-gs-store-loop.txt` (addendum 2).

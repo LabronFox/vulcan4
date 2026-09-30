@@ -939,3 +939,38 @@ Also: a dish that fails twice burns two of the three strikes before the driver p
 correct gates over retry budget.
 
 *Declared 2026-09-29, the day the captain said: "lets work on Vulcan 4! a recomp of gt4."*
+
+---
+
+## G8 — THE TOOLKIT *(registered 2026-09-30 — the contribution; NOT scheduled)*
+
+**Make the missing half reusable.** Upstream `PS2Recomp` ships the *translator*. What it does not
+ship — and what every game-level recomp therefore rewrites from scratch — is:
+
+- the **harness/driver**: loads the guest ELF, drives the recompiled code, reports the boot
+  (`tools/harness/vulcan4_harness.cpp`, 980 lines — ours),
+- the **GS layer**: the PlayStation's GPU cannot be recompiled and *nobody links an emulator's GPU
+  core*, so it must be supplied (`tools/gs/vulcan4_gs_probe.cpp`, 56 KB — ours),
+- the **Linux build path + runtime fixes** (`tools/patches/`, 10 patches — ours).
+
+**The goal:** lift those three out of GT4 and make them game-agnostic — name a game, get boot + GS +
+gates without rediscovering any of it.
+
+**Not scheduled**, deliberately: a second game is a reward for a running game (the platform-order
+rule). This entry exists so the idea cannot drift, not so it gets built next.
+
+**Done when:** a *different* PS2 game recompiles and boots using our harness + GS + patches, with the
+field notes (G9) as the only guide.
+
+## G9 — THE FIELD NOTES *(registered 2026-09-30)*
+
+**Publish the research so the next PS2 recomp is easier.** The captain: *"i also wanna post my
+research once i finish so then ps2 recomps will be a lot easier."*
+
+`docs/RECOMP-PRACTICE.md` grows into the guide; every wall in the `docs/CAMPAIGN.md` ledger becomes a
+chapter — problem → evidence → fix → the reusable lesson — alongside the disc map, the ELF/function
+anatomy, the no-BIOS backlog, and the method rules that actually mattered (*measure, don't read*;
+red test first; **verify against the ELF, not our own translation**).
+
+**Done when:** it is published where the next person will look — the recomp/PS2 communities,
+`r/ReverseEngineering`, romhacking — with a running demo as the proof it is not theory.

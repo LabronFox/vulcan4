@@ -341,3 +341,54 @@ NEXT:   Two steps, neither of which is more forward-walking:
 MEASURED (suite): **450/450**. MEASURED (boot): `functions_entered=95 halt=guest_cycle_no_progress
         bios_files=0`, `W7SCAN total start=2 end=2`. **Campaign goal NOT reached — `VULCAN4 FRAME
         source=guest` never printed.** Artifact rebuilt clean (0 `fprintf`). Addenda 1–9 on file.
+
+## 2026-09-30 20:40 · 33-g18d-gs-store-loop (passes 8-10) · **a real bug FIXED, wall narrowed to 5 bytes**
+
+WALL:   W7. Still open, but no longer the same wall.
+DID:    **One real bug found and fixed**, red test first. Ten measurement passes on W7; all temporary
+        probes removed and every artefact rebuilt clean (0 `fprintf` in the generated unit, the
+        runtime, and the harness except the three W7 probes deliberately kept).
+MEASURED — THE FIX:
+        `[SetupHeap] base=0x10519ac alignedBase=0x10519b0 size=0xffffffff runtimeBase=0x10519b0
+                     runtimeEnd=0x10519b0`
+        **`runtimeEnd == runtimeBase`: every configured guest heap was ZERO LENGTH.**
+        `PS2Runtime::resetGuestHeapLocked` set `m_guestHeapEnd = base` — the heap's TOP pinned to its
+        BASE. It only ever looked right because `guestMalloc` raises it as blocks are handed out,
+        **and GT4 runs its own allocator, so nothing ever raised it.**
+        Fixed to `m_guestHeapEnd = (limit > base) ? limit : base;` → `runtimeEnd=0x1f00000`.
+        **Red first, two tests, captured before the fix:** `G1.8e: SetupHeap(-1) gives a heap with
+        room, not a zero-length one` and `G1.8e: a heap configured with a real limit is not
+        zero-length` — both [Failed] with the mechanism in the message, both green after.
+        **Suite 452/452.**
+        **HONEST: this did not move the boot.** `functions_entered` is still 95, halt still
+        `guest_cycle_no_progress`. A real bug fixed is still a real bug fixed, and the guest can now
+        allocate from a heap with room.
+MEASURED — THE WALL, NOW MUCH SMALLER:
+        - **The range is an EMPTY RANGE BY DESIGN.** Both callers compute `end = start - 1`
+          (`0x1004394` and `0x102cec4`) — the standard empty-range idiom. So `0x01051A3F` is exactly
+          right for `0x01051A40`, and **the loop is supposed to run zero times.** That kills every
+          "inverted range" reading in addenda 1–9.
+        - `sub_0100F390` **never reaches its own reload** at `0x100f85c` (0 samples). It is entered
+          **at the loop body** `0x100f800` via `case 0x100f800u`, which is correct.
+        - On entry **`$t1` is `0x01051A45` = start + 5.** Not start, not start−1, not start+1.
+        **So the remaining wall is five bytes wide**, and the loop body runs before the empty-range
+        test is ever evaluated.
+ELIMINATED across ten passes, none to be re-chased: recompiler branch emission · resume-case
+        mechanism · the `jalr` on the `0x100f7b4` path · the store pair at `0x100f7ac/0x100f7b0` ·
+        the callee-saved `$fp` restore (emitted correctly; **I retracted this claim twice**) · the
+        scheduler/driver context divergence (the G1.8c refresh works — measured) · a stranded syscall
+        invocation (`inv5A=0 inv83=0`, refuted) · the zero-length heap (**real, now fixed**) · and
+        the inverted-range reading itself (refuted).
+NEXT:   **One probe, and it is the one I should have run in pass 4: print `$s1`, `$s2`, `$t0` and
+        `$t1` at the yield inside the outer branch at `0x100f864`.** That yield is the only place
+        `ctx->pc` is set to `0x100f800`, so it is the only place the entry value can be established.
+        If `$s1` is already `start+5` when the body is entered, the outer loop ran five times first
+        and the outer loop is the culprit. **That either names the bug or closes the wall.**
+        The `W7SCAN` / `W7NEIGH` / `W7NODE` probes stay in the harness — they are how the range was
+        proved empty by design, and the next session needs them.
+MEASURED (suite): **452/452** from `tools/PS2Recomp/ps2xTest`.
+MEASURED (boot):  `functions_entered=95 halt=guest_cycle_no_progress bios_files=0`, with
+        `SetupHeap ... runtimeEnd=0x1f00000` confirming the fix is live in the real run.
+        **Campaign goal NOT reached — `VULCAN4 FRAME source=guest` never printed.**
+        Addenda 1–10 in `.auto/queue/33-g18d-gs-store-loop.txt`. Patch:
+        `tools/patches/ps2recomp-linux-g18e-heapend.patch`.

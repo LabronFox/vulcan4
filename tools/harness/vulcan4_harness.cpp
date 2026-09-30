@@ -929,6 +929,47 @@ int main(int argc, char *argv[])
         std::cout << "VULCAN4 W7SCAN total start=" << startHits << " end=" << endHits
                   << " (capped at " << kMaxHits << " printed each)\n";
 
+        // W7 is a LIST WALK, not a buffer copy. 0x01051A40 is a node read as
+        //   0x1000ae0  lw $v1, 0x7A8C($v0)   ; head
+        //   0x1000ae4  lw $a0, 0x18($v1)    ; head->next   <- the walk
+        //   0x1000aec  ld $s0, 0x20($a0)    ; next->data
+        // and 0x01051A3F is head-1, which no well-formed list contains. Dump the head
+        // node's fields so the shape is measured rather than assumed: a next pointer of
+        // 0 or of head-1 is a terminated-or-broken list, and anything else means the
+        // walk is somewhere else entirely.
+        {
+            constexpr uint32_t kHead = 0x01051A40u;
+            auto word = [&](uint32_t a) {
+                uint32_t w = 0u;
+                if (a + 4u <= PS2_RAM_SIZE)
+                {
+                    std::memcpy(&w, rdram + a, sizeof(w));
+                }
+                return w;
+            };
+            std::cout << "VULCAN4 W7NODE head=0x" << std::hex << kHead << std::dec
+                      << " [+0x0]=0x" << std::hex << word(kHead + 0x0)
+                      << " [+0x4]=0x" << word(kHead + 0x4)
+                      << " [+0x8]=0x" << word(kHead + 0x8)
+                      << " [+0xC]=0x" << word(kHead + 0xC)
+                      << " [+0x10]=0x" << word(kHead + 0x10)
+                      << " [+0x14]=0x" << word(kHead + 0x14)
+                      << " [+0x18]=0x" << word(kHead + 0x18) << " <-next"
+                      << " [+0x1C]=0x" << word(kHead + 0x1C)
+                      << " [+0x20]=0x" << word(kHead + 0x20)
+                      << " [+0x24]=0x" << word(kHead + 0x24)
+                      << std::dec << "\n";
+            // follow up to 8 links, so a corrupt chain is visible in one line
+            uint32_t node = word(kHead + 0x18);
+            std::cout << "VULCAN4 W7WALK";
+            for (int hop = 0; hop < 8 && node != 0u; ++hop)
+            {
+                std::cout << " ->0x" << std::hex << node << std::dec;
+                node = word(node + 0x18);
+            }
+            std::cout << "\n";
+        }
+
         // The one non-stack home of the start value is a live BSS variable. Its neighbours are
         // where the matching END should be, so print them: if the buffer is described by a pair,
         // the pair is visible here, and if the end is absent here it was never computed.

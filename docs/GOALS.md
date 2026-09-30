@@ -888,6 +888,40 @@ needed zero portability work. Evidence already banked: goal `G5.2a`.
   compatible). Name it before adding it; do not install anything silently.
 - **STATUS:** ⬜ post-playability (G4), same lane as the rest of the audio work (G4.3).
 
+### ⬜ G6.2 — **THE LAP CHIME** *(the captain's own touch, 2026-09-30)*
+- **The captain, 2026-09-30:** *"u know how in gt5 when u finish a lap and it shows u ur time it makes a
+  small sound? i wanna add that."*
+- **What it is:** the instant a completed lap's time lands on screen, one short cue sounds — a small,
+  unmistakable "that lap is now history" blip. In GT4 the same moment passes **silently**.
+- **Why a recomp can do this and an emulator cannot:** the lap-completion path *is our code now*. On an
+  emulator the lap timer is a black box behind an interpreter; here the function that commits a lap
+  time is a C++ function we can name, read, and wrap. This is the smallest possible demonstration of
+  what `G10` (ownership) buys — a one-line hook on a moment the game already has.
+- **Mechanism, in order:**
+  1. **Audio must exist first.** A cue needs an output path; today none is wired (see G4.3 — the audio
+     bank inside `GT4.VOL` is unwalked, no ADPCM path). Nothing here starts before that.
+  2. **Find the moment, and prefer the *logic* site over the *draw* site.** Two candidates: the
+     HUD/lap-counter update (easy to spot, but it is a *symptom*), and the race-logic site where the
+     lap timer's value is committed and reset (the *cause*). Hook the cause: a drawn number can be
+     redrawn, a committed lap happens once.
+  3. **The sound itself — and the fence matters here.** Ship **code, not assets** (G7.0):
+     - **shippable:** a cue we synthesise in our own audio code — two partials and an envelope, no
+       sample file, no third-party audio, nothing to license. This is what the repository can carry.
+     - **the exact GT5 chime:** that is Sony's recorded asset. It never enters the repo; it is the
+       same pattern as `G6.1` — **ship the loader and the hook, the file is the user's own.** Drop it
+       in a folder, a mapping entry names it, and the hook plays it.
+- **Honest limits:** awaits a *running* race (G4) and a live audio path; the trigger must be the game's
+  real lap event, never a reimplementation of lap detection (a fake trigger that fires on the wrong
+  frame is exactly the kind of plausible lie Law 2 forbids).
+- **DONE WHEN:** a driven lap completes and a cue is audible, with the trigger site named (function +
+  address) and the cue synthesised on our side — plus a documented path for the captain to supply his
+  own sample.
+- **Why it is registered now, before the game runs:** it is the cheapest end-to-end proof of the whole
+  promise of this project — *the game is yours, so the game can sound like you want it to.* It costs
+  one hook and one envelope, and it is the kind of thing that makes a recomp feel like an instrument
+  rather than a port.
+- **STATUS:** ⬜ post-playability, same lane as G4.3/G6.1. Registry entry only — do not dispatch.
+
 ### ⬜ G7.0 — **DISTRIBUTION: code only. Assets come from the user's disc.** *(the captain's rule)*
 - **The captain, 2026-09-30:** *"We don't publish anything. Just the code. People have to bring their
   own iso file of the game — that's where we take assets."*

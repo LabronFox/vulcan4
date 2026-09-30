@@ -198,6 +198,88 @@ dedicated output directory (`/mnt/ssd/vulcan4-build/audio/`) and should also ass
 
 ---
 
+## 9. G4.3s-b — THE VOLUME FORMAT IS CRACKED (and the binary is already built)
+
+### 9.1 The decoder: already built, nothing installed
+
+The captain's note is correct and no build was needed. The binary exists and runs:
+
+```
+$ ls -la /mnt/ssd/gt6/tools/vgmstream/build/cli/vgmstream-cli
+-rwxr-xr-x 1 or or 3385672 ... vgmstream-cli
+$ vgmstream-cli
+vgmstream CLI decoder r2117 (Sep 28 2026)
+missing input file(s)
+```
+
+**3,385,672 B, vgmstream CLI decoder r2117.** **Licence: BSD-3-clause, compatible with our GPL-3.0
+tree.** Nothing was installed, downloaded, or built in this dish — the artefact already existed
+from the GT6 work. (`ls` notes it as `Sep 28 17:24`, consistent with that.)
+
+### 9.2 BREAKTHROUGH: the volume's filenames are XOR-0xFF obfuscated
+
+This is what made the walk possible. The first name-offset I chased, `0x0100BA63`, read as:
+
+```
+9e 9b 89 9a 8d 8b 96 8c 9a ff 9d 98 92 ff 9c 9e 8d ff 9c 97 9e 8d 9e 9c 8b 9a 8d ff 9c 90 91 99
+```
+
+XOR every byte with `0xFF` and it is plain text: **`advertise`**. A trivial single-byte XOR, applied
+to the whole name table.
+
+With that, the top-level directory of `GT4.VOL` decodes:
+
+```
+$ python3 ...   # nameoff, type, namelen, dataoff, XOR-0xFF the name bytes
+  advertise        type=4  data=0x504
+  bgm              type=2  data=0x540
+```
+
+**`bgm` is a real top-level directory — the music.** And its child block (the same 16-byte record
+shape) yields its first entry: **`jp`**. So the real path is `bgm/jp/...`, and the tree is walkable
+now that the names are legible.
+
+**Record shape as far as it is decoded** (PS2 volume, magic `0xacb990ad`):
+
+| Field | Meaning | Confidence |
+|---|---|---|
+| header `+0x18` | count of top-level entries (23 here) | measured |
+| record `+0x00` | filename offset, flagged `0x0100xxxx`; mask with `0x00FFFFFF` | measured |
+| record `+0x04` | type (2 = directory, 3/4 = others) | **unverified** |
+| record `+0x08` | name field length (20 for the top level) | measured |
+| record `+0x0C` | data-block offset for children | measured |
+| record stride | **24 bytes at the top level, 16 bytes inside a directory block** | measured, unexplained |
+
+The stride difference between the two levels is the loose end, and it is why the walk stops after
+one child.
+
+### 9.3 Honest status: no sound decoded yet
+
+**No `.wav` was produced. The goal gate is NOT met.** What changed is that the blocker is no longer
+"the format is unknown" — it is one specific structural question (the 24-vs-16 byte stride) that is
+answerable by dumping a second directory block, and after that the audio is expected to be a
+**Vorbis or SPU-ADPCM stream inside the `bgm/jp` tree**, which is precisely what `vgmstream-cli`
+exists to decode.
+
+The earlier negative results stand and are not re-litigated: **GT4 has no SGDP** (0 of 313
+candidates validated), so unlike GT6 there will be no `.sgb` to hand the CLI. The CLI will have to
+be pointed at the raw ADPCM bank, or at a container this survey has not yet identified. That is
+**unverified** until the walk completes.
+
+### 9.4 Recipe for the next dish
+
+```bash
+V=/mnt/ssd/gt6/tools/vgmstream/build/cli/vgmstream-cli     # BSD-3-clause, already built
+$V -o out.wav <extracted-container>                        # decodes SGDP / VAG / ADPCM
+ffprobe -v error -show_entries format=format_name,duration -of csv=p=0 out.wav
+```
+
+To get the container, finish the walk: dump a second directory block to settle the stride, then
+descend `bgm/jp/`. Names need the **XOR-0xFF** step — reading them raw yields garbage that looks
+like a plausible-looking wrong answer, which is the failure mode worth guarding against.
+
+---
+
 ## STUCK
 
 ```
@@ -216,7 +298,11 @@ BLOCKED BY: the audio bank is inside GT4.VOL and the VOL directory format is not
          there is no ADPCM decoder on this box. vgmstream -- the tool that would almost certainly
          do it -- is not installed, and installing it is a decision for the captain, not something
          to do silently in a survey dish.
-NEED:    ONE thing now, not two. A decoder is NO LONGER the blocker: a working
+NEED:    UPDATED BY G4.3s-b. The decoder is BUILT and PRESENT (section 9.1) and the volume format is
+         CRACKED (section 9.2, names are XOR-0xFF). What remains is one structural question: the
+         record stride is 24 bytes at the top level and 16 inside a directory block, and resolving
+         that lets the walk descend bgm/jp/ to the audio.
+         (Original text, retained: ONE thing now, not two. A decoder is NO LONGER the blocker: a working
          vgmstream-cli r2117 exists at
          /mnt/ssd/gt6/tools/vgmstream/build/cli/vgmstream-cli, and the sibling project has proved
          the exact pipeline (unpack VOL -> vgmstream-cli -> audio). The sole remaining unknown is

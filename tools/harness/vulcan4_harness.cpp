@@ -1317,6 +1317,25 @@ int main(int argc, char *argv[])
     // runnable set, so the report cannot show three different instants of the same run.
     const EeKernelSnapshot kernelSnapshot = runtime.eeScheduler().snapshot();
     std::string runnableThreadNames;
+    // G1.8h. Invocation depth per thread, ALWAYS in the report.
+    //
+    // W10 turned out to be a stranded SyscallOverride invocation: hasInvocation() then latches and
+    // every later call of that syscall falls through to our builtin instead of the guest's own
+    // handler, so the guest's code stops running without anything saying so. A non-zero depth at
+    // the end of a run is the signature, and it costs one integer per thread to print -- which is
+    // what it should have cost from the start. A latch that cannot be SEEN in the report is a
+    // latch that costs a day.
+    std::string threadState;
+    for (const EeThreadSnapshot &thread : kernelSnapshot.threads)
+    {
+        if (!threadState.empty())
+        {
+            threadState += " ";
+        }
+        threadState += "tid" + std::to_string(thread.id) + ":status="
+            + std::to_string(static_cast<int>(thread.status)) + ":invocations="
+            + std::to_string(thread.invocationDepth);
+    }
     for (const EeThreadSnapshot &thread : kernelSnapshot.threads)
     {
         if (thread.status == EeThreadStatus::Ready || thread.status == EeThreadStatus::Running)
@@ -1350,6 +1369,7 @@ int main(int argc, char *argv[])
               << " next_event_cycle=" << kernelSnapshot.nextEventCycle
               << " vsync_tick=" << runtime.eeScheduler().currentVSyncTick()
               << " runnable_threads=" << runnableThreadNames
+              << " thread_state=" << threadState
               << " entry_budget=" << budget.maxEntries << " spin_limit=" << budget.maxRepeatedPc
               << " deadline_s=" << budget.maxSeconds << "\n";
 

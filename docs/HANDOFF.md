@@ -1131,7 +1131,81 @@ RETRACTED, seventh: **"the search returns the wrong slot."** It does not — the
         search returning the right slot every time it runs. What is wrong is *how many times it
         runs*, which no amount of looking at its return value could ever show.
 
-NEXT:   1. **Print it. One line, and it is the wall:** at `System.cpp:426`, when
+### CORRECTION TO THE ENTRY ABOVE, made immediately after — the latch is NOT left pending
+
+I put `thread_state=` (per-thread `status` and **`invocationDepth`**) permanently in the boot
+report, because a latch that cannot be seen in the report is a latch that costs a day. It reports:
+
+    thread_state=tid1:status=0:invocations=0
+
+**`invocations=0`. `hasInvocation()` is NOT latched at the end of the run.** So the "one fact" above
+is wrong in its conclusion, though its three measurements stand. The guest's scan does run only
+once for `a2 = 0x010285F8`, and the repeated scan is for `a2 = 0x010285C0` — **and both go through
+guest code** (the load observer sees them, and only guest code uses `READ32`). So our builtin is
+NOT answering. **The guest is running, repeatedly, the SECOND search, and never the first.**
+
+That inverts the previous entry's mechanism and it is worth being precise about why, because the
+inversion is itself the finding: the driver's loop enters `0x010286DC` (after jal #1) 9,969 times
+and `0x01028640` 9,969 times, and `0x010286F0` (after jal #2) **zero** times, while the scan that
+repeats is the one `a2 = 0x010285C0` — which is set in **jal #2's delay slot** at `0x010286EC`. So
+jal #2's *arguments* are being set up on every pass while its *resume point* is never taken. Those
+two facts cannot both be true of a straight-line path, and the only place they can be reconciled
+is `PS2Runtime::dispatchGuestBranch`, which is the next thing to read.
+
+**What `dispatchGuestBranch` does, from the source (ps2_runtime.cpp:1345), and why it is the
+suspect:**
+
+    ctx->pc = targetPc;                                   // 1353
+    if (m_eeScheduler && m_eeScheduler->checkpointDue(kGuestDispatchCycles))
+    {
+        ... [Yield] trace ...
+        return false;                                     // 1383
+    }
+
+and the generated caller is:
+
+    ctx->pc = 0x1028638u;
+    if (!runtime->dispatchGuestBranch(rdram, ctx, 0x1028638u, 0x10286D4u, 0x10286DCu, DirectCall, "JAL")) { return; }
+    ctx->pc = 0x10286DCu;
+    ...
+    ctx->pc = 0x1028638u;
+    if (!runtime->dispatchGuestBranch(rdram, ctx, 0x1028638u, 0x10286E8u, 0x10286F0u, DirectCall, "JAL")) { return; }
+    ctx->pc = 0x10286F0u;
+
+**Note what the second `jal` publishes: `fallthroughPc = 0x10286F0`, and `0x10286F0` is a declared
+resume case.** It is correct as written. The one thing that is NOT handled in this shape is the case
+where the callee **throws `EeDispatcherTransfer`** rather than returning: the throw skips
+`ctx->pc = 0x10286F0u`, and the wrapper's own `jr ra` is what lands the caller there — via
+`$ra`, which the generated code set to `0x10286F0`. That works. **But if the callee throws while
+`ctx->pc` still holds `targetPc` and the throw is caught somewhere that resumes the CALLER's frame
+rather than the callee's, the caller's resume PC is whatever the callee left.** That is the one
+shape left, and it is a runtime bug, not a recompiler one.
+
+NEXT:   1. **One probe, and it closes this.** Put the existing `[Yield]` trace on the
+           `dispatchGuestBranch` path for **every** return, not only the checkpoint one — i.e.
+           report `(sourcePc, targetPc, fallthroughPc, returned)` for the first few hundred
+           dispatches whose `targetPc == 0x1028638`. The answer is then visible directly: if
+           `sourcePc = 0x10286E8` never appears, jal #2 is never dispatched; if it appears and
+           returns false with `ctx->pc = 0x1028638`, the caller is being re-entered at the callee.
+           **The `[Yield]` machinery and the cap already exist at ps2_runtime.cpp:1367 — extend
+           that, do not write a new probe.**
+        2. The red test for the underlying property, which is broader than W10 and worth having:
+           **a guest function that calls a callee which THROWS `EeDispatcherTransfer` must leave the
+           CALLER's frame at the fallthrough PC the caller published** — not at the callee's entry.
+           That is a contract of `dispatchGuestBranch` + the generated caller, it has no test, and
+           it is exactly the property this wall is probing. The fixture is the G1.8b override shape
+           already in `ps2_runtime_kernel_tests.cpp`; write it before any fix.
+        3. **Then the milestone.** Zero MMIO accesses; GS window at `0x1200xxxx` untouched;
+           `VULCAN4 FRAME source=guest` emitted by nothing.
+
+        And the standing correction list is now seven long. **Every one of them was a conclusion
+        drawn from a partial view of a system where the guest can yield in the middle of a call
+        chain.** The pattern, one more time, because it is the only thing that has actually cost
+        this project time: **a measurement that exonerates a component must sample that component at
+        a rate that can see it, and a number from a partial view is a hypothesis, not a finding.**
+
+EARLIER-PASS NEXT (kept, because step 1 there is still the cheapest way to disprove this one):
+        1. **Print it. One line, and it is the wall:** at `System.cpp:426`, when
            `hasInvocation(SyscallOverride, 0x83)` is true, report which invocation is stranded
            (`invocationStackTop()`), its `context.pc`, and how old it is. If a `SyscallOverride`
            invocation for 0x83 is sitting on the thread with a non-zero `pc`, the latch is proven

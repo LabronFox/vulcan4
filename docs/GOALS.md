@@ -1034,3 +1034,41 @@ The CPU rasteriser ports free; the future **Vulkan** backend covers Adreno (Andr
 **Done when:** a subsystem the captain names (car pipeline first) is native, byte-exact against the
 recomp, and changing it does not mean editing 8.9 MB of generated C++. **Not scheduled** — Stage 1
 first, then this turns the recomp into the project Dusklight is, at a fraction of the years.
+
+---
+
+## G11 — **THE ASSETTO BRIDGE** *(the captain's main target, declared 2026-09-30)*
+
+> *"MY MAIN TARGET IS PORTING CARS FROM ASSETTO CORSA. IT HAS A HUGE MODDING LIBRARY OF JUST CARS U
+> CAN GET"*
+
+**This is the endgame feature, and it has a supply chain that already exists** — thousands of
+community-made, modern-quality cars, free. GT4's own cars are 2005 assets; AC's library is not.
+
+**What an AC car consists of** (what the bridge consumes):
+
+| Part | Format | Our job |
+|---|---|---|
+| Mesh | `.kn5` (Kunos) | → GT4's car model format |
+| Textures | DDS / PNG | → PS2 texture formats (swizzle, CLUT, palette) |
+| Physics | `data/*.ini` (car, engine, suspension, tyres, aero) | → GT4's car parameters (**approximate** — different tyre models) |
+| Metadata | `ui/ui_car.json` | → name, brand, class, power, weight for the menus/dealership |
+
+**The ladder, easiest first:**
+
+1. **SWAP** — replace an existing car's mesh with a converted AC mesh. *(A data job. The community has
+   done swaps for 20 years.)*
+2. **SWAP + textures + parameters** — the car looks and mostly drives like the AC car.
+3. **ADD** — a car that was never on the disc: new slot, new dealership entry, appears in menus,
+   save-game safe. **This is the thing nobody has ever done**, and it requires **G10 ownership** of
+   the car-loading path — you cannot extend a path you do not own.
+
+**The fence (non-negotiable, same as the disc):** we ship **the converter**, the user brings **their own
+mods**. We never distribute cars. Attribution to the original mod authors is part of the deliverable.
+
+**Why it fits the project's spirit:** GT4's most requested feature ever is *"let me add my own car."*
+AC's modding community accidentally built the supply side of that dream.
+
+**Not scheduled.** Stage 1 first: GT4 has to render a car of its own before it can render someone
+else's. Registered so the target cannot drift, and so the fence is written down before anyone is
+tempted to ship a `.kn5`.

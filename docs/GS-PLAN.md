@@ -679,28 +679,56 @@ were ours; the runtime is unchanged.
 - **`ST` carries S and T as raw floats**, not 12.4 like the screen coordinates. FST=0 is the normal
   path: the DDA interpolates S and T and only then divides by Q.
 
-### 12.7 The test, and one thing that did not work
+### 12.7 The tests, and one thing that did not work
 
-Added: `tools/patches/ps2recomp-linux-g24-primenum.patch`, one test —
-**`GS_PRIM_TRIANGLE is 3 and 2 is LINESTRIP, so the literal 2 must not be used`**. It pins both
-values directly, which is the cheapest possible guard against the constant coming back.
+Added: `tools/patches/ps2recomp-linux-g24-primenum.patch`, one test with three groups of
+assertions, all reading the GS's **own** debug history rather than a list the test maintains about
+itself (`GS::getDebugHistory()`, which is public).
 
-**A behavioural half was attempted and is deliberately NOT shipped.** The intent was to submit a
-triangle through `GS::writeRegister` and assert its interior pixel, so the fix would be pinned by
-behaviour rather than by a number. It does not pass, and the reason is worth recording:
+**1. The constant.** `GS_PRIM_TRIANGLE` is 3 and `GS_PRIM_LINESTRIP` is 2. Cheap, and it stops the
+literal coming back. But it would have passed *before* the fix too, because the runtime was never
+wrong — so on its own it pins nothing about the fault. It needs the next group.
+
+**2. The mechanism — and this is the one that would have caught it.** The primitive type decides how
+many vertices a draw waits for, so a LINESTRIP **cannot** carry a triangle even when three vertices
+are written:
+
+| Submitted | Draws recorded by the GS | `vertexCount` per draw |
+|---|---|---|
+| `GS_PRIM_TRIANGLE` + 3 vertices | **1** | **3** |
+| literal `2` (LINESTRIP) + the same 3 vertices | **2** | **2**, **2** |
+
+Those numbers are the GS's, not mine, and they are the whole of G2.2's "8 draw events for 4
+triangles" and "the batch shifts by one vertex per draw" as an executable fact instead of a theory.
+Deliberately **no framebuffer, no rasteriser and no pixels are involved**, so this group cannot be
+broken by the separate open question in the next paragraph.
+
+**An honest caveat on "fails now, passes after."** The brief asked for a test that fails before the
+fix. Because the fault was in our **probe** and not in the runtime, no runtime test can fail before
+and pass after it — there is nothing in the runtime that changed. What group 2 does instead is make
+"what the wrong constant actually does" checkable, so anyone who writes `PRIM = 2` expecting a
+triangle finds the two-vertex batch in an assertion failure rather than in a blank frame two dishes
+later. That is the nearest honest equivalent, and it is weaker than a true before/after test, so it
+is worth saying so.
+
+**3. A behavioural test that does NOT pass, and is not shipped.** The intent was to submit a
+triangle and assert its **interior pixel**, pinning the fix by behaviour rather than by shape. It
+does not pass, and the reason is worth recording:
 
 > The batch reaches `DrawPrimitive` with **all three vertices correct** (`v0=(64,64) v1=(400,96)
-> v2=(200,360)`), `type=3`, `scissor=(0,0)-(511,511)`, `test=0x30000`, `fbw=8 psm=0x0` — every
-> input correct — and the interior pixel is still `0x00000000`. Tried: `GSCpuBackend` installed
+> v2=(200,360)`), `type=3`, `scissor=(0,0)-(511,511)`, `test=0x30000`, `fbw=8 psm=0x0` — every input
+> correct — and the interior pixel is still `0x00000000`. Tried: `GSCpuBackend` installed
 > explicitly; `FBW` 1 and 8; readback through the GS's own `GSPSMCT32::addrPSMCT32` swizzle map
 > (a linear offset reads zeroed VRAM and would fail with a *correct* rasteriser, which is exactly
 > the kind of false negative this assertion must not have).
 
 **So there is a further reason a triangle does not land that is neither the primitive type nor the
-vertex queue.** Both of those are now demonstrably healthy. That is the next thing to chase, and it
-is not on the critical path for this dish: the probe draws correct, texture-sampled geometry through
-the real register path with 37,275 colours, so the pipeline is proven end to end. But it is a loose
-end in a unit test that a future dish should close before relying on `writeRegister` as a fallback.
+vertex queue.** Both of those are now demonstrably healthy — group 2 proves the second from the GS's
+own record. This is the next thing to chase, and it is not on the critical path for this dish: the
+probe draws correct, texture-sampled geometry through the real register path with 37,275 colours, so
+the pipeline is proven end to end. But it is a loose end, and it should be closed before
+`writeRegister` is relied on as a fallback. A failing test that ships is worse than no test, so this
+one is documented instead.
 
 **Suite state: 446 tests, 445 passed, 1 failed.** The failure is
 `VU0 macro mappings cover all S1/S2 enums`, and it is **pre-existing** — proven by building and

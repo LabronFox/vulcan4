@@ -226,10 +226,12 @@ itself, not gaps in our probe — they will bite the real guest, not us.
 ### Open, and deliberately not closed
 
 - **A `writeRegister`-submitted triangle still does not land in a unit test.** Correct vertices,
-  open scissor, `TEST_1 = 0x30000`, and the interior pixel stays `0`. Not the primitive type, not
-  the vertex queue — both are demonstrably healthy now. The probe draws correctly through the GIF
-  path, so the pipeline is proven, but this loose end should be closed before `writeRegister` is
-  relied on as a fallback. Detail and the failed attempts in `docs/GS-PLAN.md` §12.7.
+  open scissor, `TEST_1 = 0x30000`, and the interior pixel stays `0`. Not the primitive type and
+  not the vertex queue: `tools/patches/ps2recomp-linux-g24-primenum.patch` proves from the GS's own
+  debug history that a `GS_PRIM_TRIANGLE` batch carries all **three** vertices, so both of those are
+  demonstrably healthy. The probe draws correctly through the GIF path, so the pipeline is proven,
+  but this loose end should be closed before `writeRegister` is relied on as a fallback. Detail and
+  the failed attempts in `docs/GS-PLAN.md` §12.7.
 - **EE→GS GIF DMA is unproven.** `GifArbiter` has never been exercised; packets are handed to
   `GS::processGIFPacket` directly.
 - **No vblank or CSR signalling.** `CSR`/`VIF` interrupt plumbing is untouched; the frame is latched

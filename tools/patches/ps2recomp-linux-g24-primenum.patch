@@ -1,15 +1,34 @@
-Pin GS_PRIM_TRIANGLE == 3 so the G2.2/G2.3 hard-coded literal 2 cannot come back.
+Pin the GS_PRIM_TRIANGLE fault that blocked G2.2 and G2.3.
 
 WHY: the G2.0/G2.2/G2.3 probe wrote PRIM as the literal 2u, believing that was
 'triangle'. GS_PRIM_TRIANGLE is 3; 2 is GS_PRIM_LINESTRIP. Every downstream symptom
-looked like a broken rasteriser -- see docs/GS-PLAN.md section 12.
+then looked like a broken rasteriser -- see docs/GS-PLAN.md section 12.
 
-Adds one test. Also adds the gs_cpu_backend.h / <memory> includes, which are not
-needed by the committed test and were only there for a behavioural variant that was
-measured, found not to pass, and deliberately NOT shipped.
+Adds one test with three groups of assertions, all reading the GS's OWN debug history
+(GS::getDebugHistory()) rather than a list the test maintains about itself:
+
+  1. GS_PRIM_TRIANGLE == 3 and GS_PRIM_LINESTRIP == 2. Cheap, but on its own it would
+     have passed BEFORE the fix too, because the runtime was never wrong -- the fault
+     was in our probe. So it needs group 2 to mean anything.
+
+  2. The mechanism, which is the one that would have caught it. The primitive type
+     decides how many vertices a draw waits for, so a LINESTRIP cannot carry a
+     triangle even when three vertices are written. Measured by the GS:
+       GS_PRIM_TRIANGLE + 3 vertices -> 1 draw,  vertexCount 3
+       literal 2 (LINESTRIP) + the same -> 2 draws, vertexCount 2 and 2
+     That is the whole of G2.2's '8 draw events for 4 triangles' and 'the batch
+     shifts by one vertex per draw' as an executable fact rather than a theory.
+     Deliberately involves no framebuffer, rasteriser or pixels, so it cannot be
+     broken by the separate open question in GS-PLAN.md section 12.7.
+
+A behavioural variant that asserted the triangle's interior PIXEL was attempted and is
+deliberately NOT shipped: the batch reaches DrawPrimitive with all three vertices
+correct and the pixel is still 0x00000000, for reasons that are neither the primitive
+type nor the vertex queue. A failing test that ships is worse than no test; that open
+question is written up in GS-PLAN.md section 12.7 and LIMITATIONS.md instead.
 --- a/ps2xTest/src/ps2_gs_tests.cpp
 +++ b/ps2xTest/src/ps2_gs_tests.cpp
-@@ -4688,6 +4688,46 @@
+@@ -4688,6 +4688,103 @@
              t.IsTrue(pattern2Ok,
                       "second T4HL transfer to a different DBP should be byte-correct, proving the discarded excess bytes from the first transfer did not leak into subsequent transfer state");
          });
@@ -40,6 +59,63 @@ measured, found not to pass, and deliberately NOT shipped.
 +                     "GS_PRIM_TRIANGLE must be 3 -- a hard-coded 2 silently selects LINESTRIP");
 +            t.Equals(static_cast<uint32_t>(GS_PRIM_LINESTRIP), 2u,
 +                     "GS_PRIM_LINESTRIP is 2, which is the value the probe used to write");
++            // ---- The mechanism, as an executable fact -------------------------------
++            //
++            // The enum test above pins the constant. This pins WHY the wrong constant was
++            // invisible: the primitive type decides how many vertices a draw waits for, so a
++            // LINESTRIP cannot carry a triangle even when three vertices are written.
++            //
++            // Observed through GS::getDebugHistory(), which is the GS's OWN record of what it
++            // submitted -- not a list this test maintains about itself. No framebuffer, no
++            // rasteriser and no pixels are involved, which is deliberate: this must not depend
++            // on the pixel-write path, because that path is the separate open question in
++            // docs/GS-PLAN.md section 12.7.
++            auto vertexCountsFor = [](uint64_t primType) -> std::vector<uint32_t>
++            {
++                std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++                GS gs;
++                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++                gs.setDebugHistoryPaused(false);
++                gs.clearDebugHistory();
++
++                auto xyz = [](uint32_t x, uint32_t y) -> uint64_t
++                {
++                    return static_cast<uint64_t>(x * 16u) |
++                           (static_cast<uint64_t>(y * 16u) << 16);
++                };
++                gs.writeRegister(GS_REG_PRIM, primType);
++                gs.writeRegister(GS_REG_RGBAQ, 0xFF2828DCull);
++                gs.writeRegister(GS_REG_XYZ2, xyz(64u, 64u));
++                gs.writeRegister(GS_REG_RGBAQ, 0xFF2828DCull);
++                gs.writeRegister(GS_REG_XYZ2, xyz(400u, 96u));
++                gs.writeRegister(GS_REG_RGBAQ, 0xFF2828DCull);
++                gs.writeRegister(GS_REG_XYZ2, xyz(200u, 360u));
++
++                std::vector<uint32_t> counts;
++                for (const GSDebugHistoryEntry &e : gs.getDebugHistory())
++                    if (e.kind == GSDebugEventKind::Draw)
++                        counts.push_back(e.vertexCount);
++                return counts;
++            };
++
++            const std::vector<uint32_t> asTriangle = vertexCountsFor(GS_PRIM_TRIANGLE);
++            t.Equals(asTriangle.size(), 1u, "three vertices + GS_PRIM_TRIANGLE must yield exactly one draw");
++            if (!asTriangle.empty())
++                t.Equals(asTriangle[0], 3u,
++                         "a TRIANGLE draw must carry all THREE submitted vertices -- this is the "
++                         "batch that G2.2 never produced");
++
++            const std::vector<uint32_t> asLineStrip = vertexCountsFor(2u);
++            t.Equals(asLineStrip.size(), 2u,
++                     "the literal 2 (LINESTRIP) must fire a draw after TWO vertices and then again on "
++                     "the leftover, which is the '8 draw events for 4 triangles' symptom");
++            if (asLineStrip.size() == 2u)
++            {
++                t.Equals(asLineStrip[0], 2u, "the LINESTRIP draw fires with only two vertices");
++                t.Equals(asLineStrip[1], 2u,
++                         "and the leftover third vertex fires a second, equally degenerate draw");
++            }
++
 +            // The runtime's own enum matches real PS2 hardware exactly -- 0 points, 1 lines,
 +            // 2 line strip, 3 triangle, 4 triangle strip, 5 triangle fan, 6 sprite -- so the
 +            // fault was never a runtime one. It was a hard-coded literal in our own probe that

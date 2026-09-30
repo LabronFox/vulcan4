@@ -522,4 +522,26 @@ Eventually the captain's Odin 2. Never an emulator.
 5. **No game data in the repo. No faking. Refused, not guessed at.**
 6. Nothing new is dispatched before the captain has seen the previous result.
 
+### ⚠️ GATE TYPES — learned the hard way (2026-09-30)
+
+The gate is a shell command, and **a shell command cannot read a diagnosis.** For four dishes in a
+row, excellent investigative work was logged as `GOAL NOT MET` because the gate demanded *"the guest
+advanced past the wall"* while the dish's actual deliverable was *"name the cause precisely"*. The
+dish text said a named dependency counts as a pass; the machine disagreed. That is a design flaw on
+Caine's side, not a failure of the work.
+
+**Two kinds of dish, two kinds of gate:**
+
+| Dish type | Gate must check | Example |
+|---|---|---|
+| **FIX** — the product must move | the product's own measurement (a counter, a colour count, a boot report) | `functions_entered > 3` |
+| **INVESTIGATE / SURVEY / DOC** — the deliverable is knowledge | the **artefact of knowledge**: the doc exists, is non-trivial, and contains the named finding | a trace line in the log + a conclusion in the doc |
+
+**Never give an investigative dish a progress gate**, and never give a fix dish a prose gate. If a
+dish is honestly both, split it into two dishes: one that produces the diagnosis (doc gate), one
+that acts on it (progress gate).
+
+Also: a dish that fails twice burns two of the three strikes before the driver parks. Prefer
+correct gates over retry budget.
+
 *Declared 2026-09-29, the day the captain said: "lets work on Vulcan 4! a recomp of gt4."*

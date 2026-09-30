@@ -170,6 +170,38 @@ the public `GS::writeRegister`, which does reach the full map.
 `FRAME_1` must carry FBW. Leaving it zero gives the rasteriser a row stride of zero and it
 draws nothing at all — silently.
 
+### Transfer path encodings (ADDED IN G2.1 — the doc was under-specified here)
+
+G2.0 documented the GIF path and the display registers but **not** the transfer registers, which
+made the transfer route unusable without reading `gs_frontend.cpp`. Now recorded, as
+`GS::writeRegisterUnlocked` actually decodes them:
+
+| Register | Addr | Field layout |
+|---|---|---|
+| `BITBLTBUF` | 0x50 | SBP 0–13, SBW 16–21, SPSM 24–29, **DBP 32–45, DBW 48–53, DPSM 56–61** |
+| `TRXPOS` | 0x51 | SSX 0–10, SSY 16–26, **DSX 32–42, DSY 48–58**, DIR 59–60 |
+| `TRXREG` | 0x52 | **W 0–11, H 32–43** |
+| `TRXDIR` | 0x53 | direction; `0` = host-to-local |
+
+Widths (`SBW`/`DBW`) are in **64-pixel words**, so a 512-pixel-wide PSMCT32 buffer is `8`. Pixel
+format `0` is PSMCT32. Note `TRXREG` puts H at bit 32, not 12 — that is not the obvious packing.
+
+`GS::uploadImageNative(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes)` is the single-call
+form: it writes those four registers and then feeds the image data, which is what a guest's
+`D_UTEXTURE`-style upload does. `GSCpuBackend::UploadImage` is what actually writes VRAM.
+
+### Register surface actually touched by the skeleton (G2.1)
+
+Fourteen registers, all written, none read back by us:
+
+`0x1C` TEXCLUP/TEXCLUT · `0x3B` TEXA · `0x40`/`0x41` SCISSOR_1/2 · `0x42`/`0x43` ALPHA_1/2 ·
+`0x47`/`0x48` TEST_1/2 · `0x4C`/`0x4D` FRAME_1/2 · `0x50` BITBLTBUF · `0x51` TRXPOS ·
+`0x52` TRXREG · `0x53` TRXDIR
+
+The sweep from `PRMODECONT` (0x1A) to `ZBUF_1` (0x4E) is written explicitly so nothing keeps a
+reset value, which is why the trace shows a contiguous block. **Nothing in 0x00–0x0F is written**,
+so `PRIM`/`RGBAQ`/`XYZF2`/`XYZ2` — the primitive path — is entirely untouched today.
+
 ### Sync / present points
 
 - `GSCpuBackend::Flush()` then `Sync(GSSyncReason::Presentation)` run inside the latch.
@@ -207,13 +239,32 @@ bash /home/or/vulcan4/tools/gs/build_gs_probe.sh
 
 The probe prints a frame line with a checksum, so the frame can be verified without opening it:
 
+**G2.0's frame, and why it was black.** `non_background=0` — every one of 262,144 pixels was
+`(0,0,0)`. G2.1 established *why*, and the answer was not what G2.0 guessed:
+
+- The triangle **did** submit. `XYZF2` and `XYZ2` both queue a vertex and both call
+  `vertexKick`, so a primitive written as `RGBAQ,ST,UV,XYZF2,XYZ2` produces **six** kicks for
+  three vertices and `Submit` **is** called. G2.0's "the triangle never submits" was wrong.
+- The rasteriser ran and produced **no pixels**. That part is still open and is tracked in
+  `LIMITATIONS.md`.
+
+**G2.1's frame, which is not black:**
+
 ```
-VULCAN4 GS FRAME path=... 512x512 pixels=1048576 non_background=0 fnv1a64=0x1b5438fac83d0383
+VULCAN4 GS pattern computed in our code: 43804 distinct colours, 1048576 bytes
+VULCAN4 GS transfer BITBLTBUF=0x8000000080000 TRXPOS=0x0 TRXREG=0x20000000200 TRXDIR=0x0
+VULCAN4 GS sync vblank_ticks=1 csr=0x1 (bit0=SIGNAL raised after FINISH)
+VULCAN4 GS FRAME path=... 512x512 non_background=251261 distinct_colours=43804
 ```
 
-**Read that honestly: `non_background=0` means the frame is currently blank.** The pipeline is
-proved end to end — GS readback to PNG is genuinely ours — but the triangle is not yet landing in
-VRAM, so rasterisation itself is **not** yet proved. See the next section for why.
+43,804 distinct colours computed by us, written into VRAM by the GS's own transfer path, read back
+out of VRAM by the GS presentation path, encoded by our own PNG writer. In-count and out-count
+match exactly, so the round trip is lossless. 119,302 B, against 845 B for the black G2.0 frame.
+
+**The honest boundary:** the content arrives via the **transfer** path, not the **rasteriser**. A
+guest that draws primitives still needs the rasteriser, and the rasteriser is not yet producing
+pixels. This dish proves the memory, transfer, readback and present routes compute and move real
+data. It does not prove triangle rasterisation.
 
 ## What is not done
 

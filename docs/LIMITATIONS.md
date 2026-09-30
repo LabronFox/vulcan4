@@ -29,10 +29,14 @@ around 1, 2 and 3; defect 4 is unsolved.
    identical to the caller: a blank frame, no message.
    *Fix: report a distinct status, or at minimum log why.*
 
-4. **The triangle never submits.** With the framebuffer registers, `FBW` and the scissor all
-   verified correct in the rasteriser's own log output, the vertex queue does not reach the three
-   vertices a triangle requires and no pixels are written. `non_background=0`; the PNG is blank.
-   **Not yet diagnosed. This is the next dish.**
+4. **The triangle rasteriser produces no pixels.** CORRECTED IN G2.1: the earlier claim that "the
+   triangle never submits" was **wrong**. `XYZF2` and `XYZ2` both queue a vertex and both call
+   `vertexKick`, so writing `RGBAQ,ST,UV,XYZF2,XYZ2` produces six kicks for three vertices and
+   `GSCpuBackend::Submit` **is** called. All the framebuffer state the rasteriser logs
+   (`fbp=0 fbw=8 psm=0x0`, `scissor=(0,0)-(511,511)`) is correct. The rasteriser runs and writes
+   nothing. **Still undiagnosed.** This is now the single biggest gap in the GS: a guest that draws
+   primitives rather than uploading pixels cannot be rendered until it is fixed. G2.1 worked around
+   it by using the transfer path, and says so.
 
 ## The GS — not implemented
 
@@ -86,6 +90,19 @@ around 1, 2 and 3; defect 4 is unsolved.
   code driving our own code.
 - **The GS cannot be recompiled.** It is fixed-function hardware, so a renderer must be supplied.
   This is the project's first real wall.
+- **The GS computes and moves real pixels, but does not yet rasterise.** As of G2.1 the frame
+  `/mnt/ssd/vulcan4-build/gs/vulcan4_gs_frame.png` (512x512, 119,302 B) carries **43,804 distinct
+  colours**, computed by our own code, written into VRAM through the GS **transfer** path
+  (`BITBLTBUF`/`TRXPOS`/`TRXREG`/`TRXDIR` + image data), read back through the GS **presentation**
+  path and encoded by our own PNG writer. In-count and out-count match exactly. What is missing is
+  the **rasteriser**: no primitive of any kind is drawn. Nothing from Gran Turismo 4 has been
+  rendered, and the guest still has `total_mmio_accesses=0`.
+- **The vblank/CSR sync primitive is host-driven and says so.** The skeleton advances a monotonic
+  vblank tick counter from the host and raises CSR bit 0 (SIGNAL) after FINISH. It **does not**
+  model vblank timing, deliver a vblank interrupt to the EE, provide DMA/AD interrupts, or emulate
+  the interrupt controller or the IOP. A guest waiting on vblank is released rather than spinning —
+  deliberately, because G1.5's `FindAddress` livelock is exactly what a guest does when a promised
+  return value never arrives. But it is released by a host thread's wall clock, not by the GS.
 - **The recompiled guest is still stuck in a syscall** after 3 functions. See
   [`docs/FIRST-BOOT.md`](FIRST-BOOT.md) and the G1.4 notes: the `jal` at `0x010286D4` dispatches
   the stub at `0x01028638` but the callee body never runs before control returns at

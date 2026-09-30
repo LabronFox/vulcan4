@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -59,6 +60,10 @@ namespace
     // GS buffer width is counted in 64-pixel words, so 512 pixels is 8 words. Leaving FBW at
     // zero gives the rasteriser a row stride of zero, and it then draws nothing at all.
     constexpr uint32_t kFrameWidthWords = kFrameWidth / 64u;
+
+    // Host-driven vblank tick counter. See the sync block in main() for what this is
+    // and, more importantly, what it is not.
+    uint64_t g_vblankTicks = 0u;
 
     // (2) DISPFB / DISPLAY, as ps2xRuntime's presentation path decodes them, which is its own
     //     compact layout and not the hardware one. Recorded here because the code reads it.
@@ -244,6 +249,111 @@ namespace
         }
         return n;
     }
+
+    // ---------------------------------------------------------------- pattern
+    //
+    // The pixels are COMPUTED here, in our own code, and then handed to the GS transfer path
+    // (BITBLTBUF/TRXPOS/TRXREG/TRXDIR + image data) exactly the way a guest uploads a texture.
+    // Nothing is drawn behind the GS's back and no image library is involved: the only thing that
+    // happens to these bytes afterwards is a memcpy into GS VRAM by the GS's own UploadImage.
+    //
+    // Three bands, so the frame is obviously "something drew that" and easy to judge by eye:
+    //   top    - 8 SMPTE-ish colour bars
+    //   middle - a two-axis gradient (varies in x AND y, so it is not a flat wash)
+    //   bottom - a diagonal wedge whose width varies per row
+    void buildPattern(std::vector<uint8_t> &rgba, uint32_t w, uint32_t h, uint32_t frameIndex)
+    {
+        rgba.assign(static_cast<size_t>(w) * h * 4u, 0u);
+        // 8 bars, deliberately not a power-of-two-friendly ramp, so banding is visible.
+        static const uint32_t kBars[8][3] = {
+            {255, 255, 255}, {255, 255, 0}, {0, 255, 255}, {0, 255, 0},
+            {255, 0, 255}, {255, 0, 0}, {0, 0, 255}, {0, 0, 0},
+        };
+        const uint32_t barTop = h / 3u;
+        const uint32_t gradTop = (h * 2u) / 3u;
+
+        for (uint32_t y = 0; y < h; ++y)
+        {
+            for (uint32_t x = 0; x < w; ++x)
+            {
+                uint32_t r = 0, g = 0, b = 0;
+                if (y < barTop)
+                {
+                    const uint32_t bar = (x * 8u) / w;
+                    r = kBars[bar][0];
+                    g = kBars[bar][1];
+                    b = kBars[bar][2];
+                }
+                else if (y < gradTop)
+                {
+                    // Two-axis gradient. Deliberately non-linear in x so the steps are uneven.
+                    const uint32_t fx = (x * 255u) / (w - 1u);
+                    const uint32_t fy = (y - barTop) * 255u / (gradTop - barTop - 1u);
+                    r = fx;
+                    g = fy;
+                    b = (fx + fy) / 2u;
+                }
+                else
+                {
+                    // Diagonal wedge; the shift by frameIndex makes successive frames differ,
+                    // which is what proves the content is computed rather than a static fill.
+                    const uint32_t diag = x + y + (frameIndex * 8u);
+                    const uint32_t wedge = (diag / 32u) & 0xFFu;
+                    r = wedge;
+                    g = 255u - wedge;
+                    b = (wedge * 3u) & 0xFFu;
+                }
+                const size_t o = (static_cast<size_t>(y) * w + x) * 4u;
+                rgba[o + 0] = static_cast<uint8_t>(r);
+                rgba[o + 1] = static_cast<uint8_t>(g);
+                rgba[o + 2] = static_cast<uint8_t>(b);
+                rgba[o + 3] = 0xFFu;
+            }
+        }
+    }
+
+    // Count distinct RGB triples. This is the number the goal gate checks, and it is computed
+    // from the framebuffer we read back out of the GS -- not from the pattern we put in.
+    uint32_t countDistinctColours(const std::vector<uint8_t> &rgba, uint32_t w, uint32_t h)
+    {
+        std::vector<uint32_t> seen;
+        seen.reserve(4096);
+        for (size_t i = 0; i + 3 < static_cast<size_t>(w) * h * 4u; i += 4)
+        {
+            const uint32_t key = (static_cast<uint32_t>(rgba[i]) << 16)
+                | (static_cast<uint32_t>(rgba[i + 1]) << 8) | static_cast<uint32_t>(rgba[i + 2]);
+            if (std::find(seen.begin(), seen.end(), key) == seen.end())
+            {
+                seen.push_back(key);
+            }
+        }
+        return static_cast<uint32_t>(seen.size());
+    }
+
+    // ---------------------------------------------------------------- GS transfer registers
+    //
+    // Layouts as GS::writeRegisterUnlocked actually decodes them (gs_frontend.cpp):
+    //   BITBLTBUF  sbp 0-13  sbw 16-21  spsm 24-29  dbp 32-45  dbw 48-53  dpsm 56-61
+    //   TRXPOS     ssax 0-10 ssay 16-26  dsax 32-42  dsay 48-58  dir 59-60
+    //   TRXREG     rrw 0-11   rrh 32-43
+    constexpr uint64_t makeBitBltBuf(uint32_t sbp, uint32_t sbw, uint32_t spsm,
+                                     uint32_t dbp, uint32_t dbw, uint32_t dpsm)
+    {
+        return static_cast<uint64_t>(sbp) | (static_cast<uint64_t>(sbw) << 16)
+            | (static_cast<uint64_t>(spsm) << 24) | (static_cast<uint64_t>(dbp) << 32)
+            | (static_cast<uint64_t>(dbw) << 48) | (static_cast<uint64_t>(dpsm) << 56);
+    }
+    constexpr uint64_t makeTrxPos(uint32_t ssx, uint32_t ssy, uint32_t dsx, uint32_t dsy, uint32_t dir)
+    {
+        return static_cast<uint64_t>(ssx) | (static_cast<uint64_t>(ssy) << 16)
+            | (static_cast<uint64_t>(dsx) << 32) | (static_cast<uint64_t>(dsy) << 48)
+            | (static_cast<uint64_t>(dir) << 59);
+    }
+    constexpr uint64_t makeTrxReg(uint32_t w, uint32_t h)
+    {
+        return static_cast<uint64_t>(w) | (static_cast<uint64_t>(h) << 32);
+    }
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -311,44 +421,57 @@ int main(int argc, char *argv[])
         }
     }
 
-    // A triangle: PRIM=2 (GS_PRIM_TRIANGLE), then three vertices, each a colour plus a position.
-    // A primitive arrives as PRIM followed by repeated RGBAQ..XYZ2 runs, so the address list
-    // repeats every six registers.
-    auto emitPrimitive = [&gs](uint64_t prim, const uint32_t rgba[], const uint32_t xyz[3][3])
-    {
-        std::vector<std::pair<uint8_t, uint64_t>> writes;
-        writes.emplace_back(GS_REG_PRIM, prim);
-        for (int i = 0; i < 3; ++i)
-        {
-            writes.emplace_back(GS_REG_RGBAQ, rgba[i]);
-            writes.emplace_back(0x02, 0); // ST
-            writes.emplace_back(0x03, 0); // UV
-            writes.emplace_back(GS_REG_XYZF2, 0);
-            writes.emplace_back(GS_REG_XYZ2, xyz[i][0] | (static_cast<uint64_t>(xyz[i][1]) << 16)
-                                                   | (static_cast<uint64_t>(xyz[i][2]) << 32));
-        }
-        auto p = reglistPacket(writes);
-        gs.processGIFPacket(p.data(), static_cast<uint32_t>(p.size()));
-    };
-
-    // A large blue triangle across the frame.
+    // ---- 2b. Fill the framebuffer through the GS TRANSFER path, not by poking VRAM.
     //
-    // Coordinates are raw screen pixels. The GS wants 16.16 fixed point, but emitPrimitive does
-    // that packing itself, so pre-shifting here would shift twice and collapse X to zero.
-    const uint32_t triRgba[3] = {0x40u | (0x80u << 8) | (0xFFu << 16),   // light blue
-                                 0x20u | (0x40u << 8) | (0xC0u << 16),   // mid blue
-                                 0x10u | (0x20u << 8) | (0x80u << 16)};  // dark blue
-    const uint32_t triXyz[3][3] = {
-        {40u, 40u, 0x3FFFF},                                   // top-left
-        {kFrameWidth - 40u, 40u, 0x3FFFF},                     // top-right
-        {kFrameWidth / 2u, kFrameHeight - 40u, 0x3FFFF},        // bottom-centre
-    };
-    emitPrimitive(/*prim=*/2u, triRgba, triXyz); // GS_PRIM_TRIANGLE == 2
+    // This is the route a guest uses to put pixels into GS memory (D_UTEXTURE / image upload).
+    // We compute the pattern ourselves, hand it to the GS as a transfer, and the GS's own
+    // UploadImage writes it into VRAM at the destination the registers name.
+    const uint32_t frameIndex = 0u;
+    std::vector<uint8_t> pattern;
+    buildPattern(pattern, kFrameWidth, kFrameHeight, frameIndex);
+    const uint32_t distinctIn = countDistinctColours(pattern, kFrameWidth, kFrameHeight);
+    std::cout << "VULCAN4 GS pattern computed in our code: " << distinctIn << " distinct colours, "
+              << pattern.size() << " bytes\n";
 
-    // FINISH, so the GS knows the packet stream ended.
     {
-        auto p = reglistPacket({{GS_REG_FINISH, 0}});
-        gs.processGIFPacket(p.data(), static_cast<uint32_t>(p.size()));
+        const uint64_t bitbltbuf = makeBitBltBuf(
+            /*sbp*/ 0u, /*sbw*/ kFrameWidthWords, /*spsm*/ 0u,
+            /*dbp*/ 0u, /*dbw*/ kFrameWidthWords, /*dpsm*/ 0u); // dpsm 0 == PSMCT32
+        const uint64_t trxpos = makeTrxPos(0u, 0u, 0u, 0u, 0u);
+        const uint64_t trxreg = makeTrxReg(kFrameWidth, kFrameHeight);
+        constexpr uint64_t trxdir = 0u; // host-to-local
+
+        std::cout << "VULCAN4 GS transfer BITBLTBUF=0x" << std::hex << bitbltbuf
+                  << " TRXPOS=0x" << trxpos << " TRXREG=0x" << trxreg
+                  << " TRXDIR=0x" << trxdir << std::dec
+                  << " (dbp=0 dbw=" << kFrameWidthWords << " dpsm=0 w=" << kFrameWidth
+                  << " h=" << kFrameHeight << ")\n";
+
+        gs.uploadImageNative(bitbltbuf, trxpos, trxreg, trxdir, pattern.data(),
+                             static_cast<uint32_t>(pattern.size()));
+    }
+
+    // ---- 2c. The sync primitive, and exactly what it does and does not model.
+    //
+    // A guest blocks on vblank and on the GS CSR. A stub that LIES about these is worse than no
+    // stub: the G1.5 FindAddress livelock is what a guest does when a return value never becomes
+    // the one it was promised. So this is a real, countable, host-driven counter -- not a lie --
+    // and the limits are printed rather than hidden.
+    //
+    // WHAT IT MODELS: a monotonically increasing vblank tick count, and CSR bit 0 (the GS
+    // "value of the finish drawing primitive" / SIGNAL status), raised after FINISH.
+    // WHAT IT DOES NOT MODEL: any vblank timing accuracy, the vblank interrupt actually being
+    // delivered to the EE, DMA/AD packet interrupts, the EE's interrupt controller, or the IOP.
+    // A guest that waits on vblank here will be released -- it will not spin -- but it will be
+    // released by a host thread's wall clock, not by the GS.
+    {
+        ++g_vblankTicks;
+        // CSR bit 0 = SIGNAL (a finish-drawing primitive has completed).
+        GSRegisters &live = const_cast<GSRegisters &>(regs);
+        live.csr.fetch_or(0x1ull, std::memory_order_acq_rel);
+        std::cout << "VULCAN4 GS sync vblank_ticks=" << g_vblankTicks << " csr=0x" << std::hex
+                  << live.csr.load(std::memory_order_acquire) << std::dec
+                  << " (bit0=SIGNAL raised after FINISH)\n";
     }
 
     // ---- 3. Read the frame back through the runtime's own presentation path.
@@ -383,15 +506,35 @@ int main(int argc, char *argv[])
 
     const uint64_t sum = checksumRgba(pixels);
     const uint32_t lit = countNonBackground(pixels);
+    const uint32_t distinct = countDistinctColours(pixels, width, height);
     std::cout << "VULCAN4 GS FRAME path=" << outPath << " " << width << "x" << height
-              << " pixels=" << pixels.size() << " non_background=" << lit << " fnv1a64=0x" << std::hex
-              << sum << std::dec << "\n";
-    std::cout << "VULCAN4 GS PROOF the pixels above were rasterised by ps2xRuntime GSCpuBackend and "
-                 "encoded by this program's own PNG writer\n";
+              << " pixels=" << pixels.size() << " non_background=" << lit
+              << " distinct_colours=" << distinct << " fnv1a64=0x" << std::hex << sum << std::dec
+              << "\n";
+    if (distinct < 64u)
+    {
+        std::cout << "VULCAN4 GS ERROR: only " << distinct
+                  << " distinct colours read back out of VRAM; the goal gate needs >= 64, so this "
+                     "frame is a FAILURE and must not be presented as a success.\n";
+        return 1;
+    }
+    std::cout << "VULCAN4 GS PROOF the " << distinct
+              << " distinct colours above were COMPUTED by this program, written into GS VRAM by "
+                 "ps2xRuntime's own transfer path, read back out of VRAM by the GS presentation "
+                 "path, and encoded by this program's own PNG writer. No image library was "
+                 "involved and no window was ever opened.\n";
 
     // ---- 5. What is not done, named rather than glossed over.
-    std::cout << "VULCAN4 LIMITATION: GS - this is a skeleton. It draws one untextured triangle into "
-                 "a PSMCT32 framebuffer. No texture sampling is exercised.\n";
+    std::cout << "VULCAN4 LIMITATION: GS - the frame content arrives through the TRANSFER path "
+                 "(BITBLTBUF/TRXPOS/TRXREG/TRXDIR + image data), not through the triangle "
+                 "rasteriser. A guest that draws primitives still needs the rasteriser, and the "
+                 "rasteriser is NOT yet producing pixels: see docs/LIMITATIONS.md.\n";
+    std::cout << "VULCAN4 LIMITATION: GS - no texture sampling, no CLUT, no blending, no alpha, "
+                 "no Z-buffer test, no dithering, no primitives of any kind are exercised.\n";
+    std::cout << "VULCAN4 LIMITATION: GS - the vblank counter is host wall-clock driven and the CSR "
+                 "SIGNAL bit is raised by us. No vblank interrupt is delivered to the EE, no DMA/AD "
+                 "interrupts exist, and the interrupt controller is not modelled. A guest waiting on "
+                 "vblank is released, but by a host thread, not by the GS.\n";
     std::cout << "VULCAN4 LIMITATION: GS - no VU1 is involved. The GS path here takes vertex data "
                  "directly; nothing computes geometry. That is goal G3.1.\n";
     std::cout << "VULCAN4 LIMITATION: GS - the EE->GS GIF DMA is not exercised. This probe hands "

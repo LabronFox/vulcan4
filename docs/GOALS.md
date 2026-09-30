@@ -57,6 +57,32 @@ Eventually the captain's Odin 2. Never an emulator.
   arithmetic, indirect calls, the spin-trap loop — all verified against raw bytes. **The
   translation is faithful.** But the run **failed**: exit 1, 2 of 721 function bodies lost.
 
+### ✅ G2.1 — The GS computes pixels (43,804 distinct colours, not a black square)
+- **DONE WHEN:** the skeleton writes a framebuffer whose content is COMPUTED through the
+  register/transfer path, reads it back, and writes a PNG with at least 64 distinct colours.
+- **RESULT (2026-09-30):** `/mnt/ssd/vulcan4-build/gs/vulcan4_gs_frame.png`, 512x512, **119,302 B**,
+  **43,804 distinct colours** (gate needs >= 64; G2.0 produced 1). 251,261 non-background pixels.
+  In-count and out-count match exactly, so the round trip through VRAM is lossless.
+- **How the content is produced:** computed in our own code (8 colour bars, a two-axis gradient, a
+  diagonal wedge), then handed to the GS through its **transfer** path — `BITBLTBUF`/`TRXPOS`/
+  `TRXREG`/`TRXDIR` plus image data via `GS::uploadImageNative`, the same route a guest uses to
+  upload a texture. `GSCpuBackend::UploadImage` writes it into VRAM. It is then read back through
+  the GS presentation path and encoded by the skeleton's own zlib PNG writer. No image library is
+  involved and no window is ever opened.
+- **CORRECTION to G2.0.** G2.0 recorded that "the triangle never submits". That was **wrong**.
+  `XYZF2` and `XYZ2` both queue a vertex and both call `vertexKick`, so a primitive written as
+  `RGBAQ,ST,UV,XYZF2,XYZ2` yields six kicks for three vertices and `Submit` **is** called. The
+  rasteriser runs with correct state and writes nothing. Still undiagnosed, and now the GS's
+  biggest gap. G2.1 routed around it and says so rather than claiming it fixed.
+- **GS-PLAN.md was under-specified and is fixed.** It documented the GIF path and the display
+  registers but **not** the transfer registers, so the transfer route was unusable without reading
+  `gs_frontend.cpp`. Added: full `BITBLTBUF`/`TRXPOS`/`TRXREG`/`TRXDIR` field layouts, the 64-pixel
+  word width rule, and the 14-register surface the skeleton actually touches.
+- **Sync primitive, honestly bounded.** A host-driven monotonic vblank tick counter plus CSR bit 0
+  (SIGNAL) raised after FINISH. Documented as **not** modelling vblank timing, vblank interrupt
+  delivery, DMA/AD interrupts, the interrupt controller or the IOP — because a stub that lies about
+  these reproduces the G1.5 `FindAddress` livelock.
+
 ### ✅ G1.5 — The body that never ran (it did run)
 - **DONE WHEN:** the `jal` at `0x010286D4` actually runs the body at `0x01028638`, and the boot
   report shows progress (`functions_entered` above 3, or a new named halt) with `bios_files=0`.

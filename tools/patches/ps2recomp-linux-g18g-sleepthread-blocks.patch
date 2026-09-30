@@ -739,10 +739,32 @@ index 0000000..4636c5e
 +
 +static const unsigned kSyscallNameCount = 58;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c4..b23312d 100644
+index c5e31c4..da24ba9 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-@@ -1121,6 +1121,275 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+@@ -701,7 +701,20 @@ int EeScheduler::cancelWakeup(int id)
+ int EeScheduler::changePriority(int id, int priority, bool interruptSafe, int &oldPriority)
+ {
+     assertExecutor();
+-    if (priority < 1 || priority >= kPriorityCount)
++    // W13. This read `priority < 1`, which refused priority 0 -- and priority 0 is the PS2's
++    // LOWEST legal priority, not an illegal value. The EE has 64 levels (0..0x3F) and a thread
++    // lowering itself to 0 is the ordinary way to give up the CPU.
++    //
++    // It is very likely a copy-paste: one clause below, `if (id == 0) id = m_currentThreadId;`
++    // because 0 is the ABI's "current thread" sentinel for the ID argument. That rule was applied
++    // to the priority argument as well.
++    //
++    // Measured on SCUS_973.28: sceChangeThreadPriority(1, 0) returned -403
++    // (KE_ILLEGAL_PRIORITY, Helpers/State.h:23) on every attempt, so Gran Turismo 4 could never
++    // yield the CPU and never slept -- sce_SleepThread was called exactly once in 90 seconds --
++    // and instead spun on sce_ChangeThreadPriority (2,253,727 calls) and sce_GetThreadId
++    // (3,004,970), 99.9998 % of all its syscalls, sitting at prio1 and never rendering.
++    if (priority < 0 || priority >= kPriorityCount)
+     {
+         return KE_ILLEGAL_PRIORITY;
+     }
+@@ -1121,6 +1134,275 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
      throw EeDispatcherTransfer{};
  }
  
@@ -1018,7 +1040,7 @@ index c5e31c4..b23312d 100644
  [[noreturn]] void EeScheduler::invokeCurrentSequence(std::vector<GuestInvocation> invocations)
  {
      assertExecutor();
-@@ -1456,23 +1725,49 @@ uint8_t *EeScheduler::rdram() const noexcept
+@@ -1456,23 +1738,49 @@ uint8_t *EeScheduler::rdram() const noexcept
  
  void EeScheduler::bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram)
  {
@@ -1076,7 +1098,7 @@ index c5e31c4..b23312d 100644
      }
  }
  
-@@ -1740,10 +2035,10 @@ void EeScheduler::applyPendingPreemption()
+@@ -1740,10 +2048,10 @@ void EeScheduler::applyPendingPreemption()
      m_timeSliceExpired = false;
  }
  
@@ -1089,7 +1111,7 @@ index c5e31c4..b23312d 100644
      const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
      m_pendingEeTimerInterrupts = 0u;
      for (uint32_t timer = 0u; timer < 4u; ++timer)
-@@ -1773,7 +2068,7 @@ void EeScheduler::processPendingEvents()
+@@ -1773,7 +2081,7 @@ void EeScheduler::processPendingEvents()
      applyPendingPreemption();
  }
  
@@ -1098,7 +1120,7 @@ index c5e31c4..b23312d 100644
  {
      for (;;)
      {
-@@ -1798,7 +2093,10 @@ void EeScheduler::processDueDeadlines()
+@@ -1798,7 +2106,10 @@ void EeScheduler::processDueDeadlines()
                  return;
              }
  
@@ -3092,10 +3114,10 @@ index 7242e65..4d8de05 100644
  }
 diff --git a/ps2xTest/src/ps2_thread_block_tests.cpp b/ps2xTest/src/ps2_thread_block_tests.cpp
 new file mode 100644
-index 0000000..3df116b
+index 0000000..993d97c
 --- /dev/null
 +++ b/ps2xTest/src/ps2_thread_block_tests.cpp
-@@ -0,0 +1,679 @@
+@@ -0,0 +1,731 @@
 +#include "MiniTest.h"
 +#include "ps2_runtime.h"
 +#include "ps2_runtime_macros.h"
@@ -3668,6 +3690,58 @@ index 0000000..3df116b
 +            t.IsTrue(std::find(gTrace.begin(), gTrace.end(), TRACE_MAIN_AFTER_SLEEP) != gTrace.end(),
 +                     "after the wake the thread must run the post-sleep frame, not nothing");
 +        });
++        tc.Run("G1.8i: priority 0 is the lowest legal EE priority, and must be settable", [](TestCase &t)
++        {
++            // W13. Gran Turismo 4's main loop lowers its own priority so something else can run,
++            // and it calls it with priority 0. Measured on SCUS_973.28:
++            //
++            //   [W13] CTP id=1 prio=0x1 arg=16 ret=0    curTid=1
++            //   [W13] CTP id=1 prio=0x0 arg=0  ret=-403 curTid=1
++            //
++            // -403 is KE_ILLEGAL_PRIORITY (Helpers/State.h:23). The call is REFUSED, so the guest
++            // never yields the CPU and never sleeps -- sce_SleepThread is called exactly once in a
++            // 90 s run -- and it spins instead: 2,253,727 calls to sce_ChangeThreadPriority and
++            // 3,004,970 to sce_GetThreadId, which is 99.9998 % of all its syscalls, at two adjacent
++            // PCs, while the thread sits at prio1 and never renders.
++            //
++            // Priority 0 is the PS2's LOWEST priority, not an illegal one. The EE has 64 levels
++            // (0..0x3F) and lowering yourself to 0 is the ordinary way to give up the CPU. The
++            // value 0 is ALSO the ABI's "current thread" sentinel for the id argument, which is
++            // almost certainly where `priority < 1` came from: it is a copy-paste of the
++            // `id == 0 -> current thread` rule one clause below, applied to the wrong argument.
++            BlockEnv env;
++            env.arm();
++            EeScheduler &ee = env.runtime.eeScheduler();
++            ee.bindMainContextForSyscall(env.runtime.cpu(), env.rdram.data());
++
++            const int mainId = EeScheduler::kMainThreadId;
++            int oldPriority = -1;
++            const int result = ee.changePriority(mainId, 0, false, oldPriority);
++
++            t.Equals(result, 0,
++                     "MECHANISM: sceChangeThreadPriority(id, 0) must succeed. 0 is the lowest legal "
++                     "EE priority and it is how a game yields the CPU; refusing it with "
++                     "KE_ILLEGAL_PRIORITY (-403) is what stopped Gran Turismo 4 from ever yielding "
++                     "or sleeping, and it is W13");
++
++            const GuestThread *main = ee.thread(mainId);
++            t.IsTrue(main != nullptr, "the main thread must still exist");
++            if (main != nullptr)
++            {
++                t.Equals(main->currentPriority, 0,
++                         "and its priority must actually be 0 afterwards, not merely accepted");
++            }
++
++            // The boundary either side must still be refused, so this is not 'accept anything'.
++            int ignored = -1;
++            t.Equals(ee.changePriority(mainId, -1, false, ignored), -403,
++                     "a negative priority is still illegal");
++            t.Equals(ee.changePriority(mainId, EeScheduler::kPriorityCount, false, ignored), -403,
++                     "and so is kPriorityCount, which is out of range");
++            t.Equals(ee.changePriority(mainId, EeScheduler::kPriorityCount - 1, false, ignored), 0,
++                     "while the top of the range must be accepted");
++        });
++
 +        tc.Run("G1.8g: EE time crossing a VBlank deadline must tell the driver to come back", [](TestCase &t)
 +        {
 +            // W12. On hardware the EE clock is the wall clock: a VBlank happens because time

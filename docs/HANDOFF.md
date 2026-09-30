@@ -233,3 +233,31 @@ NEXT:   1. **Red test first (law 4).** A recompiled function that yields inside 
 MEASURED (suite): **450/450**. MEASURED (boot): `functions_entered=95 halt=guest_cycle_no_progress
         bios_files=0`. **Campaign goal NOT reached — `VULCAN4 FRAME source=guest` never printed.**
         Addenda 1–6 in `.auto/queue/33-g18d-gs-store-loop.txt`.
+
+## 2026-09-30 19:05 · 33-g18d-gs-store-loop (investigation only, 7th pass) · **`$fp` lead KILLED**
+
+WALL:   W7. The `$fp` hypothesis from pass 6 is **refuted by measurement.**
+MEASURED:
+        ```
+        [E] sub_0100EDC8 entry#1 ctxpc=0x0100EDC8 fp=0x01051A3F s7=0x01051A40
+        [E] sub_0100EDC8 entry#7 ctxpc=0x0100EDC8 fp=0x01051A3F s7=0x0105CB32
+        [E] ld-fp RAN #1 fp=0x01051A3F
+        ```
+        1. **Every entry to `sub_0100EDC8` is at `ctxpc=0x0100EDC8`** (the function top), never at
+           `0x100f380` or any resume case. **The missing resume case for `ld $fp` is unreachable.**
+        2. **`ld $fp` runs (8+ times) and restores `fp` to `0x01051A3F`.** The restore is faithful;
+           **the saved slot already holds the bad value when the function is entered.**
+        So `$fp` is clobbered and saved **upstream of `sub_0100EDC8`**, which faithfully propagates
+        it. Also: `$s7` changes per entry group while `$fp` is constant — the two are wrong in
+        *different* ways, so they come from disagreeing sources.
+NEXT:   **STOP WALKING FORWARD ONE FUNCTION AT A TIME — six passes of diminishing returns, and I am
+        saying so rather than starting a seventh.** Ask the question that would have saved them:
+        **where do `0x01051A3F` and `0x01051A40` FIRST appear in RDRAM?** A one-shot scan for both
+        values names every site that produced them in one shot, instead of one function per pass.
+        `$fp`'s saved slot holds `0x01051A3F`, so the writer is upstream of everything examined.
+        Note `0x01051A3F` is exactly `0x01051A40 - 1`; if both appear adjacent in a table, that
+        table is the answer and the loop is just a symptom of reading it.
+MEASURED (suite): **450/450**. MEASURED (boot): `functions_entered=95 halt=guest_cycle_no_progress
+        bios_files=0`. **Campaign goal NOT reached — `VULCAN4 FRAME source=guest` never printed.**
+MEASURED (artifact): probes removed, generated unit rebuilt clean (0 `fprintf`).
+        Addenda 1–7 in `.auto/queue/33-g18d-gs-store-loop.txt`.

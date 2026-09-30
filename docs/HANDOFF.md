@@ -1999,3 +1999,84 @@ changed: dump `$a0..$a3` and `$t0..$t3` at the `sceChangeThreadPriority` call si
 with what the caller's own `jal`/argument setup put there, and find out which register the guest
 means. `sce_GetThreadId` taking **3,004,970** calls with no arguments at all is the same smell from
 the other side, and worth dumping in the same pass.
+
+## 2026-09-30 — the "wrong syscall argument register" lead is REFUTED, by the generated decode
+
+The last entry in this handoff nominated the PS2 syscall ABI as the likely cause of GT4 asking for
+kernel-reserved priority 0 three million times. **I checked it and it is wrong.** Recording the
+negative result, because a refuted hypothesis that cost nothing is worth more than a plausible one
+that costs a dish.
+
+### What the guest actually does
+
+`sub_0101F2B0` and `sub_0101F310` are arity-zero shims:
+
+```
+0101f2b0  addiu $v1, $zero, 0x29
+0101f2b4  syscall 0
+0101f2b8  jr    $ra
+
+0101f310  addiu $v1, $zero, 0x2F
+0101f314  syscall 0
+0101f318  jr    $ra
+```
+
+They set the syscall number in `$v1` and **no argument registers at all**. So the arguments must come
+from the caller, which made this checkable.
+
+Across the whole generated unit: **271** such shims, and only **20** have a `$t0` write and **18** a
+`$t1` write in the preceding instructions. Then, at the call sites themselves:
+
+| shim | call sites | set `$a0`+`$a1` | set `$t0`+`$t1` | mixed |
+|---|---|---|---|---|
+| `sceChangeThreadPriority` | 8 | 4 | **0** | 0 |
+| `sceGetThreadId` | 13 | 2 | **0** | 0 |
+
+**Zero** of 21 call sites touch `$t0`/`$t1`. This guest passes syscall arguments in
+**`$v1` for the number and `$a0`/`$a1`/`$a2` for the arguments** — and that is exactly what
+`changePriorityImpl` reads (`getRegU32(ctx, 4)` and `getRegU32(ctx, 5)`).
+
+**So the dispatcher is reading the right registers and there is no ABI mismatch.** The hunch in the
+previous entry is withdrawn.
+
+### What is left, and it is narrower
+
+The one call site in `sub_01000940` that I read in full is perfectly legitimate:
+
+```
+01000a18  jal   func_101F310          # sceGetThreadId()
+01000a1c  sw    $zero, 0x7A88($v1)    (delay slot)
+01000a20  daddu $a0, $v0, $zero       # $a0 = the thread id sceGetThreadId just returned
+01000a24  jal   func_101F2B0          # sceChangeThreadPriority()
+01000a28  addiu $a1, $zero, 0x3       (delay slot) -> priority 3
+```
+
+`$a0` is `GetThreadId`'s return moved into place, `$a1` is 3 — a legal priority. This is the ordinary
+shape and it matches the probe, which measured `id=1 curTid=1` with `ret=0`.
+
+**Therefore the 2,253,727 `-403` refusals come from the other seven call sites, which I did not
+identify.** The remaining seven are at guest `0x1011328`, `0x1011344`, `0x1011450` and four more,
+and the two I sampled earlier were `prio=0x1 ret=0` then `prio=0x0 ret=-403` — but those were the
+*first three calls of the run*, and I never established which site they came from.
+
+So the question for the next dish is a single, cheap, concrete measurement, and it needs no probe in
+shipped code:
+
+1. List all 8 `jal func_101F2B0` sites from the generated decode and read the ~12 instructions before
+   each one, exactly as `sub_01000940` was read above.
+2. Find which of them can pass `$a1 = 0`. At most one should, and it is very likely the idle loop's
+   "drop my priority" — if it passes 0, that is not a bug in our validation (0 is the kernel's) but a
+   **misread of which register the guest puts the priority in for that particular shim**, or a
+   genuinely different syscall number that our dispatcher is mis-routing to `ChangeThreadPriority`.
+   Worth checking: is `0x29` really `sceChangeThreadPriority`, and is there any chance the guest's
+   `0x29` call is a *different* function that our table maps wrongly? The decode gives the shim's
+   own name; cross-check it against the dispatcher's `case 0x29`.
+3. Only after that, revisit `requestPreemptionIfHigher`. Its `>=` guard is still the one real
+   candidate, and the FIFO-waiter failures from the earlier attempt are still unexplained.
+
+### The process lesson, fourth occurrence
+
+This session I asserted the priority convention from memory and shipped a wrong fix; then I asserted
+a syscall ABI from memory and it took one measurement to kill. The difference was only that the
+second time I looked for the evidence **before** writing the fix. That is the whole rule and it costs
+one command.

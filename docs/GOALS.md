@@ -5,16 +5,47 @@
 
 ---
 
-## ⭐ THE GOAL
+## ⭐ THE GOAL — staged, so there is always something concrete to hit
 
-**Play Gran Turismo 4 — your disc, your cars, your tracks, your rules — running natively on a
-modern machine, built out of GT4's own code.**
+**The captain, 2026-09-30:** *"Feel like we should add more detail to the goal? Like run the game on
+x86-x64 hardware first and get it running?"* — he is right: a horizon is not a target.
 
-Eventually the captain's Odin 2. Never an emulator.
+### STAGE 1 — *the* goal right now: **GT4 RUNS on x86-64 desktop**
+> **"Get Gran Turismo 4 running on PC — natively, no emulator, from the user's own disc."**
+
+"Running" is not vague. Stage 1 is done when **all six** of these are true on a Linux/Windows x86-64
+machine, with **no BIOS anywhere in the path**:
+
+| # | Stage 1 milestone | Where it lives |
+|---|---|---|
+| 1 | GT4 boots **past its own startup** (not 1–3 functions) | G1 |
+| 2 | **A picture**: GT4's own screen drawn by our GS layer | G2 |
+| 3 | **3D**: a car and a track, through the VU1 path | G3 |
+| 4 | **Input**: menus navigable, a pad works | G4 |
+| 5 | **A race you can drive** — the full loop, physically | G4 |
+| 6 | **Audio** from the disc's own data | G4 |
+
+**Then, and only then**, the rest. Order is deliberate:
+
+- **STAGE 2 — Android (Odin 2).** Same code, ARM64 build. *(Evidence already: it cross-compiles.)*
+- **STAGE 3 — Mods.** New cars (**add**, not swap), custom music. The things nobody has ever done.
+- **STAGE 4 — distribution to the community**: public builds, Spec II, other regions.
+- *(PSP stays out of the ladder entirely unless it is "PSP games forward" — see the platform-order
+  note in G5.)*
+
+### THE MISSION behind it — the captain's words, 2026-09-29
+> *"i wanna be early. i want to make sure all the fellow gt4 lovers just like me are gonna enjoy
+> this game."*
+>
+> *"This is like the most requested feature EVER. Bc in the original game u cannot add modded cars."*
+
+**Why staged:** the project's failure mode is not lack of effort — it is effort spent on a horizon
+that never resolves. Stage 1 is a product a stranger can run, and every dish either serves Stage 1
+or is explicitly a Stage 2/3 preparation. **If a dish serves none of them, it does not get dispatched.**
 
 ---
 
-## What "done" means — countable
+## What "done" means — the whole project (Stage 4), countable
 
 1. It loads a **retail GT4 disc**, no conversion step needed by the user
 2. It reaches **the real menu**, drawn by a real GS layer

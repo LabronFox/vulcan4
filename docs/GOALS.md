@@ -694,6 +694,44 @@ Eventually the captain's Odin 2. Never an emulator.
   ceiling is, and knowing it shapes how we design the loader **today** — which is why it is written
   down before the game runs.
 
+### ⬜ G6.1 — **CUSTOM MUSIC** *(the captain's demand, 2026-09-30)*
+- **The good news, and the same trick as cars:** we own the audio path, so we do **not** have to
+  crack GT4's music format to add our own. Two layers, and they are independent:
+  1. **Play the original** — decode from the user's own disc (see G4.3: the audio bank lives inside
+     `GT4.VOL`; the survey found no SGDP and no ADPCM path yet).
+  2. **Play custom** — our own music loader: drop files in a folder (OGG/MP3), a mapping table says
+     which *game state* each file covers (main menu, race, replay, results), and a **hook point**
+     intercepts the game's "play BGM id" call and plays ours instead.
+- **The hook is the whole point.** Somewhere the game asks to start background music — a script call,
+  a syscall, a table lookup. Custom music = intercept that request and satisfy it from our side.
+  That is the same pattern as `G6.0` (own the loader) and it needs the same discipline: find the
+  request site, name it, hook it.
+- **Honest split:** *background music* is the easy 90% — files, a table, a hook. **Dynamic audio**
+  (engine notes, tyre squeal, impacts) is a different problem: those are banks with pitch/loop
+  parameters tied to car state, and they should keep coming from the disc for authenticity.
+- **Capability note:** a decoder dependency will be needed (OGG/Vorbis or similar — free, GPL-
+  compatible). Name it before adding it; do not install anything silently.
+- **STATUS:** ⬜ post-playability (G4), same lane as the rest of the audio work (G4.3).
+
+### ⬜ G7.0 — **DISTRIBUTION: code only. Assets come from the user's disc.** *(the captain's rule)*
+- **The captain, 2026-09-30:** *"We don't publish anything. Just the code. People have to bring their
+  own iso file of the game — that's where we take assets."*
+- **This is already how the project is built, and it is now a stated policy, not a habit:**
+  - the repository ships **no game data** — no ISO, no `GT4.VOL`, no extracted textures, models,
+    audio or the recompiled C++ (which is a derivative of the game)
+  - the runtime requires **the user's own legally-obtained disc image** — that is the *only* input
+  - **mods are distributed as code and/or files the modder has the right to share** — never as game
+    content
+  - `.gitignore` blocks the extensions, and every dish brief repeats the rule; it is enforced by
+    review and by the goal gates
+- **Precedent we already set:** the same model as the emulator scene, and the same reasoning used on
+  the captain's other projects — **ship the engine, never the assets.** Without the user's disc the
+  program has nothing to run, exactly like an emulator without a ROM.
+- **Why this is a feature, not just caution:** it means the project can be public, discussed and
+  contributed to openly, with no takedown risk — and the community already understands this model.
+- **STATUS:** ✅ **in force now.** Verify on every release that a fresh clone plus a user's disc is
+  the whole setup (goal `G0.5` — clean room — is the standing proof).
+
 ## The discipline
 
 1. Every dish opens with `GOAL: <id>`; the driver prints it in the banner.

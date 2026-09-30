@@ -37,6 +37,7 @@
 //   See docs/FIRST-BOOT.md for the exact command line. Needs libps2_runtime.a, libps2_iop.a,
 //   raylib, ffmpeg and the generated translation unit from ps2_recomp.
 
+#include "ps2_guest_progress.h"
 #include "ps2_runtime.h"
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
@@ -94,7 +95,13 @@ namespace
     {
         uint64_t maxEntries = 2000000;   // total guest function entries
         uint32_t maxRepeatedPc = 1000000; // consecutive returns to the same PC
-        uint64_t maxCycleRepeats = 24;      // repeats of a PC-cycle before we call it no-progress
+        // Repeats of one PC cycle, with no progress anywhere inside it, before the guest is
+        // called hung. W7 tripped a threshold of 24 on a copy loop that ran ~193 passes per
+        // guest call: the call's return is the only forward signal, so the threshold has to
+        // clear one call's internal loops. 4096 clears the measured worst case by >20x while
+        // still naming a real hang; beyond that the instruction and wall-clock budgets are the
+        // honest backstop.
+        uint64_t maxCycleRepeats = 4096;
         int maxSeconds = 120;            // wall clock
     };
 
@@ -502,18 +509,19 @@ int main(int argc, char *argv[])
     uint32_t previousPc = 0xffffffffu;
     uint32_t repeatedPc = 0;
 
-    // ---- cycle detector
+    // ---- progress detector
     //
     // The guest can be executing correctly and still be going nowhere: it cycles through the same
-    // small set of PCs forever without ever reaching a new one. The same-PC detector above cannot
-    // see that, because no single PC repeats in a row. This records the recent PC history and, if
-    // the last N entries are the same cycle over and over, stops and says so. It is general: it
-    // knows nothing about the guest, it just notices that no new address is being reached.
-    std::vector<uint32_t> pcHistory;
-    std::unordered_map<uint32_t, size_t> cycleStartIndex; // pc -> where it was last seen
-    size_t cycleLength = 0;
-    uint64_t cycleRepeats = 0;
-    uint32_t cycleFirstPc = 0;
+    // small set of PCs forever without ever reaching a new one. But a PC cycle repeating is NOT
+    // that, because GT4's normal work IS a converging loop over one small set of addresses -- at
+    // W7 this detector called a copy loop six iterations from its bound a hang and stopped the
+    // boot at functions_entered=95. Only a cycle that repeats with no new code reached and no new
+    // hardware touched anywhere inside it is a hang, so the tracker is fed those two signals.
+    // It lives in the runtime (ps2_guest_progress.h) so the behaviour is unit-tested.
+    PS2GuestProgress progress;
+    progress.setHangThreshold(budget.maxCycleRepeats);
+    uint64_t progressFunctionMark = 0;
+    size_t progressMmioMark = 0;
 
     // Optional tracing, so a run that never reaches the report line can still be diagnosed
     // instead of just timing out. VULCAN4_TRACE=<n> prints the pc of the first n entries and
@@ -589,48 +597,27 @@ int main(int argc, char *argv[])
             repeatedPc = 0;
         }
 
-        // ---- cycle detection
+        // ---- progress detection
         {
-            const auto seen = cycleStartIndex.find(ctx.pc);
-            if (seen != cycleStartIndex.end() && seen->second < pcHistory.size())
+            // Forward motion the PC stream cannot show: entering code this guest has not run
+            // before, or touching hardware it has not touched before. Re-polling a register it
+            // already polls deliberately does NOT count, so a guest genuinely waiting on hardware
+            // is still caught.
+            const size_t mmioAddresses = runtime.memory().mmioCounts().size();
+            const bool reachedNewCode = (functionsEntered != progressFunctionMark)
+                || (mmioAddresses != progressMmioMark);
+            progressFunctionMark = functionsEntered;
+            progressMmioMark = mmioAddresses;
+
+            if (progress.observe(ctx.pc, reachedNewCode))
             {
-                const size_t length = pcHistory.size() - seen->second;
-                if (length > 0 && length == cycleLength)
-                {
-                    if (++cycleRepeats >= budget.maxCycleRepeats)
-                    {
-                        haltReason = kHaltCycleNoProgress;
-                        haltPc = ctx.pc;
-                        haltDetail = "guest is cycling through " + std::to_string(cycleLength)
-                            + " addresses and has reached no new one in "
-                            + std::to_string(cycleRepeats) + " repeats (first 0x"
-                            + toHex(cycleFirstPc) + ")";
-                        break;
-                    }
-                }
-                else if (length != cycleLength)
-                {
-                    cycleLength = length;
-                    cycleRepeats = 0;
-                    cycleFirstPc = pcHistory[seen->second];
-                }
-            }
-            else
-            {
-                cycleLength = 0;
-                cycleRepeats = 0;
-            }
-            cycleStartIndex[ctx.pc] = pcHistory.size();
-            pcHistory.push_back(ctx.pc);
-            if (pcHistory.size() > 4096)
-            {
-                pcHistory.erase(pcHistory.begin(), pcHistory.begin() + 2048);
-                // index bookkeeping is relative, so rebuild it after the trim
-                cycleStartIndex.clear();
-                for (size_t i = 0; i < pcHistory.size(); ++i)
-                {
-                    cycleStartIndex[pcHistory[i]] = i;
-                }
+                haltReason = kHaltCycleNoProgress;
+                haltPc = ctx.pc;
+                haltDetail = "guest is cycling through " + std::to_string(progress.hangCycleLength())
+                    + " addresses and has reached no new code or hardware in "
+                    + std::to_string(progress.hangRepeats()) + " repeats (first "
+                    + toHex(progress.hangFirstPc()) + ")";
+                break;
             }
         }
 
@@ -783,31 +770,31 @@ int main(int argc, char *argv[])
                     // dependency, with an address, which is the whole point of this dish.
                     {
                         std::vector<uint32_t> loop;
-                        if (!pcHistory.empty())
+                        if (!progress.history().empty())
                         {
                             // Walk back to the previous occurrence of the current PC: everything
                             // after it is one pass of the loop.
-                            size_t start = pcHistory.size();
-                            for (size_t i = pcHistory.size(); i-- > 0;)
+                            size_t start = progress.history().size();
+                            for (size_t i = progress.history().size(); i-- > 0;)
                             {
-                                if (pcHistory[i] == ctx.pc)
+                                if (progress.history()[i] == ctx.pc)
                                 {
                                     start = i;
                                     break;
                                 }
                             }
-                            for (size_t i = start; i < pcHistory.size() && loop.size() < 64u; ++i)
+                            for (size_t i = start; i < progress.history().size() && loop.size() < 64u; ++i)
                             {
-                                if (std::find(loop.begin(), loop.end(), pcHistory[i]) == loop.end())
+                                if (std::find(loop.begin(), loop.end(), progress.history()[i]) == loop.end())
                                 {
-                                    loop.push_back(pcHistory[i]);
+                                    loop.push_back(progress.history()[i]);
                                 }
                             }
                         }
 
                         std::cout << "VULCAN4 WAIT entry_pc=0x" << std::hex << ctx.pc << std::dec
                                   << " block_instructions=" << loop.size()
-                                  << " history_len=" << pcHistory.size()
+                                  << " history_len=" << progress.history().size()
                                   << " distinct_pcs_total=" << distinctPcs << std::endl;
 
                         uint32_t loadCount = 0;

@@ -392,3 +392,50 @@ MEASURED (boot):  `functions_entered=95 halt=guest_cycle_no_progress bios_files=
         **Campaign goal NOT reached — `VULCAN4 FRAME source=guest` never printed.**
         Addenda 1–10 in `.auto/queue/33-g18d-gs-store-loop.txt`. Patch:
         `tools/patches/ps2recomp-linux-g18e-heapend.patch`.
+
+---
+
+## 2026-09-30 — G1.8f: W7 FELL. It was the detector, not the guest. New wall W8.
+
+**WHAT FELL.** W7 was never a guest bug. Five passes of instrumentation had been building a story about
+a pinned `$t1` and an end bound that never moved; every part of that story was wrong, and the loop the
+harness kept calling a hang was **converging normally and six iterations from its bound**.
+
+The real bug was in `tools/harness/vulcan4_harness.cpp`. The no-progress detector treated *any* repeating
+PC pattern as a hang after 24 repeats:
+
+    if (++cycleRepeats >= budget.maxCycleRepeats) { haltReason = kHaltCycleNoProgress; break; }
+
+GT4's normal work is a converging loop over one small set of addresses — a rasteriser walking a glyph row,
+a physics step. Those loops revisit identical addresses *while making progress*, so the detector was
+stopping the boot inside the game's ordinary work. The PC stream alone cannot tell a converging loop from
+a hang; the distinction needs a signal outside it.
+
+**THE FIX.** `PS2GuestProgress` (new, `tools/PS2Recomp/ps2xRuntime/include/ps2_guest_progress.h`) holds the
+cycle detector and is fed the two signals the PC stream cannot show: **new code entered** and **new
+hardware touched**. Reaching either resets the streak. Re-polling a register the guest already polls does
+NOT count as progress, so a guest genuinely waiting on hardware is still caught. The threshold went
+`24 → 4096`: a guest call's own internal loops must clear it, and W7 measured ~193 passes per call. The
+`VULCAN4 WAIT` reporter is preserved via `history()` so a real wait can still be decoded and named.
+
+**MEASURED (the number that matters):** `functions_entered` **95 → 20,000,000**.
+
+**RETRACTED — do not re-adopt these.** `$t1` was *not* pinned (it is `$s1+1` and advances with it);
+`0x24`/`$fp` was *not* the end bound and did not move; the range was *not* empty by design; and
+`sub_0100F390` was *not* entered at the loop body. `taken32 == taken64` at the W7 branch, so the latent
+64-bit branch-semantics concern (2,791 branches compare `GPR_U64`, none compare `GPR_U32`) did **not** fire
+there. It is still a real concern on the hardware's terms and still unfixed — but it is not this wall.
+
+**MEASURED (suite):** **456/456** from `tools/PS2Recomp/ps2xTest`, run from `tools/PS2Recomp/ps2xTest`
+(the suite reads `../../ps2xRecomp/include/...` relative to cwd; run from anywhere else and one
+unrelated VU0 test fails on a missing `instructions.h`).
+**MEASURED (boot):** `functions_entered=20000000 halt=entry_budget_exhausted bios_files=0`,
+`distinct_pcs=112 dispatcher_transfers=15 serviced_invocations=15`, only **119 syscalls** and **469 MMIO
+accesses** across 20M entries. **Campaign goal NOT reached — `VULCAN4 FRAME source=guest` never printed.**
+
+**THE NEW WALL — W8, and it is a real one.** The guest now spins in its idle loop: it calls
+`sce_SleepThread` 11× and then enters the same ~112 functions 166k×/sec while doing no work at all.
+`dispatcher_transfers=15` in 20M entries says the cooperative scheduler is barely being serviced, so
+`sce_SleepThread` is returning immediately instead of blocking the calling thread. The main thread never
+yields, so no other thread ever runs. Next: make it block, and prove it on **thread state**, not on
+function counts. Brief: `.auto/queue/35-g18g-sleepthread-blocks.txt`.

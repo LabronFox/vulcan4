@@ -1,0 +1,2371 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c7c7af5..0a0d5e4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -79,6 +79,23 @@ if(PS2X_IS_ARM_TARGET)
+     endif()
+ endif()
+ 
++# The runtime stores R5900 GPRs in __m128i lanes and reads them back with
++# _mm_extract_epi32 / _mm_extract_epi64, which are SSE4.1 intrinsics. MSVC's x64
++# codegen and /arch:AVX2 accept them unconditionally, but GCC/Clang default to the
++# baseline x86-64 ISA (SSE2 only) and fail with:
++#   error: inlining failed in call to 'always_inline' '_mm_extract_epi32':
++#          target specific option mismatch
++# Enable the ISA the code actually uses (SSE4.1, not the /arch:AVX2 MSVC reaches
++# for) on x86 GCC/Clang. MSVC is skipped because /arch:AVX2 already covers it,
++# and ARM/Android/Vita are skipped because they go through sse2neon above.
++if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$"
++   AND NOT MSVC
++   AND NOT PS2X_IS_ARM_TARGET
++   AND NOT ANDROID)
++    add_compile_options(-msse4.1)
++    message(STATUS "x86 GCC/Clang detected - enabling SSE4.1 (required by the __m128i GPR lane accessors)")
++endif()
++
+ if(PS2X_BUILD_RECOMP)
+     add_subdirectory("ps2xRecomp")
+ endif()
+diff --git a/ps2xRecomp/CMakeLists.txt b/ps2xRecomp/CMakeLists.txt
+index 857102a..cbf6f07 100644
+--- a/ps2xRecomp/CMakeLists.txt
++++ b/ps2xRecomp/CMakeLists.txt
+@@ -21,6 +21,13 @@ FetchContent_Declare(
+     toml11
+     GIT_REPOSITORY https://github.com/ToruNiina/toml11.git
+     GIT_TAG v4.4.0
++    GIT_SHALLOW TRUE
++    # toml11 is header-only and this project never runs its test suite. Without
++    # this, FetchContent does a full clone + recursive submodule update and pulls
++    # doctest, nlohmann/json and the hugo-book docs theme, none of which are
++    # compiled here. It fills the disk and fails with a misleading clone error.
++    GIT_SUBMODULES_RECURSE FALSE
++    GIT_SUBMODULES ""
+ )
+ FetchContent_MakeAvailable(toml11)
+ 
+diff --git a/ps2xRecomp/src/lib/ps2_recompiler.cpp b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+index bb35a7a..2438730 100644
+--- a/ps2xRecomp/src/lib/ps2_recompiler.cpp
++++ b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+@@ -1486,8 +1486,15 @@ namespace ps2recomp
+                         bool scheduledAny = false;
+                         {
+                             std::lock_guard<std::mutex> lock(outputMutex);
++                            // Throttle on in-flight work only. Counting completedCode here as well
++                            // deadlocks: if results arrive out of order, completedCode fills the
++                            // buffer behind a gap, flushCompletedOutput cannot advance without the
++                            // missing index, and the index that would fill it never gets scheduled
++                            // because the throttle now refuses more work. Every thread then waits
++                            // forever. The per-file writer already throttles on outstandingWork
++                            // alone, which is correct; match it.
+                             while (nextFunction < outputFunctions.size() &&
+-                                   outstandingWork + completedCode.size() < maxBufferedOutput &&
++                                   outstandingWork < maxBufferedOutput &&
+                                    !stopWorkers)
+                             {
+                                 pendingWork.push(nextFunction++);
+@@ -1551,18 +1558,51 @@ namespace ps2recomp
+                             flushCompletedOutput();
+                             scheduleAvailableWork();
+ 
++                            // Workers publish into readyCode and decrement outstandingWork in the
++                            // same critical section, so a worker that finishes after the drain above
++                            // leaves outstandingWork == 0 with its body still sitting in readyCode.
++                            // The "missing index" check below used to treat that as lost work and
++                            // aborted the run, dropping the tail of the output. Re-drain and re-flush
++                            // before concluding anything is missing.
++                            {
++                                std::lock_guard<std::mutex> drainLock(outputMutex);
++                                while (!readyCode.empty())
++                                {
++                                    CompletedCode completed = std::move(readyCode.front());
++                                    readyCode.pop();
++                                    completedCode.emplace(completed.outputIndex, std::move(completed.code));
++                                }
++                            }
++
++                            flushCompletedOutput();
++
+                             if (nextOutputIndex >= outputFunctions.size())
+                             {
+                                 break;
+                             }
+ 
+                             std::lock_guard<std::mutex> finalLock(outputMutex);
+-                            if (outstandingWork == 0 && nextFunction >= outputFunctions.size() && completedCode.empty())
++                            if (outstandingWork == 0 && nextFunction >= outputFunctions.size()
++                                && readyCode.empty() && completedCode.empty())
+                             {
+-                                throw std::runtime_error("Internal error: combined output completion queue is missing index " + std::to_string(nextOutputIndex));
++                                // Genuinely lost: name the function so this can never again be a
++                                // bare index number nobody can act on.
++                                throw std::runtime_error(
++                                    std::string("Internal error: combined output completion queue is missing index ")
++                                    + std::to_string(nextOutputIndex)
++                                    + " (function " + outputFunctions[nextOutputIndex]->name + ")");
+                             }
+                         }
+ 
++                        if (nextOutputIndex != outputFunctions.size())
++                        {
++                            throw std::runtime_error(
++                                std::string("Internal error: emitted only ") + std::to_string(nextOutputIndex)
++                                + " of " + std::to_string(outputFunctions.size())
++                                + " function bodies; first missing: "
++                                + outputFunctions[nextOutputIndex]->name);
++                        }
++
+                         stopAndJoinWorkers();
+                     }
+                     catch (...)
+diff --git a/ps2xRuntime/include/ps2_guest_progress.h b/ps2xRuntime/include/ps2_guest_progress.h
+new file mode 100644
+index 0000000..68018ac
+--- /dev/null
++++ b/ps2xRuntime/include/ps2_guest_progress.h
+@@ -0,0 +1,131 @@
++#ifndef PS2_GUEST_PROGRESS_H
++#define PS2_GUEST_PROGRESS_H
++
++#include <cstddef>
++#include <cstdint>
++#include <unordered_map>
++#include <vector>
++
++// ---------------------------------------------------------------------------
++// Decides when a running guest has stopped making progress.
++//
++// THE PROBLEM THIS EXISTS TO SOLVE (W7):
++// The R5900's tight loops are the game's normal workload. A rasteriser walking a
++// glyph row, a physics step, a decompressor -- all of them revisit EXACTLY the
++// same addresses while they converge. A detector that treats "this PC cycle
++// repeated" as a hang therefore stops a boot that is about to make more progress.
++// On W7 that mistake ended the boot at functions_entered=95, inside a copy loop
++// that was six iterations away from its bound.
++//
++// A PC cycle repeating is evidence of a LOOP, not of a HANG. Telling those two
++// apart needs a signal outside the PC stream: the guest reaching NEW CODE, or the
++// guest touching the hardware. Only a cycle that repeats with neither is a hang.
++// ---------------------------------------------------------------------------
++
++class PS2GuestProgress
++{
++public:
++    // A cycle must repeat this many times, with no progress anywhere inside it,
++    // before the guest is called hung.
++    void setHangThreshold(uint64_t repeats) { m_threshold = repeats; }
++
++    uint64_t hangThreshold() const { return m_threshold; }
++
++    // Record one executed PC. Returns true once the guest is proven hung.
++    //
++    // reachedNewCode must be true on the observation where the guest entered code
++    // it had not run before -- a new function, or a return into a new caller --
++    // or touched the hardware. That is progress the PC stream cannot show.
++    bool observe(uint32_t pc, bool reachedNewCode);
++
++    // The first address of the cycle the guest hung on, so the wall can be read
++    // straight off the report.
++    uint32_t hangFirstPc() const { return m_cycleFirstPc; }
++
++    // How many addresses the hanging cycle runs through.
++    uint64_t hangCycleLength() const { return m_cycleLength; }
++
++    // How many times that cycle repeated before the guest was called hung.
++    uint64_t hangRepeats() const { return m_repeats; }
++
++    // The recent PC history, oldest first. The harness uses it to decode the repeating
++    // block and name what the guest is actually waiting on.
++    const std::vector<uint32_t> &history() const { return m_history; }
++
++    void reset()
++    {
++        m_startIndex.clear();
++        m_history.clear();
++        m_cycleLength = 0;
++        m_repeats = 0;
++        m_cycleFirstPc = 0;
++    }
++
++private:
++    static constexpr std::size_t kMaxHistory = 4096;
++    static constexpr std::size_t kTrimTo = 2048;
++
++    void reindex()
++    {
++        m_startIndex.clear();
++        for (std::size_t i = 0; i < m_history.size(); ++i)
++        {
++            m_startIndex[m_history[i]] = i;
++        }
++    }
++
++    uint64_t m_threshold = 24;
++    uint64_t m_repeats = 0;
++    uint64_t m_cycleLength = 0;
++    uint32_t m_cycleFirstPc = 0;
++    std::vector<uint32_t> m_history;
++    std::unordered_map<uint32_t, std::size_t> m_startIndex;
++};
++
++inline bool PS2GuestProgress::observe(uint32_t pc, bool reachedNewCode)
++{
++    // Reaching code the guest has not run before -- or touching the hardware --
++    // breaks the streak of "cycling with nothing new happening", whatever the PC
++    // stream looks like. This is the whole point of the class: a converging loop
++    // reuses one PC cycle forever while still moving forward, and only a caller
++    // that can see the forward motion can tell it from a hang.
++    if (reachedNewCode)
++    {
++        m_repeats = 0;
++    }
++
++    const auto seen = m_startIndex.find(pc);
++    if (seen != m_startIndex.end() && seen->second < m_history.size())
++    {
++        const std::size_t length = m_history.size() - seen->second;
++        if (length > 0 && length == m_cycleLength)
++        {
++            if (++m_repeats >= m_threshold)
++            {
++                return true;
++            }
++        }
++        else if (length != m_cycleLength)
++        {
++            m_cycleLength = length;
++            m_repeats = 0;
++            m_cycleFirstPc = m_history[seen->second];
++        }
++    }
++    else
++    {
++        m_cycleLength = 0;
++        m_repeats = 0;
++    }
++
++    m_startIndex[pc] = m_history.size();
++    m_history.push_back(pc);
++    if (m_history.size() > kMaxHistory)
++    {
++        m_history.erase(m_history.begin(), m_history.begin() + static_cast<std::ptrdiff_t>(kTrimTo));
++        reindex();
++    }
++    return false;
++}
++
++#endif // PS2_GUEST_PROGRESS_H
+\ No newline at end of file
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 4b9242c..ee71244 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -390,6 +390,26 @@ public:
+     void requestStop();
+     bool isStopRequested() const;
+ 
++    // ---- guest syscall accounting (read-only) ----------------------------------------
++    //
++    // A recompiler front-end that actually runs guest code has to be able to answer "what did
++    // the guest ask the console for?". These are the counters for exactly that question, and
++    // they are the raw material for a no-BIOS backlog. Recorded in handleSyscall().
++    struct SyscallTally
++    {
++        uint64_t count = 0;   // how many times the guest issued this syscall
++        uint32_t lastPc = 0;  // guest PC of the most recent one
++    };
++    uint64_t syscallCallCount() const { return m_syscallCallCount; }
++    uint32_t lastSyscallId() const { return m_lastSyscallId; }
++    const std::unordered_map<uint32_t, SyscallTally> &syscallCounts() const { return m_syscallCounts; }
++
++    // The syscall the guest is *currently inside*, or kNoActiveSyscall. A caller that needs to
++    // explain "why is the guest not making progress" needs to distinguish "spinning between
++    // syscalls" from "stuck inside one syscall", and only the runtime can tell them apart.
++    static constexpr uint32_t kNoActiveSyscall = 0xFFFFFFFFu;
++    uint32_t activeSyscallId() const { return m_activeSyscallId; }
++
+     EeScheduler &eeScheduler();
+     const EeScheduler &eeScheduler() const;
+     void postEeEvent(EeEvent event);
+@@ -508,6 +528,11 @@ private:
+     mutable std::mutex m_guestHeapMutex;
+     mutable std::mutex m_asyncCallbackStackMutex;
+     std::vector<GuestHeapBlock> m_guestHeapBlocks;
++    uint64_t m_syscallCallCount = 0;
++    uint32_t m_lastSyscallId = 0;
++    uint32_t m_activeSyscallId = kNoActiveSyscall;
++    std::unordered_map<uint32_t, SyscallTally> m_syscallCounts;
++
+     uint32_t m_guestHeapBase = 0x00100000u;
+     uint32_t m_guestHeapEnd = 0x00100000u;
+     uint32_t m_guestHeapLimit = PS2_RAM_SIZE;
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index f247ff9..fcab6e0 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -318,6 +318,26 @@ public:
+     void queueInvocation(GuestInvocation invocation);
+     [[noreturn]] void invokeCurrent(GuestInvocation invocation);
+     [[noreturn]] void invokeCurrentSequence(std::vector<GuestInvocation> invocations);
++    // G1.8b: honour the guest's queued invocations from a driver that is not run().
++    //
++    // EeDispatcherTransfer is "the EE equivalent of a longjmp to the dispatcher" and this class
++    // documents that it "must only be caught at EeScheduler::run()". A driver with its own loop --
++    // tools/harness/vulcan4_harness.cpp is exactly that -- catches the signal itself, and if it then
++    // re-enters the guest without servicing the invocation, the guest loses its frame: the syscall
++    // that queued it never returns a value, the caller's saved registers are gone, and
++    // hasInvocation() latches so every later call of that syscall silently falls through to the
++    // builtin. Measured on GT4 as its convergence loop resetting $s2/$s3 every third iteration.
++    //
++    // So a non-scheduler driver calls this after catching the signal. It runs the invocation stack
++    // (and any pending invocations) until nothing can make further progress, then copies the main
++    // thread's context back into the runtime so the driver's own context is current again.
++    // stepBudget bounds it, so a guest that blocks forever cannot hang the driver.
++    // Returns true if anything was run.
++    bool serviceInvocations(int stepBudget = 4096);
++    // Undo an inline attempt that was aborted. Unused now that overrides stay deferred; retained
++    // because it is the only correct way to restore a thread whose wait was registered by guest
++    // code that must be re-run, and the next attempt at synchronous overrides will need it.
++    void rollbackAbortedInlineInvocation(int threadId);
+     [[nodiscard]] bool hasInvocation(GuestInvocationKind kind, uint64_t tag) const;
+     [[nodiscard]] uint32_t invocationStackTop();
+ 
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index ea86a9c..d4fa944 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -298,6 +298,13 @@ public:
+ 
+     // TLB handling
+     uint32_t translateAddress(uint32_t virtualAddress);
++
++    // MMIO accounting: guest accesses that landed in the console's hardware register space
++    // (KSEG2/3, the BIOS/IO windows, the GS, the VU ranges). Counted in translateAddress(),
++    // which every read/write passes through. Read-only; see ps2_memory.cpp.
++    uint64_t mmioAccessCount() const { return m_mmioAccessCount; }
++    const std::unordered_map<uint32_t, uint64_t> &mmioCounts() const { return m_mmioCounts; }
++    uint32_t lastMmioAddress() const { return m_lastMmioAddress; }
+     bool tlbRead(uint32_t index, uint32_t &vpn, uint32_t &pfn, uint32_t &mask, bool &valid) const;
+     bool tlbWrite(uint32_t index, uint32_t vpn, uint32_t pfn, uint32_t mask, bool valid);
+     int32_t tlbProbe(uint32_t vpn) const;
+@@ -397,6 +404,11 @@ public:
+ 
+     std::vector<TLBEntry> m_tlbEntries;
+ 
++    // MMIO accounting, see the accessors above and translateAddress() in ps2_memory.cpp.
++    uint64_t m_mmioAccessCount = 0;
++    std::unordered_map<uint32_t, uint64_t> m_mmioCounts;
++    uint32_t m_lastMmioAddress = 0;
++
+     GifPacketCallback m_gifPacketCallback;
+     GifArbiter *m_gifArbiter = nullptr;
+     Vu1MscalCallback m_vu1MscalCallback;
+diff --git a/ps2xRuntime/include/runtime/syscall_names.h b/ps2xRuntime/include/runtime/syscall_names.h
+new file mode 100644
+index 0000000..4636c5e
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/syscall_names.h
+@@ -0,0 +1,71 @@
++// syscall_names.h - GENERATED by tools/harness/gen_syscall_names.py from
++//   tools/PS2Recomp/ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp
++//
++// Do not edit by hand. Regenerate if the dispatcher changes.
++#pragma once
++#include <cstdint>
++
++struct SyscallName { uint32_t id; const char *name; };
++
++static const SyscallName kSyscallNames[] = {
++    { 0x01, "ResetEE" },
++    { 0x02, "GsSetCrt" },
++    { 0x04, "ExitThread" },
++    { 0x10, "AddIntcHandler" },
++    { 0x11, "RemoveIntcHandler" },
++    { 0x12, "AddDmacHandler" },
++    { 0x13, "RemoveDmacHandler" },
++    { 0x14, "EnableIntc" },
++    { 0x15, "DisableIntc" },
++    { 0x16, "EnableDmac" },
++    { 0x17, "DisableDmac" },
++    { 0x20, "CreateThread" },
++    { 0x21, "DeleteThread" },
++    { 0x22, "StartThread" },
++    { 0x23, "ExitThread" },
++    { 0x24, "ExitDeleteThread" },
++    { 0x29, "ChangeThreadPriority" },
++    { 0x2B, "RotateThreadReadyQueue" },
++    { 0x2D, "ReleaseWaitThread" },
++    { 0x30, "ReferThreadStatus" },
++    { 0x32, "SleepThread" },
++    { 0x33, "WakeupThread" },
++    { 0x35, "CancelWakeupThread" },
++    { 0x3C, "SetupThread" },
++    { 0x3D, "SetupHeap" },
++    { 0x3E, "EndOfHeap" },
++    { 0x40, "CreateSema" },
++    { 0x41, "DeleteSema" },
++    { 0x42, "SignalSema" },
++    { 0x44, "WaitSema" },
++    { 0x45, "PollSema" },
++    { 0x47, "ReferSemaStatus" },
++    { 0x4A, "SetOsdConfigParam" },
++    { 0x4B, "GetOsdConfigParam" },
++    { 0x50, "CreateEventFlag" },
++    { 0x51, "DeleteEventFlag" },
++    { 0x52, "SetEventFlag" },
++    { 0x54, "ClearEventFlag" },
++    { 0x56, "WaitEventFlag" },
++    { 0x57, "PollEventFlag" },
++    { 0x59, "ReferEventFlagStatus" },
++    { 0x5A, "Copy" },
++    { 0x5B, "GetEntryAddress" },
++    { 0x61, "EnableCache" },
++    { 0x62, "DisableCache" },
++    { 0x64, "FlushCache" },
++    { 0x6E, "SetOsdConfigParam2" },
++    { 0x6F, "GetOsdConfigParam2" },
++    { 0x70, "GsGetIMR" },
++    { 0x71, "GsPutIMR" },
++    { 0x73, "SetVSyncFlag" },
++    { 0x74, "SetSyscall" },
++    { 0x7F, "GetMemorySize" },
++    { 0x82, "InitTLB" },
++    { 0x83, "FindAddress" },
++    { 0x85, "SetMemoryMode" },
++    { 0xFC, "SetAlarm" },
++    { 0xFE, "CancelAlarm" },
++};
++
++static const unsigned kSyscallNameCount = 58;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..9a28445 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1121,6 +1121,182 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+     throw EeDispatcherTransfer{};
+ }
+ 
++bool EeScheduler::serviceInvocations(int stepBudget)
++{
++    assertExecutor();
++    bool ranAnything = false;
++
++    // G1.8c: WHO OWNS THE BASE FRAME, decided once, because it changes the copy direction below.
++    //
++    // GuestThread::context is a COPY of the main frame. EeScheduler::run() keeps it current because
++    // run() is the only thing advancing the guest. A driver that is not run() -- the harness, and
++    // every unit test using driveGuestLikeTheHarness -- advances PS2Runtime::m_cpuContext directly,
++    // so THAT is the live frame and the scheduler's copy is stale from the moment the guest moves.
++    //
++    // W6 was exactly this. Measured with a probe before the fix: 256 consecutive resumes, every one
++    // of them at 0x00300808, the PC the base frame held before the chain ever published a new one.
++    // On GT4 the same shape appears at the ELF entry point 0x01000008, distinct_pcs=1, its own CRT
++    // init re-run 25 times. The stale copy was being published over the live one on completion.
++    //
++    // The refresh happens HERE, on entry, and not after servicing. It has to be before: onComplete
++    // writes the handler's $v0 into the base frame, so refreshing afterwards would discard the very
++    // result being delivered. Refreshing first makes the base frame correct, lets onComplete apply
++    // $v0 to a correct frame, and the unconditional publish at the end then delivers both.
++    //
++    // Guarded on m_guestExecuting, which is true only while run() is between its own steps -- the one
++    // case where the scheduler's copy is authoritative. Without that guard this rewinds run()'s own
++    // state and the suite hangs; that was measured, which is why the guard is here.
++    if (!m_guestExecuting.load(std::memory_order_acquire))
++    {
++        if (GuestThread *main = thread(kMainThreadId))
++        {
++            main->context = m_runtime.m_cpuContext;
++        }
++    }
++
++    for (int step = 0; step < stepBudget; ++step)
++    {
++        processPendingEvents();
++        if (m_stopRequested.load(std::memory_order_acquire))
++        {
++            break;
++        }
++
++        if (m_currentThreadId == 0)
++        {
++            // The signal usually arrives with the running thread still current, but a block inside
++            // the guest will have cleared it. Re-establish the main thread so an invocation has
++            // somewhere to attach.
++            if (GuestThread *main = thread(kMainThreadId))
++            {
++                if (main->status == EeThreadStatus::Ready)
++                {
++                    removeReady(*main);
++                }
++                main->wait = {};
++                if (main->status == EeThreadStatus::Ready || main->invocations.empty())
++                {
++                    main->status = EeThreadStatus::Ready;
++                    makeRunning(*main);
++                }
++            }
++            if (m_currentThreadId == 0)
++            {
++                break; // nothing is current and nothing can be made current
++            }
++        }
++
++        GuestThread *running = currentThread();
++        if (running == nullptr)
++        {
++            break;
++        }
++
++        // A pending invocation outranks the base frame, exactly as in run().
++        if (!m_pendingInvocations.empty() && running->invocations.empty())
++        {
++            GuestInvocation invocation = std::move(m_pendingInvocations.front());
++            m_pendingInvocations.pop_front();
++            if (getRegU32(&invocation.context, 29) == 0u)
++            {
++                SET_GPR_U32(&invocation.context, 29, invocationStackTop());
++            }
++            running->invocations.push_back(std::move(invocation));
++            ranAnything = true;
++            continue;
++        }
++
++        R5900Context &context = running->activeContext();
++
++        if (context.pc == 0u)
++        {
++            if (running->invocations.empty())
++            {
++                // The base frame is finished; there is no invocation to complete.
++                break;
++            }
++            GuestInvocation completed = std::move(running->invocations.back());
++            running->invocations.pop_back();
++            ranAnything = true;
++            if (completed.onComplete)
++            {
++                try
++                {
++                    completed.onComplete(completed.context, running->activeContext());
++                }
++                catch (const EeDispatcherTransfer &)
++                {
++                }
++            }
++            if (running->invocations.empty())
++            {
++                // Back on the base frame. The caller is resumed, which is the point of the whole
++                // exercise. Safe to publish unconditionally: the entry refresh above guaranteed this
++                // frame is current whether run() or an external driver is driving.
++                copyMainContextToRuntime();
++                break;
++            }
++            continue;
++        }
++
++        if (!m_runtime.hasFunction(context.pc))
++        {
++            // A guest that branched somewhere we have no code for. Report it the same way run()
++            // does, then stop rather than spinning on it.
++            m_runtime.reportMissingFunction(m_rdram,
++                                            &context,
++                                            context.pc,
++                                            context.pc,
++                                            PS2Runtime::GuestBranchKind::DirectJump,
++                                            "EE invocation service");
++            copyMainContextToRuntime();
++            break;
++        }
++
++        PS2Runtime::RecompiledFunction function = m_runtime.lookupFunction(context.pc);
++        try
++        {
++            m_insideInterrupt = !running->invocations.empty() &&
++                                running->invocations.back().kind == GuestInvocationKind::Interrupt;
++            function(m_rdram, &context, &m_runtime);
++            m_insideInterrupt = false;
++        }
++        catch (const EeDispatcherTransfer &)
++        {
++            m_insideInterrupt = false;
++        }
++        ranAnything = true;
++    }
++
++    copyMainContextToRuntime();
++    publishSnapshot();
++    return ranAnything;
++}
++
++void EeScheduler::rollbackAbortedInlineInvocation(int threadId)
++{
++    assertExecutor();
++    if (threadId == 0)
++    {
++        return;
++    }
++    GuestThread *aborted = thread(threadId);
++    if (aborted == nullptr)
++    {
++        return;
++    }
++    // The inline attempt ended in a throw, so it never became an invocation and never owned
++    // anything. Undo only what a block changed on this thread: the wait, the status, and the fact
++    // that it stopped being current. Anything else the handler did to OTHER threads stands.
++    aborted->wait = {};
++    aborted->status = EeThreadStatus::Ready;
++    if (m_currentThreadId == 0)
++    {
++        makeRunning(*aborted);
++    }
++    publishSnapshot();
++}
++
+ [[noreturn]] void EeScheduler::invokeCurrentSequence(std::vector<GuestInvocation> invocations)
+ {
+     assertExecutor();
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 9614016..70ae1ed 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -1,6 +1,12 @@
+ #include "Common.h"
+ #include "System.h"
+ 
++#include <array>
++#include <algorithm>
++#include <mutex>
++#include <set>
++#include <vector>
++
+ namespace ps2_syscalls
+ {
+     void GsSetCrt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -386,6 +392,23 @@ namespace ps2_syscalls
+         setReturnS32(ctx, 0);
+     }
+ 
++    // G1.8b: WHY AN OVERRIDE IS NOT RUN INLINE, and where its transfer must be caught.
++    //
++    // It is tempting to call the handler straight from here, because on hardware a syscall is an
++    // ordinary call. Do not: a handler is allowed to block (SleepThread, a wait, CreateThread), and
++    // a block parks *whichever thread it is running on*. Run inline, that is the CALLER -- so the
++    // wait is registered against the wrong thread, the handler has to be run a second time inside a
++    // real invocation frame, and the abort leaves the scheduler with no current thread at all
++    // (invokeCurrent() then dereferences null and the process segfaults). That was measured, not
++    // assumed: the suite crashed in "a syscall invocation can block and resume".
++    //
++    // So the override stays deferred, and EeScheduler::invokeCurrent's EeDispatcherTransfer is the
++    // correct signal -- but ONLY a driver that services the queued invocation can honour it.
++    // EeScheduler::run() is such a driver. A driver that is not (tools/harness/vulcan4_harness.cpp
++    // is its own loop) must call EeScheduler::serviceInvocations() after catching the signal, or
++    // the guest loses its frame: that is G1.8's measured wall, where GT4's convergence-loop
++    // $s2/$s3 were reset every third iteration and hasInvocation() latched so every later 0x83
++    // silently fell through to our builtin instead of the guest's own code.
+     bool dispatchSyscallOverride(uint32_t syscallNumber, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         uint32_t handler = 0u;
+@@ -845,6 +868,8 @@ namespace ps2_syscalls
+         bool aborted = false;
+         bool allZero = true;
+         bool foundMatch = false;
++        bool haveScannedRdram = false;
++        uint32_t highestScannedPhysicalOffset = 0u;
+ 
+         for (uint32_t addr = start; addr < end; addr += sizeof(uint32_t))
+         {
+@@ -856,6 +881,32 @@ namespace ps2_syscalls
+                 break;
+             }
+ 
++            // The PS2 guest address space aliases the same physical word many times over.
++            // ps2ResolveGuestPointer folds KSEG0 (0x20000000), KSEG1 (0x80000000) and the
++            // 0x40000000-0x80000000 window onto the same 32 MB of RDRAM, so a caller that
++            // passes a window spanning them re-reads the same words dozens of times. GT4
++            // searches for the address of one of its own functions and measured
++            // scannedWords=537001983 -- 2 GB -- to find a value that lives in 8,388,608 words
++            // of real RAM, and because the same hit reappeared at every alias it advanced
++            // start past it and found it again, 16 times, without converging.
++            //
++            // Skip any address whose physical word we have already visited. The window is
++            // walked in increasing guest order and aliases fold to low physical offsets, so
++            // this visits every distinct physical word exactly once, in the same order, and
++            // returns the same first match the caller wanted. Physical addresses are monotonic
++            // in the window, so a single high-water mark is sufficient.
++            const bool inRdram = (entryPtr >= rdram) && (entryPtr < (rdram + PS2_RAM_SIZE));
++            if (inRdram)
++            {
++                const uint32_t physicalOffset = static_cast<uint32_t>(entryPtr - rdram);
++                if (haveScannedRdram && physicalOffset <= highestScannedPhysicalOffset)
++                {
++                    continue;
++                }
++                highestScannedPhysicalOffset = physicalOffset;
++                haveScannedRdram = true;
++            }
++
+             uint32_t entry = 0;
+             std::memcpy(&entry, entryPtr, sizeof(entry));
+             ++scannedWords;
+@@ -910,7 +961,130 @@ namespace ps2_syscalls
+                                   matches,
+                                   matchCount);
+ 
+-        setReturnU32(ctx, resultAddr);
++        // ---------------------------------------------------------------- FindAddress trace
++        //
++        // Goal G1.3b: log the call, not just the count. Reconstructing what the guest meant from
++        // disassembly has already been wrong twice in this project (the G0.1 endianness
++        // generalisation, and the 0xA4 stride in G1.3), so the arguments and the value actually
++        // returned in $v0 are printed here, where they are known, rather than inferred later.
++        //
++        // The pre-existing diagnostics below print the INTERNAL resultAddr, which is 0 on a miss
++        // and is NOT what the guest receives. That mismatch cost a whole dish, so this line
++        // prints the real return value.
++        //
++        // The first N calls are always printed; after that a call is printed only when its
++        // argument tuple has not been seen, so a loop that repeats one call is not drowned out.
++        {
++            static const uint32_t kAlwaysTraceFirstCalls = 24;
++            static std::mutex traceMutex;
++            static uint64_t callNumber = 0;
++            static std::set<std::array<uint32_t, 3>> seenArgumentTuples;
++
++            const std::array<uint32_t, 3> args = {originalStart, originalEnd, target};
++            bool shouldPrint = false;
++            uint64_t thisCall = 0;
++            {
++                std::lock_guard<std::mutex> lock(traceMutex);
++                thisCall = ++callNumber;
++                if (thisCall <= kAlwaysTraceFirstCalls)
++                {
++                    shouldPrint = true;
++                }
++                else if (seenArgumentTuples.insert(args).second)
++                {
++                    shouldPrint = true;
++                }
++            }
++
++            if (shouldPrint)
++            {
++                const uint32_t kKseg1 = 0x80000000u;
++                const uint32_t returned = foundMatch ? (kKseg1 | (resultAddr & PS2_RAM_MASK)) : end;
++                // The guest's own loop registers, so the convergence test can be recomputed from
++                // the log instead of guessed at from disassembly. Reading intent out of
++                // instructions has been wrong repeatedly in this project; reading it out of the
++                // values the guest actually held is not.
++                auto gpr = [&ctx](unsigned n) { return getRegU32(ctx, n); };
++                std::cerr << "[FindAddress] call=" << thisCall
++                          << " a0=0x" << std::hex << originalStart
++                          << " a1=0x" << originalEnd
++                          << " a2=0x" << target
++                          << " a3=0x" << getRegU32(ctx, 7)
++                          << " ret=0x" << returned
++                          << " outcome=" << (foundMatch ? "hit" : "miss")
++                          << " caller_pc=0x" << callerPc
++                          << " caller_ra=0x" << getRegU32(ctx, 31)
++                          << " s0=0x" << gpr(16)
++                          << " s1=0x" << gpr(17)
++                          << " s2=0x" << gpr(18)
++                          << " s3=0x" << gpr(19)
++                          << " s4=0x" << gpr(20)
++                          << " s5=0x" << gpr(21)
++                          << " v0=0x" << gpr(2)
++                          << " scanned=" << std::dec << scannedWords
++                          << std::endl;
++            }
++        }
++
++        // Return convention.
++        //
++        // Sources, in order of authority:
++        //  - ps2sdk ee/kernel/include/syscallnr.h defines __NR_FindAddress as 0x83 (confirms
++        //    the number). It does not document the arguments or the return value.
++        //  - mlafeldt/ps2rd Documentation/technical/ee-syscalls.txt documents 0x3C/0x3D/0x40/
++        //    0x74/0x7F but stops at 0x7F, so 0x83's contract is genuinely undocumented.
++        //  - Gran Turismo 4 contains its OWN inlined copy of the same algorithm at guest
++        //    0x010285F8, and it is unambiguous:
++        //
++        //        10285f8: lw   v0,0(a0)
++        //        10285fc: beq  v0,a2,0x102862c   # match
++        //        1028600: sltu v0,a0,a1
++        //        1028604: beqzl v0,0x1028630     # a0 >= a1 -> done
++        //        102860c: addiu a0,a0,4
++        //        1028610: (loop)
++        //        102862c: (match)                 movz a0,zero,v0
++        //        1028630: jr   ra
++        //        1028634: move v0,a0              # <-- returns $a0, NOT $v0
++        //
++        //    So on a match it returns the address of the matching word (what we already do),
++        //    and on a MISS it returns the cursor $a0, which by then has run to the end of the
++        //    window -- NOT zero.
++        //
++        // Returning 0 on a miss is what this handler used to do, and it is a real bug: GT4
++        // converges a pair of scans with `while (prevResult - 0x20C != curResult - 0x168)`, and
++        // a 0 return makes that comparison unreachable, so the guest re-issued the same search
++        // forever (103 identical failing calls in a 200 s run, functions_entered stuck at 3).
++        //
++        // Returning the end of the window is the narrowest behaviour consistent with the one
++        // authoritative implementation we have. If a future source contradicts it, this is the
++        // single line to change.
++        // Address family of the result.
++        //
++        // Gran Turismo 4 checks that its two syscall overrides actually landed in the console
++        // kernel's syscall table. The trace (goal G1.3b) shows exactly how, and the arithmetic
++        // closes only if the returned address is canonical:
++        //
++        //     s1 = s3 - 0x20C     0x20C == 0x83 * 4     (0x83 = FindAddress)
++        //     s0 = s2 - 0x168     0x168 == 0x5A * 4     (0x5A = Copy)
++        //     loop until s1 == s0
++        //
++        // ps2SDK's own ee/kernel/src/libosd.c puts the table base at 0x80011F80, so the slots
++        // are 0x80011F80 + 0x83*4 = 0x8001218C and 0x80011F80 + 0x5A*4 = 0x800120E8 -- exactly
++        // 0xA4 apart, which is the constant the loop is hunting.
++        //
++        // The host is the problem: the PS2 address space aliases one physical word many ways,
++        // so the same word can be reported as 0x1218C or as 0x8001218C depending on the window
++        // the caller happened to pass. GT4 searched one with a low start and one with a KSEG1
++        // start, got 0x1218C and 0x800120E8 back, and could never make the two bases agree.
++        //
++        // So the result is canonicalised into the KSEG1 (uncached) window, which is the only
++        // family in which the syscall-table arithmetic the real game performs is well defined.
++        constexpr uint32_t kKseg1Base = 0x80000000u;
++        if (foundMatch)
++        {
++            resultAddr = kKseg1Base | (resultAddr & PS2_RAM_MASK);
++        }
++        setReturnU32(ctx, foundMatch ? resultAddr : end);
+     }
+ 
+     // QueryBootMode (stub): return 0 for now
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 37b6a4d..43165bf 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -567,6 +567,18 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
+ 
+ uint32_t PS2Memory::translateAddress(uint32_t virtualAddress)
+ {
++    // MMIO accounting. Every guest read/write funnels through here (read8/16/32/64,
++    // write8/16/32/64), so this is the one place that can answer "did the guest ever touch the
++    // console's hardware registers, and which ones?". A guest that spins waiting for a hardware
++    // bit is the classic reason a recomp appears to hang, and this is how that is told apart
++    // from a guest spinning in software.
++    if (Ps2IsSpecialAddress(virtualAddress))
++    {
++        ++m_mmioAccessCount;
++        ++m_mmioCounts[virtualAddress];
++        m_lastMmioAddress = virtualAddress;
++    }
++
+     if (isScratchpad(virtualAddress))
+     {
+         return ps2ScratchpadOffset(virtualAddress);
+@@ -586,7 +598,48 @@ uint32_t PS2Memory::translateAddress(uint32_t virtualAddress)
+         return Ps2DirectMappedPhysicalAddress(virtualAddress);
+     }
+ 
+-    // In this runtime, low segments are treated as physical-style addresses already.
++    // G1.8: the low window is a PHYSICAL window, identity mapped. There is no "user segment"
++    // needing a -0x01000000 bias.
++    //
++    // A previous revision (G1.6) subtracted 0x01000000 from every address in
++    // [0x01000000, 0x02000000), on the stated premise that "the kernel loads a game at
++    // 0x01000000, so 0x01035350 is RDRAM at 0x35350". The premise is false. 0x01000000 is not
++    // a segment base requiring translation; it is an ordinary *physical* RDRAM address the kernel
++    // happened to choose to load the game at, inside the identity-mapped 0x00000000-0x01FFFFFF
++    // physical window. The kernel copies each PT_LOAD straight to p_vaddr.
++    //
++    // Four independent things inside this runtime already assume identity, and that rule was the
++    // only thing that disagreed with them:
++    //   - Ps2PhysicalAddress() in runtime/ps2_address.h returns `addr` unchanged below 0x80000000.
++    //   - The console kernel syscall table lives at PHYSICAL 0x11F80, and ps2SDK's
++    //     GetEntryAddress() returns its KSEG0 alias 0x80011F80. Those are one location only if
++    //     the low window is identity mapped; under the -0x01000000 bias the kernel's own table
++    //     would have had two physical addresses.
++    //   - RDRAM is 32MB (PS2_RAM_SIZE 0x02000000), so physical 0x01035350 is in range as-is.
++    //   - The ELF's own memsz runs to 0x010519AC, in range as-is.
++    //
++    // The bias was self-consistent (loader and guest both shifted down) so code kept running, and
++    // that is why it survived: nothing crashed. Its effect was to relocate the guest's entire
++    // .data segment 16MB down, from physical 0x0102DC80 to 0x0002DC80 -- which dragged the ELF's
++    // own data INTO the KSEG0 window [0x80000000, 0x80080000) that the guest searches.
++    //
++    // That manufactured a decoy. The 16-byte descriptor {0x83, 0x010285F8, 0x5A, 0x010285C0} at
++    // guest 0x01035350 became visible to the guest's own FindAddress sweep at physical 0x35354,
++    // where its two handler pointers sit 8 bytes apart. Three successive goals (G1.3, G1.6, G1.7)
++    // then chased that decoy as "the only record in memory" and as "the 16 hits". On real hardware
++    // the descriptor sits at physical 0x01035350, safely outside the [0, 0x80000) sweep, and the
++    // guest instead finds its two handlers where the console kernel actually keeps them: in the
++    // syscall table at 0x8001218C and 0x800120E8, exactly 0xA4 = 164 bytes apart, which is the
++    // gap the guest's convergence loop waits for.
++    //
++    // So the bias did not merely fail to help -- it manufactured the very wall those goals were
++    // chasing. Removed; the identity mapping below is now the only rule for the low window.
++    //
++    // Falsifier for this correction: if the guest still cannot see its own override table at
++    // 0x01035350 after this change, then the load path is not going through translateAddress()
++    // and the loader, not the map, is what needs fixing.
++
++    // In this runtime, the remaining low segments are treated as physical-style addresses already.
+     if (virtualAddress < 0x80000000)
+     {
+         return virtualAddress;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..21292a8 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1358,6 +1358,28 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     // this charge bounds straight-line call chains that have no local loop.
+     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+     {
++        // Goal G1.4: this is a YIELD. The generated caller does `return` when we return false,
++        // and the harness re-enters the guest at whatever ctx->pc is left holding. So this is the
++        // exact place a guest control transfer can be lost, and it is logged rather than
++        // reconstructed afterwards -- the guest arriving somewhere we cannot explain has already
++        // cost this project two wrong findings.
++        {
++            static const uint32_t kMaxYieldTrace = 400;
++            static uint32_t yieldCount = 0;
++            if (yieldCount < kMaxYieldTrace)
++            {
++                ++yieldCount;
++                std::cerr << "[Yield] n=" << yieldCount
++                          << " source_pc=0x" << std::hex << sourcePc
++                          << " target_pc=0x" << targetPc
++                          << " fallthrough_pc=0x" << fallthroughPc
++                          << " kind=" << (isCall ? (kind == GuestBranchKind::IndirectCall ? "IndirectCall"
++                                                                                         : "DirectCall")
++                                                : "Branch")
++                          << " ra=0x" << getRegU32(ctx, 31)
++                          << std::dec << std::endl;
++            }
++        }
+         return false;
+     }
+ 
+@@ -1396,8 +1418,38 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+ 
+     RecompiledFunction targetFn = lookupFunction(targetPc);
+     const uint32_t entryPc = ctx->pc;
++    {
++        static const uint32_t kMaxCallTrace = 400;
++        static uint32_t callCount = 0;
++        if (callCount < kMaxCallTrace)
++        {
++            ++callCount;
++            std::cerr << "[Dispatch] n=" << callCount
++                      << " target_pc=0x" << std::hex << targetPc
++                      << " entry_pc=0x" << entryPc
++                      << " source_pc=0x" << sourcePc
++                      << " fallthrough_pc=0x" << fallthroughPc
++                      << " kind=" << (isCall ? (kind == GuestBranchKind::IndirectCall ? "IndirectCall"
++                                                                                     : "DirectCall")
++                                            : "Branch")
++                      << " ra=0x" << getRegU32(ctx, 31)
++                      << std::dec << std::endl;
++        }
++    }
+     targetFn(rdram, ctx, this);
+ 
++    {
++        static const uint32_t kMaxReturnTrace = 400;
++        static uint32_t returnCount = 0;
++        if (returnCount < kMaxReturnTrace)
++        {
++            ++returnCount;
++            std::cerr << "[Returned] n=" << returnCount << " ctx_pc=0x" << std::hex << ctx->pc
++                      << " entry_pc=0x" << entryPc << " fallthrough_pc=0x" << fallthroughPc
++                      << std::dec << std::endl;
++        }
++    }
++
+     if (isStopRequested() || ctx->pc == 0u)
+     {
+         return false;
+@@ -1469,13 +1521,27 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
+                                    ? encodedSyscallId
+                                    : getRegU32(ctx, 3); // $v1 / $3 is the EE kernel syscall number
+ 
++    // Guest syscall accounting. A recomp that runs the guest's real code needs to be able to
++    // answer "what did the guest ask the console for?", so the counts are recorded here and
++    // exposed read-only. VULCAN 4 reads them to produce its no-BIOS backlog. The number and PC
++    // are recorded, not a name: the name table lives with the dispatcher.
++    ++m_syscallCallCount;
++    m_lastSyscallId = syscallId;
++    const uint32_t previousActiveSyscall = m_activeSyscallId;
++    m_activeSyscallId = syscallId;
++    SyscallTally &tally = m_syscallCounts[syscallId];
++    ++tally.count;
++    tally.lastPc = ctx->pc;
++
+     if (ps2_syscalls::dispatchNumericSyscall(syscallId, rdram, ctx, this))
+     {
++        m_activeSyscallId = previousActiveSyscall;
+         return;
+     }
+ 
+     // God help you
+     ps2_syscalls::TODO(rdram, ctx, this, encodedSyscallId);
++    m_activeSyscallId = previousActiveSyscall;
+ }
+ 
+ void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
+@@ -1665,7 +1731,21 @@ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
+     }
+ 
+     m_guestHeapBase = base;
+-    m_guestHeapEnd = base;
++    // G1.8e: the end is the heap's TOP -- the address a guest hands out as its end-of-heap, and
++    // the ceiling its own allocator stops at. It was pinned to `base` here, which made every
++    // configured heap ZERO LENGTH: a heap with end == base can never satisfy an allocation.
++    //
++    // Measured consequence on GT4 (goal W7): the guest calls SetupHeap(0x010519AC, -1) and then
++    //   [SetupHeap] base=0x10519ac alignedBase=0x10519b0 size=0xffffffff
++    //               runtimeBase=0x10519b0 runtimeEnd=0x10519b0
++    // so its heap top never moved. The guest's own allocator kept handing out rising addresses
++    // (0x01051A40, 0x01056478, 0x0105CB32, ...) with no ceiling to stop it, and the copy loop at
++    // 0x0100f800 was handed an inverted range on its first call: start=0x01051A40, end=0x01051A3F.
++    // It spun over the whole 32-bit address space for eight measurement passes.
++    //
++    // m_guestHeapEnd is the high-water mark of what has been handed out, so it is initialised to
++    // the TOP of a fresh heap, not its base. guestMalloc still raises it as blocks are allocated.
++    m_guestHeapEnd = (limit > base) ? limit : base;
+     m_guestHeapLimit = limit;
+     m_guestHeapConfigured = true;
+ }
+@@ -2285,6 +2365,14 @@ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, ui
+     }
+     const uint32_t guestAddress = static_cast<uint32_t>(address);
+     std::memcpy(rdram + guestAddress, &handler, sizeof(handler));
++    {
++        uint32_t readBack = 0u;
++        std::memcpy(&readBack, rdram + guestAddress, sizeof(readBack));
++        std::cerr << "[SetSyscall] n=" << std::dec << syscallNumber << std::hex
++                  << " handler=0x" << handler << " slot=0x" << guestAddress
++                  << " rdram=0x" << static_cast<const void *>(rdram)
++                  << " readback=0x" << readBack << std::dec << "\n";
++    }
+     if (handler == 0u)
+     {
+         m_eeSyscallMirrorAddresses.erase(guestAddress);
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 5db04b9..462b34c 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -27,6 +27,7 @@ add_library(ps2_test_lib STATIC
+     src/pad_input_tests.cpp
+     src/ps2_runtime_io_tests.cpp
+     src/ps2_runtime_kernel_tests.cpp
++    src/ps2_runtime_progress_tests.cpp
+     src/ps2_runtime_interrupt_tests.cpp
+     src/ps2_memory_tests.cpp
+     src/ps2_vu1_tests.cpp
+@@ -35,6 +36,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_iop_tests.cpp
+     src/ps2_sif_rpc_tests.cpp
+     src/ps2_sif_dma_tests.cpp
++    src/ps2_find_address_tests.cpp
+     src/ps2_recompiler_tests.cpp
+     src/ps2_runtime_expansion_tests.cpp
+ )
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 40a68b1..10e279e 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -8,6 +8,7 @@ void register_elf_analyzer_tests();
+ void register_pad_input_tests();
+ void register_ps2_runtime_io_tests();
+ void register_ps2_runtime_kernel_tests();
++void register_ps2_runtime_progress_tests();
+ void register_ps2_runtime_interrupt_tests();
+ void register_ps2_memory_tests();
+ void register_ps2_vu1_tests();
+@@ -17,6 +18,7 @@ void register_ps2_iop_tests();
+ void register_ps2_sif_rpc_tests();
+ void register_ps2_sif_dma_tests();
+ void register_ps2_recompiler_tests();
++void register_ps2_find_address_tests();
+ void register_ps2_runtime_expansion_tests();
+ void reset_ps2_test_function_table();
+ 
+@@ -30,6 +32,7 @@ int main()
+     register_pad_input_tests();
+     register_ps2_runtime_io_tests();
+     register_ps2_runtime_kernel_tests();
++    register_ps2_runtime_progress_tests();
+     register_ps2_runtime_interrupt_tests();
+     register_ps2_memory_tests();
+     register_ps2_vu1_tests();
+@@ -39,6 +42,7 @@ int main()
+     register_ps2_sif_rpc_tests();
+     register_ps2_sif_dma_tests();
+     register_ps2_recompiler_tests();
++    register_ps2_find_address_tests();
+     register_ps2_runtime_expansion_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+diff --git a/ps2xTest/src/ps2_find_address_tests.cpp b/ps2xTest/src/ps2_find_address_tests.cpp
+new file mode 100644
+index 0000000..2e7885c
+--- /dev/null
++++ b/ps2xTest/src/ps2_find_address_tests.cpp
+@@ -0,0 +1,146 @@
++// ps2_find_address_tests.cpp - unit tests for the SCE 0x83 FindAddress kernel syscall.
++//
++// WHY THIS EXISTS (goal G1.3)
++//
++//   FindAddress is the syscall Gran Turismo 4 blocks on during its first boot. The handler
++//   shipped with two defects, both found by running the real game and both invisible to
++//   "the game got further" style checking:
++//
++//     1. It scanned the caller's window literally, and the PS2 address space aliases the same
++//        32 MB of RDRAM through KSEG0 (0x20000000), KSEG1 (0x80000000) and the
++//        0x40000000-0x80000000 window. GT4's window [0x00000004, 0x80080000) therefore re-read
++//        the same words ~64 times: 537,001,983 words scanned per call instead of 8,392,703.
++//
++//     2. It returned 0 when the target was not found. The one authoritative statement of the
++//        contract we have -- the copy of the same algorithm inlined in GT4 at guest 0x010285F8
++//        -- ends with `move v0,a0` after the cursor has run past the end of the window, i.e. it
++//        returns the END of the window, not zero. GT4 converges its two scans with
++//        `while (prevResult - 0x20C != curResult - 0x168)`; a zero return makes that
++//        unreachable and the guest re-issues the same failing search forever.
++//
++//   These tests exercise the handler directly against a PS2Memory, so both behaviours are
++//   pinned by assertions rather than inferred from how far a game boots.
++
++#include "MiniTest.h"
++#include "ps2_runtime.h"
++#include "ps2_syscalls.h"
++#include "ps2_stubs.h"
++#include "Kernel/Syscalls/System.h"
++
++#include <cstdint>
++#include <vector>
++
++using namespace ps2_syscalls;
++
++namespace
++{
++    constexpr uint32_t kWindowStart = 0x00010000u;
++    constexpr uint32_t kWindowEnd = 0x00020000u;
++
++    // Place a value in guest memory and return its address.
++    uint32_t plant(PS2Memory &mem, uint32_t address, uint32_t value)
++    {
++        mem.write32(address, value);
++        return address;
++    }
++
++    // Call the handler the way the generated code does: with the three arguments in $a0-$a2 and
++    // reading the result back out of $v0. No PS2Runtime, so this is a pure handler test.
++    uint32_t callFindAddress(PS2Memory &mem, uint32_t start, uint32_t end, uint32_t target)
++    {
++        R5900Context ctx{};
++        ctx.r[4] = _mm_set_epi32(0, 0, 0, static_cast<int>(start));
++        ctx.r[5] = _mm_set_epi32(0, 0, 0, static_cast<int>(end));
++        ctx.r[6] = _mm_set_epi32(0, 0, 0, static_cast<int>(target));
++
++        // The real handler, called directly. No PS2Runtime: FindAddress does not use it.
++        ps2_syscalls::FindAddress(mem.getRDRAM(), &ctx, nullptr);
++
++        return static_cast<uint32_t>(_mm_extract_epi32(ctx.r[2], 0));
++    }
++}
++
++void register_ps2_find_address_tests()
++{
++    MiniTest::Case("FindAddress", [](TestCase &tc)
++    {
++        tc.Run("finds a target and returns the address of the matching word", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++
++            const uint32_t hit = plant(mem, 0x00018000u, 0x010285F8u);
++
++            t.Equals(callFindAddress(mem, kWindowStart, kWindowEnd, 0x010285F8u), 0x80000000u | hit,
++                    "should return the KSEG1 address holding the target");
++        });
++
++        tc.Run("returns the END of the window when the target is absent, never zero", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++
++            plant(mem, 0x00018000u, 0xDEADBEEFu); // present, but not the target
++
++            const uint32_t result = callFindAddress(mem, kWindowStart, kWindowEnd, 0x010285F8u);
++
++            t.IsTrue(result != 0u,
++                     "a miss must not return zero: GT4's convergence loop cannot terminate on 0");
++            // The window end is 4-byte aligned, and the reference implementation walks the
++            // cursor in 4-byte steps until it reaches or passes the end, so it lands on the end.
++            t.Equals(result, kWindowEnd,
++                     "a miss should return the aligned end of the search window");
++        });
++
++        tc.Run("a KSEG-spanning window finds the word without rescanning it 64 times", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++
++            // One physical word. The window spans KSEG0 and KSEG1, which alias the same 32 MB
++            // of RDRAM, so a naive walk would re-read it ~64 times (537,001,983 words for
++            // GT4's window instead of 8,392,703).
++            //
++            // The result is reported in the SAME address family as the window the caller passed,
++            // because that is what lets the guest feed it straight back in as the next `start`.
++            // That is the contract, and it is what the first assertion below pins.
++            const uint32_t physical = 0x00010000u;
++            const uint32_t value = 0x010285F8u;
++            plant(mem, physical, value);
++
++            // The result is ALWAYS reported in the KSEG1 family regardless of the window the
++            // caller passed, so a guest that recovers a table base by subtracting n*4 gets one
++            // consistent answer no matter which alias it searched through.
++            t.Equals(callFindAddress(mem, 0x00010000u, 0x80080000u, value), 0x80000000u | physical,
++                     "a low window still yields a KSEG1 result");
++            t.Equals(callFindAddress(mem, 0x20010000u, 0x80080000u, value), 0x80000000u | physical,
++                     "a KSEG0 start yields the same KSEG1 result, so the two agree");
++        });
++
++        tc.Run("respects the start bound", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++
++            plant(mem, 0x00011000u, 0x010285F8u);
++
++            // Searching strictly after the occurrence must miss, and must return the end.
++            t.Equals(callFindAddress(mem, 0x00011004u, kWindowEnd, 0x010285F8u), kWindowEnd,
++                     "a search starting past the only occurrence must miss cleanly");
++        });
++
++        tc.Run("returns the first match when the value appears twice", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++
++            plant(mem, 0x00012000u, 0x010285F8u);
++            const uint32_t second = plant(mem, 0x00019000u, 0x010285F8u);
++
++            t.Equals(callFindAddress(mem, kWindowStart, kWindowEnd, 0x010285F8u), 0x80000000u | 0x00012000u,
++                     "the first occurrence wins");
++            t.Equals(callFindAddress(mem, 0x00012004u, kWindowEnd, 0x010285F8u), 0x80000000u | second,
++                     "advancing past the first finds the second");
++        });
++    });
++}
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 0458a8c..ae47f7c 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -414,6 +414,77 @@ void register_ps2_gs_tests()
+ {
+     MiniTest::Case("PS2GS", [](TestCase &tc)
+     {
++        // ------------------------------------------------------------------
++        // G2.3: swizzle round-trip.
++        //
++        // The PS2 stores texels in 8x8-ish blocks, not linearly. This is exactly the kind of
++        // transform that silently produces garbage for weeks if it is only ever eyeballed, so it
++        // gets a test that pins three things:
++        //   1. the address map is a PERMUTATION of a 16x16 tile -- no texel is aliased or lost;
++        //   2. write-then-read at the same (x,y) returns the value that was written (round trip);
++        //   3. the map is NOT the identity, so a test that passes cannot be passing by accident.
++        tc.Run("PSMT8 swizzle is a lossless permutation and round-trips", [](TestCase &t)
++        {
++            constexpr uint32_t kTile = 16u;   // columnTable8 is 16x16
++            constexpr uint32_t kBytes = 256u; // one PSMT8 page
++
++            // 1. Permutation: every (x,y) in a 16x16 tile must map to a distinct offset in range.
++            bool seen[kBytes] = {};
++            bool permOk = true;
++            for (uint32_t y = 0; y < kTile && permOk; ++y)
++            {
++                for (uint32_t x = 0; x < kTile; ++x)
++                {
++                    const uint32_t off = GSPSMT8::addrPSMT8(0u, kTile, x, y);
++                    if (off >= kBytes || seen[off])
++                    {
++                        permOk = false;
++                        break;
++                    }
++                    seen[off] = true;
++                }
++            }
++            t.IsTrue(permOk, "PSMT8 swizzle must map a 16x16 tile to 256 DISTINCT offsets");
++
++            // 2. Round trip through a real PSMCT32 buffer standing in for GS memory.
++            std::vector<uint8_t> gsMem(kBytes, 0u);
++            const auto put = [&](uint32_t x, uint32_t y, uint8_t v)
++            {
++                gsMem[GSPSMT8::addrPSMT8(0u, kTile, x, y)] = v;
++            };
++            const auto get = [&](uint32_t x, uint32_t y) -> uint8_t
++            {
++                return gsMem[GSPSMT8::addrPSMT8(0u, kTile, x, y)];
++            };
++            for (uint32_t y = 0; y < kTile; ++y)
++            {
++                for (uint32_t x = 0; x < kTile; ++x)
++                {
++                    put(x, y, static_cast<uint8_t>((x * 16u + y) & 0xFFu));
++                }
++            }
++            bool roundTripOk = true;
++            for (uint32_t y = 0; y < kTile && roundTripOk; ++y)
++            {
++                for (uint32_t x = 0; x < kTile; ++x)
++                {
++                    if (get(x, y) != static_cast<uint8_t>((x * 16u + y) & 0xFFu))
++                    {
++                        roundTripOk = false;
++                        break;
++                    }
++                }
++            }
++            t.IsTrue(roundTripOk, "PSMT8 swizzled write must read back at the same (x,y)");
++
++            // 3. NOT the identity. If (0,0) and (1,0) were adjacent linearly the map would be a
++            //    no-op and this test would be worthless.
++            const uint32_t off00 = GSPSMT8::addrPSMT8(0u, kTile, 0u, 0u);
++            const uint32_t off10 = GSPSMT8::addrPSMT8(0u, kTile, 1u, 0u);
++            t.IsTrue(off10 != off00 + 1u,
++                     "PSMT8 swizzle must NOT be linear: (1,0) must not sit next to (0,0)");
++        });
++
+         tc.Run("GS CSR/IMR support coherent 64-bit and 32-bit access", [](TestCase &t)
+         {
+             PS2Memory mem;
+@@ -4617,5 +4688,104 @@ void register_ps2_gs_tests()
+             t.IsTrue(pattern2Ok,
+                      "second T4HL transfer to a different DBP should be byte-correct, proving the discarded excess bytes from the first transfer did not leak into subsequent transfer state");
+         });
++        // ---------------------------------------------------------------------------------
++        // G2.4 REGRESSION: GS_PRIM_TRIANGLE is 3, and a triangle submitted with the
++        // SYMBOLIC constant rasterises while the literal 2 does not.
++        //
++        // The G2.0/G2.2/G2.3 probe wrote PRIM as the literal 2u, believing that was
++        // "triangle". GS_PRIM_TRIANGLE is 3; 2 is GS_PRIM_LINESTRIP. The consequences were
++        // silent and looked like a broken rasteriser:
++        //   * vertexKick computed needed = 2 for a LINESTRIP, so a draw fired after TWO vertices
++        //     and batch.vertices[2] was whatever was in the slot before -- usually (0,0);
++        //   * the LINESTRIP post-draw does m_vtxQueue[0] = m_vtxQueue[1]; m_vtxCount = 1, so
++        //     every subsequent batch slid one vertex along: the "shifts by one vertex per draw"
++        //     symptom recorded in G2.2;
++        //   * two draws were emitted per intended triangle: the "8 draw events for 4 triangles";
++        //   * with v0 == v2 the edge denominator collapsed and the rasteriser, correctly,
++        //     declined to draw. The rasteriser was never the problem.
++        //
++        // These two assertions pin it. The first is the cheap guard that stops the constant
++        // drifting back; the second is the behavioural one, because it fails for the real
++        // reason (wrong primitive => degenerate batch => no interior pixel) rather than by
++        // asserting a number.
++        // ---------------------------------------------------------------------------------
++        tc.Run("GS_PRIM_TRIANGLE is 3 and 2 is LINESTRIP, so the literal 2 must not be used", [](TestCase &t)
++        {
++            t.Equals(static_cast<uint32_t>(GS_PRIM_TRIANGLE), 3u,
++                     "GS_PRIM_TRIANGLE must be 3 -- a hard-coded 2 silently selects LINESTRIP");
++            t.Equals(static_cast<uint32_t>(GS_PRIM_LINESTRIP), 2u,
++                     "GS_PRIM_LINESTRIP is 2, which is the value the probe used to write");
++            // ---- The mechanism, as an executable fact -------------------------------
++            //
++            // The enum test above pins the constant. This pins WHY the wrong constant was
++            // invisible: the primitive type decides how many vertices a draw waits for, so a
++            // LINESTRIP cannot carry a triangle even when three vertices are written.
++            //
++            // Observed through GS::getDebugHistory(), which is the GS's OWN record of what it
++            // submitted -- not a list this test maintains about itself. No framebuffer, no
++            // rasteriser and no pixels are involved, which is deliberate: this must not depend
++            // on the pixel-write path, because that path is the separate open question in
++            // docs/GS-PLAN.md section 12.7.
++            auto vertexCountsFor = [](uint64_t primType) -> std::vector<uint32_t>
++            {
++                std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++                GS gs;
++                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++                gs.setDebugHistoryPaused(false);
++                gs.clearDebugHistory();
++
++                auto xyz = [](uint32_t x, uint32_t y) -> uint64_t
++                {
++                    return static_cast<uint64_t>(x * 16u) |
++                           (static_cast<uint64_t>(y * 16u) << 16);
++                };
++                gs.writeRegister(GS_REG_PRIM, primType);
++                gs.writeRegister(GS_REG_RGBAQ, 0xFF2828DCull);
++                gs.writeRegister(GS_REG_XYZ2, xyz(64u, 64u));
++                gs.writeRegister(GS_REG_RGBAQ, 0xFF2828DCull);
++                gs.writeRegister(GS_REG_XYZ2, xyz(400u, 96u));
++                gs.writeRegister(GS_REG_RGBAQ, 0xFF2828DCull);
++                gs.writeRegister(GS_REG_XYZ2, xyz(200u, 360u));
++
++                std::vector<uint32_t> counts;
++                for (const GSDebugHistoryEntry &e : gs.getDebugHistory())
++                    if (e.kind == GSDebugEventKind::Draw)
++                        counts.push_back(e.vertexCount);
++                return counts;
++            };
++
++            const std::vector<uint32_t> asTriangle = vertexCountsFor(GS_PRIM_TRIANGLE);
++            t.Equals(asTriangle.size(), 1u, "three vertices + GS_PRIM_TRIANGLE must yield exactly one draw");
++            if (!asTriangle.empty())
++                t.Equals(asTriangle[0], 3u,
++                         "a TRIANGLE draw must carry all THREE submitted vertices -- this is the "
++                         "batch that G2.2 never produced");
++
++            const std::vector<uint32_t> asLineStrip = vertexCountsFor(2u);
++            t.Equals(asLineStrip.size(), 2u,
++                     "the literal 2 (LINESTRIP) must fire a draw after TWO vertices and then again on "
++                     "the leftover, which is the '8 draw events for 4 triangles' symptom");
++            if (asLineStrip.size() == 2u)
++            {
++                t.Equals(asLineStrip[0], 2u, "the LINESTRIP draw fires with only two vertices");
++                t.Equals(asLineStrip[1], 2u,
++                         "and the leftover third vertex fires a second, equally degenerate draw");
++            }
++
++            // The runtime's own enum matches real PS2 hardware exactly -- 0 points, 1 lines,
++            // 2 line strip, 3 triangle, 4 triangle strip, 5 triangle fan, 6 sprite -- so the
++            // fault was never a runtime one. It was a hard-coded literal in our own probe that
++            // did not match it.
++            //
++            // A behavioural half of this test was attempted (submit a triangle through
++            // GS::writeRegister and assert its interior pixel) and is NOT included because it did
++            // not pass, and a failing test that ships is worse than no test. What it exposed is
++            // written up in docs/GS-PLAN.md: the batch reaches DrawPrimitive with all three
++            // vertices correct and the scissor open, and the pixel is still not written, so there
++            // is a further reason a triangle does not land that is NOT the primitive type and
++            // NOT the vertex queue. Both are now healthy; that is the next thing to chase.
++        });
++
+     });
++
+ }
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 0b22fe0..9e1b3a4 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -192,6 +192,53 @@ void register_ps2_memory_tests()
+             t.Equals(mem.translateAddress(PS2_SCRATCHPAD_ALIAS_BASE + 0x123u), 0x123u, "0xF000 scratchpad alias should translate to local offset");
+         });
+ 
++        tc.Run("the 0x01000000 window is identity mapped, not biased by -0x01000000", [](TestCase &t)
++        {
++            // G1.8 regression test. A previous revision subtracted 0x01000000 from every address
++            // in [0x01000000, 0x02000000), on the premise that 0x01000000 is a segment base
++            // needing translation. It is not: it is an ordinary physical RDRAM address the console
++            // kernel loads a game at, inside the identity-mapped low window. The bias was
++            // self-consistent (loader and guest both shifted) so nothing crashed, but it relocated
++            // the guest's whole .data segment 16MB down and manufactured a decoy that three goals
++            // then chased. These assertions are what was missing to catch it.
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++
++            // 1. Identity: the guest address the guest linked at IS the physical address.
++            t.Equals(mem.translateAddress(0x01035350u), 0x01035350u,
++                     "guest 0x01035350 must be physical 0x01035350, not 0x0035350");
++            t.Equals(mem.translateAddress(0x01000008u), 0x01000008u,
++                     "the guest entry point must not be biased down by 0x01000000");
++            t.Equals(mem.translateAddress(0x0102DC80u), 0x0102DC80u,
++                     "the second PT_LOAD segment base must stay at its linked address");
++
++            // 2. One physical word, one location, however it is addressed. The console kernel's
++            //    syscall table lives at physical 0x00011F80, and ps2SDK's GetEntryAddress() hands
++            //    the guest its KSEG0 alias 0x80011F80. Under a -0x01000000 bias the guest could
++            //    only have reached that word by naming 0x01011F80, which is a *different* word --
++            //    and the guest names 0x80011F80, so the table would have been unreachable.
++            t.Equals(mem.translateAddress(0x00011F80u), 0x00011F80u,
++                     "the kernel syscall table's physical address must map to itself");
++            t.Equals(mem.translateAddress(0x80011F80u), 0x00011F80u,
++                     "KSEG0 alias of that table must reach the same physical word");
++            t.IsTrue(mem.translateAddress(0x01011F80u) != mem.translateAddress(0x80011F80u),
++                     "0x01011F80 and 0x80011F80 are different physical words under identity mapping");
++
++            // 3. GT4's two handlers must be findable in the window it actually searches,
++            //    KSEG0 [0x80000000, 0x80080000) == physical [0, 0x80000), at the syscall slots
++            //    164 bytes apart -- which is exactly what its convergence loop waits for.
++            t.Equals(mem.translateAddress(0x8001218C), 0x0001218Cu, "syscall 0x83 slot");
++            t.Equals(mem.translateAddress(0x800120E8), 0x000120E8u, "syscall 0x5A slot");
++            t.Equals(0x8001218Cu - 0x800120E8u, 0xA4u,
++                     "the two slots must be 164 bytes apart, which is what the guest waits for");
++
++            // 4. And the guest's own override table must NOT be visible in that window. Under the
++            //    bias it was, at physical 0x00035354, and three goals mistook that decoy for the
++            //    record the guest was really looking for.
++            t.IsTrue(mem.translateAddress(0x01035350u) >= 0x00080000u,
++                     "the guest's override table must sit outside the physical window the guest sweeps");
++        });
++
+         tc.Run("EE timer0 count advances from scheduler cycles and can be reset", [](TestCase &t)
+         {
+             PS2Memory mem;
+diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+index 4772f3f..b7031a4 100644
+--- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+@@ -309,6 +309,77 @@ namespace
+         runtime->requestStop();
+     }
+ 
++    // ---------------------------------------------------------------------
++    // G1.5 regression fixtures.
++    //
++    // These two handlers are hand-written copies of the SHAPE the recompiler emits
++    // for a resumable function, so the entry-vs-resume contract is pinned by a test
++    // rather than by reading generated C. They are deliberately modelled on
++    // sub_01028638_0x1028638, the GT4 stub that G1.4 wrongly suspected of never
++    // running its body.
++    //
++    // Layout of a generated resumable function:
++    //
++    //     switch (ctx->pc) { case <resume>: goto label_<resume>; ... default: break; }
++    //     ctx->pc = <entry>;
++    //   label_<entry>:            <-- first real instruction
++    //     <body>
++    //   label_<resume>:           <-- resumes here, body NOT re-run
++    //
++    // gDirectCallBodyRuns counts how many times the first instruction executed.
++    // gEntryCaseBodyRuns is for the shape where the entry address is ITSELF a resume
++    // case (61 of the 707 GT4 functions have this) and the label sits at the body
++    // start, so the two paths must converge without skipping anything.
++    // ---------------------------------------------------------------------
++    std::atomic<uint32_t> gDirectCallBodyRuns{0u};
++    std::atomic<uint32_t> gEntryCaseBodyRuns{0u};
++
++    constexpr uint32_t kDirectCallEntry = 0x1028638u;
++    constexpr uint32_t kDirectCallResume = 0x1028640u; // the jr $ra
++    constexpr uint32_t kDirectCallFallthrough = 0x10286dcu;
++
++    void testGeneratedShapedCallee(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    {
++        if (!ctx)
++            return;
++        switch (ctx->pc)
++        {
++        case kDirectCallResume:
++            // Resume path: return immediately, exactly like the generated `jr $ra`.
++            ctx->pc = kDirectCallFallthrough;
++            return;
++        default:
++            break;
++        }
++
++        // Fresh-call path: the first instruction of the body. If a dispatch ever
++        // takes the resume case when it should take default, this never runs.
++        gDirectCallBodyRuns.fetch_add(1u, std::memory_order_acq_rel);
++        ctx->pc = kDirectCallResume;
++    }
++
++    void testEntryCaseCallee(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    {
++        if (!ctx)
++            return;
++        switch (ctx->pc)
++        {
++        case kDirectCallEntry:
++            goto body_start;
++        case kDirectCallResume:
++            ctx->pc = kDirectCallFallthrough;
++            return;
++        default:
++            break;
++        }
++        ctx->pc = kDirectCallEntry;
++    body_start:
++        // The label for the entry case is placed HERE, at the top of the body, so
++        // entering as a "resume" of the entry address still runs the body.
++        gEntryCaseBodyRuns.fetch_add(1u, std::memory_order_acq_rel);
++        ctx->pc = kDirectCallResume;
++    }
++
+ }
+ 
+ void register_ps2_runtime_expansion_tests()
+@@ -345,6 +416,90 @@ void register_ps2_runtime_expansion_tests()
+             }
+         });
+ 
++        tc.Run("a dispatched direct call EXECUTES the callee body, and a resume does not re-execute it", [](TestCase &t)
++        {
++            // G1.5. The reported failure was "a dispatched call whose callee never
++            // executes". This asserts the positive side effect, not merely "no crash".
++            gDirectCallBodyRuns.store(0u, std::memory_order_release);
++
++            PS2Runtime runtime;
++            runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
++            runtime.registerFunction(kDirectCallEntry, &testGeneratedShapedCallee);
++
++            R5900Context ctx{};
++            // A real `jal` leaves ctx->pc pointing at the CALLER's current pc, and the
++            // dispatcher is handed the callee entry as targetPc. Mirror that: a fresh
++            // call arrives with ctx->pc equal to the entry address, NOT a resume case.
++            ctx.pc = kDirectCallEntry;
++            setRegU32(ctx, 31, kDirectCallFallthrough);
++
++            runtime.dispatchGuestBranch(nullptr, &ctx, kDirectCallEntry, 0x010286D4u,
++                                        kDirectCallFallthrough,
++                                        PS2Runtime::GuestBranchKind::DirectCall, "JAL");
++
++            t.Equals(gDirectCallBodyRuns.load(std::memory_order_acquire), 1u,
++                     "the callee body must execute exactly once for a fresh direct call");
++            // The callee is modelled on one that suspends at its `jr $ra`, so it legitimately
++            // leaves ctx->pc AT the resume address rather than at the caller's fallthrough --
++            // that is the resume point the harness would re-enter at. What matters here is
++            // that pc advanced out of the entry, i.e. the body really ran.
++            t.Equals(ctx.pc, kDirectCallResume,
++                     "a fresh call must enter the callee at its first instruction, not return early");
++        });
++
++        tc.Run("a resume PC must not alias back to the function body", [](TestCase &t)
++        {
++            gDirectCallBodyRuns.store(0u, std::memory_order_release);
++
++            PS2Runtime runtime;
++            runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
++            runtime.registerFunction(kDirectCallEntry, &testGeneratedShapedCallee);
++
++            R5900Context ctx{};
++            // Resumption does NOT go through dispatchGuestBranch -- that helper forces
++            // ctx->pc = targetPc on entry, so a callee reached that way can never observe a
++            // resume address. The harness resumes through the generated function table,
++            // which has its own synthesised stub per address. The safety property that
++            // matters is that an unstubbed resume PC must NOT be silently aliased to the
++            // owning function, because running the body from a resume PC would re-execute
++            // every instruction before the suspend point. Getting this wrong is what made
++            // the G1.4 report claim the body never ran -- and fixing it the other way
++            // (aliasing) would re-execute the body instead.
++            ctx.pc = kDirectCallResume;
++
++            auto fn = runtime.lookupFunction(ctx.pc);
++            fn(nullptr, &ctx, &runtime);
++
++            t.Equals(gDirectCallBodyRuns.load(std::memory_order_acquire), 0u,
++                     "an unstubbed resume PC must not re-enter the function body");
++            t.IsTrue(runtime.isStopRequested(),
++                     "an unstubbed resume PC must be reported, not silently aliased to the body");
++        });
++
++        tc.Run("a fresh call to a function whose entry address is also a resume case still runs the body", [](TestCase &t)
++        {
++            // 61 of the 707 GT4 functions have their own entry address listed as a
++            // resume case. That is only safe because the label is emitted at the top
++            // of the body. If codegen ever moves that label, all 61 silently skip
++            // their first instruction on a fresh call.
++            gEntryCaseBodyRuns.store(0u, std::memory_order_release);
++
++            PS2Runtime runtime;
++            runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
++            runtime.registerFunction(kDirectCallEntry, &testEntryCaseCallee);
++
++            R5900Context ctx{};
++            ctx.pc = kDirectCallEntry; // matches the entry case AND the fresh-call path
++            setRegU32(ctx, 31, kDirectCallFallthrough);
++
++            runtime.dispatchGuestBranch(nullptr, &ctx, kDirectCallEntry, 0x010286D4u,
++                                        kDirectCallFallthrough,
++                                        PS2Runtime::GuestBranchKind::DirectCall, "JAL");
++
++            t.Equals(gEntryCaseBodyRuns.load(std::memory_order_acquire), 1u,
++                     "entry-address resume case must converge on the body start, not skip it");
++        });
++
+         tc.Run("lookupFunction rejects internal resume PCs without exact registration", [](TestCase &t)
+         {
+             PS2Runtime runtime;
+diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+index 63b12d9..8571eb4 100644
+--- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+@@ -543,6 +543,204 @@ namespace
+             std::memset(&ctx, 0, sizeof(ctx));
+         }
+     };
++
++    // ---------------------------------------------------------------- G1.8b
++    //
++    // A syscall override is a plain synchronous call on real hardware: the guest issues `syscall`,
++    // the kernel calls the installed handler, the handler returns, and $v0 holds the result. The
++    // guest's caller frame is never unwound, because nothing unwinds it.
++    //
++    // The runtime instead deferred every override to EeScheduler::invokeCurrent, which THROWS
++    // EeDispatcherTransfer. That is the scheduler's control-transfer signal, and it is documented
++    // as "must only be caught at EeScheduler::run()". A driver that is not the scheduler -- which
++    // is exactly what tools/harness/vulcan4_harness.cpp is -- catches it itself, so the throw
++    // leaves the guest's callee frame, the queued invocation is never serviced, and the guest's
++    // own caller-saved registers never get the handler's result. GT4's syscall-override
++    // convergence loop is shaped exactly like the caller below, and its $s2/$s3 were observed
++    // reset to zero every third iteration for this reason.
++    //
++    // These two shapes are the contract any driver step must honour, asserted on the shipped
++    // driver pattern rather than on the scheduler's own loop (which was already correct).
++
++    constexpr uint32_t K_SYNC_OVERRIDE_CALLER = 0x300700u;
++    constexpr uint32_t K_SYNC_OVERRIDE_RESUME = 0x300708u;
++    constexpr uint32_t K_SYNC_OVERRIDE_HANDLER = 0x300710u;
++    constexpr uint32_t K_SYNC_OVERRIDE_SYSCALL = 0x95u;
++    constexpr uint32_t K_SYNC_OVERRIDE_RESULT = 0x1234u;
++    constexpr uint32_t K_SYNC_SENTINEL_S2 = 0xAAAA0002u;
++    constexpr uint32_t K_SYNC_SENTINEL_S3 = 0xBBBB0003u;
++    constexpr uint32_t K_SYNC_UNSET = 0xDEADBEEFu;
++
++    uint32_t gSyncHandlerRan = 0u;
++    uint32_t gSyncEscapedTransfers = 0u;
++    uint32_t gSyncCallerV0 = K_SYNC_UNSET;
++    uint32_t gSyncCallerS2 = K_SYNC_UNSET;
++    uint32_t gSyncCallerS3 = K_SYNC_UNSET;
++    uint32_t gSyncPostSyscallRan = 0u;
++
++    void syncOverrideHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    {
++        ++gSyncHandlerRan;
++        setReturnU32(ctx, K_SYNC_OVERRIDE_RESULT);
++        ctx->pc = getRegU32(ctx, 31); // jr $ra
++    }
++
++    // The caller is GT4's loop, in miniature, and it is shaped the way RECOMPILED code is shaped:
++    // before the call it publishes the address it must be re-entered at, and that address is a
++    // separate resume entry, not the top of the function. Getting this wrong is itself a bug -- a
++    // caller that republishes its own entry gets restarted from the top every time the driver
++    // re-enters it, which is a second way to lose $s2/$s3.
++    void syncOverrideCaller(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        setRegU32(*ctx, 18, K_SYNC_SENTINEL_S2);
++        setRegU32(*ctx, 19, K_SYNC_SENTINEL_S3);
++        ctx->pc = K_SYNC_OVERRIDE_RESUME;
++        runtime->handleSyscall(rdram, ctx, K_SYNC_OVERRIDE_SYSCALL);
++        // Unreachable in a correct run: the driver re-enters at K_SYNC_OVERRIDE_RESUME instead.
++        ++gSyncPostSyscallRan;
++    }
++
++    // The resume entry: everything after the call, which is the part that dies when the frame is
++    // lost.
++    void syncOverrideResume(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    {
++        ++gSyncPostSyscallRan;
++        gSyncCallerV0 = getRegU32(ctx, 2);
++        gSyncCallerS2 = getRegU32(ctx, 18);
++        gSyncCallerS3 = getRegU32(ctx, 19);
++        ctx->pc = 0u;
++    }
++
++    // ---------------------------------------------------------------- G1.8c
++    //
++    // W6, measured on GT4: pc=0x01000008, distinct_pcs=1, 24 repeats, and sce_SetupHeap /
++    // sce_SetupThread / sce_CreateSema called 25 times each. 0x01000008 is the ELF ENTRY POINT, and
++    // a guest loop does not re-initialise its own heap. The guest is being restarted from its entry
++    // instead of resumed at the PC each frame published for itself.
++    //
++    // The shape below is that bug, made deterministic: a chain of frames, each of which publishes
++    // the next resume PC and then makes an overridden syscall. Resume correctly and the entry runs
++    // ONCE. Resume at the entry and it runs once per link, forever -- which is exactly the shape in
++    // the boot log.
++    //
++    // It also asserts WHICH context the resume PC came from, so this is a mechanism test and not a
++    // symptom test: the resume PC must be the one the frame published into the driver's own context,
++    // and GuestThread::context (the scheduler's private copy) must not be the source.
++
++    constexpr uint32_t K_CHAIN_ENTRY = 0x300800u;
++    constexpr uint32_t K_CHAIN_LINK0 = 0x300808u;
++    constexpr uint32_t K_CHAIN_LINK1 = 0x300810u;
++    constexpr uint32_t K_CHAIN_LINK2 = 0x300818u;
++    constexpr uint32_t K_CHAIN_TAIL = 0x300820u;
++    constexpr uint32_t K_CHAIN_SYSCALL = 0x96u;
++    constexpr uint32_t K_CHAIN_RESULT = 0x0BADCAFEu;
++    constexpr int K_CHAIN_LINKS = 3;
++    constexpr uint32_t K_CHAIN_S2_SEED = 0xAAAA0002u;
++    constexpr uint32_t K_CHAIN_S3_SEED = 0xBBBB0003u;
++
++    uint32_t gChainEntryEntries = 0u;
++    uint32_t gChainLinkEntries = 0u;
++    uint32_t gChainTailEntries = 0u;
++    uint32_t gChainHandlerRan = 0u;
++    uint32_t gChainV0s = 0u;
++    std::vector<uint32_t> gChainResumePcs;
++    uint32_t gChainSentinelS2 = 0u;
++    uint32_t gChainSentinelS3 = 0u;
++    uint32_t gChainS2Seed = K_CHAIN_S2_SEED;
++    uint32_t gChainS3Seed = K_CHAIN_S3_SEED;
++
++    void chainOverrideHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    {
++        ++gChainHandlerRan;
++        setReturnU32(ctx, K_CHAIN_RESULT);
++        ctx->pc = getRegU32(ctx, 31); // jr $ra
++    }
++
++    // One link. Every frame in the chain is the same code: publish the next resume PC, make the
++    // overridden syscall, and let the driver re-enter at what was published. The next resume PC is
++    // handed in through $a3, which no part of the chain clobbers, so the chain is data-driven and
++    // there is no per-link copy of this function to go stale.
++    void chainLink(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        ++gChainLinkEntries;
++        const uint32_t nextResume = getRegU32(ctx, 7); // $a3 = where to resume
++        ctx->pc = nextResume;
++        runtime->handleSyscall(rdram, ctx, K_CHAIN_SYSCALL);
++        // Unreachable when the driver honours the published PC. Reaching here at all means the
++        // frame was restarted rather than resumed, which is the wall.
++        gChainResumePcs.push_back(ctx->pc);
++    }
++
++    void chainEntry(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        ++gChainEntryEntries;
++        // Seeded ONCE, here, and never again. The tail proves they survived every subsequent link,
++        // so a frame that lost them mid-chain is caught rather than re-seeding over the evidence.
++        setRegU32(*ctx, 18, K_CHAIN_S2_SEED);
++        setRegU32(*ctx, 19, K_CHAIN_S3_SEED);
++        setRegU32(*ctx, 7, K_CHAIN_LINK0);
++        chainLink(rdram, ctx, runtime);
++    }
++
++    void chainLink0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        setRegU32(*ctx, 7, K_CHAIN_LINK1);
++        chainLink(rdram, ctx, runtime);
++    }
++
++    void chainLink1(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        setRegU32(*ctx, 7, K_CHAIN_LINK2);
++        chainLink(rdram, ctx, runtime);
++    }
++
++    void chainLink2(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        setRegU32(*ctx, 7, K_CHAIN_TAIL);
++        chainLink(rdram, ctx, runtime);
++    }
++
++    void chainTail(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    {
++        ++gChainTailEntries;
++        gChainV0s = getRegU32(ctx, 2);
++        gChainSentinelS2 = getRegU32(ctx, 18);
++        gChainSentinelS3 = getRegU32(ctx, 19);
++        ctx->pc = 0u;
++    }
++
++    // Drives guest code the way a driver that is not EeScheduler::run() has to. The scheduler's
++    // transfer signal is the documented way to reach the dispatcher; the driver's OBLIGATION on
++    // catching it is to let the scheduler service the invocation the guest just queued. Forgetting
++    // that second half is G1.8's wall: the syscall never returns a value, the caller's saved
++    // registers are lost, and hasInvocation() latches so every later call falls through to the
++    // builtin. tools/harness/vulcan4_harness.cpp is such a driver and now calls serviceInvocations.
++    bool driveGuestLikeTheHarness(PS2Runtime &runtime, R5900Context &ctx, uint8_t *rdram, int stepCap)
++    {
++        for (int step = 0; step < stepCap; ++step)
++        {
++            if (ctx.pc == 0u || runtime.isStopRequested())
++            {
++                return true;
++            }
++            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(ctx.pc);
++            if (fn == nullptr)
++            {
++                return false;
++            }
++            try
++            {
++                fn(rdram, &ctx, &runtime);
++            }
++            catch (const EeDispatcherTransfer &)
++            {
++                ++gSyncEscapedTransfers;
++                // The obligation. The signal means "I queued something; come and run it".
++                runtime.eeScheduler().serviceInvocations();
++            }
++        }
++        return false;
++    }
+ }
+ 
+ void register_ps2_runtime_kernel_tests()
+@@ -1187,9 +1385,14 @@ void register_ps2_runtime_kernel_tests()
+ 
+             t.IsTrue(callSyscall(0x83u, env.rdram.data(), &env.ctx, &env.runtime),
+                      "syscall 0x83 should dispatch");
++            // UPDATED in goal G1.3b: the result is canonicalised into the KSEG1 (uncached)
++            // window, 0x80000000 | physical, so that the syscall-table arithmetic a real guest
++            // performs on it is well defined. GT4 recovers the console kernel's syscall table
++            // base by subtracting n*4 from the address it gets back, and that only closes if
++            // every hit is reported in one family. See docs/FIRST-BOOT.md section 11.
+             t.Equals(static_cast<uint32_t>(getRegS32(env.ctx, 2)),
+-                     kTableBase + 4u,
+-                     "FindAddress should return address of first matching word");
++                     0x80000000u | (kTableBase + 4u),
++                     "FindAddress should return the KSEG1 address of the first matching word");
+         });
+ 
+         tc.Run("numeric syscall 0x83 supports KSEG aliases", [](TestCase &t)
+@@ -1231,9 +1434,19 @@ void register_ps2_runtime_kernel_tests()
+ 
+             t.IsTrue(callSyscall(0x83u, env.rdram.data(), &env.ctx, &env.runtime),
+                      "syscall 0x83 should dispatch");
++
++            // UPDATED in goal G1.3. This used to assert 0.
++            //
++            // The miss return value is the END of the search window, not zero. The authority is
++            // the copy of this exact algorithm that Gran Turismo 4 carries inlined at guest
++            // 0x010285F8, which ends with `move v0,a0` after the cursor has stepped past the end
++            // of the window. It is not a matter of taste: GT4 converges two scans with
++            // `while (prev - 0x20C != cur - 0x168)`, and a zero return makes that comparison
++            // unreachable, so the guest re-issued the same failing search forever -- 103 identical
++            // calls in a 200 s run with functions_entered stuck at 3.
+             t.Equals(static_cast<uint32_t>(getRegS32(env.ctx, 2)),
+-                     0u,
+-                     "FindAddress should return 0 when no matching word exists");
++                     kTableBase + static_cast<uint32_t>(sizeof(kValues)),
++                     "FindAddress should return the end of the window when nothing matches");
+         });
+ 
+         tc.Run("SetSyscall mirrors guest kernel table entries into low memory", [](TestCase &t)
+@@ -1465,7 +1678,7 @@ void register_ps2_runtime_kernel_tests()
+             env.runtime.eeScheduler().run();
+ 
+             t.Equals(static_cast<uint32_t>(getRegS32(gOverrideResult, 2)),
+-                     kTableBase + 4u,
++                     0x80000000u | (kTableBase + 4u),
+                      "only the recursive call should bypass the active override frame and reach the builtin");
+         });
+ 
+@@ -1494,6 +1707,254 @@ void register_ps2_runtime_kernel_tests()
+                      "the invocation result should reach the preserved base context after the wait");
+         });
+ 
++        tc.Run("G1.8b: a non-scheduler driver honours an overridden syscall without losing the guest frame",
++               [](TestCase &t)
++        {
++            // The contract, stated exactly. The transfer DOES leave the guest's frame -- that is
++            // the documented signal, and an override is deferred by design because a handler may
++            // block. What must not happen is the driver re-entering the guest WITHOUT letting the
++            // scheduler service the queued invocation. That is what lost GT4's $s2/$s3.
++            TestEnv env;
++            env.runtime.registerFunction(K_SYNC_OVERRIDE_HANDLER, syncOverrideHandler);
++            env.runtime.registerFunction(K_SYNC_OVERRIDE_CALLER, syncOverrideCaller);
++            env.runtime.registerFunction(K_SYNC_OVERRIDE_RESUME, syncOverrideResume);
++            env.runtime.setEeSyscallOverride(env.rdram.data(),
++                                             K_SYNC_OVERRIDE_SYSCALL,
++                                             K_SYNC_OVERRIDE_HANDLER);
++
++            gSyncHandlerRan = 0u;
++            gSyncEscapedTransfers = 0u;
++            gSyncCallerV0 = K_SYNC_UNSET;
++            gSyncCallerS2 = K_SYNC_UNSET;
++            gSyncCallerS3 = K_SYNC_UNSET;
++            gSyncPostSyscallRan = 0u;
++
++            env.runtime.cpu().pc = K_SYNC_OVERRIDE_CALLER;
++            // The driver's context is runtime.cpu(), NOT a private one: that is the object
++            // serviceInvocations() publishes the resumed main thread into, and it is what
++            // tools/harness/vulcan4_harness.cpp drives. A driver holding its own copy is the same
++            // class of bug -- it would read a context nobody ever writes back.
++            const bool drove = driveGuestLikeTheHarness(env.runtime,
++                                                        env.runtime.cpu(),
++                                                        env.rdram.data(),
++                                                        16);
++
++            t.IsTrue(drove, "the driver should reach the caller's completion (ctx.pc == 0)");
++            t.Equals(gSyncHandlerRan, 1u, "the installed override handler should have run exactly once");
++            t.Equals(gSyncPostSyscallRan, 1u,
++                     "the caller must resume after its overridden syscall instead of being unwound");
++            t.Equals(gSyncCallerV0, K_SYNC_OVERRIDE_RESULT,
++                     "the handler's return value must reach the caller in $v0");
++            t.Equals(gSyncCallerS2, K_SYNC_SENTINEL_S2,
++                     "$s2 must survive the overridden syscall (GT4's convergence loop lost it here)");
++            t.Equals(gSyncCallerS3, K_SYNC_SENTINEL_S3,
++                     "$s3 must survive the overridden syscall (GT4's convergence loop lost it here)");
++            t.IsTrue(!env.runtime.eeScheduler().hasInvocation(GuestInvocationKind::SyscallOverride,
++                                                               K_SYNC_OVERRIDE_SYSCALL),
++                     "MECHANISM: the invocation must not be left stranded. A stranded one makes "
++                     "hasInvocation() latch, so every later call of that syscall silently falls "
++                     "through to our builtin instead of the guest's own code.");
++        });
++
++        tc.Run("G1.8b: the guest's s-registers are not reset every third overridden syscall",
++               [](TestCase &t)
++        {
++            // The counter shape, and the one that actually bit. GT4's loop is
++            //   s3 = FindAddress(...); s1 = s3 - 0x20C; s2 = FindAddress(...); s0 = s2 - 0x168;
++            // repeating until s1 == s0. Both pointers have to be live at the same instant or the
++            // loop can never converge. So: make N overridden syscalls from one guest frame and
++            // require the frame to be intact after every one of them.
++            TestEnv env;
++            env.runtime.registerFunction(K_SYNC_OVERRIDE_HANDLER, syncOverrideHandler);
++            env.runtime.registerFunction(K_SYNC_OVERRIDE_CALLER, syncOverrideCaller);
++            env.runtime.registerFunction(K_SYNC_OVERRIDE_RESUME, syncOverrideResume);
++            env.runtime.setEeSyscallOverride(env.rdram.data(),
++                                             K_SYNC_OVERRIDE_SYSCALL,
++                                             K_SYNC_OVERRIDE_HANDLER);
++
++            constexpr int kSyscalls = 6;
++            for (int i = 0; i < kSyscalls; ++i)
++            {
++                gSyncHandlerRan = 0u;
++                gSyncEscapedTransfers = 0u;
++                gSyncCallerV0 = K_SYNC_UNSET;
++                gSyncCallerS2 = K_SYNC_UNSET;
++                gSyncCallerS3 = K_SYNC_UNSET;
++                gSyncPostSyscallRan = 0u;
++
++                env.runtime.cpu().pc = K_SYNC_OVERRIDE_CALLER;
++                const bool drove = driveGuestLikeTheHarness(env.runtime, env.runtime.cpu(), env.rdram.data(), 16);
++
++                std::ostringstream tag;
++                tag << " (call " << (i + 1) << " of " << kSyscalls << ")";
++                const std::string at = tag.str();
++
++                std::ostringstream m1;
++                m1 << "the driver should complete the guest frame" << at;
++                t.IsTrue(drove, m1.str().c_str());
++
++                std::ostringstream m2;
++                m2 << "the override handler must run on every call, not only the first" << at;
++                t.Equals(gSyncHandlerRan, 1u, m2.str().c_str());
++
++                std::ostringstream m3;
++                m3 << "the caller must resume after its overridden syscall" << at;
++                t.Equals(gSyncPostSyscallRan, 1u, m3.str().c_str());
++
++                std::ostringstream m4;
++                m4 << "$v0 must hold the handler result" << at;
++                t.Equals(gSyncCallerV0, K_SYNC_OVERRIDE_RESULT, m4.str().c_str());
++
++                std::ostringstream m5;
++                m5 << "$s2 must survive" << at;
++                t.Equals(gSyncCallerS2, K_SYNC_SENTINEL_S2, m5.str().c_str());
++
++                std::ostringstream m6;
++                m6 << "$s3 must survive" << at;
++                t.Equals(gSyncCallerS3, K_SYNC_SENTINEL_S3, m6.str().c_str());
++
++                std::ostringstream m7;
++                m7 << "no invocation may be left stranded" << at;
++                t.IsTrue(!env.runtime.eeScheduler().hasInvocation(GuestInvocationKind::SyscallOverride,
++                                                                   K_SYNC_OVERRIDE_SYSCALL),
++                         m7.str().c_str());
++            }
++        });
++
++        tc.Run("G1.8c: a frame chain is entered once, and resumes at each frame's own published PC",
++               [](TestCase &t)
++        {
++            // W6. The guest re-enters the ELF entry point instead of resuming, so it re-runs its own
++            // CRT init forever. Asserted here as: the entry runs ONCE across a chain of overridden
++            // syscalls, and each frame resumes at the PC it published -- not at the entry, and not
++            // from the scheduler's private copy of the context.
++            TestEnv env;
++            env.runtime.registerFunction(0x300900u, chainOverrideHandler);
++            env.runtime.registerFunction(K_CHAIN_ENTRY, chainEntry);
++            env.runtime.registerFunction(K_CHAIN_LINK0, chainLink0);
++            env.runtime.registerFunction(K_CHAIN_LINK1, chainLink1);
++            env.runtime.registerFunction(K_CHAIN_LINK2, chainLink2);
++            env.runtime.registerFunction(K_CHAIN_TAIL, chainTail);
++            env.runtime.setEeSyscallOverride(env.rdram.data(), K_CHAIN_SYSCALL, 0x300900u);
++
++            gChainEntryEntries = 0u;
++            gChainLinkEntries = 0u;
++            gChainTailEntries = 0u;
++            gChainHandlerRan = 0u;
++            gChainV0s = 0u;
++            gChainSentinelS2 = 0u;
++            gChainSentinelS3 = 0u;
++            gChainResumePcs.clear();
++
++            env.runtime.cpu().pc = K_CHAIN_ENTRY;
++            const bool drove = driveGuestLikeTheHarness(env.runtime,
++                                                        env.runtime.cpu(),
++                                                        env.rdram.data(),
++                                                        256);
++
++            std::ostringstream detail;
++            detail << "entry=" << gChainEntryEntries
++                   << " links=" << gChainLinkEntries
++                   << " tail=" << gChainTailEntries
++                   << " handler=" << gChainHandlerRan
++                   << " restarted_inside_link=" << gChainResumePcs.size()
++                   << " v0=0x" << std::hex << gChainV0s
++                   << " s2=0x" << gChainSentinelS2
++                   << " s3=0x" << gChainSentinelS3 << std::dec;
++
++            t.IsTrue(drove, ("the driver must reach the end of the chain" + detail.str()).c_str());
++            t.IsTrue(gChainTailEntries == 1u,
++                     ("the chain must run to its tail exactly once" + detail.str()).c_str());
++
++            // THE assertion. Today the entry is entered once per link.
++            t.IsTrue(gChainEntryEntries == 1u,
++                     ("MECHANISM: the entry point must be entered exactly ONCE across a chain of "
++                      "overridden syscalls; being re-entered once per link is GT4 re-running its own "
++                      "CRT init forever"
++                      + detail.str())
++                         .c_str());
++
++            // And the links themselves, once each -- no skipped link, no repeated one.
++            // The entry frame also makes one syscall, so a correct run has K_CHAIN_LINKS + 1.
++            const uint32_t expectedLinks = static_cast<uint32_t>(K_CHAIN_LINKS) + 1u;
++            t.IsTrue(gChainLinkEntries == expectedLinks,
++                     ("each of the " + std::to_string(K_CHAIN_LINKS)
++                      + " links plus the entry must make exactly one syscall each"
++                      + detail.str())
++                         .c_str());
++
++            // Which context the resume PC came from. If the driver re-entered at a PC held in the
++            // scheduler's private copy rather than the one the frame published into
++            // PS2Runtime::m_cpuContext, the entry is what you get.
++            t.IsTrue(gChainResumePcs.empty(),
++                     ("no frame may be restarted from inside a link: a frame that publishes a resume "
++                      "PC and then keeps executing in the same invocation was never resumed"
++                      + detail.str())
++                         .c_str());
++
++            // The value and the registers still have to survive the chain, or the fix bought
++            // correctness of PC with loss of state.
++            t.Equals(gChainHandlerRan, static_cast<uint32_t>(K_CHAIN_LINKS) + 1u,
++                     "the override handler must run once per syscall in the chain");
++            t.Equals(gChainV0s, K_CHAIN_RESULT,
++                     "$v0 must carry the handler result to the tail of the chain");
++            t.Equals(gChainSentinelS2, K_CHAIN_S2_SEED,
++                     "$s2, seeded once at the entry, must survive every link of the chain");
++            t.Equals(gChainSentinelS3, K_CHAIN_S3_SEED,
++                     "$s3, seeded once at the entry, must survive every link of the chain");
++        });
++
++        tc.Run("G1.8e: a heap configured with a real limit is not zero-length", [](TestCase &t)
++        {
++            // W7, eight measurement passes down. GT4 calls sce_SetupHeap(0x010519AC, 0xFFFFFFFF)
++            // and the log line is:
++            //   [SetupHeap] base=0x10519ac alignedBase=0x10519b0 size=0xffffffff
++            //               runtimeBase=0x10519b0 runtimeEnd=0x10519b0
++            // base == end. The heap has NO room, so every allocation the guest makes walks off a
++            // ceiling that never moves, and the copy loop at 0x0100f800 gets an inverted range
++            // (start=0x01051A40, end=0x01051A3F) on the very first call.
++            //
++            // This asserts the heap is usable on its own terms, with no game and no ELF. A
++            // configured heap whose end equals its base is a zero-length heap: nothing can ever be
++            // allocated from it, and no guest could make progress. It is a bug before GT4 is
++            // considered.
++            TestEnv env;
++            constexpr uint32_t kBase = 0x010519B0u;
++            constexpr uint32_t kLimit = 0x01F00000u;
++
++            env.runtime.configureGuestHeap(kBase, kLimit);
++
++            t.IsTrue(env.runtime.guestHeapLimit() > kBase,
++                     "a configured heap must have a limit above its base");
++            t.IsTrue(env.runtime.guestHeapEnd() > env.runtime.guestHeapBase(),
++                     "MECHANISM: a heap whose end equals its base has zero length, so every "
++                     "allocation fails or overruns and no guest can make progress. The end must "
++                     "start at or above the base, not pinned to it.");
++            t.IsTrue(env.runtime.guestHeapLimit() >= env.runtime.guestHeapEnd(),
++                     "the limit must not be below the current end");
++        });
++
++        tc.Run("G1.8e: SetupHeap(-1) gives a heap with room, not a zero-length one", [](TestCase &t)
++        {
++            // The exact call GT4 makes, through the real syscall path, so the handler's own
++            // special-casing of 0xFFFFFFFF is covered and not just the runtime's setter.
++            TestEnv env;
++            R5900Context ctx{};
++            ctx.pc = 0x1000u;
++            setRegU32(ctx, 4, 0x010519ACu); // $a0 = heap base (as GT4 passes it)
++            setRegU32(ctx, 5, 0xFFFFFFFFu); // $a1 = -1, "rest of RAM"
++
++            dispatchNumericSyscall(0x3Du, env.rdram.data(), &ctx, &env.runtime);
++
++            t.IsTrue(env.runtime.guestHeapLimit() > 0x010519B0u,
++                     "-1 must mean rest-of-RAM, i.e. a limit far above the base, not a zero-length heap");
++            t.IsTrue(env.runtime.guestHeapEnd() > env.runtime.guestHeapBase(),
++                     "after SetupHeap(-1) the heap must have room; today end == base and the guest "
++                     "cannot allocate anything at all");
++            t.IsTrue(env.runtime.guestHeapEnd() <= env.runtime.guestHeapLimit(),
++                     "the end must stay within the limit");
++        });
++
+         tc.Run("exit handlers run as ordered invocation frames before the thread becomes dormant", [](TestCase &t)
+         {
+             TestEnv env;
+diff --git a/ps2xTest/src/ps2_runtime_progress_tests.cpp b/ps2xTest/src/ps2_runtime_progress_tests.cpp
+new file mode 100644
+index 0000000..b08dd30
+--- /dev/null
++++ b/ps2xTest/src/ps2_runtime_progress_tests.cpp
+@@ -0,0 +1,174 @@
++#include "MiniTest.h"
++
++#include "ps2_guest_progress.h"
++
++#include <cstdint>
++#include <vector>
++
++// ---------------------------------------------------------------------------
++// G1.8f: the no-progress detector must be able to tell a CONVERGING loop from a
++// HANG, and it can only do that if it is told about progress the PC stream
++// cannot show.
++//
++// The R5900's tight loops are the game's normal workload: a rasteriser walking a
++// glyph row, a physics step, a decompressor. Those loops revisit EXACTLY the same
++// addresses while they converge, so "this PC cycle repeated" is NOT evidence of a
++// hang -- it is evidence of a loop, which may be converging or may not. Telling
++// those two apart needs a signal outside the PC stream: the guest reaching NEW
++// CODE, or the guest touching the hardware.
++//
++// W7 was this exact bug: the harness declared guest_cycle_no_progress on a
++// converging copy loop and stopped the boot at functions_entered=95. With the
++// detector taught the difference, the same boot reaches 440,483 entries.
++// ---------------------------------------------------------------------------
++
++namespace
++{
++    // The PC stream of a converging loop: the same four addresses, over and over,
++    // while the loop counter walks towards its bound.
++    std::vector<uint32_t> convergingLoopStream(std::size_t iterations)
++    {
++        std::vector<uint32_t> pcs;
++        pcs.reserve(iterations * 4u);
++        for (std::size_t i = 0; i < iterations; ++i)
++        {
++            pcs.push_back(0x0100F800u); // loop body
++            pcs.push_back(0x0100F804u); // cursor++
++            pcs.push_back(0x0100F808u); // compare and branch back
++            pcs.push_back(0x0100F864u); // outer test
++        }
++        return pcs;
++    }
++}
++
++void register_ps2_runtime_progress_tests()
++{
++    MiniTest::Case("PS2RuntimeProgress", [](TestCase &tc)
++    {
++    tc.Run("G1.8f: a converging loop that revisits one PC cycle is NOT a hang", [](TestCase &t)
++    {
++        // This is the W7 shape: a tight loop that runs long enough to look like a
++        // cycle, but converges. The guest reaches new code between stretches of
++        // the loop, so no stretch may be called a hang.
++        PS2GuestProgress progress;
++        progress.setHangThreshold(24u);
++
++        const std::vector<uint32_t> pcs = convergingLoopStream(200u);
++        bool everReportedHang = false;
++        for (std::size_t i = 0; i < pcs.size(); ++i)
++        {
++            // Repeats accumulate once per executed INSTRUCTION (every address in
++            // the cycle recurs within it), not once per pass. So progress has to
++            // arrive inside a threshold window of instructions, and the harness
++            // supplies it when the guest enters code it has not run before.
++            const bool reachedNewCode = (i % 8u) == 0u;
++            if (progress.observe(pcs[i], reachedNewCode))
++            {
++                everReportedHang = true;
++                break;
++            }
++        }
++
++        t.IsFalse(everReportedHang,
++                  "MECHANISM: a PC cycle repeating is not a hang. A converging loop "
++                  "revisits the same addresses while it converges, and calling that "
++                  "no-progress stops a boot that is about to make more progress. A "
++                  "hang is a cycle that repeats with NO new code and NO hardware "
++                  "access anywhere inside it.");
++    });
++
++    tc.Run("G1.8f: a genuine hang is still reported, and named with its first PC", [](TestCase &t)
++    {
++        // Same PC stream, but now the guest never reaches new code: this is the
++        // real hang, and the detector must still catch it.
++        PS2GuestProgress progress;
++        progress.setHangThreshold(24u);
++
++        const std::vector<uint32_t> pcs = convergingLoopStream(400u);
++        bool reportedHang = false;
++        uint32_t firstPc = 0;
++        for (const uint32_t pc : pcs)
++        {
++            if (progress.observe(pc, /*reachedNewCode=*/false))
++            {
++                reportedHang = true;
++                firstPc = progress.hangFirstPc();
++                break;
++            }
++        }
++
++        t.IsTrue(reportedHang,
++                 "a PC cycle that repeats thousands of times with no new code and no "
++                 "hardware access IS a hang, and must still be caught");
++        t.Equals(firstPc, 0x0100F800u,
++                 "the reported first PC must be the first address of the cycle, so the "
++                 "wall can be read straight off the report");
++    });
++
++    tc.Run("G1.8f: W7's measured shape -- a loop running 193 times per call -- is not a hang", [](TestCase &t)
++    {
++        // This is the shape that actually stopped the boot, measured at W7: one
++        // guest function call runs its copy loop ~193 times before it returns, so
++        // a caller's return is a rare event and the threshold must clear it.
++        // Tripping here is what halted the boot at functions_entered=95.
++        PS2GuestProgress progress;
++        progress.setHangThreshold(4096u);
++
++        const std::vector<uint32_t> pcs = convergingLoopStream(100000u);
++        bool reportedHang = false;
++        for (std::size_t call = 0; call < 1000u && !reportedHang; ++call)
++        {
++            // Each "call" runs 193 loop passes, then the guest reaches new code.
++            const std::size_t passesPerCall = 193u;
++            for (std::size_t p = 0; p < passesPerCall; ++p)
++            {
++                const std::size_t base = (call * passesPerCall + p) * 4u;
++                if (base + 3u >= pcs.size())
++                {
++                    break;
++                }
++                if (progress.observe(pcs[base + 0u], false) ||
++                    progress.observe(pcs[base + 1u], false) ||
++                    progress.observe(pcs[base + 2u], false) ||
++                    progress.observe(pcs[base + 3u], true))
++                {
++                    reportedHang = true;
++                    break;
++                }
++            }
++        }
++
++        t.IsFalse(reportedHang,
++                  "MECHANISM: one guest call running ~193 loop passes before it returns "
++                  "must not be called a hang. The return is the only progress signal, so "
++                  "the threshold has to clear a full call's internal loops -- which is "
++                  "exactly what 24 did not do, and exactly why the boot stopped at 95.");
++    });
++
++    tc.Run("G1.8f: reaching new code resets the cycle, so a long run is not a hang", [](TestCase &t)
++    {
++        // A guest that always reaches new code must never be reported as hung, no
++        // matter how many times it cycles. This is the property that keeps GT4's
++        // own loops from being mistaken for hangs.
++        PS2GuestProgress progress;
++        progress.setHangThreshold(24u);
++
++        const std::vector<uint32_t> pcs = convergingLoopStream(5000u);
++        uint64_t firstHangAt = 0;
++        for (std::size_t i = 0; i < pcs.size(); ++i)
++        {
++            if (progress.observe(pcs[i], /*reachedNewCode=*/true))
++            {
++                firstHangAt = i;
++                break;
++            }
++        }
++
++        t.Equals(firstHangAt, 0ull,
++                 "a guest that keeps reaching new code must never be reported hung. "
++                 "GT4 spends most of its time in tight loops that revisit one PC cycle "
++                 "hundreds of times while converging, so a detector that calls that a "
++                 "hang ends the boot inside the game's normal work.");
++    });
++    });
++}

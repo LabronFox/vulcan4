@@ -2177,6 +2177,14 @@ Three things are now in place so this cannot recur:
 
 ### Next, in order
 
+**How this list is used (added 2026-10-01, the captain's instruction: "don't you want him to work for
+hours?"):** work items **in order**, one at a time. Items **1–3 are the CPU lane** (the live wall,
+W15). Items **4–6 are independent lanes** — they do not wait on W15, and they exist so a night cannot
+be wasted by one wall stalling. **If you are genuinely blocked on an item, write the blocker down in
+this file and move to the next item.** Do not pad the list, do not invent work, and do not mark the
+goal complete unless the evidence matches the goal's own words — if the goal says "a frame", a frame
+is what the log must show, not adjacent progress.
+
 1. `requestPreemptionIfHigher` with `<=`, **plus** `hasReadyAtOrAbovePriority` scanning upward, as
    one change — they are a pair, and neither was tested correctly on its own. Red first, and the
    three failing tests above are the gate: if the pair does not turn them green, the pair is wrong.
@@ -2184,3 +2192,22 @@ Three things are now in place so this cannot recur:
    `sce_ChangeThreadPriority`. `distinct_pcs` and `sce_SleepThread` are the numbers to watch.
 3. Only after that: why does `sub_01011508` walk a list at all, and what is `func_101F350`? It is
    called once per node and is the last unexplained thing in the loop.
+
+**— independent lanes below: these do not wait on 1–3 —**
+
+4. **The GS can draw a *texture*, not just a flat triangle.** This is the single most valuable
+   unblocked item on the board: the menu is 2D *textured* art, and our GS has only ever drawn computed
+   geometry (`triangle.png`, 39,936 px). Prove the palette/CLUT + swizzle path against **the game's own
+   texture data** — no synthetic gradients, no invented formats. **Gate:** a PNG whose pixels come
+   from a real GT4 texture on the disc, with the source texture's offset, dimensions **and format
+   named** in the entry. Report the path; do not read the image into context (law 9).
+5. **Pad input, the read path.** `PADMAN` is load-emulated (W11), so the module exists — now prove a
+   press reaches the guest. **Gate:** a test that drives a synthetic button press through our pad path
+   and asserts the guest's *own read* returns the mapped bit, with the pad config source (the game's
+   own mapping, not ours) named. Stage 1 milestone 4 is "a gamepad works" — this is its first honest step.
+6. **The `sceGs*` static inventory.** The live boot calls none of them, so it can only come from static
+   analysis. **Gate:** the list produced with addresses, cross-checked against the 197 SCE functions
+   that still have no runtime handler, appended to the docs. This is `docs/GS-PLAN.md`'s missing half.
+
+If all six are done, re-read `docs/CAMPAIGN.md` and append a new list — **but never invent work: every
+item must name its gate, and any item you cannot gate does not belong on this list.**

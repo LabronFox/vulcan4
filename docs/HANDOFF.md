@@ -261,3 +261,46 @@ MEASURED (suite): **450/450**. MEASURED (boot): `functions_entered=95 halt=guest
         bios_files=0`. **Campaign goal NOT reached — `VULCAN4 FRAME source=guest` never printed.**
 MEASURED (artifact): probes removed, generated unit rebuilt clean (0 `fprintf`).
         Addenda 1–7 in `.auto/queue/33-g18d-gs-store-loop.txt`.
+
+## 2026-09-30 19:35 · 33-g18d-gs-store-loop · **W7 CLOSED — the end bound exists nowhere**
+
+WALL:   W7. **CLOSED.** I ran the memory scan I recommended in the previous handoff instead of only
+        writing it down, and it answered the question seven function-by-function passes had not.
+MEASURED:
+        ```
+        VULCAN4 W7SCAN start 0x1051a40 at 0x1047a8c      <- live BSS global
+        VULCAN4 W7SCAN start 0x1051a40 at 0x1ffceec      <- the struct slot
+        VULCAN4 W7SCAN end   0x1051a3f at 0x1ffc870      <- STACK
+        VULCAN4 W7SCAN end   0x1051a3f at 0x1ffcef4      <- STACK (the struct slot the loop reads)
+        VULCAN4 W7SCAN total start=2 end=2
+        ```
+        - **Two occurrences of each value in all 32 MB of RDRAM.** Not 87 candidate sites.
+        - The start has exactly one home in guest data: a **lone non-zero word in a field of zeros**
+          at `0x01047A8C`, inside BSS, so a runtime variable. One instruction reads it:
+          `0x1000ae0: lw $v1,0x7A8C($v0)`. It is the guest's buffer cursor.
+        - **The end value `0x01051A3F` appears NOWHERE in the code** — `grep` over the whole
+          707-function translation unit returns **0**. Not a static initialiser. In RDRAM it exists
+          at two addresses, **both on the stack.**
+        - **Therefore: the inverted range is the ABSENCE of a value, not a wrong computation.** The
+          struct is filled at `0x1010a48`–`0x1010a6c`; the `0x24` slot was never written, and the
+          loop is reading a stale stack leftover as its end pointer. That is why `$s7` advances while
+          `$fp` never moves.
+NEXT:   **This is now a control-flow question, not a data question.**
+        1. **Dump all eight struct slots at the call** (`0x0,0x8,0xc,0x10,0x18,0x20,0x24`) and see
+           which are stale. If `0x24` is the only one never freshly written, the fill is short-
+           circuiting.
+        2. **Most likely shape, check it first:** a syscall or `EeDispatcherTransfer` thrown between
+           `0x1010a40` (`jal func_100EDC8`) and `0x1010a6c` (`sw $fp,0x24($s0)`) would leave the
+           struct **half-filled** — exactly what a stale `0x24` beside a fresh `0x20` looks like.
+           `$fp` callee-saved and `$s7` fresh is the signature of a frame abandoned between two
+           stores. **Check that `jal`'s return PC.**
+        3. Only if 1 and 2 are negative: the fill is guarded by a condition that evaluated false.
+        **The red test, now easy to state and still owed:** a transfer thrown between two stores into
+        the same struct must leave it visibly half-written, and the harness must report that rather
+        than let the guest spin on the stale half. That is a test about the *driver*.
+        Method note, the second time this session: addendum 7 said scan instead of walking. **One
+        scan closed what seven passes had not.** When a value is wrong, find ALL its occurrences
+        before tracing any single use — a wrong value has one producer, an ABSENT value has none.
+MEASURED (suite): **450/450**. MEASURED (boot): `functions_entered=95 halt=guest_cycle_no_progress
+        bios_files=0`. **Campaign goal NOT reached — `VULCAN4 FRAME source=guest` never printed.**
+        Addenda 1–8 in `.auto/queue/33-g18d-gs-store-loop.txt`.

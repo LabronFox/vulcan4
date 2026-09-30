@@ -885,6 +885,71 @@ int main(int argc, char *argv[])
                              std::chrono::steady_clock::now() - start)
                              .count();
 
+    // ------------------------------------------------------------------ W7 value scan
+    //
+    // Seven measurement passes established that W7's copy loop is innocent and that its END POINTER
+    // is $fp, whose callee-saved stack slot already holds 0x01051A3F when sub_0100EDC8 is entered.
+    // The writer is therefore upstream of every function looked at so far. Walking forward one
+    // function per pass is how seven passes produced no writer, so this asks the question that would
+    // have answered it in one: WHERE do the start and the end value first appear in RDRAM?
+    //
+    // Printed only when the guest actually stalled with the inverted range, so it costs nothing on a
+    // run that gets past it. Both values are reported with their address, and adjacency is the thing
+    // to look for: 0x01051A3F is exactly 0x01051A40 - 1, so if they sit next to each other in one
+    // table, that table is the producer and the loop is only a symptom of reading it.
+    {
+        constexpr uint32_t kW7Start = 0x01051A40u;
+        constexpr uint32_t kW7End = 0x01051A3Fu;
+        constexpr int kMaxHits = 48;
+        int startHits = 0;
+        int endHits = 0;
+        for (uint32_t off = 0; off + 4u <= PS2_RAM_SIZE; off += 4u)
+        {
+            uint32_t word = 0u;
+            std::memcpy(&word, rdram + off, sizeof(word));
+            if (word == kW7Start)
+            {
+                if (startHits < kMaxHits)
+                {
+                    std::cout << "VULCAN4 W7SCAN start 0x" << std::hex << word << " at 0x" << off
+                              << std::dec << "\n";
+                }
+                ++startHits;
+            }
+            else if (word == kW7End)
+            {
+                if (endHits < kMaxHits)
+                {
+                    std::cout << "VULCAN4 W7SCAN end   0x" << std::hex << word << " at 0x" << off
+                              << std::dec << "\n";
+                }
+                ++endHits;
+            }
+        }
+        std::cout << "VULCAN4 W7SCAN total start=" << startHits << " end=" << endHits
+                  << " (capped at " << kMaxHits << " printed each)\n";
+
+        // The one non-stack home of the start value is a live BSS variable. Its neighbours are
+        // where the matching END should be, so print them: if the buffer is described by a pair,
+        // the pair is visible here, and if the end is absent here it was never computed.
+        {
+            constexpr uint32_t kHome = 0x01047A8Cu;
+            std::cout << "VULCAN4 W7NEIGH around 0x" << std::hex << kHome << std::dec << ":";
+            for (int32_t d = -32; d <= 32; d += 4)
+            {
+                const uint32_t addr = static_cast<uint32_t>(static_cast<int32_t>(kHome) + d);
+                if (addr + 4u > PS2_RAM_SIZE)
+                {
+                    continue;
+                }
+                uint32_t word = 0u;
+                std::memcpy(&word, rdram + addr, sizeof(word));
+                std::cout << " [" << std::hex << addr << "]=0x" << word << std::dec;
+            }
+            std::cout << "\n";
+        }
+    }
+
     // ------------------------------------------------------------------ syscall table probe
     //
     // GT4 registers two of its own syscall handlers (0x83 and 0x5A) and then scans low RDRAM for

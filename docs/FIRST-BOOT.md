@@ -1331,3 +1331,73 @@ out of runway before it, and it is not going to claim an answer it did not measu
 - **It is not "the guest never reached an initialiser"** in the simplest reading — the value needs no
   initialiser.
 
+
+
+### 6. G1.6 RESULT — the experiment, run: it was the LOADER
+
+The diagnostic in `tools/harness/vulcan4_harness.cpp` (`VULCAN4 PROBE1..4`) reads RDRAM directly
+after the image is loaded. **Before the fix:**
+
+```
+VULCAN4 PROBE2 rdram[0x35354..0x35363] = 0x0 0x0 0x0 0x0   <-- sub_010285F8 IS **MISSING**
+VULCAN4 PROBE3 0x010285F8 at RAM offset 0x1035354, 0x010285C0 at RAM offset 0x103535c
+VULCAN4 PROBE4 search window [0,0x80000): non-zero words = 2
+```
+
+**Candidate 1 was right: the ELF loader.** `PS2Memory::translateAddress`
+(`ps2_memory.cpp:600`) treated every address below `0x80000000` as an identity map:
+
+```cpp
+// In this runtime, low segments are treated as physical-style addresses already.
+if (virtualAddress < 0x80000000) { return virtualAddress; }
+```
+
+But `0x01000000`–`0x01FFFFFF` is the PS2 **user segment**: the kernel loads a game at `0x01000000`,
+so user vaddr `U` is RDRAM at `U - 0x01000000`. That must agree with the KSEG0 aliases, because the
+guest reaches the same bytes both ways — user `0x01035354` and KSEG0 `0x81035354` are one location,
+physical `0x35354`. Under the identity rule they were **16 MB apart**, so the guest's data was
+invisible to every KSEG0 pointer it formed. That is why the search window held **2** non-zero words.
+
+**The fix** adds the user-segment case ahead of the identity rule
+(`tools/patches/ps2recomp-linux-g16-userseg.patch`, 1 file, +22/-1):
+
+```cpp
+if (virtualAddress >= 0x01000000u && virtualAddress < 0x02000000u)
+{
+    return virtualAddress - 0x01000000u;
+}
+```
+
+**After the fix:**
+
+```
+VULCAN4 PROBE2 rdram[0x35354..0x35363] = 0x10285f8 0x5a 0x10285c0 0x0  <-- sub_010285F8 IS PRESENT
+VULCAN4 PROBE3 0x010285F8 at RAM offset 0x35354, 0x010285C0 at RAM offset 0x3535c
+VULCAN4 PROBE4 search window [0,0x80000): non-zero words = 60951
+```
+
+The descriptor is now exactly where the guest looks, and the window went from 2 non-zero words to
+**60,951**. The memory map is now self-consistent.
+
+### 7. And the honest part: the gate moved, the guest did NOT
+
+```
+VULCAN4 BOOT REPORT functions_entered=1 halt=spinning_in_guest_code bios_files=0
+```
+
+The gate is met on its second condition — the halt is no longer a livelock — and the report now
+names the real remaining state: **no syscall executing, the guest spinning in recompiled code at
+`0x0102871C` with `distinct_pcs=1`.**
+
+**This is not a step forward for the game.** `functions_entered` went **3 → 1**. `sce_FindAddress`
+is still called **154** times and still misses **102**. So:
+
+- The memory-map bug was **real** and is **fixed**. Any guest data access through a KSEG0 pointer was
+  silently reading the wrong 16 MB before; that class of bug is gone.
+- The livelock *in name* changed; the guest is **not** further along, and it has fewer distinct
+  program counters than before, so on this evidence the fix traded a livelock for an earlier spin.
+
+**No claim is made that this unblocked the guest.** The next question is now much better posed
+though: with the data in the right place, why does a 102-miss `FindAddress` still fail on a word
+that is demonstrably inside the window at `0x35354`? That is candidate 2 — the scan — and it is now
+isolated from the loader, which was not true before this dish.

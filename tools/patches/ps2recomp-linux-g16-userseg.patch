@@ -1,0 +1,48 @@
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 37b6a4d..2c8f950 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -567,6 +567,18 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
+ 
+ uint32_t PS2Memory::translateAddress(uint32_t virtualAddress)
+ {
++    // MMIO accounting. Every guest read/write funnels through here (read8/16/32/64,
++    // write8/16/32/64), so this is the one place that can answer "did the guest ever touch the
++    // console's hardware registers, and which ones?". A guest that spins waiting for a hardware
++    // bit is the classic reason a recomp appears to hang, and this is how that is told apart
++    // from a guest spinning in software.
++    if (Ps2IsSpecialAddress(virtualAddress))
++    {
++        ++m_mmioAccessCount;
++        ++m_mmioCounts[virtualAddress];
++        m_lastMmioAddress = virtualAddress;
++    }
++
+     if (isScratchpad(virtualAddress))
+     {
+         return ps2ScratchpadOffset(virtualAddress);
+@@ -586,7 +598,23 @@ uint32_t PS2Memory::translateAddress(uint32_t virtualAddress)
+         return Ps2DirectMappedPhysicalAddress(virtualAddress);
+     }
+ 
+-    // In this runtime, low segments are treated as physical-style addresses already.
++    // G1.6: the PS2 *user segment*. The kernel loads a game at 0x01000000, so a guest virtual
++    // address in [0x01000000, 0x02000000) is RDRAM at (vaddr - 0x01000000). That has to agree
++    // with the KSEG0 aliases above, because the guest reaches the SAME bytes through both: e.g.
++    // user 0x01035354 and KSEG0 0x81035354 are one location, physical 0x35354.
++    //
++    // Treating the whole sub-0x80000000 space as an identity map put the ELF's second PT_LOAD
++    // segment at physical 0x102dc80 instead of 0x2dc80 -- exactly 0x01000000 too high. Code still
++    // ran (loader and guest agreed with each other) but every KSEG0 pointer the guest formed was
++    // 16MB away from the data, so a guest searching KSEG0 0x80000000-0x80080000 for a pointer in
++    // its own .data found nothing and looped forever. Measured: the 16-byte descriptor the guest
++    // hunts for landed at RDRAM 0x1035354 while the guest searched [0, 0x80000).
++    if (virtualAddress >= 0x01000000u && virtualAddress < 0x02000000u)
++    {
++        return virtualAddress - 0x01000000u;
++    }
++
++    // In this runtime, the remaining low segments are treated as physical-style addresses already.
+     if (virtualAddress < 0x80000000)
+     {
+         return virtualAddress;

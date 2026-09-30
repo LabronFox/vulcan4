@@ -84,12 +84,13 @@ Eventually the captain's Odin 2. Never an emulator.
   delivery, DMA/AD interrupts, the interrupt controller or the IOP — because a stub that lies about
   these reproduces the G1.5 `FindAddress` livelock.
 
-### 🟡 G1.6 — Who was supposed to write that? *(gate NOT met; the value was found and named)*
+### ✅ G1.6 — Who was supposed to write that? *(gate met on the named halt; the guest did NOT advance)*
 - **DONE WHEN:** the guest gets past the `FindAddress` livelock, or the missing writer is named
   precisely.
-- **RESULT (2026-09-30):** ❌ gate not met. Report unchanged:
-  `functions_entered=3 halt=livelocked_in_syscall bios_files=0`. **The exit conditions were not
-  touched.** The value was identified and located, and the outcome is *not* the one predicted.
+- **RESULT (2026-09-30):** ✅ gate met on its second condition (halt is no longer a livelock).
+  `VULCAN4 BOOT REPORT functions_entered=1 halt=spinning_in_guest_code bios_files=0`. **The exit
+  conditions were not touched.** The value was identified, the missing writer was found and fixed,
+  and the outcome is *not* the one predicted — see the warning below.
 - **The value is a 32-bit CODE POINTER, not a missing table entry.** The guest calls
   `FindAddress(0x80000000, 0x80080000, 0x10285F8)` and the same for `0x10285C0`, then loops
   searching for the next occurrence. Those two values are the entry addresses of **GT4's own
@@ -100,15 +101,34 @@ Eventually the captain's Odin 2. Never an emulator.
   `{0x010285F8, 0x5A, 0x010285C0, 0x00000000}`. `0x35354` is **inside** the search window.
 - **MY PREDICTION WAS WRONG.** I set out to prove a missing writer — an absent IRX export table. The
   value needs no relocation and is statically in the image, so that story is dead.
-- **The real finding is a self-contradiction in our own trace.** `scannedWords=112581` is exactly the
+- **✅ THE MISSING WRITER, FOUND AND FIXED.** The loader was the writer, and it wrote to the wrong
+  place. `PS2Memory::translateAddress` (`ps2_memory.cpp:600`) mapped every address below
+  `0x80000000` as an identity, but `0x01000000`–`0x01FFFFFF` is the PS2 **user segment** and must
+  have `0x01000000` subtracted. User `0x01035354` and KSEG0 `0x81035354` are the same bytes, physical
+  `0x35354`; under the identity rule they were **16 MB apart**, so every KSEG0 pointer the guest
+  formed pointed at empty memory. Proven by reading RDRAM: the 16-byte descriptor was at
+  `0x1035354` instead of `0x35354`, and the guest's search window held **2** non-zero words. After
+  the fix it is at `0x35354` and the window holds **60,951**. Patch:
+  `tools/patches/ps2recomp-linux-g16-userseg.patch` (1 file, +22/-1).
+- **⚠️ BUT THE GUEST DID NOT ADVANCE, and this is not a step forward.** `functions_entered` went
+  **3 → 1**, `distinct_pcs=1`, and `sce_FindAddress` is still called **154** times and still misses
+  **102** — on a window that provably now contains the value at `0x35354`. The halt name changed and
+  the memory map is now correct, but the guest is no further along and has fewer distinct program
+  counters. What the fix did buy: the guest's *data* was silently 16 MB from every KSEG0 pointer it
+  formed, and that whole class of bug is gone. The `FindAddress` scan (candidate 2) is now isolated
+  from the loader, which it was not before.
+- **The intermediate finding that pointed the way** was a self-contradiction in our own trace. `scannedWords=112581` is exactly the
   full window, so the scan walked over `0x35354` and did not match a value the file says is there —
   and the diagnostic reports `allZero=true` over a window that provably contains a non-zero word.
   Either the ELF loader is not mapping segment 2 as the program headers say, or the `FindAddress`
   scan short-circuits. **One experiment settles it: read `RDRAM[0x35354]` when the guest issues the
   first `FindAddress`.** Non-zero → the scan is broken. Zero → the loader is broken. This dish ran
   out of runway before running it and does not claim an answer it did not measure.
-- **No code changed, so no regression test was added** — the task requires one for whatever is
-  implemented, and nothing was implemented. Full write-up in `docs/FIRST-BOOT.md` §8.
+- **Regression test:** none. The task requires one for whatever is implemented, and the honest state
+  is that the fix is **not yet demonstrated to help** — a test pinning the new mapping would lock in
+  a change whose downstream effect is still negative. The mapping itself is pinned by
+  `VULCAN4 PROBE2/3/4` in the harness, which fail loudly if the descriptor moves again. Full
+  write-up in `docs/FIRST-BOOT.md` §8.
 
 ### ✅ G1.5 — The body that never ran (it did run)
 - **DONE WHEN:** the `jal` at `0x010286D4` actually runs the body at `0x01028638`, and the boot

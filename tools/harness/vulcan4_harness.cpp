@@ -323,6 +323,71 @@ int main(int argc, char *argv[])
     ps2_stubs::resetMpegStubState();
     runtime.initializeEeKernelState(rdram);
 
+    // ---------------------------------------------------------------- G1.6 decisive diagnostic.
+    //
+    // The guest calls FindAddress(0x80000000, 0x80080000, 0x010285F8) and the same for
+    // 0x010285C0. In the image, those two words occur exactly once each, 8 bytes apart, as one
+    // 16-byte descriptor in the second PT_LOAD segment at vaddr 0x01035354 -- RAM offset 0x35354,
+    // which IS inside the search window. Yet the trace reports a miss over the full window and
+    // allZero=true. One of those is a lie. This prints the evidence instead of arguing about it.
+    {
+        constexpr uint32_t kRamOffset = 0x00035354u;
+        constexpr size_t kPs2RamSize = PS2_RAM_SIZE;
+        std::cout << "VULCAN4 PROBE1 ram_size=" << kPs2RamSize
+                  << " window=[0x00000000,0x00080000) desc_offset=0x" << std::hex << kRamOffset
+                  << std::dec << "\n";
+        if (kRamOffset + 16u <= kPs2RamSize)
+        {
+            uint32_t words[4];
+            std::memcpy(words, rdram + kRamOffset, sizeof(words));
+            std::cout << "VULCAN4 PROBE2 rdram[0x35354..0x35363] =";
+            for (uint32_t w : words)
+            {
+                std::cout << " 0x" << std::hex << w << std::dec;
+            }
+            std::cout << (words[0] == 0x010285F8u ? "  <-- sub_010285F8 IS PRESENT"
+                                                  : "  <-- sub_010285F8 IS **MISSING**")
+                      << (words[2] == 0x010285C0u ? " ; sub_010285C0 present"
+                                                   : " ; sub_010285C0 MISSING")
+                      << "\n";
+        }
+
+        // If the descriptor is not where the program headers say, find out where it actually is.
+        uint32_t found85f8 = 0xFFFFFFFFu;
+        uint32_t found85c0 = 0xFFFFFFFFu;
+        for (size_t off = 0; off + 4u <= kPs2RamSize; off += 4u)
+        {
+            uint32_t w = 0;
+            std::memcpy(&w, rdram + off, sizeof(w));
+            if (w == 0x010285F8u && found85f8 == 0xFFFFFFFFu)
+            {
+                found85f8 = static_cast<uint32_t>(off);
+            }
+            if (w == 0x010285C0u && found85c0 == 0xFFFFFFFFu)
+            {
+                found85c0 = static_cast<uint32_t>(off);
+            }
+        }
+        std::cout << "VULCAN4 PROBE3 rdram scan: 0x010285F8 at RAM offset 0x" << std::hex
+                  << found85f8 << std::dec << ", 0x010285C0 at RAM offset 0x" << std::hex
+                  << found85c0 << std::dec << "\n";
+        // Also: is the searched window even zeroed?
+        uint32_t nonZeroWords = 0;
+        for (size_t off = 0; off + 4u <= 0x00080000u; off += 4u)
+        {
+            uint32_t w = 0;
+            std::memcpy(&w, rdram + off, sizeof(w));
+            if (w != 0u)
+            {
+                ++nonZeroWords;
+            }
+        }
+        std::cout << "VULCAN4 PROBE4 search window [0,0x80000): non-zero words = " << nonZeroWords
+                  << (nonZeroWords == 0u ? "  (allZero=true would be CORRECT)"
+                                        : "  (so allZero=true in the trace is **FALSE**)")
+                  << "\n";
+    }
+
     // Initialise the EE scheduler.
     //
     // This is the one line PS2Runtime::run() does that a hand-rolled harness is easy to miss, and

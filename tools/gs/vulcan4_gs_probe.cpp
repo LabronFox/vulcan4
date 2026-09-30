@@ -370,11 +370,20 @@ namespace
     //      A guest writes one of them, never both. We write XYZ2 only.
     constexpr uint32_t kRegPrim = 0x00;
     constexpr uint32_t kRegRgbaq = 0x01;
+    constexpr uint32_t kRegSt = 0x02;
     constexpr uint32_t kRegUv = 0x03;
     constexpr uint32_t kRegXyz2 = 0x05;
+    constexpr uint32_t kRegTex0 = 0x06; // inside the 4-bit GIFTAG field, so it goes via the GIF path
 
-    constexpr uint64_t kPrimTriangle = 2u;
+    // G2.4 FIX. This used to be the literal 2u, on the belief that 2 is "triangle". It is not.
+    // GS_PRIM_TRIANGLE is 3; 2 is GS_PRIM_LINESTRIP. That single wrong constant is what made
+    // G2.2 and G2.3 draw nothing, and it is now spelled symbolically so a re-read of the enum
+    // can never let it drift back. The runtime's values match real PS2 hardware exactly
+    // (0 points, 1 lines, 2 line strip, 3 triangle, 4 tri strip, 5 tri fan, 6 sprite).
+    constexpr uint64_t kPrimTriangle = GS_PRIM_TRIANGLE;
+    constexpr uint64_t kPrimTriStrip = GS_PRIM_TRISTRIP;
     constexpr uint64_t kPrimIipBit = 1u << 3; // Gouraud colour interpolation
+    constexpr uint64_t kPrimTmeBit = 1u << 4; // Texture Mapping Enable -- sample the texel
 
     struct GSVertexSpec
     {
@@ -503,8 +512,47 @@ int main(int argc, char *argv[])
                     | (static_cast<uint64_t>(kFrameWidth - 1u) << 16)  // X1
                     | (static_cast<uint64_t>(kFrameHeight - 1u) << 48); // Y1
             }
+            else if (r == GS_REG_PRMODECONT)
+            {
+                // G2.4 FIX, third one. AC = 1 (PRMODECONT bit 0) makes PRIM the single source of
+                // the whole primitive register -- type, IIP, TME, ABE and the rest.
+                //
+                // With AC = 0 the frontend instead does (gs_frontend.cpp, case GS_REG_PRMODECONT):
+                //     m_prim = m_primRegister;   // PRMODE, a different register
+                //     m_prim.type = m_primRegister.type;   // only the type comes from PRIM
+                // so PRIM's TME and IIP bits are DISCARDED and PRMODE's -- which nobody wrote --
+                // decide instead. The symptom is silent and very convincing: the packet really
+                // did contain PRIM=0x1b (type 3, IIP, TME) and the GS really did receive it, and
+                // the rasteriser still reported tme=0, sampled no texture at all, and painted the
+                // quad flat white in the vertex colour. This is the documented G2.2 step 4
+                // ("PRMODECONT 1, to make PRMODE the attribute source and IIP take effect") which
+                // the probe had been leaving at 0.
+                value = 1ull;
+            }
+            else if (r == GS_REG_TEST_1)
+            {
+                // G2.4 FIX, second half. This sweep used to write TEST_1 = 0, i.e.
+                // ZTEST = method 0 = NEVER, and the rasteriser honours that:
+                //     switch (ztestMethod) { case 0: zpass = false; ... }
+                //     if (!zpass) return;                        // gs_cpu_backend.cpp
+                // so every covered pixel was discarded before it could be written. The geometry
+                // was never the problem; the test register was rejecting it.
+                //
+                // 0x30000 is the value the runtime's own passing draw test uses
+                // (ps2_gs_tests.cpp:836): ZTE=1 (bit 16), ZTEST=1 (bits 17-18), ATE=1 (bit 0),
+                // ATST=0, AREF=0 -- so "alpha >= 0", which everything passes.
+                //
+                // KNOWN RUNTIME FIDELITY GAP, recorded not papered over: real PS2 hardware gates
+                // the Z test on the ZTE bit, so TEST=0 (ZTE clear) would DISABLE it and draw
+                // normally. This runtime reads ZTEST without checking ZTE, so TEST=0 means
+                // NEVER. That is a real divergence and it will bite a real guest that programs
+                // TEST with ZTE clear. Tracked in LIMITATIONS.md; not fixed here because it is
+                // a change to runtime behaviour, not to our probe.
+                value = 0x30000ull;
+            }
             gs.writeRegister(r, value);
         }
+        gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
     }
 
     // ---- 2b. Fill the framebuffer through the GS TRANSFER path, not by poking VRAM.
@@ -550,13 +598,23 @@ int main(int argc, char *argv[])
             {200, 240, 220, 40, 40, 255},
         };
         submitTriangle(gs, /*gouraud*/ false, flat, "flat-triangle-via-REGLIST");
-        // Same triangle, same frame, different submission route. Whichever lands is the answer.
+        // Same triangle, same frame, different submission route. Both must now land identically:
+        // before the G2.4 fix both produced a degenerate 2-vertex LINESTRIP batch.
         submitTriangleDirect(gs, /*gouraud*/ false, flat, "flat-triangle");
-        // The runtime's own suite draws a PASSING TRISTRIP via writeRegister
-        // (ps2_gs_tests.cpp:834). TRISTRIP is the one topology proven to work there, so try it
-        // here: if it rasterises and TRIANGLE does not, the fault is the triangle path.
-        submitTriangleDirect(gs, /*gouraud*/ false, flat, "flat-triangle-as-TRISTRIP",
-                             /*primType*/ 3u);
+        // A TRISTRIP needs 3 vertices for its first triangle and then 1 per extra one, so a
+        // 4-vertex strip draws 2 triangles. This is the topology the runtime's own suite proves
+        // at ps2_gs_tests.cpp:834. NOTE: this line used to pass the literal 3u while claiming to
+        // be TRISTRIP -- 3 is TRIANGLE. The label was wrong; the experiment was accidentally
+        // running the right primitive, which is why the fault hid for two dishes.
+        {
+            const GSVertexSpec strip[3] = {
+                {48, 300, 255, 200, 0, 255},
+                {240, 300, 0, 200, 255, 255},
+                {464, 300, 255, 200, 0, 255},
+            };
+            submitTriangleDirect(gs, /*gouraud*/ false, strip, "flat-triangle-as-TRISTRIP",
+                                 kPrimTriStrip);
+        }
 
         // 2. A gouraud quad, submitted the way hardware does it: as TWO triangles sharing an edge,
         //    with four different corner colours. Interpolation across the interior is what makes
@@ -605,6 +663,247 @@ int main(int argc, char *argv[])
         std::cout << "VULCAN4 GS sync vblank_ticks=" << g_vblankTicks << " csr=0x" << std::hex
                   << live.csr.load(std::memory_order_acquire) << std::dec
                   << " (bit0=SIGNAL raised after FINISH)\n";
+    }
+
+    // ---- 2f. G2.4: SAMPLED TEXTURES, through the register path.
+    //
+    // Two formats, chosen so the picture proves both halves of the sampler: a direct-colour
+    // PSMCT32 texture, and a PSMT8 indexed texture that has to go through a PSMCT16 CLUT. The
+    // second is the one that would catch a broken CLUT path, which a direct-colour texture never
+    // touches.
+    //
+    // Everything here is uploaded with the GS's own transfer path and bound by writing the GS's
+    // own registers. No texel is ever poked into VRAM directly, and no pixel is painted by us.
+    {
+        constexpr uint32_t kTexW = 64u;
+        constexpr uint32_t kTexH = 64u;
+        constexpr uint32_t kTexLog2 = 6u;  // 1 << 6 == 64, which is what textureWidth is derived from
+        constexpr uint32_t kTexWidthWords = kTexW / 64u; // texture widths are also 64-px words
+
+        // Page plan, and a unit trap worth writing down.
+        //
+        // BITBLTBUF's DBP and TEX0's TBP0 are in DIFFERENT units, and mixing them up is silent:
+        //
+        //   BITBLTBUF.DBP  -- GS texel PAGES. A page is 256 KiB.
+        //   TEX0.TBP0      -- 256-BYTE BLOCKS. A page is 1024 blocks.
+        //   TEX0.CBP       -- also 256-byte blocks.
+        //
+        // G2.4 first wrote TBP0 in pages. The transfer put the texels at byte 2 MiB, the sampler
+        // looked at byte 2 KiB, read untouched zeroed VRAM, and the quad came out flat white with
+        // no error anywhere. The two constants below are PAGES (for the transfer) and the
+        // bind converts to blocks.
+        //
+        // A PSMCT32 page is 256 KiB, so the 512x512 framebuffer owns pages 0-3.
+        constexpr uint32_t kTexT32Page = 8u;
+        constexpr uint32_t kTexT8Page = 12u;
+        constexpr uint32_t kClutPage = 16u;
+        constexpr uint32_t kBlocksPerPage = 1024u; // 256 KiB / 256 B
+
+        // --- Texture A: PSMCT32, direct colour. A 2D ramp in all three channels so that a
+        //     correct UV interpolation produces a smooth, many-coloured field, and a wrong one
+        //     produces bands or a flat block. Both are visible in the numbers.
+        std::vector<uint8_t> texT32(kTexW * kTexH * 4u);
+        for (uint32_t y = 0; y < kTexH; ++y)
+            for (uint32_t x = 0; x < kTexW; ++x)
+            {
+                const size_t o = (static_cast<size_t>(y) * kTexW + x) * 4u;
+                texT32[o + 0] = static_cast<uint8_t>(x * 4u);
+                texT32[o + 1] = static_cast<uint8_t>(y * 4u);
+                texT32[o + 2] = static_cast<uint8_t>(((x ^ y) & 0x3Fu) * 4u);
+                texT32[o + 3] = 0xFFu;
+            }
+
+        // --- Texture B: PSMT8 indexed, resolved through a PSMCT16 CLUT.
+        //     The indices are a coarse function of (x,y) so the sampled result has visible
+        //     structure; the CLUT maps index -> colour with a deliberate non-identity ramp.
+        std::vector<uint8_t> texT8(kTexW * kTexH, 0u);
+        for (uint32_t y = 0; y < kTexH; ++y)
+            for (uint32_t x = 0; x < kTexW; ++x)
+                texT8[static_cast<size_t>(y) * kTexW + x] =
+                    static_cast<uint8_t>((x / 8u) + (y / 8u) * 8u);
+
+        // PSMCT16 CLUT: 256 entries x 4 bytes (R,G,B,flags). GS order is RGBA in the low bytes.
+        std::vector<uint8_t> clut(256u * 4u, 0u);
+        for (uint32_t i = 0; i < 256u; ++i)
+        {
+            clut[i * 4u + 0] = static_cast<uint8_t>(255u - i);        // R falls as index rises
+            clut[i * 4u + 1] = static_cast<uint8_t>(i);               // G rises
+            clut[i * 4u + 2] = static_cast<uint8_t>((i * 3u) & 0xFFu);
+            clut[i * 4u + 3] = 0x80u;                                  // STP/alpha bits
+        }
+
+        auto upload = [&gs](uint32_t basePage, uint32_t widthWords, uint8_t psm, uint32_t w,
+                             uint32_t h, const std::vector<uint8_t> &data, const char *label)
+        {
+            // BITBLTBUF: SBP 0-13, SBW 16-21, SPSM 24-29, DBP 32-45, DBW 48-53, DPSM 56-61
+            const uint64_t bitbltbuf = static_cast<uint64_t>(psm) | (static_cast<uint64_t>(widthWords) << 16)
+                | (static_cast<uint64_t>(psm) << 24) | (static_cast<uint64_t>(basePage) << 32)
+                | (static_cast<uint64_t>(widthWords) << 48) | (static_cast<uint64_t>(psm) << 56);
+            // TRXREG: W in bits 0-11, H in bits 32-43. (H is NOT at bit 12 -- that is the trap.)
+            const uint64_t trxreg = static_cast<uint64_t>(w) | (static_cast<uint64_t>(h) << 32);
+            gs.uploadImageNative(bitbltbuf, /*trxpos*/ 0ull, trxreg, /*trxdir*/ 0u, data.data(),
+                                 static_cast<uint32_t>(data.size()));
+            std::cout << "VULCAN4 GS texture " << label << " uploaded psm=0x" << std::hex
+                      << static_cast<uint32_t>(psm) << std::dec << " page=" << basePage << " " << w << "x"
+                      << h << " " << data.size() << "B\n";
+        };
+
+        upload(kTexT32Page, kTexWidthWords, GS_PSM_CT32, kTexW, kTexH, texT32, "PSMCT32");
+        upload(kTexT8Page, kTexWidthWords, GS_PSM_T8, kTexW, kTexH, texT8, "PSMT8");
+        upload(kClutPage, 4u, GS_PSM_CT16, 256u, 1u, clut, "PSMCT16-CLUT");
+
+        // G2.4 DIAGNOSTIC: where did the transfer actually land? Print candidate bases so the
+        // unit question is answered by measurement instead of by reading one more header.
+        for (uint32_t off : {8u * 256u, 8u * 8192u, 8u * 262144u, 12u * 256u, 12u * 262144u})
+        {
+            std::cout << "    VRAM@" << off << " =";
+            for (uint32_t k = 0; k < 12u; ++k)
+                std::cout << " " << std::hex << static_cast<uint32_t>(vram[off + k]) << std::dec;
+            std::cout << "\n";
+        }
+
+        // Bind each texture and draw a quad that spans its full extent, so UV runs 0..1 across
+        // the surface and the sampler has to interpolate every texel in between.
+        //
+        // PRIM needs TME (bit 4) set or the rasteriser never calls SampleTexture at all.
+        auto drawTexturedQuad = [&gs, kTexLog2, kBlocksPerPage](uint32_t texPage, uint8_t psm, uint32_t clutPage,
+                                                bool useClut, int top, const char *label)
+        {
+            const int left = 32, right = 480, bottom = top + 128;
+            // G2.4 MEASURED: DBP and TBP0 must use the SAME unit, and in this runtime that unit
+            // is the 256-byte block, with no conversion applied to either
+            // (UploadImage reads m_transfer.bitbltbuf.dbp raw; SampleTexture reads tex.tbp0 raw).
+            // Multiplying by kBlocksPerPage here puts the sampler 1024x past the upload and the
+            // quad goes flat white again -- measured, not assumed.
+            //
+            // RUNTIME FIDELITY BUG, recorded not worked around: real PS2 hardware defines a texel
+            // page as 256 KiB = 1024 blocks, so a real guest writes TBP0 = page*1024. This
+            // runtime's only page helper is framePageBaseToBlock(fbp) = fbp << 5, i.e. an 8 KiB
+            // page, and it is applied to the FRAMEBUFFER but not to the texture bases. So a real
+            // guest's texture base would be interpreted 32x too low. That will bite the moment a
+            // guest draws a textured primitive. Tracked in LIMITATIONS.md; fixing it is a runtime
+            // change, not a probe change, so it is not done in this dish.
+            const uint64_t tbp0 = texPage;
+            const uint64_t cbp = clutPage;
+            const uint64_t tex0 = tbp0                                                   // TBP0  0-13
+                | (static_cast<uint64_t>(1u) << 14)                                     // TBW   14-19 (64px = 1 word)
+                | (static_cast<uint64_t>(psm) << 20)                                    // TPSM  20-25
+                | (static_cast<uint64_t>(kTexLog2) << 26)                               // TW    26-29
+                | (static_cast<uint64_t>(kTexLog2) << 30)                               // TH    30-33
+                | (0ull << 34)                                                          // TCC=0 RGB
+                | (0ull << 35)                                                          // TFX=0 nearest
+                | (cbp << 37)                                                           // CBP   37-50
+                | (static_cast<uint64_t>(useClut ? GS_PSM_CT16 : 0u) << 51)             // CPSM  51-54
+                | (0ull << 55)                                                          // CSM
+                | (useClut ? 1ull : 0ull) << 61;                                        // CLD=1 load CLUT
+
+            gs.writeRegister(GS_REG_TEXCLUT, /*cbw 0-5 = 4 words, cou/cov 0*/ (4ull << 0));
+            gs.writeRegister(GS_REG_TEX0_1, tex0);
+
+            // PRIM: type=TRIANGLE | IIP | TME. S/T ride in ST (0x02) because FST=0 is the
+            // hardware's normal path -- the DDA interpolates S and T, then divides by Q.
+            const uint64_t prim = kPrimTriangle | kPrimIipBit | kPrimTmeBit;
+            const float q = 1.0f;
+            auto st = [&](float s, float t) -> uint64_t
+            {
+                uint32_t sb, tb;
+                std::memcpy(&sb, &s, 4);
+                std::memcpy(&tb, &t, 4);
+                return static_cast<uint64_t>(sb) | (static_cast<uint64_t>(tb) << 32);
+            };
+            auto xyz = [](int x, int y) -> uint64_t
+            {
+                return (static_cast<uint64_t>(x) << 4) | (static_cast<uint64_t>(y) << 20);
+            };
+            const struct { int x, y; float s, t; } corners[4] = {
+                {left, top, 0.0f, 0.0f},
+                {right, top, 1.0f, 0.0f},
+                {right, bottom, 1.0f, 1.0f},
+                {left, bottom, 0.0f, 1.0f},
+            };
+            // Two triangles sharing the left->bottom edge, submitted as a REGLIST exactly as a
+            // guest would. TEX0_1 is 0x06 and PRIM is 0x00, both inside the 4-bit GIFTAG address
+            // field, so this whole bind-and-draw is reachable through the GIF path.
+            auto emit = [&](const int *idx)
+            {
+                std::vector<std::pair<uint8_t, uint64_t>> w;
+                w.emplace_back(static_cast<uint8_t>(kRegPrim), prim);
+                w.emplace_back(static_cast<uint8_t>(kRegTex0), tex0);
+                for (int k = 0; k < 3; ++k)
+                {
+                    const auto &c = corners[idx[k]];
+                    w.emplace_back(static_cast<uint8_t>(kRegRgbaq),
+                                   0xFFull | (0xFFull << 8) | (0xFFull << 16) | (0xFFull << 24)
+                                       | (static_cast<uint64_t>(0x3F800000ull) << 32));
+                    w.emplace_back(static_cast<uint8_t>(kRegSt), st(c.s, c.t));
+                    w.emplace_back(static_cast<uint8_t>(kRegXyz2), xyz(c.x, c.y));
+                }
+                const std::vector<uint8_t> pkt = reglistPacket(w);
+                gs.processGIFPacket(pkt.data(), static_cast<uint32_t>(pkt.size()));
+            };
+            const int triA[3] = {0, 1, 2};
+            const int triB[3] = {0, 2, 3};
+            emit(triA);
+            emit(triB);
+            std::cout << "VULCAN4 GS texture " << label << " bound TPSM=0x" << std::hex
+                      << static_cast<uint32_t>(psm) << std::dec << " TME=1 IIP=1 CLUT="
+                      << (useClut ? "PSMCT16" : "none") << " -> quad (" << left << "," << top << ")-("
+                      << right << "," << bottom << ")\n";
+        };
+
+        // PSMCT32 texture first, in the upper area of the frame.
+        drawTexturedQuad(kTexT32Page, GS_PSM_CT32, 0u, /*useClut*/ false, 16, "PSMCT32-quad");
+        // PSMT8 + PSMCT16 CLUT below it. This is the one that exercises the CLUT cache.
+        drawTexturedQuad(kTexT8Page, GS_PSM_T8, kClutPage, /*useClut*/ true, 160, "PSMT8-CLUT-quad");
+    }
+
+    // ---- 2e. G2.4 DIAGNOSTIC: did the rasteriser actually write VRAM?
+    //
+    // The presented frame's colour count was byte-identical to G2.1's transfer-only background,
+    // which cannot tell us *why* geometry is invisible. It could be that the raster rejected every
+    // pixel (TEST/ALPHA), or that it wrote VRAM correctly and the presentation read a different
+    // place. Those need opposite fixes, so read the backing store directly and settle it.
+    // PSMCT32 at base page 0, width 512px = 8 words of 64px: stride is 8*16*4 = 512 bytes.
+    {
+        auto vramPixel = [&vram](uint32_t x, uint32_t y) -> uint32_t
+        {
+            const size_t off = (static_cast<size_t>(y) * 512u + x) * 4u;
+            if (off + 4u > vram.size())
+                return 0u;
+            return static_cast<uint32_t>(vram[off]) | (static_cast<uint32_t>(vram[off + 1]) << 8)
+                | (static_cast<uint32_t>(vram[off + 2]) << 16)
+                | (static_cast<uint32_t>(vram[off + 3]) << 24);
+        };
+        std::cout << "VULCAN4 GS VRAM probe (PSMCT32 @ page0, 512B stride)\n";
+        // The flat triangle is (48,48) (464,96) (200,240); its interior colour is RGBA(220,40,40,255)
+        // = 0xFF2828DC in this GS's byte order. Background is the G2.1 transfer pattern.
+        struct Probe { uint32_t x, y; const char *what; };
+        const Probe probes[] = {
+            {150, 100, "inside flat triangle (expect 0xFF2828DC)"},
+            {100, 90,  "inside flat triangle (expect 0xFF2828DC)"},
+            {250, 150, "inside flat triangle (expect 0xFF2828DC)"},
+            {400, 400, "outside geometry  (expect transfer pattern)"},
+            {8, 8,     "outside geometry  (expect transfer pattern)"},
+        };
+        for (const Probe &pr : probes)
+            std::cout << "    (" << pr.x << "," << pr.y << ") = 0x" << std::hex << vramPixel(pr.x, pr.y)
+                      << std::dec << "  " << pr.what << "\n";
+        // Count distinct colours across the whole page: if the triangles wrote, this must exceed
+        // the transfer pattern's own count.
+        std::vector<uint32_t> seen;
+        seen.reserve(65536);
+        for (uint32_t y = 0; y < 512u; ++y)
+            for (uint32_t x = 0; x < 512u; ++x)
+            {
+                const uint32_t p = vramPixel(x, y);
+                if (std::find(seen.begin(), seen.end(), p) == seen.end())
+                {
+                    seen.push_back(p);
+                    if (seen.size() > 100000u)
+                        break;
+                }
+            }
+        std::cout << "VULCAN4 GS VRAM distinct_colours=" << seen.size() << "\n";
     }
 
     // ---- 3. Read the frame back through the runtime's own presentation path.

@@ -164,3 +164,74 @@ run the thing. **None of these are fixed.** None are hidden either — that is t
 - **Licence note for the future:** PCSX2's GS is **GPL-3.0-or-later**, not LGPL-3.0 as the G2.0
   brief assumed. Compatible with us, so copying is permitted, but it would oblige us to carry
   notices, state the change, and offer corresponding source. See [`docs/GS-PLAN.md`](GS-PLAN.md).
+
+## GS limitations, as of G2.4 (measured)
+
+G2.4 fixed our own probe and drew a **sampled** texture through the register path
+(37,275 distinct colours, `docs/GS-PLAN.md` §12). That proves the happy path. These are what is
+still absent or wrong. Items marked **RUNTIME** are divergences from hardware in `ps2xRuntime`
+itself, not gaps in our probe — they will bite the real guest, not us.
+
+### Absent
+
+- **Filtering.** Only nearest sampling is exercised (`TFX = 0`). The bilinear path in
+  `SampleTexture` exists but **has never been driven by a test or a frame**, and its edge behaviour
+  on `tw`/`th` boundaries is unverified.
+- **Mipmaps and LOD.** No mip chain, no `TEX2` LOD selection, no trilinear/anisotropic anything.
+  `TEX2_1`/`TEX2_2` write `TPSM`/`CBP` but nothing selects a level.
+- **Blending.** `PRIM.ABE` and the `ALPHA_1` register are implemented in `WritePixel` but **never
+  set by our probe and never asserted by the suite**. Fixed-point blending (`FBA_1`) likewise.
+- **Z-buffer / depth test.** The Z test *rejects* correctly (G2.4 found and fixed the `TEST_1 = 0`
+  → `ZTEST = NEVER` case), but **no geometry has ever actually been depth-sorted**: our triangles
+  are submitted in back-to-front order by hand, so the Z buffer is never exercised as a *test*.
+- **CLUT animation / CSM.** `CSM` and `CSA` are decoded and the CLUT cache has a PSMCT16 path, but
+  no test covers the 512-entry suffix layout, so 16-bit CLUT index masking beyond 256 entries is
+  unverified.
+- **Rasteriser coverage.** One pixel centre per pixel, barycentric, no MSAA, no polygon offset, no
+  coverage-based fill-rule handling beyond the top-left-style epsilon. Triangles only: `DrawLine`
+  and `DrawSprite` are implemented but unverified by this dish's frame.
+
+### RUNTIME divergences from hardware (will bite the guest)
+
+- **ZTE is not honoured.** `GSCpuBackend::WritePixel` computes
+  `ztestMethod = (TEST >> 17) & 3` and applies it **unconditionally**. Hardware gates the Z test on
+  `ZTE` (bit 16), so a guest writing `TEST = 0` (ZTE clear) gets normal drawing on hardware and
+  **every pixel discarded** here. Measured in G2.4: the probe's own `TEST_1 = 0` drew nothing.
+- **`PRMODECONT`/`PRMODE` semantics will flatten a guest's geometry.** With `AC = 0`,
+  `gs_frontend.cpp`'s `case GS_REG_PRMODECONT` takes `tme`/`iip`/`abe` from the **`PRMODE`**
+  register and only `type` from `PRIM`. A guest that writes `PRIM` alone — without also setting
+  `PRMODECONT` or `PRMODE` — gets **flat, untextured geometry with no error**. Real hardware applies
+  `PRIM` directly when `AC = 0`. Measured in G2.4: our textured quads rendered flat white.
+- **Texture base units are 32× off for a real guest.** Real hardware defines a texel page as
+  256 KiB = 1024 blocks of 256 B, so a guest writes `TBP0 = page * 1024`. The runtime's only page
+  helper is `framePageBaseToBlock(fbp) = fbp << 5` — an 8 KiB page — and it is applied to the
+  **framebuffer** but not to `TEX0.TBP0` or `TEX0.CBP`, which are used as raw block indices. A guest
+  texture base would be read **32× too low**. Our probe sidesteps it by keeping upload and sample in
+  the same (wrong) unit, which is internally consistent and externally wrong.
+- **Presentation decodes `DISPFB`/`DISPLAY` in a private layout** (G2.1 finding, still open): a
+  guest writing genuine hardware `DISPLAY` values is misread.
+- **`Present` returns an empty frame with no error** when `PMODE` bit 0 is clear.
+- **The GIFTAG register address field is 4 bits** and PACKED implements only `0x00`–`0x0F`, so
+  `FRAME_1`, `ZBUF_1`, `SCISSOR`, `TEXCLUT` and `FINISH` are unreachable from a GIF packet. Our
+  primitive path is fully reachable (`PRIM` 0x00 … `TEX0_1` 0x06 all fit); the framebuffer and CLUT
+  registers are not. Unchanged since G2.0 and still the hard blocker for a guest.
+
+### Ours, and fixed, recorded so it is not re-introduced
+
+- **`PRIM = 2` used to mean "triangle" in our probe.** It is `GS_PRIM_LINESTRIP`; `GS_PRIM_TRIANGLE`
+  is 3. This cost G2.2 and G2.3 two dishes and produced a set of symptoms that all pointed at a
+  broken rasteriser. Pinned by
+  `tools/patches/ps2recomp-linux-g24-primenum.patch`.
+
+### Open, and deliberately not closed
+
+- **A `writeRegister`-submitted triangle still does not land in a unit test.** Correct vertices,
+  open scissor, `TEST_1 = 0x30000`, and the interior pixel stays `0`. Not the primitive type, not
+  the vertex queue — both are demonstrably healthy now. The probe draws correctly through the GIF
+  path, so the pipeline is proven, but this loose end should be closed before `writeRegister` is
+  relied on as a fallback. Detail and the failed attempts in `docs/GS-PLAN.md` §12.7.
+- **EE→GS GIF DMA is unproven.** `GifArbiter` has never been exercised; packets are handed to
+  `GS::processGIFPacket` directly.
+- **No vblank or CSR signalling.** `CSR`/`VIF` interrupt plumbing is untouched; the frame is latched
+  on demand, which is correct for a recompiler but means the timing model is absent.
+- **Nothing from Gran Turismo 4 has ever been rendered by this GS.** The guest has not reached it.

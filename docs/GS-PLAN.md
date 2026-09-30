@@ -497,3 +497,214 @@ G2.2 probe's GIF REGLIST submission path**, not in the runtime. That reframes G2
 experiment: submit the same primitives via `GS::writeRegister` and see whether they rasterise. If
 they do, the REGLIST encoder in the probe is the bug. I did not have the runway to run that here,
 and I am not going to claim the answer before measuring it.
+
+
+---
+
+## 12. G2.4 — THE FAULT WAS OURS, AND IT WAS A SINGLE WRONG CONSTANT
+
+The G2.3 lead was right: the rasteriser, the vertex queue and the swizzle were all fine, and the
+fault was in our submission path. **Three separate mistakes in our own probe, all of them ours,
+none of them the runtime's.** Two dishes were spent on this because each earlier one guessed a
+runtime bug instead of reading the enum.
+
+### 12.1 The fault: `PRIM` was written as the literal 2, which is a LINESTRIP
+
+```cpp
+// tools/gs/vulcan4_gs_probe.cpp, before
+constexpr uint64_t kPrimTriangle = 2u;
+```
+
+```cpp
+// include/runtime/gs/gs_types.h -- these match real PS2 hardware exactly
+GS_PRIM_POINT = 0, GS_PRIM_LINE = 1, GS_PRIM_LINESTRIP = 2,
+GS_PRIM_TRIANGLE = 3, GS_PRIM_TRISTRIP = 4, GS_PRIM_TRIFAN = 5, GS_PRIM_SPRITE = 6,
+```
+
+`2` is `GS_PRIM_LINESTRIP`. Every symptom recorded in G2.2 and G2.3 follows from that one constant,
+mechanically:
+
+| Recorded symptom | What the wrong constant actually did |
+|---|---|
+| "8 draw events for 4 triangles" | `vertexKick` computed `needed = 2` for a LINESTRIP, so a draw fired after **two** vertices and one more fired per leftover vertex |
+| "the batch shifts by one vertex per draw" | the LINESTRIP post-draw is literally `m_vtxQueue[0] = m_vtxQueue[1]; m_vtxCount = 1;` |
+| "the last slot is always `(0,0)`" | `batch.vertices[2]` was never written, so it kept whatever was in the slot before |
+| "`v0 == v2`, edge denominator collapses to zero, triangle correctly skipped" | the rasteriser was doing **the right thing** on garbage input |
+| "nothing was drawn" | nothing ever rasterised a triangle |
+
+The G2.2 notes even guessed the shape — *"most likely 1, which is the `GS_PRIM_POINT` reset
+value"* — when the real answer was 2, our own hard-coded constant, one line above the call site.
+
+**The fix is to use the symbolic enum**, so the value cannot be re-derived by hand:
+
+```cpp
+constexpr uint64_t kPrimTriangle = GS_PRIM_TRIANGLE;
+```
+
+Measured after the fix, from the GS's own `[gs:kick]` trace:
+
+```
+[kick] vtxCount=1  [kick] vtxCount=2  [kick] vtxCount=3   -> draw, all three vertices present
+```
+
+`[gs:prim] type=3 ... v0=(48,48) v1=(464,96) v2=(200,240)` — three real vertices, no `(0,0)`.
+
+**A naming trap that hid this for two dishes:** the probe's "try TRISTRIP as a control" line passed
+the literal `3u` while claiming to be TRISTRIP. `3` *is* TRIANGLE. The label was wrong and the
+experiment was accidentally running the right primitive, so the one control that would have caught
+the typo never meant what it said.
+
+### 12.2 Second fault, same dish: `TEST_1 = 0` rejects every pixel
+
+Geometry was correct but still invisible. `GSCpuBackend::WritePixel`:
+
+```cpp
+const uint32_t ztestMethod = static_cast<uint32_t>((ctx.test >> 17) & 3u);
+switch (ztestMethod) { case 0: zpass = false; break; case 1: zpass = true; break; ... }
+if (!zpass) return;
+```
+
+`TEST_1 = 0` puts ZTEST in method 0 = **NEVER**, so every covered pixel was discarded before it could
+be written. Our probe's register sweep left `TEST_1` at its reset value 0. The runtime's own passing
+draw test uses `TEST_1 = 0x30000`; the probe now does too. **This is also a real runtime fidelity
+gap** — hardware gates the Z test on the ZTE bit, so `TEST=0` would disable it and draw normally,
+whereas this runtime reads ZTEST without checking ZTE. Recorded in `LIMITATIONS.md`.
+
+### 12.3 Third fault, same dish: `PRMODECONT = 0` throws away TME and IIP
+
+With the texture path wired up, the textured quads rendered **flat white**. The packet really did
+carry `PRIM = 0x1b` (type 3, IIP, TME) and the GS really did receive it — but the batch reported
+`tme=0`, so `SampleTexture` was never called and the quad was painted in the vertex colour.
+
+```cpp
+// gs_frontend.cpp, case GS_REG_PRMODECONT
+m_prim = m_prmodecont ? m_primRegister : m_primmodeRegister;   // PRMODE, a *different* register
+m_prim.type = m_primRegister.type;                              // only the type comes from PRIM
+```
+
+With `AC = 0`, PRIM supplies the **type** and `PRMODE` supplies everything else. Nobody had written
+`PRMODE`, so PRIM's TME and IIP were silently discarded. The probe now sets `PRMODECONT = 1`, which
+is the documented G2.2 step 4 that had been left at 0.
+
+This one is worth flagging beyond our own probe: **any guest that writes PRIM without also setting
+`PRMODECONT` or `PRMODE` gets silently flat-shaded, untextured geometry from this runtime.** That is
+a divergence from hardware and it is in `LIMITATIONS.md`.
+
+### 12.4 The picture, with a sampled texture — G2.4's actual deliverable
+
+Two textures, uploaded through the GS's own transfer path and bound by writing the GS's own
+registers. No texel is ever poked into VRAM directly and no pixel is painted by us.
+
+| Texture | Format | Base | Exercises |
+|---|---|---|---|
+| `PSMCT32-quad` | `GS_PSM_CT32` direct colour, 64×64 | page 8 | the direct-colour swizzle map, nearest sampling, UV interpolation |
+| `PSMT8-CLUT-quad` | `GS_PSM_T8` indexed + **PSMCT16 CLUT** | page 12 / CLUT page 16 | the indexed swizzle map **and** the CLUT cache (`CLD=1`, `LookupCLUT`) |
+
+```
+VULCAN4 GS texture PSMCT32 uploaded psm=0x0  page=8  64x64  16384B
+VULCAN4 GS texture PSMT8    uploaded psm=0x13 page=12 64x64  4096B
+VULCAN4 GS texture PSMCT16-CLUT uploaded psm=0x2 page=16 256x1 1024B
+VULCAN4 GS texture PSMCT32-quad   bound TPSM=0x0  TME=1 IIP=1 CLUT=none
+VULCAN4 GS texture PSMT8-CLUT-quad bound TPSM=0x13 TME=1 IIP=1 CLUT=PSMCT16
+
+VULCAN4 GS FRAME ... 512x512 pixels=1048576 non_background=212091 distinct_colours=37275
+                       fnv1a64=0x45c7b19d6eb5fb5a
+```
+
+**37,275 distinct colours** (gate needs ≥1000), against 43,804 for the G2.1 transfer-only
+background and 845 bytes for the black G2.0 frame. The two textured quads alone carry **589** and
+**24** distinct colours respectively — 589 is the signature of UV interpolation across a 64×64
+texture, and a flat fill cannot produce it.
+
+Both quads are submitted as **real GIF REGLIST packets** naming `PRIM` (0x00), `TEX0_1` (0x06),
+`RGBAQ` (0x01), `ST` (0x02) and `XYZ2` (0x05) — all inside the 4-bit GIFTAG address field, so the
+whole bind-and-draw goes through the path a guest's DMA would use. `TEXCLUT` (0x1C) is the one
+register still needing `GS::writeRegister`, for the 4-bit-field reason in §"Transfer path".
+
+**The gate passes, and this time it is not the background passing it.** The colour count *fell* from
+G2.1's 43,804 precisely because geometry and texture now cover the background, and the two quads'
+own colour counts are the structural evidence that sampling happened.
+
+### 12.5 One unit trap, measured both ways
+
+`BITBLTBUF.DBP` and `TEX0.TBP0` must use the **same** unit, and in this runtime both are raw 256-byte
+block indices with no conversion on either side (`UploadImage` reads `m_transfer.bitbltbuf.dbp` raw;
+`SampleTexture` reads `tex.tbp0` raw). G2.4 first wrote `TBP0` in pages — the transfer put the texels
+at byte 2 MiB, the sampler read byte 2 KiB, and the quad went flat white with **no error anywhere**.
+Multiplying by 1024 made it worse. The fix was to make both sides agree, not to be cleverer.
+
+**That measurement exposed a real runtime bug.** Real PS2 hardware defines a texel page as 256 KiB =
+1024 blocks, so a real guest writes `TBP0 = page * 1024`. This runtime's only page helper is
+`framePageBaseToBlock(fbp) = fbp << 5` — an 8 KiB page — and it is applied to the **framebuffer** but
+not to the texture bases. A real guest's texture base would therefore be interpreted **32× too low**.
+That will bite the moment a guest draws a textured primitive, and it is in `LIMITATIONS.md`. It is a
+runtime change, so it is not fixed in this dish.
+
+### 12.6 The guest draw sequence, corrected
+
+This replaces the G2.2 sequence, which was right in structure and wrong in two values. Both errors
+were ours; the runtime is unchanged.
+
+```
+0. PRMODECONT (0x1A) = 1        AC=1, so PRIM alone supplies type/IIP/TME/ABE.  <-- was 0, SILENTLY
+                                                                       discarded TME+IIP
+1. FRAME_1    (0x4C) PSM=0 (PSMCT32), base page, FBW = width/64      -> via writeRegister (see GIF gap)
+2. ZBUF_1     (0x4E) same shape                                      -> via writeRegister
+3. TEST_1     (0x47) = 0x30000    ZTE=1, ZTEST=1, ATE=1, AREF=0     <-- was 0, ZTEST=NEVER
+                                                                       rejected EVERY pixel
+4. SCISSOR_1/_2      whole rect in ONE 64-bit value: X0 0-10, X1 16-26, Y0 32-42, Y1 48-58
+5. XYOFFSET_1 (0x3C) = 0
+6. Texture upload: BITBLTBUF(0x50) TRXPOS(0x51) TRXREG(0x52) TRXDIR(0x53), then the image data
+   -> GS::uploadImageNative(...). DBP is a 256-byte block index; see 12.5.
+7. If indexed, upload the CLUT the same way, then TEXCLUT(0x1C): CBP, CBW (64 entries), COU/COV
+8. TEX0_1     (0x06) TBP0(0-13) TBW(14-19) TPSM(20-25) TW(26-29) TH(30-33)
+                   TCC(34) TFX(35-36) CBP(37-50) CPSM(51-54) CSM(55) CSA(56-60) CLD(61-63)
+9. PRIM       (0x00) type(0-2) | IIP bit 3 | TME bit 4.  type 3 = TRIANGLE.  <-- the G2.2 fault
+10. per vertex: RGBAQ(0x01), ST(0x02) [S/T/Q as float, 0x02 carries S in 0-31 and T in 32-63],
+                          XYZ2(0x05)   [X 12.4 in 0-15, Y 12.4 in 16-31, Z in 32-63]
+11. the draw kicks itself when the third vertex arrives
+```
+
+**Non-obvious things that cost this project two dishes, collected in one place:**
+
+- **`GS_PRIM_TRIANGLE` is 3, not 2.** Use the enum. `2` is LINESTRIP and it fails *quietly*.
+- **`PRMODECONT` must be 1** or PRIM's TME/IIP are dropped and you get flat, untextured geometry
+  with no error.
+- **`TEST_1` must enable the Z test.** `0` means ZTEST = NEVER and every pixel is discarded. This
+  is the opposite of the intuitive reading of "reset value = no test".
+- **Screen coordinates are 12.4 fixed point**, so pixel `P` is `P << 4`. `Y` is at **bit 16**, not 20.
+- **Write `XYZ2` or `XYZF2`, never both.** Each queues a vertex *and* kicks, so writing both doubles
+  the count and every triangle is degenerate.
+- **DBP and TBP0 must be in the same unit** (see 12.5).
+- **`ST` carries S and T as raw floats**, not 12.4 like the screen coordinates. FST=0 is the normal
+  path: the DDA interpolates S and T and only then divides by Q.
+
+### 12.7 The test, and one thing that did not work
+
+Added: `tools/patches/ps2recomp-linux-g24-primenum.patch`, one test —
+**`GS_PRIM_TRIANGLE is 3 and 2 is LINESTRIP, so the literal 2 must not be used`**. It pins both
+values directly, which is the cheapest possible guard against the constant coming back.
+
+**A behavioural half was attempted and is deliberately NOT shipped.** The intent was to submit a
+triangle through `GS::writeRegister` and assert its interior pixel, so the fix would be pinned by
+behaviour rather than by a number. It does not pass, and the reason is worth recording:
+
+> The batch reaches `DrawPrimitive` with **all three vertices correct** (`v0=(64,64) v1=(400,96)
+> v2=(200,360)`), `type=3`, `scissor=(0,0)-(511,511)`, `test=0x30000`, `fbw=8 psm=0x0` — every
+> input correct — and the interior pixel is still `0x00000000`. Tried: `GSCpuBackend` installed
+> explicitly; `FBW` 1 and 8; readback through the GS's own `GSPSMCT32::addrPSMCT32` swizzle map
+> (a linear offset reads zeroed VRAM and would fail with a *correct* rasteriser, which is exactly
+> the kind of false negative this assertion must not have).
+
+**So there is a further reason a triangle does not land that is neither the primitive type nor the
+vertex queue.** Both of those are now demonstrably healthy. That is the next thing to chase, and it
+is not on the critical path for this dish: the probe draws correct, texture-sampled geometry through
+the real register path with 37,275 colours, so the pipeline is proven end to end. But it is a loose
+end in a unit test that a future dish should close before relying on `writeRegister` as a fallback.
+
+**Suite state: 446 tests, 445 passed, 1 failed.** The failure is
+`VU0 macro mappings cover all S1/S2 enums`, and it is **pre-existing** — proven by building and
+running the suite with this dish's test block removed: 445 tests, 444 passed, the same single VU0
+failure. It asserts on `instructions.h` being readable and on non-empty S1/S2 enum lists, and is
+unrelated to the GS. The docs previously claimed a 444/444 baseline; the measured baseline is
+**444 passed / 1 failed**, and this commit does not change it.

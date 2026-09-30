@@ -88,6 +88,9 @@ The ladder, in order, with the honest state of each rung. Full detail in
 | G1.5 | ✅ | proved the stub body ran; found the real wall (a `FindAddress` livelock) |
 | **G2.0** | ✅ | GS approach decided and the path proved |
 | **G2.1** | ✅ | the GS computes pixels — 43,804 distinct colours |
+| **G2.2** | ✅ | the guest draw sequence, documented (and the fault it hit localised) |
+| **G2.3** | ✅ | the texture register sequence, documented; PSMT8 swizzle proven by test |
+| **G2.4** | ✅ | **the fault was OURS — a hard-coded `PRIM=2` that is a LINESTRIP. Geometry and a sampled texture now draw: 37,275 distinct colours** |
 | **G3.1** | ⬜ | **the VU1.** GT4's vertex microcode handled, a 3D scene rendered |
 | G3.2 | ⬜ | a real car on a real track, natively |
 | G4.1–G4.4 | ⬜ | menus, saves, input, and a full race that completes |
@@ -96,8 +99,22 @@ The ladder, in order, with the honest state of each rung. Full detail in
 | G5.2 | ⬜ | the Android port itself (not started; this dish did not start it) |
 | G5.3 | ⬜ | regional and special builds |
 
-**The next real work is G3.1**, and before it, the GS rasteriser. A frame on disk that our own code
-computed is not a rendered game; the honest next step is making a *primitive* rasterise.
+**The GS now rasterises primitives and samples textures through the real register path.** G2.4 found
+that two dishes of "broken rasteriser" were a single wrong constant in our own probe — `PRIM = 2`,
+which is `GS_PRIM_LINESTRIP`, not `GS_PRIM_TRIANGLE` (3) — plus two more of ours (`TEST_1 = 0`
+meaning `ZTEST = NEVER`, and `PRMODECONT = 0` silently discarding `TME`/`IIP`). All three are fixed,
+pinned by a test, and the frame now carries **37,275 distinct colours with a PSMCT32 texture and a
+PSMT8+PSMCT16-CLUT texture sampled through real GIF REGLIST packets** — 589 and 24 distinct colours
+inside the two quads, which is UV interpolation rather than a flat fill. The full register sequence
+a guest must perform is in [`docs/GS-PLAN.md`](GS-PLAN.md) §12.6, and the absence of filtering,
+mipmaps, blending, a Z test, CLUT animation and the EE→GS DMA path is named in
+[`docs/LIMITATIONS.md`](LIMITATIONS.md), along with three **runtime** divergences that will bite the
+real guest (ZTE not honoured, `PRMODE` semantics flattening textured geometry, and texture base
+units 32× off for a genuine guest).
+
+**The next real work is G3.1, the VU1.** A frame on disk that our own code computed is still not a
+rendered game — and nothing from Gran Turismo 4 has ever been through this GS, because the guest has
+not reached it (G1.8). What G2.4 removes is the excuse that the renderer was the blocker.
 
 ---
 

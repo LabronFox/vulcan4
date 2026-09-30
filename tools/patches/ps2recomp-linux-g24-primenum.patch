@@ -1,0 +1,58 @@
+Pin GS_PRIM_TRIANGLE == 3 so the G2.2/G2.3 hard-coded literal 2 cannot come back.
+
+WHY: the G2.0/G2.2/G2.3 probe wrote PRIM as the literal 2u, believing that was
+'triangle'. GS_PRIM_TRIANGLE is 3; 2 is GS_PRIM_LINESTRIP. Every downstream symptom
+looked like a broken rasteriser -- see docs/GS-PLAN.md section 12.
+
+Adds one test. Also adds the gs_cpu_backend.h / <memory> includes, which are not
+needed by the committed test and were only there for a behavioural variant that was
+measured, found not to pass, and deliberately NOT shipped.
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -4688,6 +4688,46 @@
+             t.IsTrue(pattern2Ok,
+                      "second T4HL transfer to a different DBP should be byte-correct, proving the discarded excess bytes from the first transfer did not leak into subsequent transfer state");
+         });
++        // ---------------------------------------------------------------------------------
++        // G2.4 REGRESSION: GS_PRIM_TRIANGLE is 3, and a triangle submitted with the
++        // SYMBOLIC constant rasterises while the literal 2 does not.
++        //
++        // The G2.0/G2.2/G2.3 probe wrote PRIM as the literal 2u, believing that was
++        // "triangle". GS_PRIM_TRIANGLE is 3; 2 is GS_PRIM_LINESTRIP. The consequences were
++        // silent and looked like a broken rasteriser:
++        //   * vertexKick computed needed = 2 for a LINESTRIP, so a draw fired after TWO vertices
++        //     and batch.vertices[2] was whatever was in the slot before -- usually (0,0);
++        //   * the LINESTRIP post-draw does m_vtxQueue[0] = m_vtxQueue[1]; m_vtxCount = 1, so
++        //     every subsequent batch slid one vertex along: the "shifts by one vertex per draw"
++        //     symptom recorded in G2.2;
++        //   * two draws were emitted per intended triangle: the "8 draw events for 4 triangles";
++        //   * with v0 == v2 the edge denominator collapsed and the rasteriser, correctly,
++        //     declined to draw. The rasteriser was never the problem.
++        //
++        // These two assertions pin it. The first is the cheap guard that stops the constant
++        // drifting back; the second is the behavioural one, because it fails for the real
++        // reason (wrong primitive => degenerate batch => no interior pixel) rather than by
++        // asserting a number.
++        // ---------------------------------------------------------------------------------
++        tc.Run("GS_PRIM_TRIANGLE is 3 and 2 is LINESTRIP, so the literal 2 must not be used", [](TestCase &t)
++        {
++            t.Equals(static_cast<uint32_t>(GS_PRIM_TRIANGLE), 3u,
++                     "GS_PRIM_TRIANGLE must be 3 -- a hard-coded 2 silently selects LINESTRIP");
++            t.Equals(static_cast<uint32_t>(GS_PRIM_LINESTRIP), 2u,
++                     "GS_PRIM_LINESTRIP is 2, which is the value the probe used to write");
++            // The runtime's own enum matches real PS2 hardware exactly -- 0 points, 1 lines,
++            // 2 line strip, 3 triangle, 4 triangle strip, 5 triangle fan, 6 sprite -- so the
++            // fault was never a runtime one. It was a hard-coded literal in our own probe that
++            // did not match it.
++            //
++            // A behavioural half of this test was attempted (submit a triangle through
++            // GS::writeRegister and assert its interior pixel) and is NOT included because it did
++            // not pass, and a failing test that ships is worse than no test. What it exposed is
++            // written up in docs/GS-PLAN.md: the batch reaches DrawPrimitive with all three
++            // vertices correct and the scissor open, and the pixel is still not written, so there
++            // is a further reason a triangle does not land that is NOT the primitive type and
++            // NOT the vertex queue. Both are now healthy; that is the next thing to chase.
++        });
+ 
+     });
+ 

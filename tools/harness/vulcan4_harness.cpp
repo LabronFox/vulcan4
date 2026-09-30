@@ -76,6 +76,8 @@ namespace
     constexpr const char *kHaltOutOfTable = "pc_outside_generated_table";
     constexpr const char *kHaltReturnedToEntry = "returned_to_entry";
     constexpr const char *kHaltInSyscall = "stuck_in_syscall";
+    // G1.5: names the SPECIFIC syscall that dominates the call tally, not just the category.
+    constexpr const char *kHaltStalledInSyscall = "livelocked_in_syscall";
     constexpr const char *kHaltSpinningInGuest = "spinning_in_guest_code";
     // A cycle of guest PCs that keeps repeating with no new PC ever reached. This is distinct
     // from kHaltSpinTrap (one PC revisited) and from kHaltInSyscall (a syscall that is executing):
@@ -584,10 +586,46 @@ int main(int argc, char *argv[])
                 const uint32_t active = runtime.activeSyscallId();
                 if (active != PS2Runtime::kNoActiveSyscall)
                 {
-                    haltReason = kHaltInSyscall;
-                    haltDetail = std::string("blocked inside SCE syscall ") + toHex(active, 2)
-                        + " (" + syscallName(active) + "), guest pc " + toHex(ctx.pc)
-                        + " -- this syscall is the wall";
+                    // G1.5. "stuck_in_syscall" says the guest is in a syscall but not WHICH one,
+                    // or whether it is making any progress through it. On GT4 that turned out to
+                    // be the whole story: sce_FindAddress (0x83) was called 155 times, each call
+                    // brute-force scanning ~112,000 words of RDRAM for a function pointer that
+                    // nothing had ever written, and returning 0 every time. A generic name sent
+                    // G1.4 looking for a dispatch bug that did not exist. So when a single
+                    // syscall dominates the call tally AND we are deadlocked inside it, name the
+                    // syscall instead of the category.
+                    uint64_t activeCalls = 0;
+                    uint32_t dominantId = 0;
+                    uint64_t dominantCalls = 0;
+                    for (const auto &entry : runtime.syscallCounts())
+                    {
+                        activeCalls += entry.second.count;
+                        if (entry.second.count > dominantCalls)
+                        {
+                            dominantCalls = entry.second.count;
+                            dominantId = entry.first;
+                        }
+                    }
+                    const uint64_t totalCalls = runtime.syscallCallCount();
+
+                    if (active == dominantId && totalCalls > 0
+                        && dominantCalls * 2u > totalCalls)
+                    {
+                        haltReason = kHaltStalledInSyscall;
+                        haltDetail = std::string("livelocked in SCE syscall ") + toHex(active, 2)
+                            + " (" + syscallName(active) + "): " + std::to_string(dominantCalls)
+                            + " of " + std::to_string(totalCalls)
+                            + " guest syscalls were this one, at guest pc " + toHex(ctx.pc)
+                            + " -- it is being retried, not satisfied, so the wall is the "
+                              "return value it is not getting, not the call itself";
+                    }
+                    else
+                    {
+                        haltReason = kHaltInSyscall;
+                        haltDetail = std::string("blocked inside SCE syscall ") + toHex(active, 2)
+                            + " (" + syscallName(active) + "), guest pc " + toHex(ctx.pc)
+                            + " -- this syscall is the wall";
+                    }
                 }
                 else
                 {

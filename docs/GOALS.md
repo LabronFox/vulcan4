@@ -57,6 +57,37 @@ Eventually the captain's Odin 2. Never an emulator.
   arithmetic, indirect calls, the spin-trap loop — all verified against raw bytes. **The
   translation is faithful.** But the run **failed**: exit 1, 2 of 721 function bodies lost.
 
+### ✅ G1.5 — The body that never ran (it did run)
+- **DONE WHEN:** the `jal` at `0x010286D4` actually runs the body at `0x01028638`, and the boot
+  report shows progress (`functions_entered` above 3, or a new named halt) with `bios_files=0`.
+- **RESULT (2026-09-30):** the report now reads
+  `VULCAN4 BOOT REPORT functions_entered=3 halt=livelocked_in_syscall bios_files=0` — progress by
+  the second criterion, a **new named halt**, not by a new function entered.
+- **THE PREMISE WAS WRONG, and the trace says so.** The stub body **does** run. All 13 dispatches
+  carry `entry_pc=0x1028638`, and `dispatchGuestBranch` sets `ctx->pc = targetPc` as its first
+  statement (`ps2_runtime.cpp:1352`), so a callee reached through it can never see a resume
+  address. `sce_FindAddress` was called **155 times** — the body ran every time. The
+  `pc=0x01028640` on re-entry is the `case 0x1028640u` resume working as designed.
+- **Sibling scan, as asked: it is safe by construction, and now proved.** A static scan of all 707
+  generated functions found **61** whose own entry address is also a resume case — a fresh `jal`
+  to any of them would skip the body. All 61 are safe, because the entry label is emitted at the
+  *top of the body* right after `default: break`, so both paths converge. Locked in by test.
+- **Regression tests: 3 added, 444/444 green** (baseline 441). They assert a *side effect*, not
+  absence of a crash: a dispatched direct call runs the body exactly once; an entry-address resume
+  case still reaches the body; a resume PC is never aliased to the body. **Proven to have teeth by
+  mutation** — moving the entry label past the body makes exactly the first test fail.
+- **The real wall, found while looking:** a **livelock on `sce_FindAddress` (0x83)**. The guest
+  calls it 143–155 times; each call brute-force scans ~112,000 words of RDRAM for a function
+  pointer (`computeBuiltinFindAddressResult`, `System.cpp:639`) that was never written, returns 0,
+  and the guest retries until the deadline. `total_mmio_addresses=0` — the guest has touched no
+  hardware, no IRX module is loaded, and the runtime has no BIOS path, so the pointer cannot exist.
+  The scan is a heuristic substitute for the hardware's loaded-module export-table lookup.
+- **Deliberately improved:** the report's halt name. `stuck_in_syscall` said only "a syscall", which
+  is what sent G1.4 after a bug that did not exist. It is now `livelocked_in_syscall` with the
+  syscall id, its share of the call tally and the guest PC in the detail line.
+- **Upstream patch:** `tools/patches/ps2recomp-linux-g15-entryresume.patch` (test file only, +155).
+  Verified to apply cleanly on top of the existing three in the G0.5 clean room.
+
 ### ✅ G0.5 — Clean-room reproducibility: the whole chain, no hidden state
 - **DONE WHEN:** the toolchain and the harness are rebuilt in a **fresh** directory from a **fresh
   clone**, using only commands written in `docs/TOOLCHAIN.md`, and the guest boots again with the

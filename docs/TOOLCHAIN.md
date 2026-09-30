@@ -661,6 +661,7 @@ repo. But getting there required fixing the documentation, and the gaps were rea
 |---|---|---|---|
 | 1 | **`TOOLCHAIN.md` never mentioned the boot harness at all.** The whole point of the toolchain is booting a guest, and §3 built a runtime that errors out with *"Pass the guest ELF as argv[1]"*. The harness build lived only in `FIRST-BOOT.md` §6. Following `TOOLCHAIN.md` alone gets you a toolchain and no guest. | **blocking** | ✅ §10 added below |
 | 2 | **The third patch was undocumented.** §8's apply order lists `ps2recomp-linux.patch` and `ps2recomp-linux-outputfix.patch`. The repo also ships `ps2recomp-linux-g1wall.patch` (11 files, +361/-9) and it is **required** for the runtime boot path. It applied cleanly but a stranger would never have known to run it. | **blocking** | ✅ §10 |
+| 2b | **A FOURTH patch now exists.** G1.5 added `ps2recomp-linux-g15-entryresume.patch` (`ps2xTest/src/ps2_runtime_expansion_tests.cpp` only, +155). Test-only, so it is not needed to build or boot — but §10 now lists all four in order, and it applies cleanly on top of the first three. | low | ✅ §10 |
 | 3 | **The recompile configuration was neither in the repo nor documented.** The working build used `/mnt/ssd/gt4/work/gt4_recomp.toml`, a hand-edited file outside the repo. The *entire* delta from the analyzer's own output is two lines — `output` and `single_file_output = true` — but nothing anywhere said so. | **blocking** | ✅ §10 |
 | 4 | **`ps2_analyzer` emits a relative `input` path** (`input = "SCUS_973.28"`), so the recompiler resolves it against the current directory. Must be made absolute. Undocumented. | high | ✅ §10 |
 | 5 | **§6 omitted `-EL`** while §4/§5a say it is mandatory. A stranger following §6 builds a big-endian ELF and gets garbage with a clean-looking report. | high | ✅ fixed in §6 |
@@ -702,6 +703,7 @@ cd tools/PS2Recomp
 git apply ../../tools/patches/ps2recomp-linux.patch          # G0.1 toml11 + SSE4.1
 git apply ../../tools/patches/ps2recomp-linux-outputfix.patch # G0.4 output writer
 git apply ../../tools/patches/ps2recomp-linux-g1wall.patch    # G1.3 runtime + boot report
+git apply ../../tools/patches/ps2recomp-linux-g15-entryresume.patch  # G1.5 entry-vs-resume tests
 cd "$REPO"
 
 # ---- 4. configure + build into a brand-new root

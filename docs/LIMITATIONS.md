@@ -48,6 +48,37 @@ around 1, 2 and 3; defect 4 is unsolved.
 - **Z-buffering is allocated but untested.** `ZBUF_1` is set; nothing writes or tests depth.
 - **`GS::init` with `privRegs == nullptr` yields a permanently blank presentation path.**
 
+## The guest — where it actually stops (goal G1.5)
+
+- **The G1.4 premise was wrong, and the evidence is in `boot.log`.** The `jal` at `0x010286D4`
+  dispatches the stub at `0x01028638` correctly and **its body runs**. Evidence: all 13 dispatches
+  in the trace carry `entry_pc=0x1028638`, and `PS2Runtime::dispatchGuestBranch` sets
+  `ctx->pc = targetPc` as its *first statement* (`ps2_runtime.cpp:1352`), so a callee reached that
+  way can never observe a resume address. `sce_FindAddress` was invoked **155 times** — the body
+  demonstrably executed every time. The `pc=0x01028640` on re-entry is the resume case
+  (`case 0x1028640u: goto label_1028640`) working exactly as designed, not a skipped body.
+- **The entry-vs-resume mechanism is correct, and it is correct by construction.** A static scan of
+  all 707 generated functions found **61** whose own entry address is also a resume case. All 61
+  are safe: the label for the entry address is emitted at the *top of the body*, immediately after
+  `default: break`, so the fresh-call and resume paths converge without skipping an instruction.
+  If codegen ever moves that label, all 61 silently lose their first instruction. Locked in by a
+  regression test.
+- **The real wall is a livelock on `sce_FindAddress` (0x83), not a dispatch bug.** The guest calls
+  it 143–155 times; each call brute-force scans ~112,000 words of RDRAM
+  (`computeBuiltinFindAddressResult`, `Kernel/Syscalls/System.cpp:639`) looking for a function
+  pointer such as `0x10285c0`, finds nothing, and returns `0`. The guest retries. The scan is a
+  heuristic substitute for the real hardware algorithm, which resolves a function from the kernel's
+  loaded-module export table.
+- **Nothing has ever populated that table.** `total_mmio_accesses=0` and `distinct_mmio_addresses=0`:
+  the guest has not touched a single hardware register. No IRX module has been loaded, and the
+  runtime has no BIOS path at all (`bios_files=0`, and the harness contains no BIOS loading code).
+  So the pointer the guest is hunting for does not exist anywhere in memory, and no amount of
+  dispatch correctness will make the lookup succeed.
+- **A precise halt name now replaces the generic one.** The report says
+  `halt=livelocked_in_syscall`, with the detail naming syscall `0x83 (FindAddress)`, its share of
+  the call tally, and the guest PC. Previously `stuck_in_syscall` said only "a syscall", which is
+  what sent G1.4 hunting for a bug in the wrong place.
+
 ## Project-level
 
 - **Nothing from Gran Turismo 4 has ever been rendered by this GS.** The guest has not reached

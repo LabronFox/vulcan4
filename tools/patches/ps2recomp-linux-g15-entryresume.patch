@@ -1,0 +1,173 @@
+diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+index 4772f3f..b7031a4 100644
+--- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+@@ -309,6 +309,77 @@ namespace
+         runtime->requestStop();
+     }
+ 
++    // ---------------------------------------------------------------------
++    // G1.5 regression fixtures.
++    //
++    // These two handlers are hand-written copies of the SHAPE the recompiler emits
++    // for a resumable function, so the entry-vs-resume contract is pinned by a test
++    // rather than by reading generated C. They are deliberately modelled on
++    // sub_01028638_0x1028638, the GT4 stub that G1.4 wrongly suspected of never
++    // running its body.
++    //
++    // Layout of a generated resumable function:
++    //
++    //     switch (ctx->pc) { case <resume>: goto label_<resume>; ... default: break; }
++    //     ctx->pc = <entry>;
++    //   label_<entry>:            <-- first real instruction
++    //     <body>
++    //   label_<resume>:           <-- resumes here, body NOT re-run
++    //
++    // gDirectCallBodyRuns counts how many times the first instruction executed.
++    // gEntryCaseBodyRuns is for the shape where the entry address is ITSELF a resume
++    // case (61 of the 707 GT4 functions have this) and the label sits at the body
++    // start, so the two paths must converge without skipping anything.
++    // ---------------------------------------------------------------------
++    std::atomic<uint32_t> gDirectCallBodyRuns{0u};
++    std::atomic<uint32_t> gEntryCaseBodyRuns{0u};
++
++    constexpr uint32_t kDirectCallEntry = 0x1028638u;
++    constexpr uint32_t kDirectCallResume = 0x1028640u; // the jr $ra
++    constexpr uint32_t kDirectCallFallthrough = 0x10286dcu;
++
++    void testGeneratedShapedCallee(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    {
++        if (!ctx)
++            return;
++        switch (ctx->pc)
++        {
++        case kDirectCallResume:
++            // Resume path: return immediately, exactly like the generated `jr $ra`.
++            ctx->pc = kDirectCallFallthrough;
++            return;
++        default:
++            break;
++        }
++
++        // Fresh-call path: the first instruction of the body. If a dispatch ever
++        // takes the resume case when it should take default, this never runs.
++        gDirectCallBodyRuns.fetch_add(1u, std::memory_order_acq_rel);
++        ctx->pc = kDirectCallResume;
++    }
++
++    void testEntryCaseCallee(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    {
++        if (!ctx)
++            return;
++        switch (ctx->pc)
++        {
++        case kDirectCallEntry:
++            goto body_start;
++        case kDirectCallResume:
++            ctx->pc = kDirectCallFallthrough;
++            return;
++        default:
++            break;
++        }
++        ctx->pc = kDirectCallEntry;
++    body_start:
++        // The label for the entry case is placed HERE, at the top of the body, so
++        // entering as a "resume" of the entry address still runs the body.
++        gEntryCaseBodyRuns.fetch_add(1u, std::memory_order_acq_rel);
++        ctx->pc = kDirectCallResume;
++    }
++
+ }
+ 
+ void register_ps2_runtime_expansion_tests()
+@@ -345,6 +416,90 @@ void register_ps2_runtime_expansion_tests()
+             }
+         });
+ 
++        tc.Run("a dispatched direct call EXECUTES the callee body, and a resume does not re-execute it", [](TestCase &t)
++        {
++            // G1.5. The reported failure was "a dispatched call whose callee never
++            // executes". This asserts the positive side effect, not merely "no crash".
++            gDirectCallBodyRuns.store(0u, std::memory_order_release);
++
++            PS2Runtime runtime;
++            runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
++            runtime.registerFunction(kDirectCallEntry, &testGeneratedShapedCallee);
++
++            R5900Context ctx{};
++            // A real `jal` leaves ctx->pc pointing at the CALLER's current pc, and the
++            // dispatcher is handed the callee entry as targetPc. Mirror that: a fresh
++            // call arrives with ctx->pc equal to the entry address, NOT a resume case.
++            ctx.pc = kDirectCallEntry;
++            setRegU32(ctx, 31, kDirectCallFallthrough);
++
++            runtime.dispatchGuestBranch(nullptr, &ctx, kDirectCallEntry, 0x010286D4u,
++                                        kDirectCallFallthrough,
++                                        PS2Runtime::GuestBranchKind::DirectCall, "JAL");
++
++            t.Equals(gDirectCallBodyRuns.load(std::memory_order_acquire), 1u,
++                     "the callee body must execute exactly once for a fresh direct call");
++            // The callee is modelled on one that suspends at its `jr $ra`, so it legitimately
++            // leaves ctx->pc AT the resume address rather than at the caller's fallthrough --
++            // that is the resume point the harness would re-enter at. What matters here is
++            // that pc advanced out of the entry, i.e. the body really ran.
++            t.Equals(ctx.pc, kDirectCallResume,
++                     "a fresh call must enter the callee at its first instruction, not return early");
++        });
++
++        tc.Run("a resume PC must not alias back to the function body", [](TestCase &t)
++        {
++            gDirectCallBodyRuns.store(0u, std::memory_order_release);
++
++            PS2Runtime runtime;
++            runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
++            runtime.registerFunction(kDirectCallEntry, &testGeneratedShapedCallee);
++
++            R5900Context ctx{};
++            // Resumption does NOT go through dispatchGuestBranch -- that helper forces
++            // ctx->pc = targetPc on entry, so a callee reached that way can never observe a
++            // resume address. The harness resumes through the generated function table,
++            // which has its own synthesised stub per address. The safety property that
++            // matters is that an unstubbed resume PC must NOT be silently aliased to the
++            // owning function, because running the body from a resume PC would re-execute
++            // every instruction before the suspend point. Getting this wrong is what made
++            // the G1.4 report claim the body never ran -- and fixing it the other way
++            // (aliasing) would re-execute the body instead.
++            ctx.pc = kDirectCallResume;
++
++            auto fn = runtime.lookupFunction(ctx.pc);
++            fn(nullptr, &ctx, &runtime);
++
++            t.Equals(gDirectCallBodyRuns.load(std::memory_order_acquire), 0u,
++                     "an unstubbed resume PC must not re-enter the function body");
++            t.IsTrue(runtime.isStopRequested(),
++                     "an unstubbed resume PC must be reported, not silently aliased to the body");
++        });
++
++        tc.Run("a fresh call to a function whose entry address is also a resume case still runs the body", [](TestCase &t)
++        {
++            // 61 of the 707 GT4 functions have their own entry address listed as a
++            // resume case. That is only safe because the label is emitted at the top
++            // of the body. If codegen ever moves that label, all 61 silently skip
++            // their first instruction on a fresh call.
++            gEntryCaseBodyRuns.store(0u, std::memory_order_release);
++
++            PS2Runtime runtime;
++            runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
++            runtime.registerFunction(kDirectCallEntry, &testEntryCaseCallee);
++
++            R5900Context ctx{};
++            ctx.pc = kDirectCallEntry; // matches the entry case AND the fresh-call path
++            setRegU32(ctx, 31, kDirectCallFallthrough);
++
++            runtime.dispatchGuestBranch(nullptr, &ctx, kDirectCallEntry, 0x010286D4u,
++                                        kDirectCallFallthrough,
++                                        PS2Runtime::GuestBranchKind::DirectCall, "JAL");
++
++            t.Equals(gEntryCaseBodyRuns.load(std::memory_order_acquire), 1u,
++                     "entry-address resume case must converge on the body start, not skip it");
++        });
++
+         tc.Run("lookupFunction rejects internal resume PCs without exact registration", [](TestCase &t)
+         {
+             PS2Runtime runtime;

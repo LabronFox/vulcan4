@@ -1225,3 +1225,109 @@ the most useful thing a stuck dish can hand over.
 
 **Until that red test exists, any fix is a guess** — and two guesses in this project have already
 been wrong.
+
+
+---
+
+## 8. G1.6 — WHO WAS SUPPOSED TO WRITE THAT?
+
+**Verdict: the value is not missing. It is in the image, in the search window, and our own trace
+contradicts itself about it.** The gate is **not** met: the report still reads
+`halt=livelocked_in_syscall`.
+
+### 1. The value, identified
+
+The guest is not asking a question we answer wrongly. From the disassembly at the call site
+(`objdump`, `/mnt/ssd/gt4/work/SCUS_973.28`):
+
+```
+010286cc:  lui   a0, 0x8000        ; a0 = 0x80000000   <- scan start
+010286d0:  lui   a1, 0x8008        ; a1 = 0x80080000   <- scan end
+010286d4:  jal   0x1028638         ; FindAddress
+010286d8:  addiu a2, s5, -31240    ; a2 = 0x10285F8
+010286dc:  move  s3, v0
+010286e0:  lui   a0, 0x8000
+010286e4:  lui   a1, 0x8008
+010286e8:  jal   0x1028638
+010286ec:  addiu a2, s4, -31296    ; a2 = 0x10285C0
+010286f0:  addiu s1, s3, -524      ; s1 = s3 - 0x20C
+010286f4:  move  s2, v0
+010286f8:  addiu s0, s2, -360      ; s0 = s2 - 0x168
+010286fc:  beq   s1, s0, 0x1028750 ; stop when they line up
+0102870c:  addiu a0, s3, 4         ; otherwise search for the NEXT one
+01028718:  addiu a2, s5, -31240    ; looking for 0x10285F8 again
+```
+
+So the signature really is `FindAddress(start, end, value)` with `start=0x80000000`, `end=0x80080000`
+and **value = `0x10285F8` and `0x10285C0`** — and the guest then loops, searching for the *next*
+occurrence, comparing `hit(85F8) - 0x20C` against `hit(85C0) - 0x168` and stopping when they match.
+
+**What kind of value is it: a 32-bit CODE POINTER.** Proof: `0x10285F8` and `0x10285C0` are not
+data — they are the entry addresses of two of GT4's own **memory-scan helper routines**:
+
+| Symbol | First instructions | What it is |
+|---|---|---|
+| `sub_010285F8` | `lw $v0,0($a0)` / `beq $v0,$a2` / `addiu $a0,$a0,4` | a word-by-word memory search |
+| `sub_010285C0` | `srl $a2,$a2,2` / `lw $v1,0($a1)` / `daddu $a3,$a3,1` | an indexed memory search |
+
+The guest is looking for **pointers to its own scanners**. It wants to call them indirectly.
+
+### 2. Where the value lives
+
+Each value occurs **exactly once** in the whole 273,020-byte image, and they are 8 bytes apart —
+one 16-byte descriptor:
+
+```
+vaddr 0x01035354 (RAM offset 0x00035354), inside the SECOND PT_LOAD segment
+  +0   0x010285F8   <- code pointer to sub_010285F8
+  +4   0x0000005A   <- 90: a count, handle or id
+  +8   0x010285C0   <- code pointer to sub_010285C0
+  +12  0x00000000   <- terminator
+```
+
+Segment map (`readelf -l`): segment 2 is `off=0x02ec80 -> vaddr=0x0102dc80, filesz=0x13aa4,
+memsz=0x23d2c, RW`, so file offset `0x36354` maps to RAM offset `0x35354` — and `0x35354` **is inside
+the search window** `[0x00000000, 0x00080000)` the guest scans.
+
+### 3. The contradiction — and it is in OUR trace, not the game's
+
+`scannedWords=112581` is exactly the full window from `0x000120ec` to `0x00080000`
+(`0x6DF14 / 4 = 112,580`). So the scan walked over RAM offset `0x35354` and did not match — while
+the file says the word there is `0x010285F8`.
+
+Worse, the diagnostic reports **`allZero=true`** for that window. That cannot be true if segment 2
+were loaded: segment 2 covers RAM `0x2dc80..0x41724`, which lies inside the window and is full of
+data. **`allZero=true` over a window that provably contains a non-zero word is a self-contradiction
+in our own log line.**
+
+### 4. So who should write it, honestly
+
+**Not a subsystem we lack.** No IRX, no BIOS, no export table is required to explain this: the value
+is statically present in GT4's own data segment, at an absolute address, needing no relocation.
+
+Two candidates remain, and they are distinguishable with one experiment that this dish did not have
+runway for:
+
+1. **The ELF loader is not mapping segment 2 where the ELF says.** `PS2Runtime`'s loader
+   (`ps2_runtime.cpp:847+`) copies `filesz` bytes at `translateAddress(ph.vaddr)`. If that mapping is
+   wrong for the second segment, the word is absent and `allZero=true` becomes *true* — the trace
+   would be self-consistent and the guest's search is right to fail.
+2. **The `FindAddress` scan itself is wrong** — for instance the `allZero` fast-path short-circuits
+   before reaching `0x35354`, or the comparison normalises wrongly. Then the value is present and we
+   fail to see it.
+
+**The one experiment that settles it:** dump `RDRAM[0x35354]` at the moment the guest issues the
+first `FindAddress`, and compare it to `0x010285F8`. Non-zero → the scan is broken (2). Zero → the
+loader is broken (1). That is a one-line diagnostic and it is the next thing to do. **This dish ran
+out of runway before it, and it is not going to claim an answer it did not measure.**
+
+### 5. What this rules OUT, which is worth having
+
+- **It is not the missing-writer story I set out to prove.** I expected an absent IRX export table.
+  The value is in the file. The hypothesis was wrong.
+- **It is not a `FindAddress` semantics problem in the way G1.2 fixed.** The handler's argument
+  order matches the guest's own call sites exactly (`a0`,`a1`,`a2`), and the align-to-`uint32` window
+  arithmetic is right; the scan length it reports matches the window it was given.
+- **It is not "the guest never reached an initialiser"** in the simplest reading — the value needs no
+  initialiser.
+

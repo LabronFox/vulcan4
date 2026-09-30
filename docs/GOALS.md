@@ -84,6 +84,32 @@ Eventually the captain's Odin 2. Never an emulator.
   delivery, DMA/AD interrupts, the interrupt controller or the IOP — because a stub that lies about
   these reproduces the G1.5 `FindAddress` livelock.
 
+### 🟡 G1.6 — Who was supposed to write that? *(gate NOT met; the value was found and named)*
+- **DONE WHEN:** the guest gets past the `FindAddress` livelock, or the missing writer is named
+  precisely.
+- **RESULT (2026-09-30):** ❌ gate not met. Report unchanged:
+  `functions_entered=3 halt=livelocked_in_syscall bios_files=0`. **The exit conditions were not
+  touched.** The value was identified and located, and the outcome is *not* the one predicted.
+- **The value is a 32-bit CODE POINTER, not a missing table entry.** The guest calls
+  `FindAddress(0x80000000, 0x80080000, 0x10285F8)` and the same for `0x10285C0`, then loops
+  searching for the next occurrence. Those two values are the entry addresses of **GT4's own
+  memory-scan helper routines** (`sub_010285F8` is a word-by-word search, `sub_010285C0` an indexed
+  search). The guest wants pointers to its own scanners, to call indirectly.
+- **Where it lives:** exactly once each, 8 bytes apart, as one 16-byte descriptor at vaddr
+  `0x01035354` (RAM offset `0x35354`) in the **second PT_LOAD segment**:
+  `{0x010285F8, 0x5A, 0x010285C0, 0x00000000}`. `0x35354` is **inside** the search window.
+- **MY PREDICTION WAS WRONG.** I set out to prove a missing writer — an absent IRX export table. The
+  value needs no relocation and is statically in the image, so that story is dead.
+- **The real finding is a self-contradiction in our own trace.** `scannedWords=112581` is exactly the
+  full window, so the scan walked over `0x35354` and did not match a value the file says is there —
+  and the diagnostic reports `allZero=true` over a window that provably contains a non-zero word.
+  Either the ELF loader is not mapping segment 2 as the program headers say, or the `FindAddress`
+  scan short-circuits. **One experiment settles it: read `RDRAM[0x35354]` when the guest issues the
+  first `FindAddress`.** Non-zero → the scan is broken. Zero → the loader is broken. This dish ran
+  out of runway before running it and does not claim an answer it did not measure.
+- **No code changed, so no regression test was added** — the task requires one for whatever is
+  implemented, and nothing was implemented. Full write-up in `docs/FIRST-BOOT.md` §8.
+
 ### ✅ G1.5 — The body that never ran (it did run)
 - **DONE WHEN:** the `jal` at `0x010286D4` actually runs the body at `0x01028638`, and the boot
   report shows progress (`functions_entered` above 3, or a new named halt) with `bios_files=0`.

@@ -3023,3 +3023,79 @@ Suite **471 total, 470 pass, 1 fail** (pre-existing VU0). Nothing regressed.
 `distinct_pcs` 164–167, and the same `tid1 Running / tid2 Waiting:sleep,woken=0`. **This is a
 fidelity fix, not progress toward a frame.** It matters because GT4 is a game that could observe it
 and because we are trying to be the console, not because it unblocked anything.
+
+## W26/W27 — the CPU is in a guest busy-loop, and for the first time the call graph is COMPLETE
+
+Three populations of guest execution exist and **none of the two I already had was the one that
+mattered**. All three are now counted, red-tested, and permanent.
+
+### The three populations (this is the accounting lesson, finally got right)
+
+| population | counter | GT4, 45 s |
+|---|---|---|
+| harness arrival loop | `functionsEntered` / `pcEntryCounts` | 1,730,673 |
+| scheduler steps (`serviceInvocations`) | `SCHED STEPS` | **0** |
+| **`dispatchGuestBranch` → `targetFn`** | `BRANCH ENTRIES` | **8,364,000+ on the hot targets** |
+
+`dispatchGuestBranch` ends with `targetFn(rdram, ctx, this)` — so **every inter-function transfer,
+and every `jr $ra` returning into a function, re-enters that function from inside the branch
+dispatcher.** Neither the harness's arrival census nor the scheduler's step counter sees one of them.
+
+**Verified my own instruments before trusting them:** the arrival histogram sums to **exactly**
+`functions_entered` (1,730,673), so it is a complete census of what it claims to cover — and it
+covers 1.7 M while the guest actually executed 15.7 M transfers.
+
+### Two hypotheses killed by measurement, not by argument
+
+- **"The scheduler runs the guest behind a yield"** (W22b) — **REFUTED.** `SCHED STEPS total=0`.
+  W20's `invocations_run=0` was measuring the right thing after all; W22b's version of the claim was
+  not, and I retract it.
+- **"A missing `case` label silently restarts the function"** — **REFUTED.** `sub_010112E0` is entered
+  836,066 times and **every one of those entries is at its entry address `0x010112e0`**, so they are
+  real full executions, not resumes landing on a label that does not exist.
+- **And there is no loop inside it.** The loop-back at `0x10113ec` has **zero** transfers, and there is
+  exactly one `GetThreadId` per entry. `sub_010112E0` is not looping — it is being *called*.
+
+### The chain, with counts. This is where the CPU goes.
+
+```
+0x0100e768 -> 0x010175c8  x209013     a lock wrapper (one of sub_0100E340..0x100E610)
+0x01011658 -> 0x010112e0  x209017     sub_01011688 -> the mutex acquire
+0x01011690 -> 0x01011508  x209015     sub_01011688 -> the wait-list broadcast
+0x01012550 -> 0x010118b8  x313526
+0x010128f0 -> 0x010118b8  x313523
+0x01012650 -> 0x010118f0  x313526     sub_010118F0 -> the broadcast
+0x01012990 -> 0x010118f0  x313521
+0x010118c0 -> 0x010112e0  x627049     sub_010118B8 -> the mutex acquire
+0x010118f8 -> 0x01011508  x627049     sub_010118F0 -> the broadcast
+0x0101130c -> 0x0101f310  x836062     sub_010112E0 -> sceGetThreadId
+0x01011350 -> 0x010284d8  x836066     sub_010112E0 -> the critical section
+0x01011344 -> 0x0101f2b0  x627048     sub_010112E0 -> sceChangeThreadPriority(tid, 1)
+```
+
+**tid1 calls a lock that is FREE 836,066 times in 45 seconds, and never blocks once.** No sleep, no
+wakeup, no contention — the object reads `OWNER(+0x20)=0`, `list(+0x0C)=0` (W22).
+
+### The deadlock, stated in one sentence
+
+**tid1 spins calling an uncontended lock; tid2 is asleep in `sce_SleepThread` on a test-and-clear
+word with bit `0x100` (`sub_0100AE78`) waiting for that bit to be set; tid1 never sets it, so nothing
+ever calls `sce_WakeupThread`, so tid2 never runs to set it.** Both halves are measured: tid2's
+`wait=sleep#0:woken=0`, and `0x33` issued zero times.
+
+### The next step, and it is now a single decode
+
+**Read `sub_01011688` (0x1011688–0x10116a8, ~32 bytes) and `sub_010175C8`.** `sub_01011688` is the
+hottest caller of the mutex pair at 209,017/209,015 and is small enough to read in one go; it is
+almost certainly the guest's `lock()`/`unlock()` wrapper, and **its return value is the condition the
+loop above it is testing.** That single decode tells us what tid1 believes it is waiting for, and it
+is the last unexplained thing in the chain.
+
+If `sub_01011688` returns "would block" and the caller ignores it, the loop condition is in the
+caller. If it returns "acquired", then tid1's loop is not a lock wait at all and the whole framing
+changes again — so read it before assuming anything.
+
+Do **not** re-run the arrival histogram, the syscall site sets, the depth counters, the caller map,
+the `-O2` comparison or the `$v1` work. All are built, permanent and settled.
+
+Suite **472 total, 471 pass, 1 fail** (pre-existing VU0).

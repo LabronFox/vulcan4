@@ -1457,7 +1457,100 @@ int main(int argc, char *argv[])
         // the whole run enters 2.04M functions, so either the syscall tally counts resumes as well
         // as guest calls, or the shim arrivals have to be somewhere else in the table. Reading the
         // shim's own arrival count out of the full list answers it; guessing from a slice does not.
-        // W22. Who calls the functions the spin runs through. General, not hardcoded: any function's
+        // W27. The guest's call graph, hottest edges first: caller -> callee x count. The only complete view
+    // of guest control flow, because it covers the transfers the arrival census cannot see.
+    {
+        std::vector<PS2Runtime::BranchEdge> edges(runtime.branchEdges().begin(),
+                                                   runtime.branchEdges().end());
+        std::sort(edges.begin(), edges.end(),
+                  [](const PS2Runtime::BranchEdge &l, const PS2Runtime::BranchEdge &r)
+                  { return l.count > r.count; });
+        std::cout << "VULCAN4 CALL GRAPH distinct_edges=" << edges.size() << " hottest:\n";
+        const std::size_t limit = std::min<std::size_t>(28, edges.size());
+        for (std::size_t i = 0; i < limit; ++i)
+        {
+            std::cout << "    " << toHex(edges[i].source) << " -> " << toHex(edges[i].target) << " x"
+                      << edges[i].count << "\n";
+        }
+    }
+
+// W27. Function entries made BY dispatchGuestBranch, by target PC. The third population, and the
+    // decisive one: dispatchGuestBranch ends with targetFn(rdram, ctx, this), so every inter-function
+    // transfer re-enters its target from inside the branch dispatcher -- invisible to both the
+    // arrival census and the scheduler's step counter. A target with no `case` label in the generated
+    // switch silently restarts that function from its entry instead of resuming it.
+    {
+        const auto &byTarget = runtime.branchTargetEntries();
+        std::vector<std::pair<uint32_t, uint64_t>> targets(byTarget.begin(), byTarget.end());
+        std::sort(targets.begin(), targets.end(),
+                  [](const std::pair<uint32_t, uint64_t> &l, const std::pair<uint32_t, uint64_t> &r)
+                  { return l.second > r.second; });
+        std::cout << "VULCAN4 BRANCH ENTRIES distinct_targets=" << targets.size() << " top:";
+        const std::size_t limit = std::min<std::size_t>(20, targets.size());
+        for (std::size_t i = 0; i < limit; ++i)
+        {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), " %s=%llu", toHex(targets[i].first).c_str(),
+                          static_cast<unsigned long long>(targets[i].second));
+            std::cout << buf;
+        }
+        std::cout << "\n";
+    }
+
+// W26. Guest steps the SCHEDULER ran, by the PC it re-entered at. This is the population the
+    // arrival histogram structurally cannot see -- serviceInvocations() calls the generated function
+    // directly -- and it is where a loop iterating behind a dispatchGuestBranch yield actually lives.
+    {
+        std::vector<std::pair<uint32_t, uint64_t>> steps(kernelSnapshot.schedulerEntries.begin(),
+                                                          kernelSnapshot.schedulerEntries.end());
+        std::sort(steps.begin(), steps.end(),
+                  [](const std::pair<uint32_t, uint64_t> &l, const std::pair<uint32_t, uint64_t> &r)
+                  { return l.second > r.second; });
+        std::cout << "VULCAN4 SCHED STEPS total=" << kernelSnapshot.schedulerSteps
+                  << " distinct_pcs=" << steps.size() << " top:";
+        const std::size_t stepLimit = std::min<std::size_t>(20, steps.size());
+        for (std::size_t i = 0; i < stepLimit; ++i)
+        {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), " %s=%llu", toHex(steps[i].first).c_str(),
+                          static_cast<unsigned long long>(steps[i].second));
+            std::cout << buf;
+        }
+        std::cout << "\n";
+    }
+
+// W26. Guest control transfers BY SITE, biggest first. This is the first line that can see a loop
+    // iterating internally: the arrival histogram cannot, because guest code that runs behind a
+    // dispatchGuestBranch yield never passes through the harness's arrival loop.
+    {
+        const auto &bySite = runtime.branchDispatchCounts();
+        std::vector<std::pair<uint32_t, uint64_t>> transfers(bySite.begin(), bySite.end());
+        std::sort(transfers.begin(), transfers.end(),
+                  [](const std::pair<uint32_t, uint64_t> &l, const std::pair<uint32_t, uint64_t> &r)
+                  { return l.second > r.second; });
+        std::cout << "VULCAN4 XFER SITES distinct=" << transfers.size() << " total=";
+        uint64_t xferTotal = 0;
+        for (const auto &entry : transfers)
+        {
+            xferTotal += entry.second;
+        }
+        std::cout << xferTotal << " top:";
+        const std::size_t xferLimit = std::min<std::size_t>(24, transfers.size());
+        for (std::size_t i = 0; i < xferLimit; ++i)
+        {
+            const double share = xferTotal == 0
+                                     ? 0.0
+                                     : 100.0 * static_cast<double>(transfers[i].second) /
+                                           static_cast<double>(xferTotal);
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), " %s=%llu(%.2f%%)", toHex(transfers[i].first).c_str(),
+                          static_cast<unsigned long long>(transfers[i].second), share);
+            std::cout << buf;
+        }
+        std::cout << "\n";
+    }
+
+// W22. Who calls the functions the spin runs through. General, not hardcoded: any function's
     // entry PC with its distinct return addresses. This is what names the caller of a function the
     // way the syscall site sets name the issuer of a syscall.
     {

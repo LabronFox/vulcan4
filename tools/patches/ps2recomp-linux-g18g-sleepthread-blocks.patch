@@ -292,7 +292,7 @@ index 0000000..68018ac
 +#endif // PS2_GUEST_PROGRESS_H
 \ No newline at end of file
 diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
-index 4b9242c..0e42efe 100644
+index 4b9242c..b9731ce 100644
 --- a/ps2xRuntime/include/ps2_runtime.h
 +++ b/ps2xRuntime/include/ps2_runtime.h
 @@ -21,6 +21,8 @@
@@ -382,7 +382,7 @@ index 4b9242c..0e42efe 100644
  }
  
  inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
-@@ -390,6 +444,66 @@ public:
+@@ -390,6 +444,97 @@ public:
      void requestStop();
      bool isStopRequested() const;
  
@@ -431,6 +431,37 @@ index 4b9242c..0e42efe 100644
 +        std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> callSiteS0;
 +    };
 +    uint64_t syscallCallCount() const { return m_syscallCallCount; }
++    // W26. Guest control transfers taken, BY SITE. The PC histogram counts what the harness's
++    // arrival loop sees, and guest code that runs behind a dispatchGuestBranch yield increments
++    // neither it nor functionsEntered -- so a loop that iterates internally is invisible there. Every
++    // backward edge and every call goes through dispatchGuestBranch, which is handed the site's own
++    // PC, so counting by site sees the loop itself. W22b named this measurement; this is it.
++    const std::unordered_map<uint32_t, uint64_t> &branchDispatchCounts() const
++    {
++        return m_branchDispatchCounts;
++    }
++    // W27. Function entries made by dispatchGuestBranch ITSELF, by target PC. This is the third
++    // population and it is the one that matters: dispatchGuestBranch ends with targetFn(rdram, ctx,
++    // this), so every inter-function transfer -- and every `jr $ra` returning into a function --
++    // re-enters that function from INSIDE the branch dispatcher. Neither the harness's arrival
++    // census nor the scheduler's step counter sees any of it. Measured, it is 849,025 of
++    // sub_010112E0's entries, and the target is a PC with no `case` label, so each one silently
++    // restarts the function from its entry and re-runs its prologue.
++    const std::unordered_map<uint32_t, uint64_t> &branchTargetEntries() const
++    {
++        return m_branchTargetEntries;
++    }
++    // W27. The call graph of EVERY guest transfer, (source PC, target PC) counted. Hot target
++    // without its callers is half an answer; this is the other half. It is the only complete view of
++    // the guest's control flow available, because it covers the transfers the arrival census cannot
++    // see -- the ones dispatchGuestBranch makes itself.
++    struct BranchEdge
++    {
++        uint32_t source = 0;
++        uint32_t target = 0;
++        uint64_t count = 0;
++    };
++    const std::vector<BranchEdge> &branchEdges() const { return m_branchEdges; }
 +    // W19. How deep handleSyscall has ever been nested. A guest syscall that blocks and is then
 +    // resumed by RE-INVOKING handleSyscall -- rather than by resuming at the continuation
 +    // instruction -- shows up here as a depth above 1, and that is the only cheap way to tell
@@ -449,11 +480,18 @@ index 4b9242c..0e42efe 100644
      EeScheduler &eeScheduler();
      const EeScheduler &eeScheduler() const;
      void postEeEvent(EeEvent event);
-@@ -508,6 +622,14 @@ private:
+@@ -508,6 +653,21 @@ private:
      mutable std::mutex m_guestHeapMutex;
      mutable std::mutex m_asyncCallbackStackMutex;
      std::vector<GuestHeapBlock> m_guestHeapBlocks;
 +    uint64_t m_syscallCallCount = 0;
++    // W26. Guest control transfers by site PC. See branchDispatchCounts().
++    std::unordered_map<uint32_t, uint64_t> m_branchDispatchCounts;
++    // W27. See branchTargetEntries().
++    std::unordered_map<uint32_t, uint64_t> m_branchTargetEntries;
++    // W27. See branchEdges(). Linear-scan insert, keyed on (source,target); a generated unit has a
++    // bounded number of distinct edges so this stays small however hard the guest is hammered.
++    std::vector<BranchEdge> m_branchEdges;
 +    // W19. Nesting depth of handleSyscall, and the deepest it has ever been. See syscallCallDepth().
 +    uint32_t m_syscallCallDepth = 0;
 +    uint32_t m_maxSyscallCallDepth = 0;
@@ -517,7 +555,7 @@ index 0f19c9f..84c551e 100644
  #define READ128(addr) ([&]() -> __m128i {                     \
      uint32_t _addr = (uint32_t)(addr);                        \
 diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
-index f247ff9..065f6b5 100644
+index f247ff9..793d37f 100644
 --- a/ps2xRuntime/include/runtime/ee_scheduler.h
 +++ b/ps2xRuntime/include/runtime/ee_scheduler.h
 @@ -93,6 +93,16 @@ enum class GuestInvocationKind : uint8_t
@@ -537,7 +575,7 @@ index f247ff9..065f6b5 100644
  struct GuestInvocation
  {
      GuestInvocationKind kind = GuestInvocationKind::Interrupt;
-@@ -226,6 +236,14 @@ struct EeKernelSnapshot
+@@ -226,6 +236,21 @@ struct EeKernelSnapshot
      std::vector<EeThreadSnapshot> threads;
      std::vector<EeSemaphoreSnapshot> semaphores;
      std::vector<EeEventFlagSnapshot> eventFlags;
@@ -549,10 +587,17 @@ index f247ff9..065f6b5 100644
 +    // GuestInvocationKind, sized to cover every kind.
 +    uint64_t invocationsRun = 0;
 +    uint64_t invocationsRunByKind[4] = {0, 0, 0, 0};
++    // W26. Guest steps the SCHEDULER ran, by the PC it re-entered at. The harness's arrival histogram
++    // cannot see these: serviceInvocations() calls the generated function directly, so a loop that
++    // iterates behind a dispatchGuestBranch yield is invisible to functionsEntered and to
++    // pcEntryCounts alike. Measured, this is where 851,318 executions of sub_010112E0's first call
++    // came from -- and the PC is the one that tells us whether the function RESUMED or RESTARTED.
++    uint64_t schedulerSteps = 0;
++    std::unordered_map<uint32_t, uint64_t> schedulerEntries;
  };
  
  enum class EeEventType : uint8_t
-@@ -318,6 +336,77 @@ public:
+@@ -318,6 +343,77 @@ public:
      void queueInvocation(GuestInvocation invocation);
      [[noreturn]] void invokeCurrent(GuestInvocation invocation);
      [[noreturn]] void invokeCurrentSequence(std::vector<GuestInvocation> invocations);
@@ -630,7 +675,7 @@ index f247ff9..065f6b5 100644
      [[nodiscard]] bool hasInvocation(GuestInvocationKind kind, uint64_t tag) const;
      [[nodiscard]] uint32_t invocationStackTop();
  
-@@ -382,8 +471,11 @@ private:
+@@ -382,8 +478,11 @@ private:
      void makeReady(GuestThread &thread, int result, bool interruptSafe);
      void requestPreemptionIfHigher(const GuestThread &readyThread, bool interruptSafe);
      void applyPendingPreemption();
@@ -644,7 +689,7 @@ index f247ff9..065f6b5 100644
      void processEvent(const EeEvent &event);
      void finishEventWaiters(EeEventFlag &flag, bool interruptSafe);
      [[nodiscard]] static bool eventCondition(uint32_t current, uint32_t requested, uint32_t mode);
-@@ -438,6 +530,10 @@ private:
+@@ -438,6 +537,13 @@ private:
      std::condition_variable m_eventCv;
      std::deque<EeEvent> m_events;
      std::vector<ScheduledEvent> m_deadlines;
@@ -652,10 +697,13 @@ index f247ff9..065f6b5 100644
 +    // W20: guest invocations actually RUN, total and by kind. See EeKernelSnapshot.
 +    uint64_t m_invocationsRun = 0;
 +    uint64_t m_invocationsRunByKind[4] = {0, 0, 0, 0};
++    // W26. Guest steps run by the scheduler, and the PC each one re-entered at. See the snapshot.
++    uint64_t m_schedulerSteps = 0;
++    std::unordered_map<uint32_t, uint64_t> m_schedulerEntries;
      std::deque<GuestInvocation> m_pendingInvocations;
      uint64_t m_eventSequence = 0;
      uint64_t m_invocationSequence = 0;
-@@ -448,6 +544,8 @@ private:
+@@ -448,6 +554,8 @@ private:
      uint32_t m_gsVSyncCallbackGp = 0;
      uint32_t m_gsVSyncCallbackSp = 0;
      std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
@@ -817,10 +865,10 @@ index 0000000..4636c5e
 +
 +static const unsigned kSyscallNameCount = 58;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c4..9794d0d 100644
+index c5e31c4..bdab38a 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-@@ -295,6 +295,20 @@ void EeScheduler::run()
+@@ -295,6 +295,24 @@ void EeScheduler::run()
          try
          {
              m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
@@ -838,10 +886,14 @@ index c5e31c4..9794d0d 100644
 +                    ++m_invocationsRunByKind[kind];
 +                }
 +            }
++            // W26. Count the step and the PC it re-entered at. The harness cannot see these: this
++            // is the scheduler calling the generated function directly, not its arrival loop.
++            ++m_schedulerSteps;
++            ++m_schedulerEntries[context.pc];
              m_guestExecuting.store(true, std::memory_order_release);
              function(m_rdram, &context, &m_runtime);
              m_guestExecuting.store(false, std::memory_order_release);
-@@ -1121,6 +1135,275 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+@@ -1121,6 +1139,275 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
      throw EeDispatcherTransfer{};
  }
  
@@ -1117,7 +1169,7 @@ index c5e31c4..9794d0d 100644
  [[noreturn]] void EeScheduler::invokeCurrentSequence(std::vector<GuestInvocation> invocations)
  {
      assertExecutor();
-@@ -1456,23 +1739,49 @@ uint8_t *EeScheduler::rdram() const noexcept
+@@ -1456,23 +1743,49 @@ uint8_t *EeScheduler::rdram() const noexcept
  
  void EeScheduler::bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram)
  {
@@ -1175,11 +1227,13 @@ index c5e31c4..9794d0d 100644
      }
  }
  
-@@ -1490,6 +1799,11 @@ void EeScheduler::publishSnapshot()
+@@ -1490,6 +1803,13 @@ void EeScheduler::publishSnapshot()
      next.sliceEndCycle = m_sliceEndCycle;
      next.nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
      next.runningThreadId = m_currentThreadId;
 +    next.invocationsRun = m_invocationsRun;
++    next.schedulerSteps = m_schedulerSteps;
++    next.schedulerEntries = m_schedulerEntries;
 +    for (size_t i = 0; i < 4; ++i)
 +    {
 +        next.invocationsRunByKind[i] = m_invocationsRunByKind[i];
@@ -1187,7 +1241,7 @@ index c5e31c4..9794d0d 100644
      next.threads.reserve(m_threads.size());
      for (const auto &[id, item] : m_threads)
      {
-@@ -1740,10 +2054,10 @@ void EeScheduler::applyPendingPreemption()
+@@ -1740,10 +2060,10 @@ void EeScheduler::applyPendingPreemption()
      m_timeSliceExpired = false;
  }
  
@@ -1200,7 +1254,7 @@ index c5e31c4..9794d0d 100644
      const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
      m_pendingEeTimerInterrupts = 0u;
      for (uint32_t timer = 0u; timer < 4u; ++timer)
-@@ -1773,7 +2087,7 @@ void EeScheduler::processPendingEvents()
+@@ -1773,7 +2093,7 @@ void EeScheduler::processPendingEvents()
      applyPendingPreemption();
  }
  
@@ -1209,7 +1263,7 @@ index c5e31c4..9794d0d 100644
  {
      for (;;)
      {
-@@ -1798,7 +2112,10 @@ void EeScheduler::processDueDeadlines()
+@@ -1798,7 +2118,10 @@ void EeScheduler::processDueDeadlines()
                  return;
              }
  
@@ -1628,10 +1682,20 @@ index 37b6a4d..43165bf 100644
      {
          return virtualAddress;
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..dc24d77 100644
+index 45cb9d2..64667db 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
-@@ -1358,6 +1358,28 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1353,11 +1353,38 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     ctx->pc = targetPc;
+     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+ 
++    // W26. Count the transfer by its site. Done before any early return so a yield, a missing
++    // function and a completed call are all counted -- the point is how many times the guest
++    // EXECUTED this transfer, not what came of it.
++    ++m_branchDispatchCounts[sourcePc];
++
+     // Every inter-function transfer is also a deterministic EE safe point.
+     // Backward edges inside generated functions use eeCheckpointDue(), while
      // this charge bounds straight-line call chains that have no local loop.
      if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
      {
@@ -1660,7 +1724,7 @@ index 45cb9d2..dc24d77 100644
          return false;
      }
  
-@@ -1396,8 +1418,38 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1396,8 +1423,55 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
  
      RecompiledFunction targetFn = lookupFunction(targetPc);
      const uint32_t entryPc = ctx->pc;
@@ -1682,6 +1746,23 @@ index 45cb9d2..dc24d77 100644
 +                      << std::dec << std::endl;
 +        }
 +    }
++    // W27. Count the entry this dispatch is about to make, by target PC, and record the edge.
++    // See branchTargetEntries() and branchEdges().
++    ++m_branchTargetEntries[entryPc];
++    {
++        auto edgeIt = std::find_if(m_branchEdges.begin(), m_branchEdges.end(),
++                                   [sourcePc, entryPc](const BranchEdge &edge)
++                                   { return edge.source == sourcePc && edge.target == entryPc; });
++        if (edgeIt != m_branchEdges.end())
++        {
++            ++edgeIt->count;
++        }
++        else
++        {
++            m_branchEdges.push_back(BranchEdge{sourcePc, entryPc, 1u});
++        }
++    }
++
      targetFn(rdram, ctx, this);
  
 +    {
@@ -1699,7 +1780,7 @@ index 45cb9d2..dc24d77 100644
      if (isStopRequested() || ctx->pc == 0u)
      {
          return false;
-@@ -1459,6 +1511,24 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx)
+@@ -1459,6 +1533,24 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx)
  
  void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encodedSyscallId)
  {
@@ -1724,7 +1805,7 @@ index 45cb9d2..dc24d77 100644
      if (ctx->in_delay_slot)
      {
          throw std::runtime_error("Attempted to execute a syscall inside a branch delay slot! "
-@@ -1469,13 +1539,109 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
+@@ -1469,13 +1561,109 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
                                     ? encodedSyscallId
                                     : getRegU32(ctx, 3); // $v1 / $3 is the EE kernel syscall number
  
@@ -1834,7 +1915,7 @@ index 45cb9d2..dc24d77 100644
  }
  
  void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
-@@ -1665,7 +1831,21 @@ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
+@@ -1665,7 +1853,21 @@ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
      }
  
      m_guestHeapBase = base;
@@ -1857,7 +1938,7 @@ index 45cb9d2..dc24d77 100644
      m_guestHeapLimit = limit;
      m_guestHeapConfigured = true;
  }
-@@ -2285,6 +2465,14 @@ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, ui
+@@ -2285,6 +2487,14 @@ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, ui
      }
      const uint32_t guestAddress = static_cast<uint32_t>(address);
      std::memcpy(rdram + guestAddress, &handler, sizeof(handler));
@@ -2421,7 +2502,7 @@ index 0b22fe0..9e1b3a4 100644
          {
              PS2Memory mem;
 diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
-index 4772f3f..0988546 100644
+index 4772f3f..41482f6 100644
 --- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
 +++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
 @@ -309,6 +309,77 @@ namespace
@@ -2593,7 +2674,7 @@ index 4772f3f..0988546 100644
          tc.Run("lookupFunction rejects internal resume PCs without exact registration", [](TestCase &t)
          {
              PS2Runtime runtime;
-@@ -1086,6 +1241,114 @@ void register_ps2_runtime_expansion_tests()
+@@ -1086,6 +1241,153 @@ void register_ps2_runtime_expansion_tests()
              t.IsTrue(threw, "syscall from delay slot should throw to preserve block atomicity");
          });
  
@@ -2636,6 +2717,45 @@ index 4772f3f..0988546 100644
 +                     "two distinct entry PCs should be recorded, not three");
 +            t.IsTrue(it->second.entryPcs.count(0x0100AAA0u) == 1, "first site should be in the set");
 +            t.IsTrue(it->second.entryPcs.count(0x0100BBB0u) == 1, "second site should be in the set");
++        });
++
++        tc.Run("dispatchGuestBranch counts every guest transfer BY SITE, including ones it does not inline",
++        [](TestCase &t)
++        {
++            // W26. The PC histogram counts what the harness's arrival loop sees, and guest code
++            // running behind a dispatchGuestBranch yield increments neither it nor the entry count.
++            // So a loop that iterates internally is invisible there -- which is how W16-W23 spent
++            // three entries looking at a histogram that structurally could not show the spin. Every
++            // backward edge and every call passes through here carrying its own site PC, so counting
++            // by site is the measurement that can see it.
++            PS2Runtime runtime;
++            R5900Context ctx{};
++            ctx.pc = 0x01000500u;
++
++            // Three transfers from two different sites. The middle one targets an address with no
++            // generated function, so it takes an early-out path -- it must still be counted, because
++            // "how many times did the guest execute this transfer" is the question, not "what came
++            // of it".
++            runtime.dispatchGuestBranch(nullptr, &ctx, 0x01000500u, 0x01001000u, 0x01001004u,
++                                       PS2Runtime::GuestBranchKind::DirectCall, "JAL");
++            runtime.dispatchGuestBranch(nullptr, &ctx, 0xDEAD0000u, 0x01002000u, 0x01002004u,
++                                       PS2Runtime::GuestBranchKind::DirectCall, "JAL");
++            runtime.dispatchGuestBranch(nullptr, &ctx, 0x01000500u, 0x01001000u, 0x01001004u,
++                                       PS2Runtime::GuestBranchKind::DirectCall, "JAL");
++
++            const auto &counts = runtime.branchDispatchCounts();
++            const auto first = counts.find(0x01001000u);
++            const auto second = counts.find(0x01002000u);
++            t.IsTrue(first != counts.end(), "the first site should be recorded");
++            t.IsTrue(second != counts.end(), "the site that took an early-out path should be recorded too");
++            if (first != counts.end())
++            {
++                t.Equals(first->second, static_cast<uint64_t>(2), "two transfers from the first site");
++            }
++            if (second != counts.end())
++            {
++                t.Equals(second->second, static_cast<uint64_t>(1), "one transfer from the second site");
++            }
 +        });
 +
 +        tc.Run("a syscall returns the dispatcher's SCALED byte index in $v1 and preserves $a0-$a3", [](TestCase &t)

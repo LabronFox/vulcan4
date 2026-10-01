@@ -5939,3 +5939,150 @@ Suite **479/479**. `VULCAN4 FRAME source=guest` has never printed.
 **Next: decode the record table at `0x010519C0`, stride and field layout, and work out which field
 `sceMcOpen`'s `$a2` is.** Everything said so far about "the path" is downstream of a structure nobody
 has read.
+
+---
+
+## W66 — VF0 was zero in every guest thread but the main one, and the four zero-comparing branches tested 32 bits
+
+Two real bugs, both found by auditing Caine's list against our own code rather than by a boot symptom.
+Both are the "looks like a physics bug" class, which is exactly why nobody found them by staring at a
+picture.
+
+### W66a — VF0, bug class 1. RED, then green.
+
+`R5900Context`'s constructor begins with `std::memset(this, 0, sizeof(*this))`, so a default-constructed
+context has `vu0_vf[0] == 0`. The main thread was correct **only by accident**: `PS2Runtime`'s
+constructor patches it afterwards at `ps2_runtime.cpp:495`. Every other path that builds a context got
+zero — and the one that matters is `EeScheduler::startThread`:
+
+```cpp
+target->context = R5900Context{};   // EeScheduler.cpp:518 -- vu0_vf[0] is now (0,0,0,0)
+```
+
+**Red test, `ps2_thread_block_tests.cpp`, "W66: VF0 must be the hardware constant 0,0,0,1 in EVERY guest
+thread, not just main":**
+
+```
+[Run]: W66: VF0 must be the hardware constant 0,0,0,1 in EVERY guest thread, not just main  [Failed]
+      - worker VF0.w MUST be the hardware constant 1,0,0,1 -- a started thread is not an exception to VF0
+```
+
+The three `CONTROL:` assertions for the main thread passed in the same run, so the failure is
+specifically the worker and not a broken fixture. The fix is in the **constructor**, not at a call site:
+
+```cpp
+vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);   // ps2_runtime.h, R5900Context()
+```
+
+and `ps2_runtime.cpp:495` is now a comment explaining that a hardware constant which has to be re-applied
+at a call site is a constant that will be forgotten at the next one. `copyVu0StateToContext`
+(`ps2_runtime.cpp:276`) already re-patched VF0 after every microprogram, so microprograms were never the
+problem — **thread creation was, and only that.**
+
+### W66b — BLTZ/BGEZ/BLEZ/BGTZ tested 32 bits, bug class 2. Measured, then red, then green.
+
+`ControlFlowEmitter::branchConditionExpression` emitted `GPR_S32` for all four. **Measured in the
+generated unit** (`/mnt/ssd/vulcan4-build/recomp/ps2_recompiled_functions.cpp`), before the fix:
+
+| pattern | 32-bit sites | 64-bit sites |
+|---|---|---|
+| `GPR_S32(ctx, N) < 0` (BLTZ family) | 83 | 0 |
+| `GPR_S32(ctx, N) >= 0` (BGEZ family) | 131 | 0 |
+| `GPR_S32(ctx, N) <= 0` (BLEZ family) | 68 | 0 |
+| `GPR_S32(ctx, N) > 0` (BGTZ family) | 88 | 0 |
+| **total** | **370** | **0** |
+
+`BEQ`/`BNE` on that same function were already `GPR_U64`, and `SLT`/`SLT`/`SLTI`/`SLTIU` in the ALU
+translators were already 64-bit — so the bug was confined to these four, which is why it could sit here
+undetected. A 32-bit test reads only the low half, so a register holding `0x8000000000000000` — negative
+as a signed 64-bit value, and something the guest gets by ordinary arithmetic on pointers — takes the
+wrong side of the branch.
+
+**Red test, `code_generator_tests.cpp`, "W66: zero-comparing branches test the full 64-bit register":**
+
+```
+[Run]: W66: zero-comparing branches test the full 64-bit register, not 32  [Failed]
+      - BLTZ must compare 64 bits, as GPR_S64(ctx, 5) < 0
+      - BGEZ must compare 64 bits, as GPR_S64(ctx, 5) >= 0
+      - BLEZ must compare 64 bits, as GPR_S64(ctx, 5) <= 0
+      - BGTZ must compare 64 bits, as GPR_S64(ctx, 5) > 0
+      - BLTZL must compare 64 bits too -- it shares the compare with BLTZ
+      - BLEZL must compare 64 bits too
+```
+
+**The first version of that test passed for the wrong reason** and I want that on the record, because it
+is the same failure mode as W61: a conditional branch's compare is not produced by
+`translateInstruction` — for the REGIMM forms that returns a *comment* — so the test was reading a
+string that was never emitted. It now goes through `generateFunction`, which is the path that actually
+emits the compare. Fixing the test made it red; the emitter fix then made it green.
+
+Regenerated after the fix: **639 functions**, `GPR_S64` forms present, `GPR_S32` count for these
+compares **0**.
+
+### Suite
+
+```
+Total Tests: 482
+Passed: 482
+Failed: 0
+```
+
+Up from 479/479 at W65. +1 VF0, +1 branch width, +1 is W67 below.
+
+---
+
+## W67 — the `fioOpen` zero was VACUOUS, and the red test that proves it
+
+**Retraction, and it is mine: "the guest never opens `core.gt4`" is withdrawn.** It was carried for hours
+as a measured fact. It was grepping a string the program never emits.
+
+`ps2_syscalls::fioOpen` (`Kernel/Syscalls/FileIO.cpp:21-42`) had **no trace call at all**. The only
+literal `fioOpen` in the runtime was the *error* string `"fioOpen error: Invalid path address"` for a
+bad path pointer. **A successful open printed nothing whatsoever.** So `grep fioOpen` → 0 could not
+distinguish "no open happened" from "no open was reported", and it was read as the former.
+
+The syscall tally does not rescue it either: `sceOpen` is recompiled as a 21-byte forwarder that calls
+`fioOpen` directly, never through `handleSyscall`, so `syscallCounts()` cannot see it either.
+
+**This is the third time this project has lost a wall to an instrument that could not report success**
+(`Ps2FastWrite32` bypassed the write observer; the no-progress detector called the game's own converging
+loops a hang; W61's strlen story). The invariant, now written down: **an operation this boot is judged on
+must emit a line when it SUCCEEDS, not only when it fails.**
+
+### Red test, then green
+
+`ps2_runtime_io_tests.cpp`, "W67: a successful fioOpen is traceable -- a zero in the log means
+something". It calls `fioOpen` against `rom0:ROMVER`, a path already known to succeed with no host file,
+redirects **both** `std::cout` and `std::cerr` around the call, and asserts the captured text names the
+call.
+
+```
+[Run]: W67: a successful fioOpen is traceable -- a zero in the log means something  [Failed]
+      - a SUCCESSFUL fioOpen must emit a trace line naming the path; today it emits nothing,
+        which is why a grep of the boot log returned 0 and that 0 was read as 'the guest never
+        opens core.gt4'. Captured text: []
+```
+
+Green after adding an **unconditional** `std::cerr` line in `fioOpen` — deliberately not
+`RUNTIME_LOG`, because that macro compiles to `do {} while(0)` when `PS2_RUNTIME_LOGS` **and**
+`AGRESSIVE_LOGS` are both 0 (`ps2_log.h:119-138`), and because `ps2_log.txt` is a **separate** buffer
+(`ps2_log.h:149,155`). `std::cerr` survives both.
+
+The test also asserts the documented bypass rather than pretending it is not there: `syscallCounts()`
+must **not** gain an open entry. If that ever changes, the tally became trustworthy and the line should
+be revisited.
+
+### The instrument, so a log can no longer go stale silently
+
+New `tools/harness/run_boot_named.sh`. `boot_span.log` appeared in **no run script at all** and predated
+the runtime archive it described by 1.5 hours; nobody could tell. Every log it writes carries the
+timestamps of the harness, the runtime archive and the generated unit, plus its own argv, in its first
+four lines.
+
+### Status, and what is NOT yet known
+
+`VULCAN4 FRAME source=guest` has never printed. **We still do not know whether the guest opens
+`core.gt4`** — and that is now an open question rather than a false answer, which is the whole value of
+W67. The instrument is live and the suite is green; the named boot run that uses them has **not** been
+made yet, and the `mkdir GAMEDATA` experiment stays **second**, read as "the open still did not happen"
+or "the open happened and returned −1", never as evidence about mounts.

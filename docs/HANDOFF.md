@@ -6130,3 +6130,70 @@ repair and the lesson together — a run that a turn boundary cannot kill cannot
 I did not hand-edit either file to make the link succeed, and I did not restore a mismatched pair. A
 matched pair only comes from one run. The recompile now running is a **repair of a broken tree**, not a
 dish, and it is not evidence of anything about GT4.
+
+---
+
+## W69 — the FIRST `[fioOpen]` line ever printed, and it is a double-prefixed device path with an empty filename
+
+Step one of the arc, and the number two days of guessing rested on is dead in a new way. The
+instrument works, and what it says is not what anyone expected.
+
+`/mnt/ssd/vulcan4-build/run/boot_w68.log`, produced by `tools/harness/run_boot_named.sh` after W68's
+repair. Distinct `[fioOpen]` lines in the whole run, verbatim:
+
+```
+  11883 [fioOpen] path="cdrom0:\CDROM0:\;1" flags=0x1 -> fd=-1
+      1 [fioOpen] path="rom0:ROMVER" flags=0x1 -> fd=3
+```
+
+### The control passed, so both numbers mean something
+
+`rom0:ROMVER` **succeeds with `fd=3`.** That is the W67 red test's exact scenario, now observed in the
+product rather than in a unit test: a successful open prints a line and returns a valid descriptor. So
+this is not another vacuous zero — it is a live instrument with a positive control in the same log.
+
+### What the guest actually opens
+
+**`cdrom0:\CDROM0:\;1` — 11,883 times, every one `fd=-1`.**
+
+Three things are wrong with that string at once, and all three are the guest's own doing, because the
+whole string is read from guest memory by `fioOpen` before we touch it:
+
+1. **Double prefix.** `cdrom0:\` followed by `CDROM0:\;1` — a device path glued to another device
+   path. One of the two was meant to be a filename and is not.
+2. **Case-flipped halves.** The first is `cdrom0:` lowercase, the second `CDROM0:` uppercase. Two
+   different producers wrote the two halves.
+3. **Empty filename.** After the device prefix there is nothing at all, just the `;1` version suffix.
+   The name the guest wanted is **absent**.
+
+### The most important negative result in this file
+
+**Neither `GAMEDATA` nor `core.gt4` appears in the path the guest opens.** Not once, in 2,000,000
+entries. So the claim "GT4 assembles `cdrom0:\GAMEDATA\...` and we do not resolve it" is **not what the
+guest is doing in this state** — and the `mkdir GAMEDATA && ln -s` experiment, which the steer had
+correctly ordered last, would not have touched this at all. It is a filesystem experiment being aimed
+at a string that is never requested.
+
+### And it is the same shape as the garbage from W64/W65
+
+W65's `joined="?/?/e.gt4"` and this are one bug wearing different clothes: a join that pastes a
+**device-qualified fragment** where a bare name belongs. Here the fragment is `CDROM0:\;1`; there it
+was two bytes of structure. Both end in a path whose *filename component is empty*, and both are
+produced before the open, not by the open.
+
+### What this rules out, and what it does not
+
+- **Ruled out:** any theory that the wall is a directory, a mount, a prefix match, a case-sensitivity
+  retry, or a missing file. None of those can explain a path with no filename in it.
+- **Ruled out:** `romDevice()` / BIOS as the blocker. `rom0:ROMVER` works.
+- **NOT ruled out, and now the wall:** why the guest holds a device path where it means to hold a
+  filename, and why the two halves are cased differently. That is upstream of the filesystem entirely.
+
+### Next single step
+
+Log the **guest address** of the path string in `fioOpen` alongside the text, and the guest PC of the
+caller, once. That names the buffer the empty name should have been in, which is the same shape of
+question as W36's answer and is the difference between "the guest is mis-assembling" and "we are
+mis-reading the guest's buffer".
+
+Suite unchanged at **482/482**. `VULCAN4 FRAME source=guest` has never printed.

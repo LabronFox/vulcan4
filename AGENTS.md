@@ -82,6 +82,13 @@ direction check.
     4824 ms behind`) at the exact minute the compile ran, and the player felt it. `nproc` is 6, not 12:
     the game gets a core or two, the build gets the rest.
 
+12. **Everything we add is OFF by default.** The game as it shipped is the default state. New cars, custom
+    music, chimes, camera and speed-feel changes, quality-of-life fixes — all **opt-in**, and `0`/`OFF` must
+    mean the untouched original behaviour, not "a subtle amount". The captain's reason, verbatim (2026-10-01):
+    *"everything i add and change is off by default. cant know if they want an authentic experience."* A
+    feature that ships enabled has changed somebody's game without being asked, and the authentic one is the
+    whole reason this project exists. This applies to *every* entry in `G6`.
+
 ## HOW YOUR WORK IS JUDGED
 
 - The captain judges the **product**: a picture, a number, a sound — not a commit log.

@@ -5225,3 +5225,54 @@ is not needed, and a `WTRACE` log reaches 2.3 GB; delete it afterwards and check
   search (host, MCARD 0, MCARD 1, disc) still runs steps 2 and 3 and never reaches step 4.
 
 **STATUS: no frame, and the milestone is NOT met.** `VULCAN4 FRAME source=guest` has never printed.
+
+---
+
+## 2026-10-01 — W57e: a 16 MB memset wipes the guest's own scratch buffer, and its length comes from guest globals
+
+Filtering `WTRACE` **by span** rather than by start address (the mistake that hid this) gives exactly one
+write covering `0x010519C0` before the prefix copy:
+
+```
+seq=17517  memset  src=0x00000000  addr=0x010519B0  size=16410192     covers 16,410,176 bytes
+```
+
+**This is W30's "copy that ran away", and it is a 16.4 MB wipe of guest memory.** `0x010519B0 +
+16,410,192 = 0x01FF6570`, which is inside the 32 MB RDRAM, so nothing rejects it — and it lands squarely
+on the buffer where the guest had just built **`/BASCUS-97328`** (seq 21–27: `WRITE8 '/'`,
+`memcpy "/B"` from `.rodata 0x0103D638`, `memcpy "SCUS-97328"` from `0x0103D650`).
+
+**That is the causal chain for the malformed prefix.** The guest builds its save-directory path, a
+runaway length computed from two guest globals wipes 16 MB including that path, and every later path
+the guest assembles from that scratch reads back `05 80` followed by zeros. The guest then copies those
+2 bytes verbatim as its path prefix, `sceMcOpen` faithfully returns `-4`, and the four-source search
+never advances.
+
+**Why this matters more than the prefix.** 16,410,192 is a *number the guest computed*, not a number we
+invented — W30 recorded that `sub_01010EA8` derives the length from two guest globals. **On real
+hardware GT4 does not wipe its own scratch**, so those globals must hold different values there. **The
+length is therefore a symptom: something upstream is giving the guest wrong values in those globals**,
+and that is the same class of defect as W41's "STATUS.IE set, nothing delivers on it" — a value the
+guest is entitled to read, and reads wrongly.
+
+**I am not claiming which globals yet.** What is measured: the wipe is real, it is 16.4 MB, it starts at
+`0x010519B0`, it happens between the path build (seq 21–27) and the prefix copy (seq 374844), and it is
+the only write spanning the prefix source in the whole run.
+
+### NEXT, and it is specific
+
+1. `sub_01010EA8` reads two guest globals for the length. **Name them and print their values at the
+   call.** If one of them is supposed to come from a syscall result or an allocation size, that is where
+   the wrong value enters. This is decidable with the WTRACE trace plus one `RUNTIME_LOG`.
+2. Only then decide (a) vs (c). On present evidence **(c) is far better supported than it was an hour
+   ago**: the guest's path is malformed because *we* gave it wrong data, not because it built it wrong.
+3. `sanitizeMemTransferSize` did **not** reject a 16.4 MB copy. Whether it should is a separate
+   question and **must not** be answered by clamping — clamping would hide the symptom. Fix the input.
+
+**The analysis lesson, recorded because it has now cost two walls:** every observer filter in this
+project has been written as "destination starts in my window". **A write that merely spans the window
+is missed**, and both W44's "contradiction" and this one are that mistake. Filters must test
+`addr < hi && addr + size > lo`, never `addr` alone.
+
+**STATUS: no frame, milestone NOT met.** `VULCAN4 FRAME source=guest` has never printed. The 2.3 GB and
+1.4 GB `WTRACE` logs were deleted; `df -h /mnt/ssd` back to 109 G free.

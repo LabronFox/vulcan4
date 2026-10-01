@@ -3683,3 +3683,66 @@ and holds the buffer after, then **something in our runtime overwrote `obj->0x0`
 something is ours.
 
 That distinction decides everything, and it is one run.
+
+## W35 — RETRACTION of W33 and W34's central claim: the path was never ASCII, and MY OWN PRINTER invented the ".."
+
+W34 said the boot wall was a path `../../e.gt4` corrupted into `\x05\x80/...`. **That is wrong, and
+so was W33's claim before it.** Both were produced by a bug in my own diagnostic: `printGuestCStr`
+renders every non-printable byte as `.`, so the bytes `05 80` printed as `..`. I then spent two
+sessions reasoning about a corruption that does not exist. Recording that first, because a plausible
+wrong answer is exactly what this project keeps paying for.
+
+### What the guest actually does, logged at the three memcpys that matter
+
+Keyed on the real `$ra` values, in `ps2_stubs::memcpy`:
+
+```
+n=1 A ra=0x1003a98  dest=0x1051a10 src=0x103d1d8 size=9  src_raw=63 6f 72 65 2e 67 74 34  = "core.gt4"
+n=2 B ra=0x1003e80  dest=0x1051a10 src=0x10519c0 size=2  src_raw=05 80 00 00 00 00 00 00 41 00 00 00
+n=3 C ra=0x1003e98  dest=0x1051a13 src=0x1051a10 size=9
+```
+
+- **A** pastes the static string `"core.gt4"` (from `.rodata` at `0x103d1d8`) into the buffer.
+- **B** pastes **2 bytes** read from **`0x010519C0`**, onto the head of that buffer.
+- **C** is a genuinely overlapping `memcpy(dst=src+3, size=9)` — the left-shift that trims a leading
+  path component.
+
+### The established facts, all from those logs
+
+1. **`0x010519C0` holds `05 80 00 00 00 00 00 00 41 00 00 00` — a 16-bit array, not a string.**
+   As characters that is `U+8005, U+0000, U+0000, U+0000, U+0041`. There is no `2E 2E` anywhere.
+2. The buffer content `sceMcOpen` reads, `05 80 2f 05 80 2f 65 2e 67 74 34`, is a **faithful** product
+   of calls A, B and C. Nothing overwrote it behind the guest's back.
+3. `obj` for calls B and C is `0x01FFFE80`, a guest **stack** slot, with `obj->0x0 = 0x1051a10` and
+   `obj->0x4 = 0`. So W33's "unaligned object at path-1 overlapping the path buffer" was the same
+   rendering artifact — there is no overlapping object.
+4. `0x010519C0` lies inside the region the one-time 16,410,192-byte copy writes
+   (`0x10519AC -> 0x10519B0`, `big_copy_count=1`), 16 bytes past its destination. **It is very likely
+   ring-buffer or stream content, not a path component.**
+5. `0x8005` is **not** a byte-swapped `0x2E2E` (`0x2E2E` is a palindrome, so no endianness error can
+   produce `0x8005`). So there is no simple width/byte-order explanation, and I am not going to invent
+   one.
+
+### Retracted, permanently
+
+- W33: "`../../e.gt4` is corrupted to `\x05\x80/...` by an object at path-1." **False** — the buffer
+  was never ASCII.
+- W33: "the `0x8005` is the correct `..` after corruption." **False** — an artifact of my printer.
+- W34: "`obj->0x0` is the bug / the second memcpy self-overlaps and drags stale bytes." **False** —
+  overlap in call C is real but harmless, and the stale bytes are not stale, they are `0x8005`.
+- W34's own green test for overlapping `memcpy` was right and stayed right: glibc loads a 9-byte copy
+  before storing it, so overlap alone corrupts nothing here.
+
+### The real question, and it is a different one
+
+**The guest is building a memory-card path whose components come from `0x010519C0`, and that address
+has never been decoded.** Either (a) it is stream/ring-buffer content and something upstream of the
+16 MB copy decodes it wrongly, or (b) it is a decoded structure field and a field offset or width on
+our side is wrong. Those need different fixes, so the next measurement must tell them apart:
+
+**Watch writes to `[0x010519C0, 0x010519CC)` and print every writer, then dump the whole 16-bit array
+around it.** If a writer is our own decoder, (b). If the value only ever arrives via the big copy,
+(a) and the ring buffer's contents are the thing to decode.
+
+`sceMcOpen`'s `-4` still stands, and is still correct for a path the guest cannot resolve. Do not
+"fix" it, and do not normalise `05 80` — that would be inventing the answer.

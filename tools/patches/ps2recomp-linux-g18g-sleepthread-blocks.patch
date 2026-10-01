@@ -1301,6 +1301,156 @@ index c5e31c4..bdab38a 100644
              {
                  m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                       { return !m_events.empty() ||
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
+index d467c4b..8968f4b 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
+@@ -87,11 +87,145 @@ namespace ps2_stubs
+         setReturnU32(ctx, newGuestAddr);
+     }
+ 
++    namespace
++    {
++        uint32_t readGuestU32(const uint8_t *rdram, uint32_t guestAddr)
++        {
++            if (rdram == nullptr || guestAddr + 4u > PS2_RAM_SIZE)
++            {
++                return 0u;
++            }
++            uint32_t value = 0u;
++            std::memcpy(&value, rdram + guestAddr, sizeof(value));
++            return value;
++        }
++
++        void printGuestCStr(const uint8_t *rdram, uint32_t guestAddr)
++        {
++            if (rdram == nullptr || guestAddr == 0u || guestAddr >= PS2_RAM_SIZE)
++            {
++                std::cout << "<null>";
++                return;
++            }
++            for (uint32_t i = 0; i < 48u; ++i)
++            {
++                const uint32_t a = guestAddr + i;
++                if (a >= PS2_RAM_SIZE)
++                {
++                    break;
++                }
++                const uint8_t ch = rdram[a];
++                if (ch == 0u)
++                {
++                    break;
++                }
++                std::cout << (ch >= 32u && ch < 127u ? static_cast<char>(ch) : '.');
++            }
++        }
++
++        // W35. The boot wall is the path built by sub_01003E10. Its decode:
++        //
++        //   0x1003e30  lw    $v0, 0x4($s4)       # obj->0x4 -- the CACHE
++        //   0x1003e34  bnez  $v0, return         # already built? return it
++        //   0x1003e40  lw    $s2, -0x2338($v0)   # $s2 = *(0x102DCC8)  FIRST name
++        //   0x1003e4c  lw    $a0, 0x0($s4)       # obj->0x0           SECOND name
++        //   0x1003e60  jal   func_101D3B8        # GT4's own allocator
++        //   0x1003e78  jal   func_101E81C        # memcpy(buf, first, lenA)
++        //   0x1003e84  sb    $v0, 0($s0)         # buf[lenA] = '/'
++        //   0x1003e90  jal   func_101E81C        # memcpy(buf+lenA+1, SECOND, lenB+1)
++        //   0x1003e94  lw    $a1, 0x0($s4) (ds)  #   $a1 = obj->0x0 -- the source
++        //   0x1003e98  sw    $s1, 0x4($s4)       # obj->0x4 = buf
++        //
++        // W33 concluded obj->0x0 was the buffer, which would make that second memcpy copy the
++        // buffer onto itself and drag a previous candidate's stale bytes ("\x05\x80") into the head
++        // of "../../e.gt4" -- after which sceMcOpen answers -4 for 104,508 polls. But W33 derived
++        // obj from a store address, and the store is to obj->0x4, not obj->0x0, so obj->0x0 was
++        // never actually observed. Also note lenB+1: the +1 copies the NUL, so the source must be a
++        // real C string, which a heap buffer would only be by accident.
++        //
++        // The second memcpy is the exact instruction that consumes obj->0x0, so logging there reads
++        // the pointer the guest actually used, with the strings printed. One run settles whether
++        // obj->0x0 names the second file or aliases the buffer.
++        void logPathBuildCopy(uint8_t *rdram, R5900Context *ctx, const char *stage)
++        {
++            static std::mutex s_mutex;
++            static uint32_t s_hits = 0u;
++            uint32_t hits = 0u;
++            {
++                std::lock_guard<std::mutex> lock(s_mutex);
++                hits = ++s_hits;
++            }
++            if (hits > 10u)
++            {
++                return;
++            }
++
++            const uint32_t obj = getRegU32(ctx, 20);  // $s4
++            const uint32_t first = getRegU32(ctx, 18); // $s2
++            const uint32_t f0 = readGuestU32(rdram, obj + 0u);
++            const uint32_t f4 = readGuestU32(rdram, obj + 4u);
++            const uint32_t dest = getRegU32(ctx, 4);  // $a0
++            const uint32_t src = getRegU32(ctx, 5);   // $a1
++            const uint32_t size = getRegU32(ctx, 6);  // $a2
++
++            std::cout << "[W35PATHCOPY] n=" << hits << " " << stage << " obj=0x" << std::hex << obj
++                      << " obj->0x0=0x" << f0 << " obj->0x4=0x" << f4 << " lenA(s0)=0x"
++                      << getRegU32(ctx, 16) << " lenB(s3)=0x" << getRegU32(ctx, 19) << std::dec
++                      << " memcpy(dest=0x" << std::hex << dest << " src=0x" << src << " size=" << std::dec
++                      << size << ") first(s2)=0x" << std::hex << first << std::dec;
++            printGuestCStr(rdram, first);
++            std::cout << " obj->0x0='";
++            printGuestCStr(rdram, f0);
++            std::cout << "' src_raw=";
++            for (uint32_t i = 0; i < 12u; ++i)
++            {
++                const uint32_t a = src + i;
++                if (a >= PS2_RAM_SIZE)
++                {
++                    break;
++                }
++                char byteText[4];
++                std::snprintf(byteText, sizeof(byteText), "%02x", rdram[a]);
++                std::cout << byteText << " ";
++            }
++            std::cout << "dst_raw=";
++            for (uint32_t i = 0; i < 12u; ++i)
++            {
++                const uint32_t a = dest + i;
++                if (a >= PS2_RAM_SIZE)
++                {
++                    break;
++                }
++                char byteText[4];
++                std::snprintf(byteText, sizeof(byteText), "%02x", rdram[a]);
++                std::cout << byteText << " ";
++            }
++            std::cout << "\n";
++        }
++    }
++
+     void memcpy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         uint32_t destAddr = getRegU32(ctx, 4); // $a0
+         uint32_t srcAddr = getRegU32(ctx, 5);  // $a1
+         uint32_t size = getRegU32(ctx, 6);     // $a2
++
++        // W35. Both memcpys of sub_01003E10 arrive here, keyed on $ra. `$ra` is the delay slot of
++        // the `jal`, which is 0x1003e7c for the first copy and 0x1003e94 for the second.
++        const uint32_t ret = getRegU32(ctx, 31);
++        if (ret == 0x01003A98u)
++        {
++            logPathBuildCopy(rdram, ctx, "A: paste the static device/name string");
++        }
++        else if (ret == 0x01003E80u)
++        {
++            logPathBuildCopy(rdram, ctx, "B: paste 2 bytes from 0x10519C0 onto the head");
++        }
++        else if (ret == 0x01003E98u)
++        {
++            logPathBuildCopy(rdram, ctx, "C: overlapping shift, dst=src+3");
++        }
++
+         size = sanitizeMemTransferSize(size, "memcpy");
+ 
+         uint32_t copied = 0u;
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
 index 564d873..4404d14 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp

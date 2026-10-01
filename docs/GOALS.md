@@ -1125,6 +1125,52 @@ needed zero portability work. Evidence already banked: goal `G5.2a`.
   had no good reason to keep: not knowing your car, not knowing your setup, and not feeling your speed.
 - **STATUS:** ⬜ post-playability, same lane as `G4`/`G6.1`–`G6.6`. Registry entry only — do not dispatch.
 
+### ⬜ G6.8 — **THE MARATHON** *(the races that were longer than a day, 2026-10-01)*
+- **The captain, 2026-10-01:** *"what are like the longest endurance races in history? lets add more!"*
+- **What it is:** an **endurance event pack** built out of races that really happened — real names, real durations,
+  real distances, taken from the sport's own history rather than invented for difficulty. GT4's 24-hour events
+  are the ceiling the disc shipped with; the sport's ceiling is higher, and the number already exists as a number
+  in the game's own event structure.
+- **The real history this draws from (verified, not remembered):**
+  - **Marathon de la Route, Nürburgring 1965–1971** — the longest motor race ever held. It began at **82 hours**
+    and grew every year, peaking at **96 hours / ~11,120 km in 1971** — four days, on the Nordschleife, with a
+    team of drivers. This is the north star of the pack and the one the captain will actually want to attempt.
+  - The **24-hour family** GT4 does not carry: **Spa 24 Hours** (1924–), **Daytona 24 Hours** (1966–), and the
+    delightful outlier **25 Hours of Thunderhill** — the only race on earth that is *one hour longer than a day*.
+  - Already on the disc: **Le Mans (Sarthe 24h I/II)** and **Nürburgring 24h** — those stay untouched; they are
+    the reference, not the target.
+  - **Bol d'Or (1922–)** is the same idea on two wheels and is deliberately **not** in scope: no bikes, no entry.
+- **Mechanism, and it is deliberately small:** GT4's endurance events are **duration-defined** — the 24h events
+  are a time value in the game's own event data, not a bespoke code path. So v1 is **our event table with longer
+  durations** on circuits the disc already has (Nordschleife, Sarthe, Tsukuba, Motegi, Fuji), reading the same
+  race loop, the same pit logic and the same tyre wear the 24h events already use. **We add a row and change a
+  number.** Anything more than that is a different goal.
+- **Honest limits, and they are the interesting part:**
+  - **GT4 has no fuel model** — endurance strategy on the disc is *tyres only*. A real 96-hour race was a fuel
+    and reliability exercise; ours inherits a simpler game and must say so instead of pretending.
+  - **No driver-fatigue model, and B-spec already is the relief driver** — the honest framing is that B-spec *is*
+    the multi-driver team rule, which is why this pack is B-spec-shaped.
+  - **Time-of-day and weather do not change in GT4's enduros** (a documented limitation of the disc's own 24h
+    events) — a 96-hour race that never sees dusk is a lie the original already tells, and we inherit it until
+    it is fixed on purpose.
+  - **96 hours at 3× B-spec is still 32 real hours**, so a **suspend/save** path is a *precondition* for this
+    pack, not a nicety. On the emulator the captain already has save states; a native build needs the equivalent
+    (same class as `G6.7`'s opt-in features), and it must be **off by default** like everything else (law 12).
+  - **Spa, Daytona, Thunderhill and Bathurst are not circuits on this disc** — those events are the `G6.0`
+    problem (add content), so they are named in the pack but **not promised in v1**.
+- **The fence:** off by default (law 12); prize money scaled honestly rather than made absurd — a longer race may
+  pay more, but it must not break the game's own economy, and no payout may ever imply a result the player did
+  not actually drive (`G6.3`'s rule, in its strictest form); the event uses the game's own race loop and leaves
+  the existing 24h events byte-for-byte alone.
+- **DONE WHEN:** a **≥72-hour** event appears only when the pack is enabled, runs end-to-end on the game's own
+  race loop with working pits and tyres, can be **suspended and resumed**, pays a sane prize, prints its real
+  duration/lap/tyre numbers in the entry, and leaves a vanilla 24h event provably unchanged alongside it.
+- **Why it belongs in G6:** because it is the one kind of content a recomp can extend **without inventing a
+  single number** — the durations came from the real sport, the circuits are already on the disc, and the event
+  structure is the game's own. It is the captain's completionism pointed at the only wall that was ever real:
+  the clock.
+- **STATUS:** ⬜ post-playability, same lane as `G4`/`G6.1`–`G6.7`. Registry entry only — do not dispatch.
+
 ### ⬜ G7.0 — **DISTRIBUTION: code only. Assets come from the user's disc.** *(the captain's rule)*
 - **The captain, 2026-09-30:** *"We don't publish anything. Just the code. People have to bring their
   own iso file of the game — that's where we take assets."*

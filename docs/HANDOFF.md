@@ -6435,3 +6435,64 @@ named `0x01051A10`. The store observer already covers every width, so it is a `V
 window once the address is known from the `$v0` passed to `sceOpen` at `0x01005000`.
 
 Suite **482/482**. `VULCAN4 FRAME source=guest` has never printed.
+
+---
+
+## W74 — the guest DOES write `core.gt4` into `0x01051A10`, correctly, and something replaces it later
+
+The shadow diff, `VULCAN4_SHADOW=1` on `[0x01051A10, 0x01051A30)`, catching the change in the act. Every
+reported change, verbatim:
+
+```
+#5 addr=0x1051a10 now=63 was=0 pc=0x1003a98    'c'
+#6 addr=0x1051a11 now=6f was=0 pc=0x1003a98    'o'
+#7 addr=0x1051a12 now=72 was=0 pc=0x1003a98    'r'
+#8 addr=0x1051a13 now=65 was=0 pc=0x1003a98    'e'
+#9 addr=0x1051a14 now=2e was=7f pc=0x1003a98   '.'
+#10 addr=0x1051a15 now=67 was=f2 pc=0x1003a98  'g'
+#11 addr=0x1051a16 now=74 was=1b pc=0x1003a98  't'
+```
+
+**`pc=0x1003a98` writes `core.gt8`… `core.gt4` into `0x01051A10`, byte by byte, correctly.** This is the
+`memcpy src=0x103d1d8` W35 first logged — `0x0103D1D8` really is `core.gt4` in the disc image, and the
+guest really does assemble that name into this buffer. The `culpritop` is
+`Ps2FastWrite32@0x1047b68`, i.e. the 32-bit fast path, and the shadow sees every byte land.
+
+### So the buffer is right, and the open is wrong, at different moments
+
+| | |
+|---|---|
+| at `pc=0x1003a98` | `0x01051A10` = `core.gt4` — **correct** |
+| at the `sceOpen` call `0x01005000` | `0x01051A10` = `cdrom0:\CDROM0:\;1` — **wrong** |
+
+Both are measured. The guest knows the right filename, writes it correctly, and by the time the disc
+open reads the buffer the right name is gone.
+
+### This retires the last of the "guest never assembles a path" family
+
+- W35: "the string it passes is not the string it built" — **still true, and now the sharpest form of
+  it: the string it builds is right and something overwrites it.**
+- W61: `0x8005` is the pointer's bytes — **dead** (W65, `MATCH=yes`).
+- W64: `sub_0100A348` clobbers it — **dead** (W66: `$s2+0x98` is scratchpad).
+- W65: `0x010519C0` is a record table — **withdrawn** (W71: `obj` is a stack frame).
+- **W69/W70: the disc and card paths are one buffer — confirmed, and this is the buffer.**
+- **W73: no `CDROM0` string exists in the image — confirmed.**
+
+### The untraced write is now bounded, and it is the wall
+
+The store observer, all widths, 600,000 entries, sees exactly **four** in-window write events at
+`0x01051A10`: the `core.gt4` copy at `0x1003a98`, then `memcpy src=0x10519c0 size=2` at `0x1003e80` and
+`sb '/'` at `0x1003e84` — the three-byte join paste that produced W35's `\x05\x80/` garbage — and that
+is all. **Nothing traced ever writes `cdrom0:` into that buffer**, yet the open reads it from there.
+
+So the wall is a single question, and it is now small enough to state in one sentence: **something
+writes the path that the disc open reads into `0x01051A10` without passing through any traced store
+path, and the store observer is provably not seeing it.**
+
+### Next single step
+
+Not another buffer watch. The `0x1047b68` in `culpritop` is the `PcUtil::addMemoryArea`-style allocator
+address — the byte writes came from a **32-bit write at `0x01047B68`**, a different guest function, and
+that is the address to read in the generated unit. One function, read from its own comments.
+
+Suite **482/482**. `VULCAN4 FRAME source=guest` has never printed.

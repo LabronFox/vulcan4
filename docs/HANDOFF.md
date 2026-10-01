@@ -5838,3 +5838,104 @@ untouched. `VULCAN4 FRAME source=guest` has never printed.
 
 **Next: `sub_0100A348`.** Not the card, not `0x8005`, not `strlen`. Find what makes the guest initialise
 a structure over its own path before it opens anything.
+
+---
+
+## W65 — Two of my own claims are dead, and `functions_entered` is not what we thought it was
+
+W64 ended with "`sub_0100A348` writes a structure field over the top of the path buffer, and `-4` is
+correct." **The attribution is wrong and is retracted.** The solid half of W64 -- that the bytes change
+and no traced write targeted them -- survives and is now much stronger. Here is both.
+
+### DEAD, measured: the recompiled SIMD `strlen` is CORRECT
+
+W61 said `0x8005` was the low bytes of the pointer `0x010519C0` read as characters. The measurement
+that settles it needed a branch observer (`VULCAN4_BRANCH_WATCH=1`), because
+`PS2Runtime::dispatchGuestBranch` calls the callee **inline** and so the result is only visible at the
+caller's *next* transfer, never at a return:
+
+```
+VULCAN4 STRLENCALL arg(a0)=0x10519c0 bytes=0580000000000000 hostStrlen=2
+VULCAN4 STRLENRET  arg=0x10519c0 returned(v0)=2 hostStrlen=2 MATCH=yes
+```
+
+**`strlen(0x010519C0)` returns 2 and the true length is 2.** The recompiled `pceqb`/`pcpyud`/`or` path
+does the right thing. `0x8005` is not a pointer artefact, the copy of two bytes is not a bug, and the
+recompiler is not at fault. **RETIRED: the whole "the guest copies a pointer's bytes as a string" line
+of reasoning, W35's and W61's.**
+
+### DEAD, measured: `sub_0100A348` is not touching the path buffer
+
+W64 blamed `pc=0x100a45c`, which the decoder says is `sb $v0, 0x98($s2)`. One store-observer call with
+a live `ctx` answers what `$s2` is:
+
+```
+VULCAN4 STRUCTSTORE pc=0x100a45c s2=0x70002050 s2+0x98=0x700020e8 v0=0x0 ra=0x100a434 inPathBuf=no
+```
+
+`$s2 = 0x70002050` and `$s2+0x98 = 0x700020e8` -- **the scratchpad**. Not `0x010519C0`. The scratchpad
+is a separate 16 KB host buffer (`ps2GetScratchpadHostPtr`), so that store cannot touch RDRAM at all.
+**RETIRED: "the guest clobbers its own path buffer in `sub_0100A348`."** The shadow diff caught the
+right *change* and attributed it to an unrelated neighbouring store, which is exactly the failure mode
+you get when a trace announces a store *before* applying it.
+
+### ALIVE, and now a refuted-complete-trace rather than an open question
+
+The bytes at `0x010519C0` do change, reproducibly, from `/BASCUS-97328GAMEDATA` to structure data:
+
+```
+SHADOWCHANGE #21 at addr=0x10519c5 now=0x0 was=0x55 ...
+```
+
+and after (a) tracing twelve previously-invisible guest-write paths, (b) fixing the observer's window
+filter to resolve PS2 address aliases, and (c) 13,959,796 traced writes, **nothing targets that
+window.** That is a stronger statement than W64's: the write path is not merely un-enumerated, a
+complete trace does not contain it. The writer is still unidentified and I am not going to guess.
+
+### The real find, and it undercuts a number the whole campaign quotes
+
+`dispatchGuestBranch` does `targetFn(rdram, ctx, this);` -- **it invokes the callee inline.** So guest
+calls nest on the C++ stack and never pass through the harness's function-entry loop. Two consequences:
+
+1. **`functions_entered` and `distinct_pcs` count only TOP-LEVEL entries.** Every G1 progress claim
+   built on those numbers is measuring a biased subset: a boot reporting
+   `functions_entered=389589 distinct_pcs=123` was in a tight loop over 123 *top-level* entry points
+   while 20,157 nested `strlen` calls happened underneath, unmeasured.
+2. **`GuestBranchKind::Return` is ~0 in 3,000,000 dispatches** (measured: `kindDirect=2999984
+   kindIndirect=5 kindJump=11 kindReturn=0`). The recompiler emits a plain `return;` whenever `jr $ra`
+   is a function's last exit, so "watch the return" is not a technique here -- watch the call for
+   arguments and the caller's next transfer for the result. The first version of this observer missed
+   every return for exactly that reason.
+
+### The span says this was never a string buffer
+
+```
+span+000 05 80 00 00 00 00 00 00  41 00 00 00 00 00 00 00
+span+010 03 00 00 00 00 00 00 00  42 00 00 00 00 00 00 00
+span+020 00 14 00 00 00 00 00 00  59 00 00 00 00 00 00 00
+span+040 00 14 00 00 30 1a 05 01  ff ff ff ff ff ff ff ff
+span+050 05 80 2f 05 80 2f 65 2e  67 74 34 00 00 00 00 00
+span+080 54 65 78 31 40 1a 05 01  00 00 00 00 90 cd 01 00
+```
+
+`$a2 = 0x01051A10` is `span+050` -- **inside** a record whose head is at `span+040`. `0x1400` appears at
+`span+020` and again at `span+040`, and `Tex1` at `span+080`. This is fixed-stride records with a name
+field at a fixed offset, and `sceMcOpen` is handed `record + 0x10`. The framing "GT4 built a path at
+0x010519C0 and then lost it" is very likely wrong from the start: **there may never have been a path
+there at open time.** Decoded properly, this is probably a mount/device table.
+
+### Instruments that stayed
+
+- `VULCAN4_BRANCH_WATCH=1` -- call arguments and results, via the dispatcher. Reusable for any guest
+  call this campaign has had to infer.
+- `VULCAN4_SHADOW=1` / `VULCAN4_SHADOW_MAX` -- diffs the watched window on every traced write of any
+  address. Catches changes no writer enumeration would find; cannot attribute them.
+- The window filter now **resolves PS2 aliases** (`0x80000000` kseg1, `0x20000000`/`0xA0000000`) before
+  comparing, and **fails scratchpad stores outright**. Writing that guard as `!isScratch && ...` inverts
+  it and lets every scratchpad store through; that bug shipped for one build and 6 was the tell.
+
+Suite **479/479**. `VULCAN4 FRAME source=guest` has never printed.
+
+**Next: decode the record table at `0x010519C0`, stride and field layout, and work out which field
+`sceMcOpen`'s `$a2` is.** Everything said so far about "the path" is downstream of a structure nobody
+has read.

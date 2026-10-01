@@ -156,6 +156,99 @@ uint32_t g_watchPeek(uint32_t guestAddr)
     return v;
 }
 
+// W65. THE MEASUREMENT W61 PROMISED AND NEVER MADE. sub_01003E10 builds the memory-card path with
+//   0x1003e40  lw    $s2, -0x2338($v0)   $s2 = *(0x0102DCC8)
+//   0x1003e44  jal   func_1013D68        func_1013D68 IS the guest's SIMD strlen
+//   0x1003e48  daddu $a0, $s2, $zero
+//   0x1003e4c  lw    $a0, 0x0($s4)
+// so the question "what does the guest's strlen return for 0x010519C0" decides whether the joined
+// path is right or garbage. W35 guessed 2, W61 guessed it was the pointer's low bytes, and both were
+// inferences from a concatenated string rather than from the call. Watch the call and the return.
+//
+// $s2 is callee-saved but $a0-$a3 are not, so the argument is only readable at the JAL. The result
+// is only readable at the return, and by then the caller's $s2 is intact, so the same site pairs.
+// W65. THE MEASUREMENT W35 AND W61 BOTH GUESSED. sub_01003E10 builds the memory-card path with
+//   0x1003e40  lw    $s2, -0x2338($v0)   $s2 = *(0x0102DCC8)
+//   0x1003e44  jal   func_1013D68        func_1013D68 IS the guest's SIMD strlen
+//   0x1003e48  daddu $a0, $s2, $zero
+// so "what does the guest's strlen return for 0x010519C0" decides whether the joined path is right or
+// garbage. W35 said 2. W61 said it was the pointer's low bytes. Neither measured it.
+//
+// WHY THIS NEEDS THE BRANCH DISPATCHER: PS2Runtime::dispatchGuestBranch calls the callee INLINE
+// (`targetFn(rdram, ctx, this)`), so a guest call nests on the C++ stack and never passes through the
+// harness's function-entry loop. Two consequences worth more than this one measurement:
+//   * functions_entered and distinct_pcs -- the two numbers every G1 progress claim rests on -- count
+//     TOP-LEVEL entries only and are blind to nested guest calls.
+//   * a `jr $ra` is emitted as a plain C++ `return;` whenever it is the function's last exit, so
+//     GuestBranchKind::Return is ~0 in 3,000,000 dispatches. Measuring a call means watching the
+//     CALL for arguments and the CALLER'S NEXT DISPATCH for the result, not waiting for a return.
+constexpr uint32_t kPathStrlenCallSite = 0x01003E44u;
+constexpr uint32_t kPathStrlenCallee = 0x01013D68u;
+constexpr uint32_t kPathStrlenCallerLo = 0x01003E10u;
+constexpr uint32_t kPathStrlenCallerHi = 0x01003F10u;
+void watchGuestCallForPath(const R5900Context *ctx,
+                           uint32_t sourcePc,
+                           uint32_t targetPc,
+                           uint32_t /*fallthroughPc*/,
+                           PS2Runtime::GuestBranchKind /*kind*/,
+                           bool /*isReturning*/)
+{
+    // W65. Off unless asked for: this is one indirect call per branch dispatch, and a 2M-entry run
+    // makes three million of them.
+    static const bool kWatch = watchEnv("VULCAN4_BRANCH_WATCH", 0u) != 0u;
+    static uint32_t lastArg = 0u;
+    static uint32_t argBytes = 0u;
+    static bool pending = false;
+    static int callLogs = 0;
+    static int retLogs = 0;
+    if (!kWatch || ctx == nullptr)
+    {
+        return;
+    }
+    if (sourcePc == kPathStrlenCallSite && targetPc == kPathStrlenCallee)
+    {
+        lastArg = getRegU32(ctx, 4);
+        argBytes = 0u;
+        if (const uint8_t *raw = getConstMemPtr(g_rdramForWatch, lastArg))
+        {
+            while (argBytes < 64u && raw[argBytes] != 0u)
+            {
+                ++argBytes;
+            }
+        }
+        pending = true;
+        if (callLogs < 3)
+        {
+            ++callLogs;
+            char text[32];
+            for (uint32_t i = 0; i < 8u; ++i)
+            {
+                const uint8_t *one = getConstMemPtr(g_rdramForWatch, lastArg + i);
+                const uint8_t b = (one != nullptr) ? *one : 0u;
+                std::snprintf(text + (i * 2u), 4u, "%02x", b);
+            }
+            std::cout << "VULCAN4 STRLENCALL arg(a0)=0x" << std::hex << lastArg
+                      << " bytes=" << text << " hostStrlen=" << std::dec << argBytes << "\n";
+        }
+        return;
+    }
+    // strlen has returned and the caller is running again: its next transfer carries the result in
+    // $v0, because nothing between the two overwrites it (0x1003e48 is `daddu $a0, $s2, $zero`).
+    if (pending && sourcePc >= kPathStrlenCallerLo && sourcePc < kPathStrlenCallerHi)
+    {
+        pending = false;
+        if (retLogs < 3)
+        {
+            ++retLogs;
+            const uint32_t got = getRegU32(ctx, 2);
+            std::cout << "VULCAN4 STRLENRET  arg=0x" << std::hex << lastArg
+                      << " returned(v0)=" << std::dec << got
+                      << " hostStrlen=" << argBytes
+                      << " MATCH=" << ((got == argBytes) ? "yes" : "NO") << "\n";
+        }
+    }
+}
+
 void watchGuestStoreForPath(uint32_t guestAddr,
                                        uint32_t size,
                                        uint64_t value,
@@ -163,6 +256,17 @@ void watchGuestStoreForPath(uint32_t guestAddr,
                                        const char *op,
                                        uint32_t srcAddr)
 {
+    // W65. WINDOW ON THE RESOLVED ADDRESS, NOT THE RAW ONE. The overlap test and the W30WRITE
+    // early-return both compare the RAW address the instruction used. PS2 gives the same physical
+    // memory several aliases -- 0x80000000 kseg1 mirrors 0x00000000, and 0x20000000/0xA0000000 are
+    // the same RAM again -- so a store to 0x810519C0 lands on exactly the bytes at 0x010519C0 and is
+    // thrown away by `guestAddr >= kWatchHi` as being outside the window. That is precisely how
+    // "the bytes changed and nothing was logged" survives a complete write trace: the write WAS
+    // logged, under an alias. Mask first, then filter, or the instrument lies about its own window.
+    // getConstMemPtr resolves scratchpad too; a scratchpad store is NOT rdram and must not match.
+    const bool isScratchStore = ps2IsScratchpadAddress(guestAddr);
+    const uint32_t resolvedAddr = isScratchStore ? 0u : (guestAddr & 0x01FFFFFFu);
+
     // W45. BEFORE-SNAPSHOT. W44 found a write to 0x010519C0 that the observer never reported, so a
     // log line describing only the state AFTER the store cannot say what was overwritten. Capturing
     // the destination bytes first turns every line into a before/after pair, which is what makes the
@@ -170,7 +274,8 @@ void watchGuestStoreForPath(uint32_t guestAddr,
     //
     // Only for writes that actually overlap the watched window: the snapshot is 16 bytes of copying
     // and the whole reason it is affordable is that the overlap test rejects almost everything.
-    const bool overlapsWatch = (guestAddr < kWatchHi) && ((guestAddr + size) > kWatchLo);
+    const bool overlapsWatch =
+        !isScratchStore && (resolvedAddr < kWatchHi) && ((resolvedAddr + size) > kWatchLo);
     // W57c. COMPACT UNFILTERED TRACE. The window filter is why this took so long: at W57b the
     // observer's own dump changed between seq=409 and seq=416 -- the guest's memory went from an
     // 8-byte string to an 11-byte one, and the Open agreed with the new value -- with NO event
@@ -333,7 +438,10 @@ void watchGuestStoreForPath(uint32_t guestAddr,
         }
         return;
     }
-    if (guestAddr >= kWatchHi || guestAddr + size <= kWatchLo)
+    // A scratchpad store is never an RDRAM write, so it can never be "in" an RDRAM window: fail it
+    // outright. Writing `!isScratchStore && ...` here would do the exact opposite and let every
+    // scratchpad store through, which is what happened the first time this was written.
+    if (isScratchStore || resolvedAddr >= kWatchHi || resolvedAddr + size <= kWatchLo)
     {
         return;
     }
@@ -704,6 +812,7 @@ int main(int argc, char *argv[])
     // W30: watch the guest buffer holding the memory-card path. Installed before the first guest
     // instruction so the one-time formatting write is caught, not just the reads that follow.
     ps2SetGuestStoreObserver(&watchGuestStoreForPath);
+    ps2SetGuestBranchObserver(&watchGuestCallForPath);
     g_rdramForWatch = rdram;
 
     // W44. Two probes read the same guest address in the same process and DISAGREE: the store

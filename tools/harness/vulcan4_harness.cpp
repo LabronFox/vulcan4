@@ -1373,6 +1373,31 @@ int main(int argc, char *argv[])
     // the end of a run is the signature, and it costs one integer per thread to print -- which is
     // what it should have cost from the start. A latch that cannot be SEEN in the report is a
     // latch that costs a day.
+    // W16: "tid2:status=2" named a symptom -- a thread is Waiting and never runs -- without saying
+    // what it is Waiting FOR. The snapshot already carries waitReason, waitId and wakeupCount, so
+    // the report now prints them. A blocked thread whose reason and id are named is a diagnosis; a
+    // blocked thread whose reason is hidden is another day of guessing.
+    const auto waitReasonName = [](EeWaitReason reason) -> const char * {
+        switch (reason)
+        {
+        case EeWaitReason::None:
+            return "none";
+        case EeWaitReason::Sleep:
+            return "sleep";
+        case EeWaitReason::Semaphore:
+            return "sema";
+        case EeWaitReason::EventFlag:
+            return "eventflag";
+        case EeWaitReason::VSync:
+            return "vsync";
+        case EeWaitReason::External:
+            return "external";
+        case EeWaitReason::Mpeg:
+            return "mpeg";
+        }
+        return "?";
+    };
+
     std::string threadState;
     for (const EeThreadSnapshot &thread : kernelSnapshot.threads)
     {
@@ -1381,7 +1406,9 @@ int main(int argc, char *argv[])
             threadState += " ";
         }
         threadState += "tid" + std::to_string(thread.id) + ":status="
-            + std::to_string(static_cast<int>(thread.status)) + ":invocations="
+            + std::to_string(static_cast<int>(thread.status)) + ":wait="
+            + waitReasonName(thread.waitReason) + "#" + std::to_string(thread.waitId) + ":woken="
+            + std::to_string(thread.wakeupCount) + ":pc=" + toHex(thread.pc) + ":invocations="
             + std::to_string(thread.invocationDepth);
     }
     for (const EeThreadSnapshot &thread : kernelSnapshot.threads)

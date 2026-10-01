@@ -2211,3 +2211,77 @@ is what the log must show, not adjacent progress.
 
 If all six are done, re-read `docs/CAMPAIGN.md` and append a new list — **but never invent work: every
 item must name its gate, and any item you cannot gate does not belong on this list.**
+
+## 2026-10-01 — W16 NAMED: tid2 is asleep inside `sce_SleepThread`, has never been woken, and nobody ever calls `sce_WakeupThread`
+
+WALL:   W15 said "tid1@prio3, 2.24M `sce_ChangeThreadPriority`" and stopped there. That named a
+        symptom. This entry names the deadlock. The report line now reads:
+
+```
+thread_state=tid1:status=0:wait=none#0:woken=0:pc=0x0101f2b8
+             tid2:status=2:wait=sleep#0:woken=0:pc=0x0101f348
+```
+
+        - `tid2` is **`Waiting` on reason `sleep`**, parked at `pc=0x0101f348`, with
+          **`woken=0`** — it has never been woken by anything.
+        - `tid1` is `Running` and busy-waits for tid2.
+        - **`sce_WakeupThread` is called ZERO times.** `0x33` does not appear in the CALLKIND
+          histogram at all (22 syscalls, and it is not one of them).
+
+        So: tid2 sleeps, tid1 spins waiting for tid2, and the one syscall that could break the
+        deadlock is never issued. That is the wall, in one line.
+
+DID:    1. **Corrected a wrong claim of my own, with the authoritative sources.** I said this
+        session that `func_101F350` is `sce_SleepThread`. It is not. The generated decode gives
+        `sub_0101F340` → `addiu $v1, $zero, 0x32` and `sub_0101F350` → `addiu $v1, $zero, 0x33`,
+        and `ps2xRuntime/include/runtime/syscall_names.h` maps `{ 0x32, "SleepThread" }` and
+        `{ 0x33, "WakeupThread" }`. So `func_101F350` is **`sce_WakeupThread`**, and
+        `sub_0101F340` is the `sce_SleepThread` shim tid2 is sitting in. Nothing above changes
+        because nothing was built on it — but it was wrong, and the wrong version would have sent
+        the next session after a wakeup path that is not being called.
+        2. **Decoded the two guest functions that make up the spin**, from the generated unit's
+        comments (authoritative, per W11):
+        - `sub_01011508` is a **wait-list broadcast**: it raises the caller to priority 1
+          (`addiu $a1, $zero, 0x1`), then for each node walks `node->0x4` (tid) against `$s3`
+          (own tid) and calls `func_101F350` = `sce_WakeupThread` for every node **except
+          itself**, then restores the priority saved from `obj+0x1C`. It is the classic
+          "raise priority so I cannot be preempted mid-walk, wake the others, drop back" shape.
+        - `sub_010116A8` is a **recursive mutex acquire** around it: `obj+0x20` is the owner tid,
+          `obj+0x18` the self-ownership check, `obj+0x24` the recursion depth, `obj+0x0C`/`+0x8`
+          the wait list, and it links a frame (`+0x0` prev, `+0x4` tid, `+0x8` saved prio) before
+          calling the broadcast. Three thin wrappers (`sub_01011688`, `sub_010118F0`, and the
+          family at `0x100E340`–`0x100E610`) call the broadcast directly.
+        3. **Made the product name the blocker instead of me.** `tools/harness/vulcan4_harness.cpp`
+        now prints `wait=<reason>#<id>:woken=<n>:pc=<hex>` per thread. The snapshot already
+        carried `waitReason`, `waitId` and `wakeupCount` (`EeThreadSnapshot`,
+        `ps2xRuntime/include/runtime/ee_scheduler.h:191`) — the report just never showed them.
+        A blocked thread whose reason and id are printed is a diagnosis; one whose reason is
+        hidden is another day of guessing. This is permanent, not a probe.
+
+MEASURED (90 s boot, `xvfb-run -a -s "-screen 0 640x480x24"`, `bios_files=0`):
+        halt=wallclock_deadline   distinct_pcs=167   vsync_tick=53
+        0x29 sce_ChangeThreadPriority calls=2223911   last_pc=0x0101f2b8
+        0x2f GetThreadId            calls=2965219   last_pc=0x0101f318   (dispatched at
+                                                Dispatcher.cpp:114; only the *names* table
+                                                lacks 0x2f, which is cosmetic)
+        0x32 sce_SleepThread        calls=54        last_pc=0x0101f348   ← tid2, parked here
+        0x33 sce_WakeupThread       ABSENT — zero calls
+        suite: 468 total, **467 pass, 1 fail** — `VU0 macro mappings cover all S1/S2 enums`,
+                pre-existing and unrelated (documented in the 2026-09-30 14:27 entry).
+
+CHECKED AND CLEARED — **this is not a scheduler bug**, and I say so before someone re-chases it:
+        `EeScheduler`'s time slice is correct. On expiry it requests a reschedule only when
+        `hasReadyAtOrAbovePriority(running->currentPriority)` (EeScheduler.cpp:378-386), and
+        otherwise calls `renewTimeSlice()`. With tid2 in `Waiting` there is **nothing to switch
+        to**, so tid1 correctly keeps the CPU. Making it preempt anyway would be a lie, not a fix.
+        Interrupt handlers are also fine: 4 `AddIntcHandler` were registered and 131 invocations
+        were serviced, so IRQs are being delivered and run. The gap is not preemption and not
+        interrupt delivery — it is that the guest never issues the wakeup.
+
+NEXT:   **The one question left on the CPU lane: on real hardware, what wakes tid2?** It is
+        answerable statically and it is the only thing that matters now — do not guess it from a
+        partial decode. Find tid2's caller of `sce_SleepThread` and read what the guest expects to
+        happen next; that names the runtime service we owe it. If it turns out the guest is waiting
+        on a wakeup that only its own later code issues, then tid1's spin is the bug and its loop
+        condition must be read properly (all of it, not the edges).
+        Items **4 (GS texture), 5 (pad read path), 6 (sceGs* inventory)** do not wait on this.

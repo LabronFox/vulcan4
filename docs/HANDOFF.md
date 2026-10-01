@@ -5474,3 +5474,71 @@ reports nothing, and the only ones left are the RPC copy helpers.
 validated against the register it claims to report.** Validating it is cheaper than any further search.
 
 **STATUS: no frame, milestone NOT met.** `VULCAN4 FRAME source=guest` has never printed. Suite **478/478**.
+
+---
+
+## 2026-10-01 — W58: THE CARD WALL IS DOWNSTREAM OF A MISSING DISC DIRECTORY. Blocked on the captain's own disc
+
+Found by validating the observer's `srcAddr` against the register it claims to report (W57i's "next"),
+which is the cheapest thing on the list and it moved the wall.
+
+### The memcpys are FAITHFUL. Both of them.
+
+```
+[MEMCPY] pc=0x1003dac a1(src)=0x103d638 a2(len)=2  a0(dst)=0x10519c1  bytes@a1=[42 41]              "BA"
+[MEMCPY] pc=0x1003dc4 a1(src)=0x103d650 a2(len)=10 a0(dst)=0x10519c3  bytes@a1=[53 43 55 53 2d 39 37 33 32 38]  "SCUS-97328"
+[MEMCPY] pc=0x1003de0 a1(src)=0x103d548 a2(len)=9  a0(dst)=0x10519cd  bytes@a1=[47 41 4d 45 44 41 54 41 00]  "GAMEDATA\0"
+[MEMCPY] pc=0x1004078 a1(src)=0x103d570 a2(len)=5  a0(dst)=0x10519f0  bytes@a1=[2f 74 6d 70 00]      "/tmp\0"
+[MEMCPY] pc=0x10006f0 a1(src)=0x103d260 a2(len)=12 a0(dst)=0x1fffe70  bytes@a1=[63 64 72 6f 6d 30 3a 5c 49 52 58 5c]  "cdrom0:\IRX\"
+[MEMCPY] pc=0x1000758 a1(src)=0x103d270 a2(len)=3  a0(dst)=0x1fffe87  bytes@a1=[3b 31 00]             ";1\0"
+```
+
+`$a1`, `$a2`, `$a0` and the bytes actually at `$a1` all agree with what the observer reported. **The
+`srcAddr` field is trustworthy — the fault line I suspected at W57i is closed.** And the buffer at
+`0x010519C0` is therefore **`/BASCUS-97328GAMEDATA`**, exactly the save directory the modding docs name.
+**The guest is not building a malformed path. Our `-4` is correct. That whole line of inquiry is closed.**
+
+### What the boot is actually blocked on
+
+The same run:
+
+```
+[IOP] failed to open IRX 'cdrom0:\IRX\SIO2MAN.IRX;1'
+[IOP] failed to open IRX 'cdrom0:\IRX\PADMAN.IRX;1'
+[IOP] failed to open IRX 'cdrom0:\IRX\MCMAN.IRX;1'
+[IOP] failed to open IRX 'cdrom0:\IRX\MCSERV.IRX;1'
+[IOP] failed to open IRX 'cdrom0:\IRX\MTAPMAN.IRX;1'
+```
+
+**`/mnt/ssd/gt4/work/IRX` does not exist.** The game ships its IOP drivers in an `IRX/` directory and
+**the extraction of it never happened** — `/mnt/ssd/gt4/work/` holds only `CORE.GT4`, `SCUS_973.28`,
+`SYSTEM.CNF`.
+
+**Of the five, we serve exactly one.** `mcserv` has an HLE provider (`createMcservService`).
+**`MCMAN`, `SIO2MAN`, `PADMAN` and `MTAPMAN` have none.**
+
+**And that is the card wall.** `MCMAN` is the memory-card manager. With MCMAN absent, the memory-card
+subsystem the guest drives does not exist, so `sceMcOpen` cannot succeed **no matter what path it is
+given** — which is exactly the 52,638 `Sync cmd=2` → `-4` per run. **The four-source search, the
+`/BASCUS-97328GAMEDATA` directory, the `core.gt4` probe, and the `-4` loop are all one missing directory.**
+
+### This is W11, and it is BLOCKED ON A MISSING INPUT
+
+W11 named it — "the `IRX/` directory does not exist and there is no disc image anywhere on the box … the
+captain must extract `IRX/` from their own disc" — and everything since has been re-deriving it from the
+card side. **Law 1 forbids shipping game data in this repository, so I cannot supply it and must not
+fake it.** This is the correct place to stop and ask.
+
+**WHAT IS NEEDED, precisely:** `IRX/` from the captain's own GT4 disc, placed at
+`/mnt/ssd/gt4/work/IRX/`, containing at minimum `SIO2MAN.IRX`, `PADMAN.IRX`, `MCMAN.IRX`, `MCSERV.IRX`,
+`MTAPMAN.IRX` (ISO names carry the `;1` version suffix). With `cdRoot` defaulting to the ELF's
+directory, `cdrom0:\IRX\...` then resolves with no further change.
+
+**Once it is there, the next dish is not optional:** `MCMAN` still has no HLE provider, so if the real
+IRX loads it must actually serve the card. Either the physical module works through our SIO/IRX loader,
+or MCMAN needs an HLE provider the way `mcserv` has one. Do not assume the first.
+
+**STATUS: no frame, milestone NOT met.** `VULCAN4 FRAME source=guest` has never printed.
+Suite **478/478**. Instrument work this session is committed and its conclusions stand on their own:
+two write-width blind spots closed, byte accounting complete, `srcAddr` validated, and four of my own
+earlier claims retracted with the reason recorded.

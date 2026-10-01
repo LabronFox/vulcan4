@@ -5628,3 +5628,65 @@ itself — research could not establish whether GT4 creates its card directory a
 
 **STATUS: milestone MET — the boot advances, past the `-4` spin, onto the `-2` path. The frame itself
 is still not reached:** `VULCAN4 FRAME source=guest` has never printed.
+
+---
+
+## 2026-10-01 — W60: the card now reports truthfully, and the boot reaches the card path at all
+
+### What the fix did, measured over 120 s
+
+| | `Sync cmd=1` | `Sync cmd=2` | frame |
+|---|---|---|---|
+| before (card claimed formatted, `free=8192`) | `result=0` ×720,920 | `result=-4` ×720,920 | no |
+| W59 (card honestly unformatted) | `result=-2` ×717,682 | **zero opens** | no |
+| **W60 (card really formatted, superblock on disk)** | `result=0` ×244,325 | `result=-4` ×244,325 | no |
+
+`[MC] GetInfo port=0 type=2 free=8151 format=1 result=0` — the card is now honestly reported: present,
+PS2 type, `clusters_per_card - alloc_offset` free, genuinely formatted.
+
+**The open rate fell from ~6,000/s to ~2,036/s and the guest got further**, so this is progress, but
+**it is not the frame and I am not claiming the wall fell.** `sceMcOpen` still answers `-4` for
+`core.gt4`, which is *correct* — the card genuinely holds no `core.gt4`, and ps2sdk is explicit that a
+read-only open of a missing file returns -4 (`ps2mc_fio.c:724-726`). The guest is still in its
+four-source search and has not reached the disc.
+
+### Two real bugs the round-trip test found, both mine, both from the same habit
+
+Adding "a card the runtime just FORMATTED must then report itself formatted" exposed a class of defect
+that had been invisible because the reader and the writer were never compared:
+
+1. **`kMcMagic` was `char[28]` with only 27 initialisers.** `sizeof` said 28, the array's last byte was
+   a zero-fill, and the comparison was a 28-byte `memcmp` against a 28-**character** magic that demanded a
+   29th byte no real card has. **Every card was declared unformatted however perfectly formatted.** The
+   same bug appeared a second time in `ps2_sif_rpc_tests.cpp` — same magic, same 27 initialisers.
+2. **The writer copied `sizeof(kMcMagic)` = 29 bytes into a 28-character field**, shifting `page_len`
+   to 0x29 instead of 0x28 and every later field with it. The page came out **511 bytes**. Found by
+   measuring the file, not by reading the code: `os.path.getsize` said 511 and a 512-byte `bytearray`
+   said 512, and printing the length after each write localised it to the version `memcpy`.
+
+Both are now written from the string itself with `static_assert(sizeof(...) - 1 == 28)`, so the field
+width and the text cannot disagree again. **The lesson is the one this campaign keeps relearning:
+compare what you write against what you read, and count your initialisers.**
+
+### Honest note on my own process
+
+I truncated `ps2_sif_rpc_tests.cpp` to ~395 lines with a careless slice-and-replace, and only noticed
+because the build stopped compiling while the stale binary kept passing tests. Restored from git and
+redone. **A green suite built from a stale binary is worse than a red one**, and the build error was the
+only thing that caught it.
+
+**Also corrected:** the earlier claim that this would make the boot "get past the card stage" was wrong
+in its mechanism. The guest is not blocked on our card reporting; it is blocked on the file not existing,
+and the correct `-4` is what keeps it in the search.
+
+### NEXT
+
+The card is real now. The remaining question is the one research could **not** establish: does GT4 create
+`/BASCUS-97328GAMEDATA` on the card itself at boot, and with what call? Its open loop is
+`mode=0x1` (`O_RDONLY`, no `O_CREAT` — confirmed), so that loop is a read and will never create
+anything. **A create or `mkdir` must exist elsewhere in the guest's flow, and we have not found it.**
+That is a guest-code question in `sub_01003D9C`–`sub_01003E98` and the four-source search that follows,
+not a card question.
+
+**STATUS: milestone advanced, frame NOT reached.** `VULCAN4 FRAME source=guest` has never printed.
+Suite **479/479**.

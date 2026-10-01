@@ -679,7 +679,7 @@ index 0baca03..6ba21a3 100644
  
          uint32_t written = 0u;
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
-index d12592f..d55f197 100644
+index d12592f..44af777 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
 @@ -76,6 +76,7 @@ namespace ps2_stubs
@@ -690,7 +690,7 @@ index d12592f..d55f197 100644
          struct McPortState
          {
              std::string currentDir = "/";
-@@ -151,6 +152,120 @@ namespace ps2_stubs
+@@ -151,6 +152,138 @@ namespace ps2_stubs
              return (parent / (leaf + "_slot" + std::to_string(port))).lexically_normal();
          }
  
@@ -717,8 +717,14 @@ index d12592f..d55f197 100644
 +        // same way -- a superblock record inside the folder (MemoryCardFolder.cpp:236-244, written by
 +        // FlushSuperBlock at :1196-1205) -- so the convention is not invented here.
 +        constexpr char kMcSuperblockName[] = "_pcsx2_superblock";
-+        constexpr char kMcMagic[28] = {'S','o','n','y',' ','P','S','2',' ','M','e','m','o','r','y',
-+                                       ' ','C','a','r','d',' ','F','o','r','m','a','t'};
++        // W59. The magic was declared `char[28]` with only 27 initialisers, so `sizeof(kMcMagic)`
++        // reported 28 while the array's LAST byte was a zero-fill -- and the comparison was a
++        // 28-byte memcmp against a string that is only 27 characters. The card was therefore declared
++        // unformatted no matter what was on disk, and the byte-accounting habit of checking the
++        // initialiser count would have caught it. Written from the string itself so the two cannot
++        // disagree again.
++        constexpr char kMcMagic[] = "Sony PS2 Memory Card Format ";
++        static_assert(sizeof(kMcMagic) == 29u, "magic is 28 characters plus its NUL");
 +        constexpr uint32_t kMcClustersPerCard = 8192u;
 +        constexpr uint32_t kMcAllocOffset = 41u;
 +        constexpr uint32_t kMcAllocEnd = kMcClustersPerCard - kMcAllocOffset; // 8151
@@ -741,8 +747,15 @@ index d12592f..d55f197 100644
 +        std::vector<uint8_t> buildMcSuperblock()
 +        {
 +            std::vector<uint8_t> page(512u, 0u);
-+            std::memcpy(page.data(), kMcMagic, sizeof(kMcMagic));
++            // W59. `sizeof(kMcMagic)` is 29 -- 28 characters plus the string's NUL. Copying 29
++            // bytes into a 28-CHARACTER field pushed every subsequent field one byte right, so
++            // page_len landed at 0x29 instead of 0x28 and the whole page was misaligned. The magic
++            // is 28 characters; the NUL belongs to the string, not to the card.
++            static_assert(sizeof(kMcMagic) - 1u == 28u, "the magic is 28 characters");
++            std::memcpy(page.data(), kMcMagic, sizeof(kMcMagic) - 1u);
++            // version is a 12-byte field at 0x1C
 +            std::memcpy(page.data() + 0x1Cu, "1.2.0.0", 8u);
++            std::memset(page.data() + 0x1Cu + 8u, 0, 4u);
 +            put16(page, 0x28u, 512u);              // page_len
 +            put16(page, 0x2Au, 2u);                // pages_per_cluster
 +            put16(page, 0x2Cu, 16u);               // pages_per_block
@@ -771,7 +784,12 @@ index d12592f..d55f197 100644
 +            {
 +                return false;
 +            }
-+            std::vector<uint8_t> head(28u, 0u);
++            // W59. This compared `sizeof(kMcMagic)` bytes against a 28-CHARACTER magic, so it
++            // demanded a 29th byte that no real card has -- and every card, however perfectly
++            // formatted, was declared unformatted. The magic is the 28 characters; the NUL that
++            // follows is a string terminator, not part of the field.
++            constexpr std::size_t kMagicChars = sizeof(kMcMagic) - 1u;
++            std::vector<uint8_t> head(kMagicChars, 0u);
 +            std::FILE *f = std::fopen(sb.string().c_str(), "rb");
 +            if (f == nullptr)
 +            {
@@ -779,7 +797,7 @@ index d12592f..d55f197 100644
 +            }
 +            const size_t got = std::fread(head.data(), 1u, head.size(), f);
 +            std::fclose(f);
-+            return got == head.size() && std::memcmp(head.data(), kMcMagic, sizeof(kMcMagic)) == 0;
++            return got == head.size() && std::memcmp(head.data(), kMcMagic, kMagicChars) == 0;
 +        }
 +
 +        void writeMcSuperblock(int32_t port)
@@ -811,7 +829,7 @@ index d12592f..d55f197 100644
          void ensureMcRootExists(int32_t port)
          {
              std::error_code ec;
-@@ -683,6 +798,9 @@ namespace ps2_stubs
+@@ -683,6 +816,9 @@ namespace ps2_stubs
                  {
                      McPortState &state = g_mcPorts[static_cast<size_t>(port)];
                      state.currentDir = "/";
@@ -821,7 +839,7 @@ index d12592f..d55f197 100644
                      state.formatted = true;
                      result = kMcResultSucceed;
                  }
-@@ -874,7 +992,34 @@ namespace ps2_stubs
+@@ -874,7 +1010,34 @@ namespace ps2_stubs
              {
                  McPortState &state = g_mcPorts[static_cast<size_t>(port)];
                  cardType = kMcTypePs2;
@@ -857,7 +875,7 @@ index d12592f..d55f197 100644
                  format = state.formatted ? kMcFormatted : kMcUnformatted;
                  result = state.formatted ? kMcResultSucceed : kMcResultNoFormat;
              }
-@@ -927,7 +1072,11 @@ namespace ps2_stubs
+@@ -927,7 +1090,11 @@ namespace ps2_stubs
              for (McPortState &state : g_mcPorts)
              {
                  state.currentDir = "/";
@@ -870,7 +888,7 @@ index d12592f..d55f197 100644
              }
          }
          ensureMcRootExists(0);
-@@ -1090,7 +1239,12 @@ namespace ps2_stubs
+@@ -1090,7 +1257,12 @@ namespace ps2_stubs
                          << " a0(port)=" << static_cast<uint32_t>(getRegU32(ctx, 4)) << " a1(slot)="
                          << static_cast<uint32_t>(getRegU32(ctx, 5)) << " a2(buf)=0x" << std::hex
                          << getRegU32(ctx, 6) << " a3(mode)=0x" << getRegU32(ctx, 7) << std::dec);
@@ -884,7 +902,7 @@ index d12592f..d55f197 100644
                          << " slot=" << slot << " addr=0x" << std::hex
                          << pathAddr << std::dec << " bytes=[" << pathHex << "] '" << path
                          << "' flags=0x" << std::hex << flags << std::dec << " guest='" << guestPath
-@@ -1309,6 +1463,7 @@ namespace ps2_stubs
+@@ -1309,6 +1481,7 @@ namespace ps2_stubs
                  const std::filesystem::path root = getMcRootPath(port);
                  std::error_code ec;
                  std::filesystem::remove_all(root, ec);
@@ -1168,10 +1186,10 @@ index 4f979be..85bed67 100644
              constexpr uint32_t dirAddr = GUEST_STRING_AREA_START + 0xB00;
  
 diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
-index 8140cd4..0bcfbb1 100644
+index 8140cd4..04e48e8 100644
 --- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
 +++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
-@@ -2009,6 +2009,87 @@ void register_ps2_runtime_kernel_tests()
+@@ -2009,6 +2009,125 @@ void register_ps2_runtime_kernel_tests()
              }
          });
  
@@ -1251,6 +1269,44 @@ index 8140cd4..0bcfbb1 100644
 +                     "the backup blocks and the '.'/'..' root entries all validate). -2 is the state "
 +                     "that sends the guest down its 'no card' path instead of its 'no such file' path.");
 +
++            // THE ROUND TRIP, and the case that actually broke: writeMcSuperblock's own output
++            // must satisfy mcRootIsFormatted. It did not, for a long time, for two reasons that both
++            // looked like "the card is fine": the magic comparison demanded a byte no real card has,
++            // and the writer copied 29 bytes into a 28-CHARACTER field, shifting every later field
++            // by one. A format that produces a card the runtime then calls unformatted is not a format.
++            //
++            // `paths.mcRoot` is the temp root this test created, so it is re-armed explicitly here:
++            // the assertions above restore `saved`, and formatting the wrong root proves nothing.
++            PS2Runtime::IoPaths formatPaths = PS2Runtime::getIoPaths();
++            formatPaths.mcRoot = root;
++            PS2Runtime::setIoPaths(formatPaths);
++            // port and slot must be set: sceMcFormat reads them from $a0/$a1 and refuses any slot
++            // other than 0, so calling it with whatever the previous command left behind formats
++            // nothing and the round-trip below then "proves" nothing.
++            SET_GPR_U32(&env.ctx, 4, 0u); // port
++            SET_GPR_U32(&env.ctx, 5, 0u); // slot
++            ps2_stubs::sceMcFormat(env.rdram.data(), &env.ctx, &env.runtime);
++            // Re-init so `formatted` is DERIVED from what is now on disk rather than carried over
++            // from the format's own assignment -- that is the whole property under test.
++            ps2_stubs::sceMcInit(env.rdram.data(), &env.ctx, &env.runtime);
++            SET_GPR_U32(&env.ctx, 6, kTypePtr);
++            SET_GPR_U32(&env.ctx, 7, kFreePtr);
++            SET_GPR_U32(&env.ctx, 8, kFormatPtr);
++            ps2_stubs::sceMcGetInfo(env.rdram.data(), &env.ctx, &env.runtime);
++            std::memcpy(&format, env.rdram.data() + kFormatPtr, sizeof(format));
++            std::memcpy(&freeBlocks, env.rdram.data() + kFreePtr, sizeof(freeBlocks));
++            int32_t formatResult = 0;
++            SET_GPR_U32(&env.ctx, 5, 0x00201000u);
++            SET_GPR_U32(&env.ctx, 6, 0x00201100u);
++            ps2_stubs::sceMcSync(env.rdram.data(), &env.ctx, &env.runtime);
++            std::memcpy(&formatResult, env.rdram.data() + 0x00201100u, sizeof(formatResult));
++            t.Equals(format, 1,
++                     "a card the runtime just FORMATTED must then report itself formatted. A format "
++                     "that writes a superblock the reader cannot match is not a format.");
++            t.Equals(formatResult, 0, "and getinfo must report success for it");
++            t.Equals(freeBlocks, 8151,
++                     "free is clusters_per_card - alloc_offset = 8192 - 41 for a formatted empty card");
++
 +            paths.mcRoot = saved;
 +            PS2Runtime::setIoPaths(paths);
 +            std::filesystem::remove_all(root, ec);
@@ -1260,10 +1316,10 @@ index 8140cd4..0bcfbb1 100644
          {
              TestEnv env;
 diff --git a/ps2xTest/src/ps2_sif_rpc_tests.cpp b/ps2xTest/src/ps2_sif_rpc_tests.cpp
-index 4d8de05..66c1324 100644
+index 4d8de05..1f7db29 100644
 --- a/ps2xTest/src/ps2_sif_rpc_tests.cpp
 +++ b/ps2xTest/src/ps2_sif_rpc_tests.cpp
-@@ -364,6 +364,36 @@ void register_ps2_sif_rpc_tests()
+@@ -364,6 +364,39 @@ void register_ps2_sif_rpc_tests()
              ioPaths.mcRoot = temp.path / "mc0";
              PS2Runtime::setIoPaths(ioPaths);
  
@@ -1274,9 +1330,12 @@ index 4d8de05..66c1324 100644
 +                std::error_code fec;
 +                std::filesystem::create_directories(ioPaths.mcRoot, fec);
 +                std::vector<uint8_t> page(512u, 0u);
-+                const char magic[28] = {'S','o','n','y',' ','P','S','2',' ','M','e','m','o','r','y',
-+                                        ' ','C','a','r','d',' ','F','o','r','m','a','t'};
-+                std::memcpy(page.data(), magic, sizeof(magic));
++                // Derived from the string, so the field width and the text cannot disagree. This one
++                // was `char[28]` with 27 initialisers, and the missing 28th byte was a zero-fill that
++                // made every card look unformatted.
++                constexpr char magic[] = "Sony PS2 Memory Card Format ";
++                static_assert(sizeof(magic) - 1u == 28u, "the card magic is 28 characters");
++                std::memcpy(page.data(), magic, sizeof(magic) - 1u);
 +                std::memcpy(page.data() + 0x1Cu, "1.2.0.0", 8u);
 +                auto put16 = [&](std::size_t at, uint16_t v){ page[at]=static_cast<uint8_t>(v&0xFFu); page[at+1u]=static_cast<uint8_t>((v>>8)&0xFFu); };
 +                auto put32 = [&](std::size_t at, uint32_t v){ for(std::size_t i=0;i<4u;++i) page[at+i]=static_cast<uint8_t>((v>>(8u*i))&0xFFu); };
@@ -1300,7 +1359,7 @@ index 4d8de05..66c1324 100644
              constexpr uint32_t kSendAddr = 0x00034000u;
              constexpr uint32_t kRecvAddr = 0x00035000u;
              constexpr uint32_t kEndParamAddr = 0x00036000u;
-@@ -403,8 +433,12 @@ void register_ps2_sif_rpc_tests()
+@@ -403,8 +436,12 @@ void register_ps2_sif_rpc_tests()
                       "get info result should succeed");
              t.Equals(readGuestStruct<int32_t>(env.rdram.data(), kEndParamAddr + 0u), 2,
                       "get info should report PS2 card type");

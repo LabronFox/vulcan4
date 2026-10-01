@@ -3816,3 +3816,90 @@ thing left, and it is a decode, not a fix.
 **Decode the function containing `0x1003D9C`** — the routine that assembles `/BASCUS-97328GAMEDATA`
 component by component. It is where the `/` separators and the 2-byte token are produced, so its
 decode will say what `0x8005` is. One function, and it decides the wall.
+
+## W37 — item 1–3 closed out; the MC wall is not a path bug, and item 4 is unblocked
+
+### Items 1, 2, 3 — closed, with what closed them
+
+- **Item 1 (`requestPreemptionIfHigher` with `<=`, plus `hasReadyAtOrAbovePriority`) is NOT the fix
+  and must not be applied.** Priority is not the bug. W24 named the hardware truth (`0x29` returns the
+  *previous* priority; thread 0 is the boot/idle thread; `$a0`–`$a3` are preserved) and the W15 loop is
+  downstream of the memory-card open. `<=` would change preemption order and cannot move a `-4`.
+- **Item 2** (re-run 90 s, watch the set/restore pair stop dominating `sce_ChangeThreadPriority`) is
+  **moot**: the loop's call graph is `sub_0100E730 → sub_010175C8 → sceMcSync`, not
+  `sce_ChangeThreadPriority`. `distinct_pcs` and `sce_SleepThread` are no longer the numbers that
+  matter; `sceMcOpen`'s result is.
+- **Item 3** (`sub_01011508`'s list walk, `func_101F350`) is **answered**: `func_101F350` is
+  `0x33 WakeupThread`, and `sub_01011508` walks the ready queue. Both were named in W24; the walk is
+  *not* the wall.
+
+### The caller chain, now complete and fully named
+
+```
+sub_01005148        0x10051e8 jal sub_0100E3C8
+sub_01005430        0x10054a8 jal sub_0100E610
+sub_0100E610        0x100e664 jal func_1016F88  (sceMcOpen)      <- ra=0x100e66c, the retry loop
+sub_0100E730        0x100e674 jal func_100E730  -> sceMcSync      (W15's poller)
+```
+
+`sub_0100E610`'s loop is now read exactly, and it is the retry:
+
+```
+0x100e650 jal func_10119A0     # the lock/enter helper
+0x100e664 jal func_1016F88     # sceMcOpen(port, slot, buffer, mode)
+0x100e66c bnez $v0, 0x100e650  # NON-ZERO (i.e. FAILURE) -> RETRY IMMEDIATELY
+```
+
+**There is no sleep, no backoff, and no give-up in the guest's own code.** `sceMcOpen` returns `-4`,
+the branch is taken, and it calls straight back into `sceMcOpen`. That is the 10,238-per-port spin.
+`sceMcSync`'s `1` is correct and irrelevant.
+
+### What `sub_01003E10` and `func_101D3B8` actually are
+
+`sub_01003E10` is a **correct path join**, verified instruction by instruction:
+
+```
+0x1003e40 lw  $s2, -0x2338($v0)        # $s2  = *(0x102DCC8)      FIRST component
+0x1003e44 jal func_1013D68             # strlen($s2)               <- func_1013D68 IS strlen (SIMD pceqb)
+0x1003e4c lw  $a0, 0x0($s4)           # $a0  = obj->0x0           SECOND component
+0x1003e50 jal func_1013D68             # strlen(obj->0x0)
+0x1003e60 jal func_101D3B8             # allocate
+0x1003e78 jal func_101E81C             # memcpy(buf, first, lenA)
+0x1003e84 sb  '/'                      # separator
+0x1003e90 jal func_101E81C             # memcpy(buf+lenA+1, obj->0x0, lenB+1)
+0x1003e98 sw  $s1, 0x4($s4)           # cache into obj->0x4
+```
+
+`func_101D3B8` is **not** an allocator: it is a one-shot bootstrap that calls `func_101D2A0`,
+`func_101D650`, `func_101ADB0`, `func_101D528`, `func_102DB98`, `func_101D7D8` and stores its result to
+`sp+0`. It is `sbrk`'s initialiser, run once. **It is not `ps2_stubs::malloc` and our
+`allocateGuestBlockLocked` is not in this path.**
+
+Also: our own `sceMcOpen` log reads `flags` from `$v1`, which is `0x0` garbage on a direct stub call —
+the real mode is `$a3`. That is a **logging defect only**; it does not affect the `-4`.
+
+### The blocker, written down as the instructions require
+
+**BLOCKER (items 1–3):** the guest builds a filename whose leading two bytes are `0x8005`, hands it
+to `sceMcOpen`, gets `-4`, and retries forever **with no backoff in its own code**. `0x8005` is not
+ASCII, is not a byte swap of `..`, and **no structure in this project establishes what a 2-byte token
+in front of `/` means**. The three `.rodata` components are now known (`GAMEDATA` at `0x103D548`,
+`BA` at `0x103D638`, `SCUS-97328` at `0x103D650` — note the string table is *contiguous and reversed*,
+which is why reading the offsets by eye gives the wrong component names). Guessing the token would be
+inventing the answer, so I stopped and moved on. **The next CPU-lane attack, when picked up, is to
+find who writes `0x8005` into the filename buffer — the store observer already names the site class
+(`pc=0x1012214`, `pc=0x1012648`, `pc=0x10122fc`), so it is a small, well-bounded search.**
+
+### Moving to item 4 — GS texture from the game's own data
+
+Item 4 does not wait on this. A prior scan is on disk at `/mnt/ssd/gt4/gswork/hunt.log` with real
+candidates, and it already separates noise from signal:
+
+- `.data`: 333 candidates, but `grad=0.00` means flat zero fill — **noise, not texture.**
+- **`.rodata`: 8 PSMT8 64×64 candidates with `grad=26..37` and entropy 5.2–6.0 bits/byte.** PSMT8 is
+  8-bit-indexed and therefore needs a CLUT, which is exactly the palette path item 4 asks to prove.
+- `CORE.GT4`: 31,480 candidates, all `grad≈70` — that is a photo/text corpus, not a CLUT texture.
+
+**`.rodata` PSMT8 at `0x040180` (and the seven after it) is the item-4 candidate: real indexed pixel
+data from the game's own ELF, with a gradient and entropy a flat fill cannot fake.** Next: name its
+dimensions and format from the surrounding data, find its CLUT, and render it through our GS.

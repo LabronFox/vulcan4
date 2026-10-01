@@ -1275,6 +1275,106 @@ index c5e31c4..bdab38a 100644
              {
                  m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                       { return !m_events.empty() ||
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+index 564d873..cb8ea83 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+@@ -586,7 +586,6 @@ namespace ps2_stubs
+         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
+         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
+         const std::string path = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
+-
+         int32_t result = kMcResultNoEntry;
+         {
+             std::lock_guard<std::mutex> lock(g_mcStateMutex);
+@@ -984,12 +983,46 @@ namespace ps2_stubs
+     {
+         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
+         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
+-        const std::string path = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
++        const uint32_t pathAddr = getRegU32(ctx, 6);
++        const std::string path = readPs2CStringBounded(rdram, pathAddr, kMcMaxPathLen);
+         const uint32_t flags = getRegU32(ctx, 7);
++        // W28. GT4 hands us a path that is NOT printable ASCII -- it arrives as binary junk and we
++        // answer -4, which is what its boot loop spins on. A C-string print cannot show what the
++        // bytes actually are, so the raw bytes go in the log as hex. Whatever encoding this is, it
++        // has to be read off the guest's memory, not guessed at from a mangled printf.
++        // Dump a WINDOW, not just the string: the pointer lands 0x30 bytes below the 0x1051a40
++        // guest buffer the W7 entry already investigated, so the path is probably a field inside a
++        // larger structure and its siblings are what explain the encoding.
++        std::string pathHex;
++        if (const uint8_t *raw = getConstMemPtr(rdram, pathAddr >= 0x40u ? pathAddr - 0x40u : 0u))
++        {
++            char byteText[4];
++            for (size_t i = 0; i < 160u; ++i)
++            {
++                const uint8_t b = raw[i];
++                // No early break: this is a WINDOW, and stopping at the first NUL would hide the
++                // whole structure the path sits in.
++                std::snprintf(byteText, sizeof(byteText), "%02x", b);
++                pathHex += byteText;
++                pathHex += ' ';
++            }
++        }
++        else
++        {
++            pathHex = "<unreadable>";
++        }
+ 
+         int32_t result = kMcResultNoEntry;
+         {
+             std::lock_guard<std::mutex> lock(g_mcStateMutex);
++            // W28. Declared above the port check so the [MC] Open log line below can report what
++            // was asked for even when the port is invalid -- which is exactly the case where "the
++            // guest asked for a file and got -4" has to stay visible.
++            std::string guestPath;
++            std::filesystem::path hostPath;
++            bool create = false;
++            bool exists = false;
++            std::error_code ec;
+             if (isValidMcPortSlot(port, slot))
+             {
+                 McPortState &state = g_mcPorts[static_cast<size_t>(port)];
+@@ -999,11 +1032,10 @@ namespace ps2_stubs
+                 }
+                 else
+                 {
+-                    const std::string guestPath = normalizeGuestMcPathLocked(port, path);
+-                    const std::filesystem::path hostPath = guestMcPathToHostPath(port, guestPath);
+-                    std::error_code ec;
+-                    const bool create = (flags & PS2_FIO_O_CREAT) != 0u;
+-                    const bool exists = std::filesystem::exists(hostPath, ec) && !ec;
++                    guestPath = normalizeGuestMcPathLocked(port, path);
++                    hostPath = guestMcPathToHostPath(port, guestPath);
++                    create = (flags & PS2_FIO_O_CREAT) != 0u;
++                    exists = std::filesystem::exists(hostPath, ec) && !ec;
+                     if (guestPath == "/")
+                     {
+                         result = kMcResultDeniedPermit;
+@@ -1039,6 +1071,23 @@ namespace ps2_stubs
+                 }
+             }
+             setMcCommandResultLocked(kMcCmdOpen, result);
++            // W28. sceMcOpen is the call GT4's boot spins on: sub_0100E730 polls
++            // sceMcSync until it returns 1, and every one of those polls answers -4
++            // (kMcResultNoEntry) because the Open underneath failed. There was no log line for
++            // Open at all -- Chdir, GetDir and GetInfo all had one -- so the path and the flag word
++            // were invisible, and "the guest is opening a file we say does not exist" cannot be
++            // acted on without knowing WHICH file and with WHICH flags. The flag matters: hardware
++            // returns -4 only when neither sceMcFileCreateFile (0x0200) nor sceMcFileCreateDir
++            // (0x0040) is set, so a 0x0200 open must create the entry rather than report it missing.
++            RUNTIME_LOG("[MC] Open port=" << port << " slot=" << slot << " addr=0x" << std::hex
++                        << pathAddr << std::dec << " bytes=[" << pathHex << "] '" << path
++                        << "' flags=0x" << std::hex << flags << std::dec << " guest='" << guestPath
++                        << "' host='" << hostPath.string() << "' exists=" << (exists ? 1 : 0)
++                        << " create=" << (create ? 1 : 0)
++                        << " parent=" << (std::filesystem::exists(hostPath.parent_path(), ec) && !ec
++                                              ? "yes"
++                                              : "NO")
++                        << " result=" << result);
+         }
+         setReturnS32(ctx, 0);
+     }
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
 index 07fcd29..a4213c7 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp

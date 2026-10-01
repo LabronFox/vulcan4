@@ -3197,3 +3197,81 @@ capability is within reach of what we already have.
 
 Do not re-run the arrival histogram, syscall site sets, depth counters, caller map, `-O2` or the
 `$v1` work. All built, permanent, settled. Suite **472 total, 471 pass, 1 fail** (pre-existing VU0).
+
+## W29 — the exact bytes GT4 asks `sceMcOpen` for, and why our answer is -4
+
+W28 named the wall. This names the request. `sceMcOpen` had **no log line at all** (Chdir, GetDir and
+GetInfo all had one), so the path and the flag word were invisible; it has one now, in the same style,
+and it dumps a **window** of guest memory because the pointer lands inside a structure.
+
+```
+[MC] Open port=0 slot=0 addr=0x1051a10 flags=0x1
+      '?/?/e.gt4'  exists=0 create=0 parent=NO result=-4
+```
+
+**The guest string is exactly 11 bytes, NUL-terminated:**
+
+```
+05 80 2f 05 80 2f 65 2e 67 74 34 00
+```
+
+i.e. `05 80` `/` `05 80` `/` `e` `.` `g` `t` `4` NUL. **`2f` is `/`, so the tail `/e.gt4` is plain
+ASCII — the front is not.** And `flags=0x1` is `O_RDONLY`: **the guest is trying to READ an existing
+file, and correctly does not pass the create flag** (`sceMcFileCreateFile = 0x0200`).
+
+### The window explains where the pointer points
+
+Dumping 160 bytes from `0x10519d0` (i.e. `pathAddr - 0x40`) shows this is the guest's **file/IO
+table**, not a bare string:
+
+```
+03 00 00 00 00 00 00 00  42 00 00 00 00 00 00 00   ........B.......
+00 14 00 00 00 00 00 00  59 00 00 00 00 00 00 00   ........Y.......
+00 00 00 00 7f f2 1b 00  5a 00 00 00 00 00 00 00   ........Z.......
+00 14 00 00 30 1a 05 01  ff ff ff ff ff ff ff ff   ....0...........
+05 80 2f 05 80 2f 65 2e 67 74 34 00 00 00 00 00   ../../e.gt4.....
+00 00 00 00 00 00 00 00  5f 00 00 00 00 00 00 00   ........_.......
+00 1a 05 01 40 1a 0d 01  ff ff ff ff ff ff ff ff   ....@...........
+54 65 78 31 40 1a 05 01  00 00 00 00 90 cd 01 00   Tex1@...........
+00 28 cd 01 01 00 04 00  70 1a 05 01 98 1a 05 01   .(......p.......
+```
+
+- **The pointers `0x01051a30`, `0x01051a40`, `0x01051a70`, `0x01051a98` are fields of this table** —
+  and **`0x01051a40` is the `head` that the W7 diagnostic chased six dishes ago.** Two threads of
+  this campaign have now landed on the same guest structure.
+- **`54 65 78 31` is `Tex1`** — the magic of the texture asset the GS lane found in `.rodata`, and
+  `90 cd 01 00` / `00 28 cd 01` are its size field. **So this table is the guest's asset list, and the
+  entry it is failing to open is a texture named `e.gt4`.**
+- `ff ff ff ff` twice looks like a "not set / free" sentinel for the two adjacent fields.
+
+### So what we know, and what we refuse to guess
+
+- GT4 wants to **read** an asset it calls `e.gt4`, from a card it believes has it.
+- It asks with a path whose first two components are the 2-byte token `05 80`.
+- Our `normalizeGuestMcPathLocked` treats the path as absolute under the card root, producing
+  `/<05 80>/<05 80>/e.gt4`, whose parent does not exist, and we answer `-4` — which is the correct
+  libmc code for "no such entry" but the wrong answer for what the guest wants.
+
+**`05 80` is not decoded, and I am not going to decode it by intuition.** It is two bytes that could
+be a directory handle, a 16-bit index, an escape for `..`, or the guest's own path encoding — and
+guessing which is precisely the move that cost this project four dishes on a pointer once already.
+
+### The two measurements that will decode it, and they are cheap
+
+1. **Find the WRITER of `0x1051a10`.** Something formats that path into the table; the same table
+   already holds `Tex1`, so there is a formatter nearby and it will name the encoding. The call graph
+   is built (`VULCAN4 CALL GRAPH`), and `0x1051a40`'s own neighbours are in the earlier W7 entry.
+2. **Read `sub_010116A8`'s caller `sub_010118B8` / `sub_010118F0` pair and whatever calls
+   `sub_01012388`** — the guest's lock wrapper at 1,254,104 entries. That is the caller retrying the
+   open, and its loop condition is what decides whether a missing file is fatal or expected.
+
+**Whichever comes first, do not "fix" `-4` to something else.** `-4` is right for a missing entry; if
+the guest is unhappy it is because it believes the entry exists, so the fix is to serve the entry,
+not to change the code.
+
+Also worth noting for whoever takes this: `free=8192` from `sceMcGetInfo` is plausible but generic —
+a real freshly formatted 8 MB card reports ~7505 free clusters (1 KiB each). Not the blocker, but do
+not treat 8192 as measured truth.
+
+Suite **472 total, 471 pass, 1 fail** (pre-existing VU0). The `[MC] Open` log line, its guest-memory
+window dump, and the hoisted locals it needs are permanent.

@@ -3099,3 +3099,101 @@ Do **not** re-run the arrival histogram, the syscall site sets, the depth counte
 the `-O2` comparison or the `$v1` work. All are built, permanent and settled.
 
 Suite **472 total, 471 pass, 1 fail** (pre-existing VU0).
+
+## W28 — THE WALL IS THE MEMORY CARD. GT4 is opening its save file and our virtual card says "no entry", forever.
+
+After a long line of accounting work, the boot wall is finally a **concrete missing service**, not a
+scheduling puzzle. It was found by reading the call graph, and it took eleven entries to get there.
+
+### The chain, root first
+
+`sub_0100E730` (0x100e730–0x100e790, 0x60 bytes) is the outermost named function in the hot chain and
+it is a **spin on a return value**:
+
+```
+sub_0100E730($a0, $a1):
+    s0 = $a1 ; s1 = $a0 ; s2 = 1
+    goto loop
+loop:
+    0x100e758  jal func_10119A0        # $a0 = 0
+    0x100e764  $a1 = $s1
+    0x100e768  jal func_10175C8        # $a2 = $s0
+    0x100e770  bne $v0, $s2, loop      # spin until $v0 == 1
+```
+
+**And `func_10175C8` is a bare stub, ten lines of generated code:**
+
+```cpp
+void sub_010175C8_0x10175c8(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+    ctx->pc = getRegU32(ctx, 31);
+    ps2_stubs::sceMcSync(rdram, ctx, runtime);
+}
+```
+
+**`sceMcSync` — the MEMORY CARD SYNC syscall.** Its neighbours in the generated unit are
+`mceGetInfoApdx` and `sceMcGetInfo`. **GT4's boot is polling the memory card.**
+
+### What the guest is actually doing — from the runtime's own log
+
+```
+104508  [MC] GetInfo port=0 type=2 free=8192 format=1 result=0
+209016  [MC] Sync cmd=1 result=0
+209016  [MC] Sync cmd=2 result=-4
+```
+
+- `cmd=1` is `kMcCmdGetInfo`, `cmd=2` is `kMcCmdOpen`, `result=-4` is `kMcResultNoEntry`
+  (`MemoryCard.cpp:8-28`).
+- **The card is present and formatted** — `free=8192 format=1 result=0`. So this is not a missing
+  device; our virtual memory card exists and answers.
+- **GT4 opens a file and gets "no entry", then does it again.** 104,508 times in 45 seconds.
+
+### And `sceMcSync` is NOT the bug — it returns 1 correctly
+
+Worth stating because it is the obvious suspect and it is clean:
+
+```cpp
+if (!hadPending) { setReturnS32(ctx, -1); return; }   // "no operation was executing"
+...
+setReturnS32(ctx, 1);                                  // "1 = command finished in this runtime's
+                                                        //      immediate model" (comment, verbatim)
+```
+
+The log proves both branches are taken as designed — 209,016 syncs for 104,508 opens, so the `-1`
+idle path fires too, exactly once per idle poll. **`$v0` is 1 on every completing call**, so
+`sub_0100E730`'s `bne $v0, 1` does not spin *inside itself*. It returns. 209,013 times.
+
+### So the real loop is a caller of `sub_0100E730`, retrying an `sceMcOpen` that answers -4
+
+**`sceMcOpen` returning `kMcResultNoEntry` for a file that does not exist is correct libmc
+behaviour.** The question is what GT4 does with it, and on a real console with an empty card it
+either creates the save or falls back to "no save, start fresh" — **it does not retry forever**. So
+one of these is true, and they have very different fixes:
+
+1. **Our `sceMcOpen` result is right and GT4's fallback path needs something we do not provide.**
+   Most likely candidate: GT4 enumerates or creates its directory structure on the card first, and
+   something in that path is not reaching the state it needs — e.g. `sceMcGetEntSpace`, `sceMcMkdir`
+   or `sceMcOpen` with the create flag.
+2. **Our result is wrong for this case.** `-4` is right for a missing entry in general; if GT4 is
+   opening a file it expects to create, or opening with a mode we mis-handle, a different code is
+   correct.
+
+**Which one is it is a question about libmc, not about this binary, so it goes to the same authority
+W24 used.** The specific things to establish:
+
+- `sceMcOpen`'s exact contract: the mode/`flag` argument values, and whether "file absent" is
+  reported as `-4` or by creating it.
+- What a **real console with an empty, formatted card** returns for a full
+  `sceMcGetInfo` → `sceMcOpen("...")` → `sceMcSync` sequence, so there is a reference to compare our
+  log against.
+- Whether GT4's "no save" fallback is reached by a *count* (retry N times) or by a *state* — because
+  if it is a count, our loop is simply running faster than the console ever would, and the fix is
+  about rate, not about results.
+
+**This is the first wall in this line that has an obvious next action and a bounded fix.** It is
+also the first one where the honest answer might be that the user has to supply something: a memory
+card is user data, exactly like the disc (law #1 and law #7). But **do not assume that** — an empty
+formatted virtual card already works, and a real console boots GT4 with an empty card, so the
+capability is within reach of what we already have.
+
+Do not re-run the arrival histogram, syscall site sets, depth counters, caller map, `-O2` or the
+`$v1` work. All built, permanent, settled. Suite **472 total, 471 pass, 1 fail** (pre-existing VU0).

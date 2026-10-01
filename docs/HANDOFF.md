@@ -4615,3 +4615,59 @@ three leading bytes clobbered — i.e. **the guest is opening its own disc execu
 memory-card RPC (it genuinely arrives via `mcserv.cpp:291`, so the routing is not obviously wrong).
 Not proven. For the record, GT4's real *card* directory is `/BASCUS-97436GAMEDATA` (a later, different
 open), which is presumably where the brief's "/BA/SCUS-97328/GAMEDATA" came from.
+
+---
+
+## 2026-10-01 — G1 ROUTING: the branch is named, and the misroute is "no provider", not a wrong one
+
+**THE BRANCH THE CAPTAIN ASKED FOR** — `tools/PS2Recomp/ps2xIOP/src/iop_subsystem.cpp:197`:
+
+```cpp
+RpcResult IopSubsystem::handleRpc(const RpcRequest &request)
+{
+    const auto route = m_impl->routes.find(request.sid);              // <-- the value tested
+    detail::IopService *hle = route != m_impl->routes.end() ? route->second : nullptr;
+    RpcResult emulated = m_impl->emulator.handleRpc(request);
+    if (emulated.handled || !hle) { return emulated; }
+    return hle->handleRpc(request);
+}
+```
+
+It is a clean SID table lookup, not a heuristic. `request.sid` is the only discriminator, and
+`routes` is built from each service's `sids()` with a duplicate check at `iop_subsystem.cpp:54-59`.
+
+**WHICH HALF IS WRONG: neither half routes wrongly. There is simply nothing to route TO.**
+
+- `mcserv` declares `m_sids = {0x80000400, 0x80000480}` (`mcserv.cpp:395`) — the correct MCSERV SIDs.
+  It does **not** claim the FileIO SID, so it cannot be stealing disc traffic.
+- **We have no FileIO provider at all.** `grep` for `sids() const override` across
+  `tools/PS2Recomp/ps2xIOP` returns exactly three services: `mcserv`, `libsd`, `dbcman`.
+  `0x80000001` (FileIO) appears in **zero** files.
+- Yet `iop_module_manager.cpp:70` lists **`"fileio"` in `m_builtinKeys`**, so
+  `sceSifLoadModule("fileio")` **succeeds** — the guest is told its filesystem driver loaded.
+- `IopEmulator::hasRpcServer()` only answers true for servers the *guest* registered via
+  `sceSifRegisterRpc` (`iop_rpc.cpp:215`, `server.sid = cpu.gpr[5]`, correct SDK convention). With no
+  BIOS there are no ROM-registered IOP drivers at all, so an HLE provider is the only thing that can
+  serve a SID — and for FileIO there is none.
+
+**SO THE SEQUENCE BEHIND 212,577 `sceMcOpen` CALLS IS:** GT4 loads `fileio`, is told it loaded, issues
+an open for its own disc executable (`core.gt4`), **nothing serves the SID so the open fails**, and the
+guest falls back to the memory-card RPC — which reaches `mcserv.cpp:291` → `sceMcOpen` → -4 because a
+card has no `e.gt4` — and retries forever.
+
+**The routing is correct. The missing provider is the bug.** That also means the milestone is reachable:
+serve the FileIO open and the guest never falls back, so `sceMcOpen` calls for the disc path go to
+zero on their own — which is exactly the measurable the captain set.
+
+**NEXT DISH (W48): an HLE FileIO provider.** Red test first, on behaviour not counts:
+- register SID `0x80000001`, and `IopSubsystem::canBindRpc(0x80000001)` must then be **true** (it is
+  false today — that is the red);
+- an open of `cdrom0:/core.gt4` must resolve to the disc and return a usable descriptor, and must
+  **not** appear in the memory-card call list;
+- `mc0:/...` must still resolve to the card, so the card path is not regressed by fixing the disc one;
+- an unknown device must still fail loudly (`VULCAN 4 LIMITATION: ...`), never silently.
+Then re-run: `sceMcOpen` calls for the disc path must be **0**, the -4 loop must stop, and the new halt
+reason must be reported honestly even if it is worse than `stuck_in_syscall`.
+
+**STATUS: not fixed, no frame printed.** No code changed for this dish — it was spent establishing
+which half is wrong, as instructed. Suite untouched.

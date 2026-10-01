@@ -3275,3 +3275,87 @@ not treat 8192 as measured truth.
 
 Suite **472 total, 471 pass, 1 fail** (pre-existing VU0). The `[MC] Open` log line, its guest-memory
 window dump, and the hoisted locals it needs are permanent.
+
+## W30 — the store observer was blind to the IOP/RPC path, and fixing it exposed a 16 MB guest memcpy
+
+W29 named the request and refused to guess the encoding. This entry decodes what it can, **fixes a
+real defect in the diagnostic facility itself**, and lands a serious new suspect.
+
+### A real fix, and it paid for itself immediately
+
+`ps2TraceGuestRangeWrite` was an empty no-op carrying `// TODO we dont need this anymore`. It is the
+write path for **`IopHost::writeGuest` / `zeroGuest`** and for **`rpcCopyToRdram` / `rpcZeroToRdram`** —
+so four of the five ways a guest buffer can change were invisible to `ps2SetGuestStoreObserver`, which
+`WRITE8/16/32/64` all feed. It now forwards to the observer (the address stands in for the value,
+since a range write has none). Three lines, and it immediately changed what could be seen.
+
+### What the write-watch then showed, on the `0x1051a10` path buffer
+
+| site | store | writes |
+|---|---|---|
+| `pc=0x1003c5c` `ra=0x1003c10` | 1 byte ×264 | **`CDROM0:\`** at `0x1051a18`–`0x1051a1f` |
+| `pc=0x1003e84` `ra=0x1003e80` | 1 byte ×67 | `/` at `0x1051a12` |
+| `pc=0x1003e80` `ra=0x1003e80` | **2 bytes** ×67 | **`05 80` — a halfword store of `0x8005`** |
+| `pc=0x1003c10` `ra=0x1003c10` | 8 bytes ×33 | a quadword |
+| `pc=0x1003a98`, `0x1003e98` | 9 bytes | — |
+| **`pc=0x1010eec`** | **16,410,192 bytes** | **see below** |
+
+Three things fall out of this:
+
+1. **`05 80` is not text.** It is one 16-bit store of the value **`0x8005`**. It is never printed as a
+   character by anything.
+2. **The guest is writing `CDROM0:` into the same region** that the memory-card open reads from.
+   `CDROM0:` is a PS2 device name. **So the guest builds several candidate paths in one reused
+   scratch buffer, and `sceMcOpen` is being handed a pointer into whatever that buffer currently
+   holds** — which is how a memory-card open ends up looking at a stale mixture.
+3. The buffer is in **BSS** (file offset `0x52a10` is past PT_LOAD2's `filesz=0x13aa4`, so it loads as
+   zero) — so every byte of it was written at runtime.
+
+### The new suspect: a 16 MB guest memcpy
+
+`pc=0x1010eec` is the delay slot of `jal func_101E9D0` inside **`sub_01010EA8`**, which is an aligned
+copy:
+
+```
+0x1010eb8  $s0 = *(0x1033214)
+0x1010ecc  $s0 = ($s0 + 0xF) & ~0xF          // align down to 16
+0x1010ec8  $s1 = *(0x1033218)
+0x1010ed8  $s1 = $s1 - $s0                   // size
+0x1010ee4  jal func_101E9D0                  // the guest's memcpy
+```
+
+`func_101E9D0` is the guest's own memcpy helper — it is called from at least five sites
+(`0x1001030`, `0x1003680`, `0x1003690`, `0x1003850`, `0x1010ee4`). **Its length comes from two guest
+globals at `0x1033214` and `0x1033218`, and it copied 16,410,192 bytes.**
+
+A 16 MB copy into guest memory will stamp over whatever the source holds, including the memory-card
+path buffer. **That is a far better explanation for a path full of `0x8005` than any theory about
+encoding.** It also means the `0x8005` bytes may not be a path component at all but residue from a
+copy that ran away.
+
+**What to check, in this order — and it is cheap:**
+
+1. **Print `*(0x1033214)` and `*(0x1033218)` when `sub_01010EA8` runs**, and the `src`/`dst` it
+   computes. If the length is garbage, that is the bug and it is upstream of everything else in this
+   entry. If the length is sane, then a 16 MB copy is legitimate and only the *source* matters.
+2. **Then re-read `0x1051a10` after the copy** rather than before, so we know whether the copy is
+   what put `0x8005` there.
+3. Only then return to `sceMcOpen`. **Do not touch `-4`.**
+
+### And the two static finds, for whoever continues
+
+- **Device-name table at `0x0102DC90`** (file offset `0x2ec94`), four entries:
+  `0x102dc90 → "DISK"`, `0x102dc94 → "MCARD 0"`, `0x102dc98 → "MCARD 1"`, `0x102dc9c → "HOST"`,
+  with the strings themselves at `0x103d1e8`–`0x103d200`.
+- **`"e.gt4"` is a static ELF string at `0x0103D1DB`** (file offset `0x3e1db`), immediately followed
+  by `DISK`, `MCARD 0`, `MCARD 1`, `HOST`, `hot`, `Q211ImageLo…`. The guest copies the filename half
+  correctly, byte for byte.
+
+### Honest state
+
+`05 80` is **not decoded** — it is a halfword `0x8005`, and whether it is a device handle, a
+directory index or copy residue is exactly what steps 1–3 decide. I am not writing a normaliser for
+it on the strength of a guess.
+
+Suite **472 total, 471 pass, 1 fail** (pre-existing VU0). The `ps2TraceGuestRangeWrite` fix, the
+`[MC] Open` log with its guest-memory window, the RDRAM token scan and the store watch are permanent.

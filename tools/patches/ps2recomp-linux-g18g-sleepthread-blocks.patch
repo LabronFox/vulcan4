@@ -292,7 +292,7 @@ index 0000000..68018ac
 +#endif // PS2_GUEST_PROGRESS_H
 \ No newline at end of file
 diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
-index 4b9242c..b9731ce 100644
+index 4b9242c..5748f82 100644
 --- a/ps2xRuntime/include/ps2_runtime.h
 +++ b/ps2xRuntime/include/ps2_runtime.h
 @@ -21,6 +21,8 @@
@@ -382,7 +382,33 @@ index 4b9242c..b9731ce 100644
  }
  
  inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
-@@ -390,6 +444,97 @@ public:
+@@ -262,11 +316,21 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
+                                     const R5900Context *ctx)
+ {
+     (void)rdram;
+-    (void)guestAddr;
+-    (void)size;
+     (void)op;
+-    (void)ctx;
+-    // TODO we dont need this anymore so on next release it will be deleted
++    // W30. This used to be an empty no-op carrying "TODO we dont need this anymore", which is how
++    // a whole class of guest writes became invisible: ps2TraceGuestWrite covers WRITE8/16/32/64,
++    // but the IOP write path (IopHost::writeGuest / zeroGuest) and the RPC copies
++    // (rpcCopyToRdram / rpcZeroToRdram) all come through HERE. A driver that cannot see inside a
++    // guest frame cannot answer "what wrote this?", and this function was the answer for four of the
++    // five writers.
++    //
++    // The value is not known -- a range write has no single value -- so it is forwarded as the
++    // address, with size as given. An observer filtering on an address range still works; one that
++    // wanted the value has to say so by watching a narrower range.
++    if (g_ps2GuestStoreObserver != nullptr)
++    {
++        g_ps2GuestStoreObserver(guestAddr, size, static_cast<uint64_t>(guestAddr), ctx);
++    }
+ }
+ 
+ class PS2Runtime
+@@ -390,6 +454,97 @@ public:
      void requestStop();
      bool isStopRequested() const;
  
@@ -480,7 +506,7 @@ index 4b9242c..b9731ce 100644
      EeScheduler &eeScheduler();
      const EeScheduler &eeScheduler() const;
      void postEeEvent(EeEvent event);
-@@ -508,6 +653,21 @@ private:
+@@ -508,6 +663,21 @@ private:
      mutable std::mutex m_guestHeapMutex;
      mutable std::mutex m_asyncCallbackStackMutex;
      std::vector<GuestHeapBlock> m_guestHeapBlocks;
@@ -1276,7 +1302,7 @@ index c5e31c4..bdab38a 100644
                  m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                       { return !m_events.empty() ||
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
-index 564d873..cb8ea83 100644
+index 564d873..b28c13e 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
 @@ -586,7 +586,6 @@ namespace ps2_stubs
@@ -1303,10 +1329,10 @@ index 564d873..cb8ea83 100644
 +        // guest buffer the W7 entry already investigated, so the path is probably a field inside a
 +        // larger structure and its siblings are what explain the encoding.
 +        std::string pathHex;
-+        if (const uint8_t *raw = getConstMemPtr(rdram, pathAddr >= 0x40u ? pathAddr - 0x40u : 0u))
++        if (const uint8_t *raw = getConstMemPtr(rdram, pathAddr >= 0x10u ? pathAddr - 0x10u : 0u))
 +        {
 +            char byteText[4];
-+            for (size_t i = 0; i < 160u; ++i)
++            for (size_t i = 0; i < 640u; ++i)
 +            {
 +                const uint8_t b = raw[i];
 +                // No early break: this is a WINDOW, and stopping at the first NUL would hide the

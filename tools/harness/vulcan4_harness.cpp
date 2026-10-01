@@ -71,6 +71,41 @@
 
 namespace
 {
+// W30. Watch the guest buffer that holds the path GT4 hands sceMcOpen, and report the PC that
+// writes it. The path is `//e.gt4` -- `e.gt4` matches the ELF's static string byte
+// for byte, so the filename half is copied correctly and only the two directory components are
+// wrong. Finding the writer names the formatting code, and that code explains the encoding. This is
+// the one measurement left that does not require guessing.
+//
+// It rides on the store observer the recompiler already emits at every WRITE32 (159 sites), so
+// nothing had to be recompiled. The observer fires on EVERY guest store, so the filter is one
+// unsigned compare and the printing is capped: an uncapped print would dominate the run and change
+// the very throughput it is measuring.
+constexpr uint32_t kWatchLo = 0x01051A10u;
+constexpr uint32_t kWatchHi = 0x01051A20u;
+uint32_t g_watchStoreHits = 0;
+constexpr uint32_t kWatchStoreMax = 600;
+
+void watchGuestStoreForPath(uint32_t guestAddr, uint32_t size, uint64_t value, const R5900Context *ctx)
+{
+    if (guestAddr >= kWatchHi || guestAddr + size <= kWatchLo)
+    {
+        return;
+    }
+    if (g_watchStoreHits >= kWatchStoreMax)
+    {
+        return;
+    }
+    ++g_watchStoreHits;
+    std::cout << "VULCAN4 W30WRITE n=" << g_watchStoreHits << " pc=0x" << std::hex
+              << (ctx != nullptr ? ctx->pc : 0u) << " ra=0x" << (ctx != nullptr ? getRegU32(ctx, 31) : 0u)
+              << " addr=0x" << guestAddr << std::dec << " size=" << size << " value=0x" << std::hex
+              << static_cast<uint32_t>(value) << std::dec << "\n";
+}
+} // namespace
+
+namespace
+{
     // ---------------------------------------------------------------- stop reasons
     // These tokens are the vocabulary of the report line. They are stable: a log can be
     // grepped by halt=<token> across runs and across dishes.
@@ -396,6 +431,10 @@ int main(int argc, char *argv[])
 
     uint8_t *rdram = runtime.memory().getRDRAM();
     R5900Context &ctx = runtime.cpu();
+
+    // W30: watch the guest buffer holding the memory-card path. Installed before the first guest
+    // instruction so the one-time formatting write is caught, not just the reads that follow.
+    ps2SetGuestStoreObserver(&watchGuestStoreForPath);
 
     // Reset the parts of the console environment the runtime expects before the first guest
     // instruction, mirroring what PS2Runtime::run() does, minus the render loop.
@@ -1686,6 +1725,64 @@ std::cout << "\n";
                 }
                 std::cout << "\n";
             }
+            // W30. The path GT4 hands sceMcOpen begins with the 2-byte token 05 80 and I am not
+            // going to guess what it encodes. A SECOND example decodes it: scan RDRAM for every
+            // occurrence of the same byte pair and print each with context. If the guest stores
+            // other paths and they all start the same way, it is a fixed prefix; if one of them
+            // has plain ASCII where this has 05 80, then 05 80 is a handle and the ASCII one is the
+            // template it was built from. One example is a puzzle; two are a specification.
+            {
+                static const uint8_t kToken[2] = {0x05u, 0x80u};
+                int tokenHits = 0;
+                // Sanity first: the scan below is worthless if this block's view of RDRAM differs
+                // from the stub's, and "zero hits" is exactly what a wrong view produces.
+                std::cout << "VULCAN4 W30TOKEN sanity@0x1051a10:";
+                for (uint32_t k = 0; k < 16u; ++k)
+                {
+                    char byteText[4];
+                    std::snprintf(byteText, sizeof(byteText), "%02x", rdram[0x01051A10u + k]);
+                    std::cout << byteText << " ";
+                }
+                std::cout << " ramsize=0x" << std::hex << PS2_RAM_SIZE << std::dec << " hits:";
+                for (uint32_t off = 0; off + 2u + 40u <= PS2_RAM_SIZE && tokenHits < 24; ++off)
+                {
+                    if (rdram[off] != kToken[0] || rdram[off + 1u] != kToken[1])
+                    {
+                        continue;
+                    }
+                    // Require it to look like a path: a '/' within the next few bytes.
+                    bool pathish = false;
+                    for (uint32_t k = 2; k < 12u; ++k)
+                    {
+                        if (rdram[off + k] == '/')
+                        {
+                            pathish = true;
+                            break;
+                        }
+                    }
+                    if (!pathish)
+                    {
+                        continue;
+                    }
+                    ++tokenHits;
+                    std::cout << "\n  0x" << std::hex << off << std::dec << " [";
+                    uint32_t printed = 0;
+                    for (uint32_t k = 0; k < 40u && printed < 40u; ++k, ++printed)
+                    {
+                        const uint8_t b = rdram[off + k];
+                        if (b == 0u)
+                        {
+                            break;
+                        }
+                        char byteText[4];
+                        std::snprintf(byteText, sizeof(byteText), "%02x", b);
+                        std::cout << byteText << " ";
+                    }
+                    std::cout << "]";
+                }
+                std::cout << "\n";
+            }
+
             // W22. The two objects the wait-list broadcast is walking, 844,500 passes between them,
             // named by $s0 at the syscall. sub_01011508's layout, read straight from the generated
             // unit: +0x00 self/next, +0x04 node tid, +0x0C wait-list head, +0x18 owner-self check,

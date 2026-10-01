@@ -3429,3 +3429,95 @@ and certainly not by changing `-4`.**
   killed them — `SCHED STEPS`, `big_copy_count` — are permanent.
 
 Suite **472 total, 471 pass, 1 fail** (pre-existing VU0).
+
+## W32 — `$v1 = 0` at our MC stubs is EXPECTED, not a mapping bug; and the real path lives on the heap
+
+Two things decoded, one of which stopped me from declaring a root cause that does not exist.
+
+### `$v1 = 0` is benign — do not chase it
+
+The `[MC] Open` log now prints the syscall register, and it reads **`v1=0x0`** on all 25,949 calls.
+That looks damning: on hardware `$v1` carries the syscall number (EE-7a), so `sceMcOpen` running
+with `$v1 = 0` would mean we are servicing the *undefined-syscall* slot.
+
+**It does not mean that, and here is why.** The recompiler does not emit one uniform shape. Compare:
+
+```cpp
+// sub_0101F2B0 -- the general shape
+ctx->pc = 0x101f2b0u;
+runtime->handleSyscall(rdram, ctx, 0x0u);     // number read from $v1 by the runtime
+
+// sub_010175C8 -- the shape that reaches a stub DIRECTLY
+void sub_010175C8_0x10175c8(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+    ctx->pc = getRegU32(ctx, 31);
+    ps2_stubs::sceMcSync(rdram, ctx, runtime);   // NO addiu $v1 anywhere
+}
+```
+
+**When the recompiler resolves a syscall to a stub it drops the `addiu $v1, $zero, <number>`
+entirely**, because the number is already known at translation time. `$v1` therefore keeps whatever
+the guest last put there, and for these stubs that is 0. **`$v1 = 0` at a directly-called stub is
+expected and means nothing.** I was one step from filing "wrong syscall mapping" as the root cause.
+
+(It also means `ps2_call_list.h`'s X-list order is **not** the numbering — its first entry is
+`FlushCache`, which `syscall_names.h` puts at `0x64`. The list generates wrapper names, not numbers.)
+
+### The real path is on the heap, and the pointer we were handed is not it
+
+`sub_01003E10` — one of the two hottest functions in the entire boot — is a **path builder**:
+
+```
+0x1003e18  $s4 = $a0                       ; obj
+0x1003e30  $v0 = obj->0x4
+0x1003e34  bnez $v0 -> return              ; already built? done
+0x1003e40  $s2 = *(0x102dcc8)              ; a string from .data
+0x1003e44  func_1013D68($s2)               ; strlen
+0x1003e60  func_101D3B8(2*len + 2)         ; MALLOC
+0x1003e78  func_101E81C(buf, $s2, len)     ; memcpy(buf, str, len)
+0x1003e80  addiu $v0, $zero, 0x2F          ; '/'
+0x1003e84  sb    $v0, 0($s0)               ; buf[len] = '/'
+0x1003e90  func_101E81C(buf+len+1, obj->0x0, len+1)
+0x1003e98  sw    $s1, 0x4($s4)             ; obj->0x4 = built path
+```
+
+So the guest builds `<name>/<name>` into a **freshly allocated buffer** and caches the pointer at
+`obj+0x4`. That is the path it intends to open.
+
+**But the `name` pointer our `sceMcOpen` received is `0x01051A10` — static BSS, not that heap
+buffer.** So one of these is true, and I am not guessing which:
+
+1. **We are servicing a different call than the one that builds the path.** `sub_01003E10` and
+   `sub_01003B90` are hot; the Open we intercept may be a *different* MC entry point whose
+   arguments we are misreading.
+2. **The guest is passing `obj->0x0`, not `obj->0x4`.** Note `0x1003e90` memcpy's source is
+   `obj->0x0` — so `obj` has both a name at `+0x0` and a built path at `+0x4`, and `obj->0x0` may be
+   a pointer to something that is *not* the path.
+3. **The heap buffer we allocated is not where the guest thinks it is** — i.e. `func_101D3B8` (the
+   guest's allocator) and our heap disagree about addresses, so the guest writes its path somewhere
+   we do not read it from.
+
+**Option 3 is the one with the most leverage and it is cheap to test: print `obj->0x0` and `obj->0x4`
+from `sub_01003E10`, and separately print the `name` pointer and first bytes at every MC Open. If
+`obj->0x4` is a heap address in our allocator's range and the Open's `name` is `0x1051a10`, then the
+guest is passing the wrong field — and if `obj->0x4` is NOT in our heap, our allocator is the bug.**
+
+### State of the wall, honestly
+
+**Root cause is NOT yet found.** What is established, all measured:
+
+- GT4's boot spins in a memory-card poll (`sub_0100E730` → `sceMcSync`), 104,508 opens in 45 s, every
+  one answered `-4`.
+- The card is present and formatted; `sceMcSync` returns 1 correctly on completion; `-4` is the
+  right code for a missing entry.
+- **The bytes we read as "the path" are a reused buffer: guest-written `0x8005` halfwords and `/`
+  separators, plus `e.gt4` residue from a one-off 16 MB ring-buffer memmove.** W29's "GT4 wants to
+  read a texture called e.gt4" was a misreading of adjacent memory and is retracted.
+- **The guest's real path is built by `sub_01003E10` into a malloc'd buffer cached at `obj+0x4`, and
+  the pointer our stub receives is not that.**
+- `$v1 = 0` at our stubs is a recompiler artefact, not a mapping bug.
+
+**The single next measurement: `obj->0x0` and `obj->0x4` from the path builder, plus the `name`
+pointer at every Open.** That distinguishes "wrong field" from "wrong heap", and those need different
+fixes. Everything else in this line is built, permanent and settled.
+
+Suite **472 total, 471 pass, 1 fail** (pre-existing VU0).

@@ -1302,7 +1302,7 @@ index c5e31c4..bdab38a 100644
                  m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                       { return !m_events.empty() ||
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
-index 564d873..b28c13e 100644
+index 564d873..4404d14 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
 @@ -586,7 +586,6 @@ namespace ps2_stubs
@@ -1377,7 +1377,7 @@ index 564d873..b28c13e 100644
                      if (guestPath == "/")
                      {
                          result = kMcResultDeniedPermit;
-@@ -1039,6 +1071,23 @@ namespace ps2_stubs
+@@ -1039,6 +1071,24 @@ namespace ps2_stubs
                  }
              }
              setMcCommandResultLocked(kMcCmdOpen, result);
@@ -1389,7 +1389,8 @@ index 564d873..b28c13e 100644
 +            // acted on without knowing WHICH file and with WHICH flags. The flag matters: hardware
 +            // returns -4 only when neither sceMcFileCreateFile (0x0200) nor sceMcFileCreateDir
 +            // (0x0040) is set, so a 0x0200 open must create the entry rather than report it missing.
-+            RUNTIME_LOG("[MC] Open port=" << port << " slot=" << slot << " addr=0x" << std::hex
++            RUNTIME_LOG("[MC] Open v1=0x" << std::hex << getRegU32(ctx, 3) << std::dec << " port=" << port
++                        << " slot=" << slot << " addr=0x" << std::hex
 +                        << pathAddr << std::dec << " bytes=[" << pathHex << "] '" << path
 +                        << "' flags=0x" << std::hex << flags << std::dec << " guest='" << guestPath
 +                        << "' host='" << hostPath.string() << "' exists=" << (exists ? 1 : 0)

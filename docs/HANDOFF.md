@@ -5318,3 +5318,48 @@ producer instructions can be read directly out of `ps2_recompiled_functions.cpp`
 inside the 32 MB RDRAM. Clamping would hide the symptom and destroy the evidence.
 
 **STATUS: no frame, milestone NOT met.** `VULCAN4 FRAME source=guest` has never printed. Suite **478/478**.
+
+---
+
+## 2026-10-01 — W57g: RETRACTION of W57e's causal claim. The memset is the guest clearing its own heap
+
+The generated code carries the producers, so this needed no run:
+
+```
+// 0x1010ec8:  lw    $s1, 0x3218($v1)   <- $s1 = the block's END pointer
+// 0x1010ecc:  addiu $s0, $s0, 0xF
+// 0x1010ed0:  and   $s0, $s0, $a2      <- align $s0 to 16
+// 0x1010ed8:  subu  $s1, $s1, $s0      <- $s1 = END - aligned_base   (the LENGTH)
+// 0x1010edc:  daddu $a0, $s0, $zero    <- $a0 = $s0                  (the DESTINATION)
+// 0x1010ee0:  and   $s1, $s1, $a2
+// 0x1010ee4:  jal   func_101E9D0        <- the memset
+```
+
+**This is the standard "clear from the aligned base to the end of my block" idiom.** `$s0` is a base
+the guest already holds, `$s1` is `*(v1 + 0x3218)` minus that base — a *derived length*, not a constant.
+The block therefore spans `0x010519B0` to roughly `0x01FF8100`, and `0x010519B0` is the heap base
+`SetupHeap` handed out.
+
+**So the memset is GT4 initialising a ~16.4 MB block at its own heap base. That is entirely plausible
+and very likely legitimate.** It is the guest clearing memory it owns.
+
+**RETRACTED: W57e's claim that this memset "wipes the path buffer and causes the malformed prefix".**
+That was built on comparing sequence numbers across two runs that were perturbed very differently (one
+carried `WTRACE`, one did not), which is not a valid ordering. W61 — the clean run — shows the prefix
+copy at seq **405** with **no** spanning write before it, so in a clean boot the wipe has not happened
+yet when the guest reads `05 80`. **The causal chain I asserted was not established.**
+
+What survives, measured and independent of any ordering claim:
+- the guest calls `memset(0x010519B0, 0, 16,410,192)`, and `$s1` is derived as `*(v1+0x3218) - $s0`;
+- `0x010519B0` is the heap base from `SetupHeap`;
+- **in a clean run the prefix source `0x010519C0` already holds `05 80 00 …` at the copy**, while the
+  only writes to it in the boot are `WRITE8 '/'`, `memcpy "/B"` and `memcpy "SCUS-97328"`;
+- the observer is off in that run, so this is not instrumentation.
+
+**So the open question is narrower and sharper than W57e said:** the guest builds `/BASCUS-97328` at
+`0x010519C0` and then, before reading it, that buffer holds `05 80 00 …`. **Either the guest never
+actually wrote it where we think, or something overwrote it in the same breath.** The one producer of
+`05 80` I have not yet identified. **That is where the next session should start**, and it is a
+register/data-flow question in `sub_01003D9C`–`sub_01003E98`, not a memory-corruption question.
+
+**STATUS: no frame, milestone NOT met.** `VULCAN4 FRAME source=guest` has never printed. Suite **478/478**.

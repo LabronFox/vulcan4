@@ -88,8 +88,31 @@ namespace
 //     and the writer tells them apart: if the bytes arrive through the big copy the ring buffer's
 //     stream is mis-decoded, and if our own decoder writes here then a field offset or width on our
 //     side is wrong. Watch 12 bytes so a 32-bit store is not split across a boundary we chose blind.
-constexpr uint32_t kWatchLo = 0x010519C0u;
-constexpr uint32_t kWatchHi = 0x010519D0u;
+// W48. THE WINDOW WAS WATCHING THE WRONG ADDRESS, which is why W33-W45 kept concluding "the
+// guest did not write this". The address in question is the path buffer sceMcOpen is handed:
+// every one of the 253,695 opens passes a2(buf)=0x01051A10 (measured). This window was
+// 0x010519C0-0x010519D0 -- forty bytes BELOW it. The observer was reporting faithfully about an
+// address nobody was asking about, so every negative result drawn from it was worthless.
+// The window now covers the buffer the guest actually builds: 0x01051A10 through the second
+// string at +0x40. Both ends are env-overridable so the instrument can be re-aimed at the next
+// address instead of being recompiled each time.
+uint32_t watchEnv(const char *name, uint32_t fallback)
+{
+    const char *raw = std::getenv(name);
+    if (raw == nullptr || *raw == '\0')
+    {
+        return fallback;
+    }
+    char *end = nullptr;
+    const unsigned long value = std::strtoul(raw, &end, 0);
+    return (end != nullptr && *end == '\0') ? static_cast<uint32_t>(value) : fallback;
+}
+
+constexpr uint32_t kWatchPathAddr = 0x01051A10u;
+constexpr uint32_t kWatchLoDefault = kWatchPathAddr - 0x10u;
+constexpr uint32_t kWatchHiDefault = kWatchPathAddr + 0x60u;
+const uint32_t kWatchLo = watchEnv("VULCAN4_WATCH_LO", kWatchLoDefault);
+const uint32_t kWatchHi = watchEnv("VULCAN4_WATCH_HI", kWatchHiDefault);
 uint32_t g_watchStoreHits = 0;
 
 // W45. Every "the guest did NOT write this" conclusion since W33 has been read off stdout
@@ -98,7 +121,10 @@ uint32_t g_watchStoreHits = 0;
 // mid-line. So the observers now carry their own monotonic sequence number and the guest
 // thread id. Ordering comes from `seq`, which is causal, not from where a line landed.
 int g_guestThreadId = -1;
-constexpr uint32_t kWatchStoreMax = 120;
+// W48. W45 capped observers at 4-5 hits, which they burned in the first moments of boot --
+// thousands of functions before the event under investigation. Env-overridable so the
+// instrument can go deep on purpose; the default stays small so an ordinary run is quiet.
+const uint32_t kWatchStoreMax = watchEnv("VULCAN4_WATCH_MAX", 120u);
 // W30: 1 MiB. Anything at least this big is a copy, not a field write.
 constexpr uint32_t kWatchBigCopy = 1024u * 1024u;
 uint32_t g_watchBigCopyHits = 0;
@@ -163,7 +189,7 @@ void watchGuestStoreForPath(uint32_t guestAddr, uint32_t size, uint64_t value, c
     if (size >= kWatchBigCopy)
     {
         ++g_watchBigCopyHits;
-        if (g_watchBigCopyHits <= 2u)
+        if (g_watchBigCopyHits <= watchEnv("VULCAN4_BIGCOPY_MAX", 2u))
         {
             std::cout << "VULCAN4 W30BIGCOPY seq=" << ps2NextTraceSequence()
                       << " tid=" << g_guestThreadId << " n=" << g_watchBigCopyHits << " pc=0x" << std::hex
@@ -178,7 +204,7 @@ void watchGuestStoreForPath(uint32_t guestAddr, uint32_t size, uint64_t value, c
     // not know where the guest will allocate.
     if (ctx != nullptr && ctx->pc == kWatchPathStorePc)
     {
-        if (g_watchPathHits < 4u && g_rdramForWatch != nullptr)
+        if (g_watchPathHits < watchEnv("VULCAN4_PATHSTORE_MAX", 4u) && g_rdramForWatch != nullptr)
         {
             ++g_watchPathHits;
             const uint32_t obj = guestAddr >= 4u ? guestAddr - 4u : 0u;

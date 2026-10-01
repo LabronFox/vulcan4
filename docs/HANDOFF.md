@@ -4723,3 +4723,55 @@ a card file, or is reading a buffer it believes is a card path, is **not establi
 instrument cannot answer it because every observer stops after 4–5 hits, far before this event.
 **NEXT:** raise the probe hit budget (the deferred instrument fix) so the writer of `0x8005` can be
 identified causally, then re-ask the question. Do not guess the path's meaning.
+
+---
+
+## 2026-10-01 — W48: the observer was watching the WRONG ADDRESS, and then it was labelling the wrong PC
+
+Two instrument defects, both found by aiming the probe at the address actually in question and
+reading what came back. Neither is a guess; both are measured.
+
+**DEFECT 1 — the watch window never covered the address under investigation.** The address is the
+path buffer `sceMcOpen` is handed: all **253,695** opens pass `a2(buf)=0x01051A10` (measured). The
+window was `kWatchLo=0x010519C0`, `kWatchHi=0x010519D0` — **forty bytes below it**. The probe was
+reporting faithfully about an address nobody was asking about, so every negative result drawn from it
+("the guest did not write this") was worthless. That is the real reason W33–W47 kept concluding
+nothing wrote there. Now `kWatchPathAddr = 0x01051A10`, window `+0x10 … +0x60`, and both ends plus
+the hit caps are env-overridable (`VULCAN4_WATCH_LO/HI/MAX/BIGCOPY_MAX/PATHSTORE_MAX`) so the
+instrument can be re-aimed without a recompile. With the window fixed, the same run emits **4,000**
+observed writes into the buffer where it previously emitted 5.
+
+**DEFECT 2 — the reported PC is the memcpy's RETURN ADDRESS, not the store site.** With the window
+correct, the buffer's writes attribute to `0x1003a98` (size 9) and `0x1003e80` (size 2). Our own
+generated code says what those really are:
+
+```
+// 0x1003a90: 0xc407a07  jal  func_101E81C        <- the guest's own memcpy
+// 0x1003a98: 0x200102d  daddu $v0, $s0, $zero    <- a register move. Stores NOTHING.
+// 0x1003e78: 0xc407a07  jal  func_101E81C
+// 0x1003e80: 0x2402002f  addiu $v0, $zero, 0x2F   <- $v0 = '/'. Stores NOTHING.
+// 0x1003e84: 0xa2020000  sb   $v0, 0x0($s0)      <- the real 1-byte store
+```
+
+Both "writers" are the instruction **after** a `jal func_101E81C`. The observer is reporting the
+memcpy's resume address as `ctx->pc`. **So every PC label this observer has ever printed for a bulk
+copy is a return address, not a store site** — including the "pc=0x1003e80 writes 2 bytes of 0x8005"
+that the research report carried and that I repeated in the W47 entry. **That label is withdrawn.**
+
+**What the corrected observation actually shows.** The writes are real and causally ordered (seq is
+causal, from W45): seq=176 copies **9 bytes** into `0x01051A10`, seq=187 copies **2 bytes** into the
+same address. Nine bytes is exactly `core.gt4\0`. The guest composes its path from pieces — a 2-byte
+value, `/`, another 2-byte value, `/`, `e.gt4` — and the 2-byte value is `0x8005`. The byte histogram
+corroborates it: `0x2f` (`/`) written 148 times, and byte-sized writes 788 times.
+
+**So `0x8005` is a guest value the guest itself copies into a path it is building. Its meaning is
+still UNDECODED**, and I am not guessing it. What is now excluded: it is not a PS2 device-prefix id
+(no such convention), not a descriptor (far outside the code space), and **not a store instruction's
+immediate** (the instruction there is `addiu $v0,$zero,0x2F`). It is data the guest chose.
+
+**Also proven this run:** every guest write into the window is **immediately duplicated by a second
+observer hit with `pc=0x0 ra=0x0` and an identical value** — 4,000 hits, essentially all paired. So
+our own runtime writes the same bytes immediately after the guest does. W45's interleaving concern was
+real, and there are exactly two producers.
+
+**STATUS: no frame.** `VULCAN4 FRAME source=guest` has never printed. The wall stands unchanged.

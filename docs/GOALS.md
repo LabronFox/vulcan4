@@ -1363,6 +1363,50 @@ needed zero portability work. Evidence already banked: goal `G5.2a`.
 - **STATUS:** ⬜ registered as a **documented no** for the PAL audio itself, with the substitution
   (`G6.1`) named so the wish is answered rather than dismissed.
 
+### ⬜ G6.18 — **QUAL-OF-LIFE: the boring half of the wish-list** *(r/granturismo4, 2026-10-01)*
+- **Where it came from:** the 46-comment thread *"GT4 Recomp suggestions"* (u/Professional-Bar6778,
+  the other GT4 recomp) — read in full, not skimmed. This is the largest single wish-list GT4 has
+  ever collected, and most of it is not exotic.
+- **Why one entry, not forty:** law 12 makes every one of these **opt-in**, and that is a *per-feature
+  engineering cost*, not a formality. Forty sliders means forty opt-outs, forty defaults, forty things
+  to test against the untouched original. So they are registered as ONE block with the shared shape
+  named once, and split out only when one of them is actually built.
+- **What was asked for, grouped by what it costs us:**
+  - **Difficulty / accessibility:** tyre wear rate slider ("15 laps on mediums"), lower AI difficulty,
+    penalties-for-contact toggle, oil-change intervals.
+  - **Race structure:** qualifying for single races, rolling-start/low-fuel starts, **more than 6 cars**,
+    track limits for quali+races, F1-style sector timing, wet weather on all tracks.
+  - **Camera:** fully custom camera with **saveable presets**, camera-stiffness slider, POV driver cam.
+  - **Racing line:** one commenter noted the data probably already exists — the red "suggested gear"
+    brake flash in A/B licence tests. **Read the disc, don't reimplement physics.**
+  - **Cars:** paint with **custom hex + liveries**, colour options, car repaints, engine swaps
+    (the thread's top engine-swap ask: super-softs and NOS on the Benz), more colours/time options.
+  - **Sound:** engine-swap audio, clutch-kick audio, gearbox whine.
+  - **Presentation:** custom aspect ratios with **no UI stretch** (48:9, 16:3), higher refresh, photo-mode
+    PNG export, screenshot export, more cars in the grid.
+  - **Framework:** a real modding framework so users can add cars/tracks without recompiling us.
+- **The one that is not ours to refuse:** *"ability to ADD cars instead of replacing existing cars"* —
+  that is `G6.2`/`G6.1`'s supply side and it is the thread's most-upvoted idea. Already the project
+  thesis. This recompile makes it possible for the first time in GT4's history; the previous
+  generations could only swap what shipped.
+- **What we will NOT promise:** *"I don't know whether it's possible"* was the other recomp author's
+  honest answer to VR/interior imports. Same here: those are registered, not promised.
+- **STATUS:** ⬜ registered, **not scheduled**. Every line is gated on Stage 1 (a picture) — a tyre-wear
+  slider on a black screen is a lie waiting to happen. Law 12 applies to all of it without exception.
+
+### ⬜ G6.19 — **TRIPLE SCREEN, and the misconception that hid it** *(from the same thread, 2026-10-01)*
+- **Where it came from:** u/After_Inside_7231 — *"triple screen support in career mode? the game already
+  has it but it only works in arcade mode, unlike GT5/GT6."*
+- **The correction that matters, and it is ours to state plainly:** on PC this is **three windows on one
+  machine**, not three consoles and not three TVs. The PS2 version needed two extra consoles because that
+  was the hardware; ours is one PC, so the console-count objection doesn't exist here. What genuinely
+  remains is **career mode**, which GT4 does not offer even on real hardware.
+- **The fallback the thread itself proposed, which is cheaper and probably the better first move:**
+  **custom aspect ratios (48:9, 16:3) with no UI stretch** — geometrically a triple screen on one display,
+  and testable by one person instead of three. It is registered under `G6.18` and this entry is the
+  career-mode half.
+- **STATUS:** ⬜ registered, **not scheduled**. Blocked on Stage 1, same as `G6.18`.
+
 ### ⬜ G7.0 — **DISTRIBUTION: code only. Assets come from the user's disc.** *(the captain's rule)*
 - **The captain, 2026-09-30:** *"We don't publish anything. Just the code. People have to bring their
   own iso file of the game — that's where we take assets."*

@@ -4129,3 +4129,92 @@ W16 recorded, from the other end.
 **Read `func_10112E0` (acquire) and `func_1011688` (release) to completion and check them against
 `ps2xRuntime`'s own lock at `0x01043098`.** If our acquire cannot be re-entered while held, or our
 release does not clear it, that is our bug and it is fixable without touching `0x8005` at all.
+
+## W41 — ROOT CAUSE of the boot wall: `ei` sets STATUS.IE and nothing delivers on it
+
+W40 said the defect was "the unlock is on the success path only, so a failing `sceMcOpen` retries
+while holding the lock." **That is real, and it is not the wall.** Decoding the lock's callee
+(`func_10112E0`, the semaphore acquire at `0x01043098`) all the way down found the actual cause.
+
+### The lock is a semaphore whose wait is a SPIN behind an `ei`
+
+`func_10112E0` is not a mutex. It calls `func_101F2B0`/`func_101F340` (wait/signal), keeps an owner
+id at `0x18`, a counter at `0x20` and `0x24`, and its wait loop is:
+
+```
+0x10113b8  addiu $a0, $zero, 0x1
+0x10113bc  beqz  $s3, +8
+0x10113c4  bnez  $a0, +6
+0x10113cc  lw    $v0, 0x24($s0)
+0x10113d0  bgez  $v0, +3
+0x10113d8  sw    $v1, 0x24($s0)
+0x10113dc  sw    $s2, 0x1C($s0)
+0x10113e0  beqz  $a1, +2
+0x10113e8  ei                      <<<<
+0x10113ec  bnez  $a0, -0x34         <<<< back to 0x10113c4
+```
+
+**The guest is not waiting on a syscall. It is spinning, re-executing `ei`, waiting for an interrupt
+to arrive.** And on the same path, `func_10119A0` reads the very bit `ei` writes:
+
+```
+0x10119ac  mfc0 $v0, Status
+0x10119b0  xori $v0, $v0, 0x1
+0x10119b4  andi $v0, $v0, 0x1
+0x10119b8  beqz $v0, ...
+```
+
+### What our runtime does with `ei`
+
+```
+ps2xRecomp/src/lib/cop0_translator.cpp
+  case COP0_CO_EI:  return fmt::format("ctx->cop0_status |= 0x10000; // Enable interrupts");
+  case COP0_CO_DI:  return fmt::format("ctx->cop0_status &= ~0x10000; // Disable interrupts");
+```
+
+**A bit-flip, and nothing else.** And the search for a consumer is the finding:
+
+- `grep` for `cop0_status` across `ps2xRuntime/src/lib/` returns **two** hits: the write sites, and
+  **one read** — `if (ctx->cop0_status & COP0_STATUS_BEV)` on the exception path.
+- There is no interrupt-delivery path keyed on `STATUS.IE`. `grep -n "interrupt" ps2_runtime.cpp`
+  finds one comment, no code.
+
+**So `ei` looks like it worked, and no interrupt is ever deliverable.** The guest's spin at
+`0x10113e8` executes `ei` forever and is woken by nothing. That is the wall, and it explains the
+W16 symptom from the correct end: tid2 is not merely asleep waiting for a wakeup, it is **spinning
+for an interrupt that our runtime has no mechanism to deliver**.
+
+### Fixed this pass, honestly scoped
+
+Red test first: `"the guest's ei can actually let an interrupt in: STATUS.IE gates delivery"`. It
+caught two of my own mistakes before it went green — I asserted `pending=false` while expecting
+"held", and I restored IE before asserting "held with IE clear". Both were **my test's** bugs and
+are fixed; the runtime was right both times.
+
+Landed: `interruptDeliveryGatedByStatusIe()` and `pendingInterruptHeldByStatusIe(bool)` on
+`PS2Runtime`. **These report the delivery decision; they do not build the interrupt controller**, and
+I am not claiming the wall is passed. What they buy is that the missing step is now *observable*, so
+the spin is diagnosable as "waiting on an interrupt that cannot arrive" rather than as a busy loop.
+
+One correction the test forced, worth keeping: **delivery needs `IE` (bit 0) AND `EIE` (bit 16)**, not
+`IE` alone. The R5900 delivers only when both are set; `di`/`ei` move bit 0 while `dtei`/`eiei` move
+bit 16, and a check on bit 0 alone would report an interrupt deliverable while `EIE` is still clear.
+My first version had exactly that bug and the test caught it.
+
+**Suite: 474 total, 473 pass, 1 fail** — the pre-existing, unrelated `VU0 macro mappings` case.
+
+### What is still true, and what this does NOT fix
+
+- **`sceMcOpen`'s `-4` is still correct** and still caused by the undecoded `0x8005` in the filename.
+  Fixing interrupt delivery does not make a bad filename open.
+- **W40's unlock-on-success-only observation stands** as a real (secondary) defect worth its own
+  red test, but it is not the wall — the wall is upstream of it, in a spin that never completes.
+- **`VULCAN4 FRAME source=guest` is still 0.** The guest has not reached the GS.
+
+### Next concrete step, and it is now the real one
+
+**Build the interrupt delivery path**: a pending-interrupt register set by the devices that already
+exist (timer, VSync, and the `sceMcSync`/`sioIntr` chain the MC path uses), checked against
+`STATUS.IE`/`STATUS.EIE` at the checkpoint, taking the branch to `cop0_epc` with the CAUSE register
+populated. That is the piece `ei` promises and nothing currently provides — and unlike `0x8005`, it
+is entirely ours to build, so it does not require decoding anything we have refused to guess at.

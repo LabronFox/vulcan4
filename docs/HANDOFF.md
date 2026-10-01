@@ -2920,3 +2920,70 @@ reminder that my predictions in this loop have been wrong twice.
 
 Suite **470 total, 469 pass, 1 fail** (pre-existing VU0). Two counters added this entry
 (`callSiteArg1`, and the harness print restructured).
+
+## W24 — AUTHORITATIVE: the PS2 has a boot/idle thread 0, and `sceGetThreadId` returns 0 while it is current
+
+This came out of a researcher dispatched to answer W23's open question from real sources rather than
+from this binary. It is the most decisive thing found in this whole line of work, and **it also says
+plainly that the fix is NOT yet safe to write.** Read all of it before touching `GetThreadId`.
+
+### What the hardware actually does
+
+Sources: `yuias/PS2BiosRebuild` (`docs/spec/04-ee-kernel.md` EE-7, `docs/spec/05-ee-syscall-abi.md`
+SYS-1/SYS-10, `docs/analysis/33-ee-threads.md`, `src/kernel/syscall.S`, `src/kernel/thread.cpp`),
+ps2sdk (`ee/kernel/src/thread.c`, `ee/kernel/include/kernel.h`), PS2Tek `EE_Syscalls.md`.
+
+1. **`sceGetThreadId` (0x2F) returns the calling thread's id, read UNVALIDATED from a kernel global**
+   (`0x800155AC`). It is a plain index into the 256-entry thread table. **It has no error path** —
+   a negative return from our handler would be a bug in us, not a modelled condition.
+2. **Thread 0 is the kernel's boot/idle thread.** It stays `READY` at **priority 128** for the whole
+   life of a program, and it is **"what the scheduler picks when every other thread waits"**.
+3. **`src/kernel/thread.cpp:502` — `startProgramThread()` sets `current_thread = 1` only when the
+   program thread is entered. Until then the global still holds 0.** So `0x2F` legitimately returns
+   **0** on real hardware, and returns 0 *whenever thread 0 wins a pick*.
+4. **Syscalls preserve `$a0`–`$a3`.** `_syscall_entry` `sq_`s **all 32 GPRs** into a 512-byte
+   context and the return path restores them. **So GT4 reading `$a0` straight after a call is
+   correct, and our dispatcher must not clobber `$a0`–`$a3`.** Only `$v0` and `$v1` change.
+5. **`0x29`/`0x2A` `sceChangeThreadPriority(id, prio)` returns the previous priority, `-1` on
+   failure; `id 0` means the caller; priority must be `0..127` and `128` is refused as a target.**
+   Two independent sources. **W13 is confirmed correct — this line is closed.**
+6. **The idiom GT4 implements in userland is the SDK's own**, ps2sdk `ee/kernel/src/thread.c:104`
+   inside `InitThread()`: `ChangeThreadPriority(GetThreadId(), 1);` … restore. It is only safe
+   *because* 0x29 returns the old priority. **There is no EE-kernel broadcast primitive** — the
+   kernel's own answer is a priority-0 helper thread with a 512-entry request ring that the `i`
+   (interrupt-safe) syscall variants signal.
+
+### Two concrete, safe divergences this exposes — act on these first
+
+- **`$v1` on syscall return is `number × 4`, the dispatcher's byte index — and it is NOT restored.**
+  The reference kernel returns the *scaled index*, not the syscall number, and does not restore
+  `$v1`. **A recompiler that restores `$v1` diverges from hardware in a way a game can observe.**
+  Cheap to check: look at what our syscall path leaves in `$v1`.
+- **`0x29`/`0x2A` read `$a0`, `$a1` and `$a3`, NOT `$a2`.** A rebuild that packs arguments densely
+  would take the third argument from the wrong register.
+
+### The big one — and why I am NOT writing it yet
+
+Thread 0's existence explains the shape of W16–W23 completely: if the guest's loop condition is
+`tid != 0`, and on hardware thread 0 wins picks whenever nothing else is runnable, then the guest
+must be able to observe 0 — and our runtime can never produce it, because
+`bindMainContextForSyscall` keeps a live current thread and `GetThreadId` returns
+`currentThreadId() == 1` forever.
+
+**But the researcher explicitly could not establish that GT4's loop is genuinely waiting for thread 0,
+nor that our decode of the writer of `$a0` is right.** So this stays a hypothesis with a strong
+mechanism behind it, and I am not going to change a syscall's return value on it. That is the move
+that cost this project four dishes on a pointer, and my `$a0`-is-the-object prediction in W21 was
+wrong too.
+
+**The measurement that decides it, unchanged from W23 and still owed:** sample `$a0` and `$s1` on
+every entry into `sub_010112E0` and on every loop-back, and report distinct `(s1, a0)` pairs with
+counts.
+
+- **`(1, 1)` always** → the loop is provably non-terminating *as decoded*, the decode of the `$a0`
+  writer must be re-read from the generated C++ (inlining hides it), and thread 0 is very likely the
+  mechanism.
+- **any `a0 == 0`** → the loop terminates and **the spin is somewhere else entirely**, and thread 0
+  is a red herring.
+
+Either way the `$v1` fix above is independent, safe, and worth doing now.

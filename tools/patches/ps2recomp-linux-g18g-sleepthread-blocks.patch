@@ -3128,10 +3128,10 @@ index 7242e65..4d8de05 100644
  }
 diff --git a/ps2xTest/src/ps2_thread_block_tests.cpp b/ps2xTest/src/ps2_thread_block_tests.cpp
 new file mode 100644
-index 0000000..484842d
+index 0000000..6845991
 --- /dev/null
 +++ b/ps2xTest/src/ps2_thread_block_tests.cpp
-@@ -0,0 +1,807 @@
+@@ -0,0 +1,889 @@
 +#include "MiniTest.h"
 +#include "ps2_runtime.h"
 +#include "ps2_runtime_macros.h"
@@ -3704,6 +3704,88 @@ index 0000000..484842d
 +            t.IsTrue(std::find(gTrace.begin(), gTrace.end(), TRACE_MAIN_AFTER_SLEEP) != gTrace.end(),
 +                     "after the wake the thread must run the post-sleep frame, not nothing");
 +        });
++        tc.Run("G1.8j: preemption is by priority NUMBER, and lower priority never takes the CPU",
++               [](TestCase &t)
++        {
++            // Item 1 of the "Next, in order" list asked for requestPreemptionIfHigher's guard to go
++            // from >= to <=. This test is the evidence that it must not, and it gates both versions.
++            //
++            // The PS2 EE orders priorities by NUMBER, ascending:
++            //
++            //   ps2sdk, ee/kernel: "0 - 127 (lower number is higher priority, but 0 is reserved by
++            //     the kernel)"
++            //   PS2Tek, BIOS EE Threading, reschedule(): "Loop through active thread priority list,
++            //     starting from 0 (highest priority)"
++            //
++            // A Ready thread preempts the Running one iff ready.number < running.number, so
++            // requestPreemptionIfHigher's guard -- `if (ready >= running) return;`, proceeding only
++            // when ready < running -- is already correct. `<=` does not merely add preemption on
++            // equal priority, it INVERTS the test: it proceeds only when ready > running, i.e. when
++            // the newly Ready thread is the LOWER priority. Measured: the suite falls to 465/468,
++            // breaking both FIFO waiter tests and "starting a strictly higher-priority thread
++            // preempts immediately".
++            //
++            // hasReadyAtOrAbovePriority is correct for the same reason and is NOT the partner bug the
++            // list suspected. "At or above priority p" is the set {0..p} because smaller is higher, so
++            // scanning `for (i = 0; i <= p; ++i)` asks the right question; scanning upward would ask
++            // about threads LOWER than p.
++            //
++            // Both threads' frames are parked at pc = 0 first. serviceInvocations() is NOT a neutral
++            // "apply the flag" call -- it runs guest frames -- and three earlier versions of this test
++            // were fooled by that: one read currentThreadId() without servicing, one left the reschedule
++            // flag latched from an earlier step so the next assertion passed on a stale flag, and one
++            // let the main thread execute and finish. None of them could tell a correct guard from an
++            // inverted one. With pc = 0 the scheduler's choice is the only thing that can move.
++            BlockEnv env;
++            env.arm();
++            EeScheduler &ee = env.runtime.eeScheduler();
++            ee.bindMainContextForSyscall(env.runtime.cpu(), env.rdram.data());
++            const int mainId = EeScheduler::kMainThreadId;
++
++            auto park = [&ee](int id)
++            {
++                GuestThread *th = ee.thread(id);
++                if (th != nullptr)
++                {
++                    th->context.pc = 0u;
++                }
++            };
++
++            int ignored = -1;
++            t.Equals(ee.changePriority(mainId, 40, false, ignored), 0, "pin the main thread at 40");
++            const int worker = ee.createThread(EeThreadCreateParams{0, K_WORKER, 0x20000u, 0x800u, 0, 80, 0});
++            t.IsTrue(worker > 0, "the fixture must create the worker");
++            if (worker <= 0)
++            {
++                return;
++            }
++            t.Equals(ee.startThread(worker, 0u, env.runtime.cpu(), false), 0, "and start it");
++
++            park(mainId);
++            park(worker);
++            t.Equals(ee.currentThreadId(), mainId,
++                     "a Ready thread at 80 must NOT take the CPU from the running thread at 40: 80 is "
++                     "the lower priority, because a smaller number is a higher priority here. This is "
++                     "the assertion that fails under the <= guard");
++
++            t.Equals(ee.changePriority(worker, 20, false, ignored), 0, "raise the worker above main");
++            park(mainId);
++            park(worker);
++            ee.serviceInvocations();
++            t.Equals(ee.currentThreadId(), worker,
++                     "and a Ready thread at 20 MUST take it: 20 is the higher priority. This is the "
++                     "case the >= guard already handles correctly");
++
++            t.Equals(ee.changePriority(mainId, 20, false, ignored), 0, "now make them equal at 20");
++            park(mainId);
++            park(worker);
++            ee.serviceInvocations();
++            t.Equals(ee.currentThreadId(), worker,
++                     "a Ready thread at the SAME priority must not displace the running one -- "
++                     "sceRotateThreadReadyQueue exists precisely because the console never rotates "
++                     "the ready queue by itself at one priority, so this is load-bearing");
++        });
++
 +        tc.Run("G1.8i: sceChangeThreadPriority returns the PREVIOUS priority, not 0", [](TestCase &t)
 +        {
 +            // W13, and this is the actual cause. Gran Turismo 4's idle loop, read from the

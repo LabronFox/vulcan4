@@ -1067,6 +1067,64 @@ needed zero portability work. Evidence already banked: goal `G5.2a`.
   changed. Both are frictions the original had no good reason to keep.
 - **STATUS:** ⬜ post-playability, same lane as `G4`/`G6.1`–`G6.5`. Registry entry only — do not dispatch.
 
+### ⬜ G6.7 — **THE RUSH** *(make the speed feel like speed, 2026-10-01)*
+- **The captain, 2026-10-01:** *"also. one more request for the recomp. making gt4 make u feel like ur going fast"*
+- **What it is:** GT4 at 60 fps, 4:3-era camera framing and a near-static chase cam can read *slow* even at
+  300 km/h — the speedometer says fast, the eyes say gentle. THE RUSH is a set of **opt-in, renderer-side**
+  changes whose only job is to close that gap: camera field of view, camera dynamics, speed-scaled shake,
+  motion blur, and a wind layer in the audio. It changes **what it feels like**, never what the game *is*.
+- **Why the original couldn't:** it was bound to a fixed PS2 frame budget with no post-processing headroom, a
+  fixed output resolution and a camera tuned for *readability on a CRT*, not for sensation. Almost everything
+  below is either a number the guest already publishes (which we can rescale) or a pass over a finished frame
+  (which we own, because we supply the GS).
+- **Mechanism, in order — cheapest and most honest first:**
+  1. **Find the camera state as data, first.** The guest publishes an eye/target/roll triple and some FOV or
+     projection constant every frame. **A dish that cannot name that address does not get to write a knob** —
+     the whole feature depends on owning that one structure, and reading it is also how we prove we have not
+     disturbed it.
+  2. **FOV + camera placement** (the biggest single win, and it is arithmetic): widen the projection, drop the
+     eye point a little and move it in. Peripheral motion is what sells speed; the difference should be proven
+     with a side-by-side capture pair at the same car, same track, same speed.
+  3. **Camera dynamics instead of a rigid mount:** integrate our camera toward the guest's target with a small
+     spring/damper so the camera *trails under acceleration and leads under braking*. This is the single change
+     that turns "a car in a frame" into "something being thrown at you" — and it is renderer-side only, so the
+     guest's own state stays untouched.
+  4. **Post-process on the finished frame** (`G2`'s own output stage): radial blur scaled by speed, a shallow
+     speed-scaled vignette, and a light chromatic pinch at the edges. **Frame-rate independent by construction**
+     — a blur whose strength is a per-second value, not a per-frame one — and it must be honest about cost:
+     print the measured frame time with the pass on and off.
+  5. **Shake, deliberately conservative:** speed- and kerb-scaled, amplitude-capped, and **never** in a way that
+     moves the driving line more than the player's own inputs do.
+  6. **Audio wind layer** *(depends on `G4.3`)*: wind and tyre roar scaled by road speed, because a large part
+     of "fast" is heard, not seen. Same rule as `G6.2`: a real cause-driven layer, never a costume.
+  7. **A high-refresh mode** as the cheapest trick of all: the renderer is ours, so present at 120/144 Hz with
+     the guest still running at its own tick. This costs almost nothing to try and is often the single most
+     convincing speed cue on a modern panel.
+- **The fence (non-negotiable, and it is this project's whole identity):** every one of these is **opt-in with
+  `OFF = the untouched original frame`**. A purist must be able to switch THE RUSH off and get exactly the
+  picture the 2005 hardware produced — this is a *view*, not a remaster, and it is never allowed to be
+  **on by default in a way the player cannot audit**. Nothing here touches physics, times, AI, saves or
+  progression: `G6.6`'s rule (never counterfeit progress) applies in its strongest form, because this feature
+  is pure appearance.
+- **Also non-negotiable, for a different reason:** shake and blur are the two effects that make some players
+  physically ill. Each is a **separate** toggle with a real `0`, and `0` must mean *zero*, not "a subtle
+  amount". A preset nobody can fully turn off is a bug, not a feature.
+- **Honest limits:** the FOV and camera-placement work is only possible if the camera state is a structure we
+  can read (step 1 — if it turns out to be computed in VU1 microcode, this goal inherits `G3.1`'s schedule);
+  wider FOV costs precision on tight circuits like Costa di Amalfi, so the default must stay the game's own;
+  motion blur needs GPU headroom we have not measured yet on the target machines, and on a Titan-class card
+  that is fine while on an integrated GPU it may not be — **the number gets printed either way**; camera
+  trailing can make a *precise* driver slower, which is why it is a slider and not a religion; and the
+  audio layer cannot be honestly built before the audio path (`G4.3`) exists at all.
+- **DONE WHEN:** on a real track, at a real speed, `OFF` produces a frame indistinguishable from the untouched
+  renderer while `RUSH` produces a capture pair a stranger describes as *faster* without being told which is
+  which; every effect has a real zero; frame cost is measured and printed; and the camera/FOV address we
+  rescale is named in the entry, not guessed at.
+- **Why it belongs in G6:** `G6.4` made the game tell you **what** you are driving, `G6.6` made it tell you
+  **what you changed** — this one makes it tell you **how fast you are going**. Three frictions the original
+  had no good reason to keep: not knowing your car, not knowing your setup, and not feeling your speed.
+- **STATUS:** ⬜ post-playability, same lane as `G4`/`G6.1`–`G6.6`. Registry entry only — do not dispatch.
+
 ### ⬜ G7.0 — **DISTRIBUTION: code only. Assets come from the user's disc.** *(the captain's rule)*
 - **The captain, 2026-09-30:** *"We don't publish anything. Just the code. People have to bring their
   own iso file of the game — that's where we take assets."*

@@ -2801,3 +2801,54 @@ by the `switch (ctx->pc)` case labels and the `goto` graph the recompiler emitte
 
 Both branches of that decision are cheap. **Do not re-run the `$ra`, entry-site, depth, caller-map or
 `-O2` experiments** — all are built, permanent, and settled.
+
+### W22b — the goto graph confirms the loop edge, and names where the counting breaks
+
+Read `sub_010112E0`'s generated control flow rather than its comments. Its resume points are
+exactly:
+
+```
+case 0x1011314u  case 0x1011320u  case 0x1011330u  case 0x1011338u  case 0x101134cu
+case 0x1011358u  case 0x1011418u  case 0x1011444u  case 0x1011458u  case 0x1011464u  case 0x10114e0u
+```
+
+and the loop edge is real and internal:
+
+```
+label_10113ec:  // 0x10113ec: bne $a0,$zero,-52
+      goto label_1011320;
+```
+
+**So `0x1011314` — the delay slot of `jal func_101F310` — IS a resume label.** The guest can be
+re-entered there, which re-issues `GetThreadId` without the loop having advanced. That is the
+resumable-basic-block family this codebase has already been bitten by (G1.8g, W8, W10), and it is
+worth ruling in or out before anything else.
+
+**Where the counting breaks, stated plainly:** every `jal` in that loop is emitted as
+
+```cpp
+SET_GPR_U32(ctx, 31, <return>);
+if (!runtime->dispatchGuestBranch(rdram, ctx, <target>, <site>, <return>, DirectCall, "JAL")) {
+    ... inline body ...
+}
+```
+
+When `dispatchGuestBranch` returns **true** the call is not inlined — the guest has yielded or
+transferred, the generated function returns, and control leaves the harness's arrival loop. Every
+guest instruction executed after that point runs **inside** `dispatchGuestBranch` /
+`serviceInvocations`, which increment neither `functionsEntered` nor `pcEntryCounts`. That is why
+arrivals read `0x1011314`=4 and `0x101134c`=1 while the same sites issue 856,860 and 642,644
+syscalls. **The arrival counters cannot see guest code that runs behind a `dispatchGuestBranch`
+yield, and no amount of reading the arrival histogram will reconcile it.**
+
+**Therefore the one measurement that closes this is not another arrival counter — it is a counter
+at the `jal` itself.** Specifically: tally, per guest PC, how many times `dispatchGuestBranch`
+returns true, and how many times it returns false. If it returns true on most iterations in this
+loop, the guest is yielding mid-loop ~850,000 times, and *that* is the wall — the guest is being
+handed back and forth inside one function instead of running, and the fix is in the yield
+condition (`checkpointDue`), not in the mutex code, not in the guest, and not in the syscall
+dispatch.
+
+Cheapest form: one counter in the harness around the existing call, or a counter in
+`PS2Runtime::dispatchGuestBranch` split by return value, printed at the halt. It is two counters
+and it discriminates immediately. **Write that red test first.**

@@ -5363,3 +5363,60 @@ actually wrote it where we think, or something overwrote it in the same breath.*
 register/data-flow question in `sub_01003D9C`–`sub_01003E98`, not a memory-corruption question.
 
 **STATUS: no frame, milestone NOT met.** `VULCAN4 FRAME source=guest` has never printed. Suite **478/478**.
+
+---
+
+## 2026-10-01 — W57h: the prefix memcpy's operands are fully traced, and the last contradiction is now isolated
+
+### The full chain, read out of the generated code (no run needed)
+
+```
+0x1003e40  lw    $s2, -0x2338($v0)     $v0=lui 0x103 -> $s2 = *(0x0102DCC8)   a GLOBAL pointer
+0x1003e44  jal   func_1013D68          strlen($s2)                              -> $v0
+0x1003e4c  lw    $a0, 0x0($s4)         second name
+0x1003e50  jal   func_1013D68          strlen(second)
+0x1003e60  jal   func_101D3B8          GT4's own allocator
+0x1003e68  daddu $a1, $s2, $zero       $a1 = $s2  = *(0x0102DCC8)   SOURCE
+0x1003e70  daddu $a2, $s0, $zero       $a2 = $s0  = strlen($s2)      LENGTH
+0x1003e74  daddu $a0, $s1, $zero       $a0 = $s1  = allocated buffer  DESTINATION
+0x1003e78  jal   func_101E81C          memcpy
+```
+
+**So the "2-byte prefix" is `strlen(*(0x0102DCC8))` bytes copied from the buffer that global points at.**
+The length is a **`strlen` result**, not a constant. A length of 2 means the runtime's `strlen` saw a
+NUL at offset 2 — which is exactly what `05 80 00 …` gives, and **not** what `/BASCUS-97328` gives (13).
+
+### Every write that overlaps the 2 bytes, clean run, CORRECT span test
+
+First prefix copy at seq 405. With `addr <= 0x010519C1 && addr + size > 0x010519C1`:
+
+```
+seq=3   memset  src=0  addr=0x010519B0  size=16410192      the 16MB heap clear
+seq=25  memcpy  src=0x0103D638  addr=0x010519C1  size=2   "/B"
+```
+
+**Two writes. Neither is after seq 27.** And the build at seq 21–27 (`'/'`, `"/B"`, `"SCUS-97328"`) is
+*after* the 16 MB clear at seq 3, so the clear cannot be what garbles the buffer — **W57e's retraction
+stands and is now confirmed with a correct filter.**
+
+**THE ISOLATED CONTRADICTION, stated in one line:** the only writes to `0x010519C0` in the whole boot
+are `'/'` at seq 21 and `"/B"` at seq 25, so the buffer should read `/BASCUS-97328` when the copy at
+seq 405 reads it — and `strlen` of that is 13, not 2. **Yet the copy delivers 2 bytes and the bytes are
+`05 80`.** Either the guest never wrote `/BASCUS-97328` where we think, or something writes those two
+bytes on a path that reports **no destination address at all**.
+
+**That last clause is the sharpest lead and it is checkable:** a writer that reports no `addr` cannot be
+placed by any address filter, which is exactly the shape of the last two walls. Candidates that write
+without reporting a guest destination: `IopHost::writeGuest`/`zeroGuest` (these *do* report, via
+`ps2TraceGuestRangeWrite`), the RPC copy helpers, and **any write that goes through `getMemPtr` on a
+different array than the observer's `g_rdramForWatch`** — which would mean the observer and the runtime
+are looking at **different guest memory**, and that would explain every "the bytes changed and nothing
+was logged" in this campaign at once.
+
+**NEXT, one run, and it is a single comparison:** in `sceMcOpen`, print the first 16 bytes of the name
+**both** via `getConstMemPtr(rdram, pathAddr)` (what we serve) **and** via the same pointer the
+observer watches. If they differ, the two views of guest memory are not the same array and the whole
+family of contradictions is closed. If they agree, the write is genuinely unreported and the search
+narrows to the RPC copy helpers.
+
+**STATUS: no frame, milestone NOT met.** `VULCAN4 FRAME source=guest` has never printed. Suite **478/478**.

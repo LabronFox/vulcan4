@@ -6086,3 +6086,47 @@ four lines.
 W67. The instrument is live and the suite is green; the named boot run that uses them has **not** been
 made yet, and the `mkdir GAMEDATA` experiment stays **second**, read as "the open still did not happen"
 or "the open happened and returned −1", never as evidence about mounts.
+
+---
+
+## W68 — I damaged the generated unit by aborting a recompiler run, and the tree was already mismatched
+
+A plain "rebuild the harness" step failed to link, and the reason is worth more than the fix.
+
+### What was already wrong before tonight touched anything
+
+`register_functions.cpp` (dated **Sep 29 19:46**) names `sub_0102DAA8_0x102daa8`,
+`sub_0102DB10_0x102db10`, `sub_0102DBE8_0x102dbe8` and three more. The generated unit dated
+**Oct 1 22:03** defines **none of them** (`grep -c '^void sub_0102DB10_0x102db10'` = 0). So the last
+**working** harness binary was linked at 20:26:54, against an older generated unit, and every artifact
+on disk after that point came from different runs of the recompiler. `WALL-INSTRUMENT.md` had already
+noticed half of this and said so: *"the current generated `ps2_recompiled_functions.cpp` (22:03) is
+newer than the linked object (20:07) and no longer contains that symbol"*. It did not follow it to the
+conclusion that **the tree does not link**.
+
+This is the same lesson as `boot_span.log`, one layer up: a stale artifact was not detected because
+nobody tried to build. **A build that has not been run is not a build.**
+
+### And then I made it worse, in exactly the way I was warned about
+
+I started a recompiler run to capture its report, and **aborted it**. The output is written as it goes,
+so the abort left `ps2_recompiled_functions.cpp` **truncated mid-run**:
+
+| state | functions in the generated unit |
+|---|---|
+| 22:02 backup (`/tmp/opencode/gen_before.cpp`, pre-branch-fix) | 639 |
+| 23:04, completed run | 639 |
+| after my abort | **328** |
+
+The file now in place carries the *new* 64-bit branches (10 `GPR_S64` sites) but only half the
+functions, which is why the link fails on missing symbols rather than on anything obvious.
+
+**The captain's rule was "do not re-run the recompiler as if that were progress" and the rule I broke was
+sharper: never interrupt a run that writes its output in place.** Backgrounding it with `nohup` is the
+repair and the lesson together — a run that a turn boundary cannot kill cannot be truncated by one.
+
+### What I did not do
+
+I did not hand-edit either file to make the link succeed, and I did not restore a mismatched pair. A
+matched pair only comes from one run. The recompile now running is a **repair of a broken tree**, not a
+dish, and it is not evidence of anything about GT4.

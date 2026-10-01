@@ -584,6 +584,95 @@ index a863310..1ca4bbf 100644
      const uint32_t offset = addr & PS2_RAM_MASK;
      if (!Ps2FastRangeIsContiguous(offset, sizeof(__m128i)))
      {
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Compatibility.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Compatibility.cpp
+index 9f8f59f..af23765 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Compatibility.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Compatibility.cpp
+@@ -1,6 +1,7 @@
+ #include "Common.h"
+ #include "Compatibility.h"
+ #include "ps2_log.h"
++#include "ps2_runtime.h"
+ 
+ namespace ps2_stubs
+ {
+@@ -112,6 +113,7 @@ namespace ps2_stubs
+             {
+                 const uint32_t out = static_cast<uint32_t>(ch);
+                 std::memcpy(dst, &out, sizeof(out));
++                ps2TraceGuestRangeWrite(rdram, wcAddr, sizeof(out), "compatWideChar", nullptr, wcAddr);
+             }
+         }
+         setReturnS32(ctx, (ch == 0u) ? 0 : 1);
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/DMA.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/DMA.cpp
+index b32e44a..bd08874 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/DMA.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/DMA.cpp
+@@ -1,5 +1,6 @@
+ #include "Common.h"
+ #include "DMA.h"
++#include "ps2_runtime.h"
+ 
+ namespace ps2_stubs
+ {
+@@ -63,6 +64,7 @@ namespace ps2_stubs
+         {
+             std::lock_guard<std::mutex> lock(g_dmaEnvMutex);
+             std::memcpy(dst, &g_dmaCurrentEnv, sizeof(g_dmaCurrentEnv));
++            ps2TraceGuestRangeWrite(rdram, envAddr, sizeof(g_dmaCurrentEnv), "dmaGetEnv", nullptr, envAddr);
+         }
+         setReturnU32(ctx, envAddr);
+     }
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Font.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Font.cpp
+index 41e4387..d430f9f 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Font.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Font.cpp
+@@ -1,5 +1,6 @@
+ #include "Common.h"
+ #include "Font.h"
++#include "ps2_runtime.h"
+ 
+ namespace ps2_stubs
+ {
+@@ -131,7 +132,10 @@ namespace ps2_stubs
+             uint8_t *dst = getMemPtr(rdram, glyphAlloc);
+             const uint8_t *src = getConstMemPtr(rdram, glyphSrc);
+             if (dst && src)
++            {
+                 std::memcpy(dst, src, 0x2010u);
++                ps2TraceGuestRangeWrite(rdram, glyphAlloc, 0x2010u, "fontGlyph", nullptr, glyphSrc);
++            }
+         }
+ 
+         uint32_t isDoubleByte = 0;
+@@ -148,7 +152,10 @@ namespace ps2_stubs
+                 uint8_t *dst = getMemPtr(rdram, kernAlloc);
+                 const uint8_t *src = getConstMemPtr(rdram, kernSrc);
+                 if (dst && src)
++                {
+                     std::memcpy(dst, src, 0xc400u);
++                    ps2TraceGuestRangeWrite(rdram, kernAlloc, 0xc400u, "fontKern", nullptr, kernSrc);
++                }
+             }
+         }
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+index b1bb6d8..cd1c8a9 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -669,6 +669,12 @@ namespace
+         {
+             return true;
+         }
++        // W64. This helper writes guest RAM a BYTE AT A TIME through a raw pointer, so it never
++        // appeared in the store observer -- and it is the shared sink for GS packet words, VU
++        // matrices, rendered strings and more. The W63 measurement needed a writer that neither the
++        // guest store path nor a card call could explain, and this is the class that fits. Traced
++        // once, here, rather than at each of its dozen callers.
++        ps2TraceGuestRangeWrite(rdram, addr, static_cast<uint32_t>(len), "writeGuestBytes", nullptr, addr);
+ 
+         bool allViaPtrs = true;
+         for (size_t i = 0; i < len; ++i)
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
 index 0baca03..6ba21a3 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
@@ -679,7 +768,7 @@ index 0baca03..6ba21a3 100644
  
          uint32_t written = 0u;
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
-index d12592f..6321dff 100644
+index d12592f..5c293e2 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
 @@ -76,6 +76,7 @@ namespace ps2_stubs
@@ -829,7 +918,47 @@ index d12592f..6321dff 100644
          void ensureMcRootExists(int32_t port)
          {
              std::error_code ec;
-@@ -683,6 +816,9 @@ namespace ps2_stubs
+@@ -268,6 +401,30 @@ namespace ps2_stubs
+             return std::chrono::system_clock::to_time_t(systemTime);
+         }
+ 
++        // W64. Every guest-memory write in this file went through a RAW host memcpy, which the
++        // store observer cannot see. The observer is the instrument every "the guest did not write
++        // this" conclusion in this campaign rests on, so an untraced writer makes all of them
++        // unfalsifiable -- and it is exactly what W63 needed: the guest built
++        // /BASCUS-97328GAMEDATA at 0x010519C0, no observed store ever touched that address again,
++        // and by sceMcOpen time it held `05 80`. One helper, every site, so a card write into guest
++        // RAM is as visible as a guest one from now on.
++        template <typename T>
++        bool writeMcToGuest(uint8_t *rdram,
++                            uint32_t addr,
++                            const T &value,
++                            const char *tag,
++                            const R5900Context *ctx)
++        {
++            uint8_t *dst = getMemPtr(rdram, addr);
++            if (dst == nullptr)
++            {
++                return false;
++            }
++            std::memcpy(dst, &value, sizeof(value));
++            ps2TraceGuestRangeWrite(rdram, addr, static_cast<uint32_t>(sizeof(value)), tag, ctx, addr);
++            return true;
++        }
++
+         void writeMcCString(uint8_t *rdram, uint32_t addr, const std::string &value)
+         {
+             if (addr == 0u)
+@@ -282,6 +439,8 @@ namespace ps2_stubs
+             }
+ 
+             std::memcpy(dst, value.c_str(), value.size() + 1u);
++            // W64. Another raw write into guest RAM that the store observer could not see.
++            ps2TraceGuestRangeWrite(rdram, addr, static_cast<uint32_t>(value.size() + 1u), "mcCString", nullptr, addr);
+         }
+ 
+         void writeMcDateTime(SceMcStDateTime &out, std::time_t value)
+@@ -683,6 +842,9 @@ namespace ps2_stubs
                  {
                      McPortState &state = g_mcPorts[static_cast<size_t>(port)];
                      state.currentDir = "/";
@@ -839,7 +968,41 @@ index d12592f..6321dff 100644
                      state.formatted = true;
                      result = kMcResultSucceed;
                  }
-@@ -874,7 +1010,34 @@ namespace ps2_stubs
+@@ -828,7 +990,17 @@ namespace ps2_stubs
+                         }
+                         else if (uint8_t *dst = getMemPtr(rdram, tableAddr))
+                         {
+-                            std::memcpy(dst, entries.data(), entryCount * sizeof(SceMcTblGetDir));
++                            const uint32_t bytes = entryCount * static_cast<uint32_t>(sizeof(SceMcTblGetDir));
++                            std::memcpy(dst, entries.data(), bytes);
++                            // W64. This write was a raw host memcpy, which means the store observer
++                            // NEVER SAW IT -- and the observer is the instrument every "the guest did
++                            // not write this" conclusion in this campaign rests on. A guest call that
++                            // lands a table on top of a buffer we were watching is exactly the shape
++                            // of the W63 measurement: the guest built /BASCUS-97328GAMEDATA at
++                            // 0x010519C0 (pc 0x1003d9c), no guest store ever touched that address
++                            // again, and by sceMcOpen time the buffer held `05 80` instead. Route the
++                            // write through the observer so it is visible from now on.
++                            ps2TraceGuestRangeWrite(rdram, tableAddr, bytes, "mcGetDir", ctx, tableAddr);
+                             result = static_cast<int32_t>(entryCount);
+                         }
+                         else
+@@ -842,7 +1014,13 @@ namespace ps2_stubs
+             setMcCommandResultLocked(kMcCmdGetDir, result);
+         }
+         RUNTIME_LOG("[MC] GetDir port=" << port << " '" << rawPath
+-                                        << "' maxent=" << maxEntries << " -> result=" << result);
++                                        << "' maxent=" << maxEntries
++                                        // W64. tableAddr is the field that matters: it is where the
++                                        // guest asked us to LAND the table, and if it lands on the
++                                        // buffer it was still using for a path we have just watched a
++                                        // perfectly good path get overwritten by our own answer.
++                                        << " table=0x" << std::hex << tableAddr << std::dec
++                                        << " -> result=" << result);
+         setReturnS32(ctx, 0);
+     }
+ 
+@@ -874,7 +1052,34 @@ namespace ps2_stubs
              {
                  McPortState &state = g_mcPorts[static_cast<size_t>(port)];
                  cardType = kMcTypePs2;
@@ -875,7 +1038,35 @@ index d12592f..6321dff 100644
                  format = state.formatted ? kMcFormatted : kMcUnformatted;
                  result = state.formatted ? kMcResultSucceed : kMcResultNoFormat;
              }
-@@ -927,7 +1090,11 @@ namespace ps2_stubs
+@@ -884,24 +1089,15 @@ namespace ps2_stubs
+ 
+         if (typePtr != 0u)
+         {
+-            if (uint8_t *out = getMemPtr(rdram, typePtr))
+-            {
+-                std::memcpy(out, &cardType, sizeof(cardType));
+-            }
++            writeMcToGuest(rdram, typePtr, cardType, "mcGetInfoType", ctx);
+         }
+         if (freePtr != 0u)
+         {
+-            if (uint8_t *out = getMemPtr(rdram, freePtr))
+-            {
+-                std::memcpy(out, &freeBlocks, sizeof(freeBlocks));
+-            }
++            writeMcToGuest(rdram, freePtr, freeBlocks, "mcGetInfoFree", ctx);
+         }
+         if (formatPtr != 0u)
+         {
+-            if (uint8_t *out = getMemPtr(rdram, formatPtr))
+-            {
+-                std::memcpy(out, &format, sizeof(format));
+-            }
++            writeMcToGuest(rdram, formatPtr, format, "mcGetInfoFormat", ctx);
+         }
+ 
+         RUNTIME_LOG("[MC] GetInfo port=" << port << " type=" << cardType
+@@ -927,7 +1123,11 @@ namespace ps2_stubs
              for (McPortState &state : g_mcPorts)
              {
                  state.currentDir = "/";
@@ -888,7 +1079,7 @@ index d12592f..6321dff 100644
              }
          }
          ensureMcRootExists(0);
-@@ -993,6 +1160,70 @@ namespace ps2_stubs
+@@ -993,6 +1193,49 @@ namespace ps2_stubs
          // Dump a WINDOW, not just the string: the pointer lands 0x30 bytes below the 0x1051a40
          // guest buffer the W7 entry already investigated, so the path is probably a field inside a
          // larger structure and its siblings are what explain the encoding.
@@ -905,61 +1096,40 @@ index d12592f..6321dff 100644
 +            if (pathJoinLogs < 3)
 +            {
 +                ++pathJoinLogs;
-+                // The two components, read from the addresses the guest BUILT them at rather than
-+                // from registers, because by the time we are called the registers are the caller's,
-+                // not sub_01003E10's ($s2 is long gone -- it reads 0 here). W37 measured:
-+                //   first  component = *(0x0102DCC8)
-+                //   second component = the guest's obj->0x0, cached into obj->0x4 by 0x1003e98
-+                // so read the global, and dump the joined buffer's raw head with the separator visible.
-+                // W61. THE COMPONENT IS A POINTER, NOT A STRING, and this is the first time anyone
-+                // has looked. 0x1003e40 is `lw $s2, -0x2338($v0)` with $v0 = lui 0x103, so $s2 is the
-+                // WORD at 0x0102DCC8 -- and the guest's very next act is `strlen($s2)` and
-+                // `memcpy(buf, $s2, len)`. So the first component of the path is whatever 32-bit
-+                // VALUE lives at 0x0102DCC8, treated by the guest as an address, and copied out.
-+                //
-+                // That is why the joined path is 05 80 / 05 80 / e.gt4: those are not bytes the guest
-+                // chose, they are TWO COPIES OF THE SAME 16-BIT VALUE, printed as text. 0x0102DCC8
-+                // holds 0x8005, and the guest faithfully builds "8005/8005/e.gt4" from it.
-+                //
-+                // Logged as the raw word, so the claim is checkable rather than a reading.
++                // W64. THREE FIELDS, and that is all that survived this investigation. The raw word at
++                // 0x0102DCC8 is a POINTER (0x010519C0), which retired W35's "16-bit array that has
++                // never been decoded" and W61's "it is the low bytes of the pointer". The flat read
++                // exists because getConstMemPtr resolves through the TLB while the store observer
++                // indexes flat, and if those two ever disagree about a guest address, every store
++                // observation this project has made is about a different buffer than the one the
++                // code reads. They agree here. That is a real result and it is worth one line.
 +                uint32_t firstWord = 0;
 +                std::memcpy(&firstWord, rdram + (0x0102DCC8u & 0x01FFFFFFu), sizeof(firstWord));
-+                uint8_t firstBytes[8] = {0};
-+                std::memcpy(firstBytes, &firstWord, sizeof(firstWord));
++                char flatText[64];
++                const uint32_t flat = 0x010519C0u & 0x01FFFFFFu;
++                for (size_t i = 0; i < 16u; ++i)
++                {
++                    std::snprintf(flatText + (i * 2u), 4u, "%02x", rdram[flat + i]);
++                }
 +                std::string second;
 +                if (const uint8_t *g = getConstMemPtr(rdram, pathAddr))
 +                {
 +                    second.assign(reinterpret_cast<const char *>(g), 64u);
 +                    second = second.substr(0, second.find('\0'));
 +                }
-+                std::string sep;
-+                for (uint32_t i = 0; i < 8u; ++i)
-+                {
-+                    char c[2] = {0, 0};
-+                    if (const uint8_t *b = getConstMemPtr(rdram, pathAddr + i))
-+                    {
-+                        c[0] = (*b >= 32u && *b < 127u) ? static_cast<char>(*b) : '?';
-+                        sep += c[0];
-+                    }
-+                }
 +                RUNTIME_LOG("[MC] OpenJoin pc=0x" << std::hex << (ctx != nullptr ? ctx->pc : 0u)
-+                            << " ra=0x" << (ctx != nullptr ? getRegU32(ctx, 31) : 0u) << std::dec
-+                            << " a2(buf)=0x" << std::hex << pathAddr
-+                            << " a3(mode)=0x" << getRegU32(ctx, 7)
-+                            << " word@0x0102DCC8=0x" << std::hex << firstWord << std::dec
-+                            << " its4bytes=[" << static_cast<uint32_t>(firstBytes[0]) << " "
-+                            << static_cast<uint32_t>(firstBytes[1]) << " "
-+                            << static_cast<uint32_t>(firstBytes[2]) << " "
-+                            << static_cast<uint32_t>(firstBytes[3]) << "]"
-+                            << " joined=\"" << second << "\""
-+                            << " head8=\"" << sep << "\"");
++                                                << " a2(buf)=0x" << pathAddr
++                                                << " a3(mode)=0x" << getRegU32(ctx, 7)
++                                                << " word@0x0102DCC8=0x" << firstWord
++                                                << " flat@0x010519C0=" << flatText << std::dec
++                                                << " joined=\"" << second << "\"");
 +            }
 +        }
 +
          std::string pathHex;
          if (const uint8_t *raw = getConstMemPtr(rdram, pathAddr >= 0x10u ? pathAddr - 0x10u : 0u))
          {
-@@ -1090,7 +1321,12 @@ namespace ps2_stubs
+@@ -1090,7 +1333,12 @@ namespace ps2_stubs
                          << " a0(port)=" << static_cast<uint32_t>(getRegU32(ctx, 4)) << " a1(slot)="
                          << static_cast<uint32_t>(getRegU32(ctx, 5)) << " a2(buf)=0x" << std::hex
                          << getRegU32(ctx, 6) << " a3(mode)=0x" << getRegU32(ctx, 7) << std::dec);
@@ -973,7 +1143,36 @@ index d12592f..6321dff 100644
                          << " slot=" << slot << " addr=0x" << std::hex
                          << pathAddr << std::dec << " bytes=[" << pathHex << "] '" << path
                          << "' flags=0x" << std::hex << flags << std::dec << " guest='" << guestPath
-@@ -1309,6 +1545,7 @@ namespace ps2_stubs
+@@ -1131,6 +1379,8 @@ namespace ps2_stubs
+             {
+                 const size_t bytesRead = std::fread(dst, 1u, static_cast<size_t>(size), it->second.file);
+                 result = std::ferror(it->second.file) ? kMcResultDeniedPermit : static_cast<int32_t>(bytesRead);
++                // W64. A file read is a guest-memory write too, and it was invisible to the observer.
++                ps2TraceGuestRangeWrite(rdram, dstAddr, static_cast<uint32_t>(bytesRead), "mcRead", ctx, dstAddr);
+                 if (std::ferror(it->second.file))
+                 {
+                     std::clearerr(it->second.file);
+@@ -1278,17 +1528,11 @@ namespace ps2_stubs
+ 
+         if (cmdPtr != 0u)
+         {
+-            if (uint8_t *out = getMemPtr(rdram, cmdPtr))
+-            {
+-                std::memcpy(out, &cmd, sizeof(cmd));
+-            }
++            writeMcToGuest(rdram, cmdPtr, cmd, "mcSyncCmd", ctx);
+         }
+         if (resultPtr != 0u)
+         {
+-            if (uint8_t *out = getMemPtr(rdram, resultPtr))
+-            {
+-                std::memcpy(out, &result, sizeof(result));
+-            }
++            writeMcToGuest(rdram, resultPtr, result, "mcSyncResult", ctx);
+         }
+ 
+         // 1 = command finished in this runtime's immediate model.
+@@ -1309,6 +1553,7 @@ namespace ps2_stubs
                  const std::filesystem::path root = getMcRootPath(port);
                  std::error_code ec;
                  std::filesystem::remove_all(root, ec);
@@ -981,6 +1180,41 @@ index d12592f..6321dff 100644
                  ec.clear();
                  std::filesystem::create_directories(root, ec);
                  if (!ec)
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/VU.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/VU.cpp
+index b7840d4..afffb79 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/VU.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/VU.cpp
+@@ -1,5 +1,6 @@
+ #include "Common.h"
+ #include "VU.h"
++#include "ps2_runtime.h"
+ 
+ namespace ps2_stubs
+ {
+@@ -375,6 +376,7 @@ namespace ps2_stubs
+         if (dst && src)
+         {
+             std::memcpy(dst, src, sizeof(float) * 16u);
++            ps2TraceGuestRangeWrite(rdram, dstAddr, sizeof(float) * 16u, "vu0CopyMatrix", nullptr, srcAddr);
+         }
+         setReturnS32(ctx, 0);
+     }
+@@ -388,6 +390,7 @@ namespace ps2_stubs
+         if (dst && src)
+         {
+             std::memcpy(dst, src, sizeof(float) * 4u);
++            ps2TraceGuestRangeWrite(rdram, dstAddr, sizeof(float) * 4u, "vu0CopyVector", nullptr, srcAddr);
+         }
+         setReturnS32(ctx, 0);
+     }
+@@ -401,6 +404,7 @@ namespace ps2_stubs
+         if (dst && src)
+         {
+             std::memcpy(dst, src, sizeof(float) * 3u);
++            ps2TraceGuestRangeWrite(rdram, dstAddr, sizeof(float) * 3u, "vu0CopyVectorXYZ", nullptr, srcAddr);
+         }
+         setReturnS32(ctx, 0);
+     }
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
 index 70ae1ed..3836cdd 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp

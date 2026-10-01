@@ -5745,3 +5745,96 @@ the guest retries ~2,000/s and 130 identical lines prove nothing.
 
 **STATUS: no frame.** `VULCAN4 FRAME source=guest` has never printed. The open question is now one
 instruction, and it is named.
+
+---
+
+## W64 — W61's `strlen` story was WRONG. The guest clobbers its own path buffer, and I can name the instruction
+
+W61 concluded that `0x8005` was the low bytes of the pointer `0x010519C0` treated as characters, and
+tried to support it with a standalone replica of the recompiled `strlen`. **Both the claim and the
+replica were bad, and W61 is retracted.** The replica's branch sense was inverted *and* it was fed a
+host pointer (`0x10519c0`) where a guest address was required, so it segfaulted repeatedly. A
+conclusion that needs a crashing replica to survive was never a conclusion. `0x8005` is not the
+pointer. The pointer is fine. **`strlen` is fine.** The guest is copying 2 bytes because the buffer
+genuinely holds `05 80 00`, and it genuinely is 2 bytes long.
+
+### What is actually there, from the product
+
+```
+[MC] OpenJoin pc=0x100e66c a2(buf)=0x1051a10 a3(mode)=0x1
+[MC]   @0x0102DCC8 = c0190501 00000000 f0190501 00000000
+[MC]   @0x010519C0 = 05800000 00000000 41000000 00000000 03000000 ... 42000000 ... 00140000 ... 59000000
+[MC]   flat 0x10519C0 = 05800000000000004100000000000000
+[MC]   @joinbuf    = 05802f05802f652e 67743400 ...
+```
+
+Read flat and through `getConstMemPtr` (which resolves the TLB; the store observer indexes flat) --
+**identical**, so the two instruments do not disagree. `RDRAMPROBE cached=live same=YES`, so it is not
+a stale buffer. The bytes really are `05 80`.
+
+### The guest builds the path correctly, and then destroys it
+
+W36 was right about the source and this turn confirms it on the product, with sources:
+
+```
+op=WRITE8        pc=0x1003d9c addr=0x10519c0 size=1  value=0x2f                    -> '/'
+op=memcpy src=0x103d638 pc=0x1003dac addr=0x10519c1 size=2                         -> 'BA'
+op=memcpy src=0x103d650 pc=0x1003dc4 addr=0x10519c3 size=10                        -> 'SCUS-97328'
+op=memcpy src=0x103d548 pc=0x1003de0 addr=0x10519cd size=9                         -> 'GAMEDATA'
+```
+
+`/BASCUS-97328GAMEDATA`, built instruction by instruction, exactly as W36 said. Then a full 2,000,000
+entry run with `VULCAN4_TRACE_WRITES=1` -- **13,959,796 traced writes**, of which six touch that
+window, the last being the `GAMEDATA` copy. Nothing else. And yet by `sceMcOpen` the buffer is `05 80`.
+
+### The instrument that actually answers it: a shadow diff, not more writer-hunting
+
+Enumerating writers failed, because the list is open-ended. So stop asking who wrote it. `VULCAN4_SHADOW=1`
+keeps a private copy of the window and, on **every** traced write of **any** address, diffs it:
+
+```
+VULCAN4 SHADOWCHANGE #16 at addr=0x10519c0 now=0x5 was=0x2f pc=0x100a45c ra=0x100a434
+VULCAN4 SHADOWCHANGE #24 at addr=0x10519c8 now=0x41 was=0x39 pc=0x100a45c ra=0x100a434
+```
+
+`/BASCUS-...` becomes `05 80 00 ... 41 ...` **at `pc=0x100a45c`, and the guest did it itself**:
+
+```
+// 0x100a450: ori   $a0, $a0, 0x1000
+// 0x100a454: ld    $v0, 0x0($a0)
+// 0x100a458: dsrl  $v0, $v0, 16
+// 0x100a45c: sb    $v0, 0x98($s2)      <- inside sub_0100A348 (0x100a348-0x100a6e8)
+```
+
+A byte-at-a-time store into `$s2+0x98` whose byte comes from a global at `0x012001000`, i.e.
+**`sub_0100A348` is writing a structure field over the top of the path buffer.** `0x010519C0` is not a
+scratch buffer that happens to hold a path; it is a field inside a larger structure that the guest
+also uses as scratch. The path survives only until this function runs.
+
+**So: `-4` is correct.** The guest hands `sceMcOpen` a filename built from structure bytes, the card
+has no such file, and a read-only open of a missing file returns -4 (`ps2mc_fio.c:724-726`). Our card
+is not at fault, and no amount of card work will move this wall. The open question is now sharp and
+it is a guest-side one: **why does GT4 run `sub_0100A348` over its own path buffer before opening?**
+
+### Two real defects fixed on the way, both mine
+
+1. **`tools/harness/vulcan4_harness.cpp:189` was a VLA sized by the watch window** --
+   `uint8_t before[kWatchHi - kWatchLo]`. Fine for the default ~0x70-byte window, a guaranteed stack
+   overflow for any wide one: `VULCAN4_WATCH_HI=0x02000000` meant a 16 MB stack array, and the
+   diagnostic **segfaulted the whole boot**, which briefly looked like a new product bug. Now a
+   bounded `static uint8_t before[4096]` with the dump clamped to what it can hold.
+2. **The card module wrote guest RAM through raw `memcpy`, invisible to the store observer.** Seven
+   sites in `MemoryCard.cpp` (`GetDir`, three in `GetInfo`, two in `Sync`, `Read`, `writeMcCString`),
+   plus `Font.cpp`, `Compatibility.cpp`, `DMA.cpp`, `VU.cpp` and the shared `writeGuestBytes` sink in
+   `Support.h`. Every one now reports through `ps2TraceGuestRangeWrite` / `writeMcToGuest`. The
+   observer is the instrument every "the guest did not write this" conclusion in this campaign rests
+   on; twelve untraced write paths made all of them unfalsifiable.
+
+### Standing state
+
+Suite **479/479** from `tools/PS2Recomp/ps2xTest`. Card: `GetInfo type=2 free=8151 format=1 result=0`,
+`sceMcOpen` -4 for a garbage name is correct. `sceMcSync` still returns a hardcoded `1`, unproven and
+untouched. `VULCAN4 FRAME source=guest` has never printed.
+
+**Next: `sub_0100A348`.** Not the card, not `0x8005`, not `strlen`. Find what makes the guest initialise
+a structure over its own path before it opens anything.

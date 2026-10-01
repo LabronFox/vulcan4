@@ -179,6 +179,66 @@ void watchGuestStoreForPath(uint32_t guestAddr,
     // window dump, so "the bytes changed and nothing was logged" stops being possible. Off unless
     // VULCAN4_TRACE_WRITES is set, because it is one line per guest write.
     static const bool kTraceAllWrites = watchEnv("VULCAN4_TRACE_WRITES", 0u) != 0u;
+
+    // W64. SHADOW COMPARE. Tracing every write path and still seeing "the bytes changed and nothing
+    // was logged" means enumerating writers is the wrong strategy: there is at least one left, and
+    // the list is open-ended. So stop asking who wrote it. Keep a private copy of the watched window
+    // and, on EVERY traced write of ANY address, diff it. The first observer call after the change
+    // names the pc at which the change became visible, which localises it without needing to know
+    // the writer in advance. Off unless VULCAN4_SHADOW is set: it is a memcmp per traced write.
+    static const bool kShadow = watchEnv("VULCAN4_SHADOW", 0u) != 0u;
+    // W64b. The shadow diff runs at the TOP of the observer, but a traced store is announced BEFORE
+    // it is applied (PS2Runtime::Store8 calls ps2TraceGuestWrite, then m_memory.write8). So a change
+    // detected at call N was made by the write announced at call N-1, and printing THIS call's op
+    // names the wrong write. Keep the previous one.
+    static const char *prevOp = nullptr;
+    static uint32_t prevAddr = 0u;
+    static uint32_t prevSize = 0u;
+    static uint32_t prevPc = 0u;
+    static uint8_t shadow[4096];
+    static bool shadowInit = false;
+    static uint32_t shadowChanges = 0;
+    if (kShadow && g_rdramForWatch != nullptr)
+    {
+        const uint32_t span = std::min(kWatchHi - kWatchLo, static_cast<uint32_t>(sizeof(shadow)));
+        if (!shadowInit)
+        {
+            for (uint32_t k = 0; k < span; ++k)
+            {
+                shadow[k] = g_rdramForWatch[kWatchLo + k];
+            }
+            shadowInit = true;
+        }
+        for (uint32_t k = 0; k < span; ++k)
+        {
+            if (shadow[k] != g_rdramForWatch[kWatchLo + k])
+            {
+                if (shadowChanges < watchEnv("VULCAN4_SHADOW_MAX", 8u))
+                {
+                    std::cout << "VULCAN4 SHADOWCHANGE #" << shadowChanges
+                              << " at addr=0x" << std::hex << (kWatchLo + k)
+                              << " now=0x" << static_cast<uint32_t>(g_rdramForWatch[kWatchLo + k])
+                              << " was=0x" << static_cast<uint32_t>(shadow[k])
+                              << " pc=0x" << (ctx != nullptr ? ctx->pc : 0u)
+                              << " ra=0x" << (ctx != nullptr ? getRegU32(ctx, 31) : 0u)
+                              << " culpritop=" << (prevOp != nullptr ? prevOp : "?")
+                              << " culpritaddr=0x" << prevAddr
+                              << " culpritsize=" << prevSize
+                              << " culpritpc=0x" << prevPc << std::dec << "\n";
+                }
+                ++shadowChanges;
+                shadow[k] = g_rdramForWatch[kWatchLo + k];
+            }
+        }
+    }
+    if (kShadow)
+    {
+        prevOp = op;
+        prevAddr = guestAddr;
+        prevSize = size;
+        prevPc = (ctx != nullptr) ? ctx->pc : 0u;
+    }
+
     if (kTraceAllWrites && g_rdramForWatch != nullptr)
     {
         std::cout << "VULCAN4 WTRACE seq=" << ps2NextTraceSequence() << " op="
@@ -186,19 +246,26 @@ void watchGuestStoreForPath(uint32_t guestAddr,
                   << " addr=0x" << guestAddr << " size=" << std::dec << size << " inwin="
                   << (overlapsWatch ? 1 : 0) << "\n";
     }
-    uint8_t before[kWatchHi - kWatchLo];
+    // W64. This used to be a VLA sized by the watch window: `uint8_t before[kWatchHi - kWatchLo]`.
+    // That is fine for the default ~0x70-byte window and a guaranteed stack overflow for any wide
+    // one -- VULCAN4_WATCH_HI=0x02000000 with a 16 MB window meant a 16 MB stack array, which is
+    // how a diagnostic segfaulted the whole boot and briefly looked like a real bug. Bounded, static,
+    // and the dump below is clamped to what it can actually hold.
+    static uint8_t before[4096];
+    const uint32_t windowBytes = (kWatchHi > kWatchLo) ? (kWatchHi - kWatchLo) : 0u;
+    const uint32_t dumpBytes = std::min(windowBytes, static_cast<uint32_t>(sizeof(before)));
     if (overlapsWatch && g_rdramForWatch != nullptr && g_watchStoreHits < kWatchStoreMax)
     {
-        for (uint32_t k = kWatchLo; k < kWatchHi && k < PS2_RAM_SIZE; ++k)
+        for (uint32_t k = 0; k < dumpBytes; ++k)
         {
-            before[k - kWatchLo] = g_rdramForWatch[k];
+            before[k] = g_rdramForWatch[kWatchLo + k];
         }
         std::cout << "VULCAN4 W45BEFORE seq=" << ps2NextTraceSequence() << " addr=0x" << std::hex << guestAddr << " size=" << std::dec << size
                   << " op=" << ((ctx != nullptr) ? "guest" : "fastpath") << " bytes=";
-        for (uint32_t k = kWatchLo; k < kWatchHi && k < PS2_RAM_SIZE; ++k)
+        for (uint32_t k = 0; k < dumpBytes; ++k)
         {
             char byteText[4];
-            std::snprintf(byteText, sizeof(byteText), "%02x", before[k - kWatchLo]);
+            std::snprintf(byteText, sizeof(byteText), "%02x", before[k]);
             std::cout << byteText << " ";
         }
         std::cout << "\n";

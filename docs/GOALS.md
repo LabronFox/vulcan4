@@ -1248,6 +1248,121 @@ needed zero portability work. Evidence already banked: goal `G5.2a`.
   paper. Not scheduled, not promised, not to be dispatched. Revisit only when `G6.7` has proven the camera
   state can be read.
 
+### ⬜ G6.12 — **THE POLE AND THE PIT WALL OF THE PAST** *(the race-rules wish list, 2026-10-01 — one comment, 13 items)*
+- **Where it came from:** u/FantozziUgo, one hour into the thread, opening *"Dunno if these are even
+  doable but just thinking out loud:"* and then listing thirteen things. Boss's public reply:
+  *"all of these are planned and engine swaps are top priority out of all of these"* — so this entry
+  exists to make sure that public promise is not a memory. It is a **list, not a feature**: it is
+  deliberately kept as one block so nothing silently disappears.
+- **The thirteen, verbatim, grouped by what they actually are:**
+  - *race format* — start a race with less than full fuel; qualifying for single races; track limits
+    for quali and races; contact penalties on **all** races, not only Special Conditions; timing
+    sectors (F1-style) on every track
+  - *setup freedom* — a clutch you must press to change gear (dogleg gets none — clutch on downshift
+    only); rewindable replays
+  - *camera* — a POV driver camera even with no cockpit
+  - *the car* — repainting; racing mods like GT2; **engine swaps**; oil change for the Polyphony
+    Formula car; mods for special vehicles (*"super softs and NOS on the Benz motorwagen"*)
+  - *the world* — wet surface on **all** tracks, not just Tsukuba
+  - and the one that overlaps an existing entry: **+1 to races with more cars** → this is `G6.10`
+- **What is already registered here, so the public reply was honest:** engine swaps = `G6.5` (the
+  captain's own, and the one he called top priority); pit-wall tuning = `G6.6`; more than six cars =
+  `G6.10`; wet weather for all tracks is new; everything else is unregistered.
+- **The honest part, stated now rather than in a comment three years from now:** several of these are
+  **not "impossible in a recomp"** and the captain should know which before the reply goes out —
+  • *low-fuel starts and qualifying* are **data and rules**, squarely in reach once the game runs.
+  • *contact penalties on all races* is a **rules-table change**, same family.
+  • *sectors and wet weather on every track* are **event/track data**, same family again.
+  • *the clutch* is real work: it is a **new input + a change to the shift path**, not a flag.
+  • *POV camera* is `G6.7`'s camera state, already scoped there.
+  • *rewindable replays* is a **recording/transport layer that does not exist yet** — closest thing on
+    the list to a genuinely new system, and the one most likely to be quietly dropped.
+- **The fence:** all of it **off by default** (law 12). A "low fuel start" option that quietly changes
+  every race would be the exact failure this project is named for. Every item is opt-in, and `OFF`
+  must be the untouched 2005 behaviour including the 2005 rules.
+- **STATUS:** ⬜ registered, **not scheduled**. Nothing here outranks the picture, the VU1, or a
+  drivable race. It is a promise *kept in writing*, not a promise *made in public*.
+
+### ⬜ G6.13 — **THE COMMUNITY'S MODDING FRAMEWORK** *(2026-10-01 — "some sort of framework to make it easy to mod the game")*
+- **Where it came from:** u/RobinVerhulstZ. This is the comment worth answering carefully, because it
+  is not a feature request for *this* project — it is a request about **who is allowed to build the
+  features**, and it quietly describes what `G11` (the asset bridge) would have to be.
+- **What he is actually asking for:** not "add cars", but a *supported way for anyone to add cars*.
+  That is a different deliverable: a documented data format, a validation pass, and a hot-load path.
+- **The dependency is the whole answer:** this cannot exist before `G6.0`/`G6.0a` (add cars, and the
+  audit of every place GT4 assumes a fixed car count). A framework for a car system that cannot yet
+  add a car is a framework for nothing.
+- **The fence, and it is a real one:** a modding framework means third-party code touching the
+  runtime. Law 1 (no game data in the repo) and law 3 (refused, not guessed) both have to extend to it.
+  Anything shipped must be opt-in (law 12) and must not be able to write into the recompiler's own
+  build. Say that before promising anything, not after someone ships a bad mod.
+- **STATUS:** ⬜ registered, **not scheduled**, blocked on `G6.0a`. The *answer* to him can be given
+  today, though — "add cars is the first thing I'm building; a framework for it comes after, and it
+  ships to everyone" is true and is a better reply than a promise.
+
+### ⬜ G6.14 — **THE LONG FRAME** *(triple-screen in career, and a physics that is not glued to the frame, 2026-10-01)*
+- **Where it came from:** u/RobinVerhulstZ, same comment. Two different asks, both real.
+- **Triple-screen in career mode:** the game **already has** triple-screen — but it only works in
+  arcade mode, and it needs two extra PS2s for the hardware. The ask is therefore *"let the third screen
+  work in career"*, i.e. drop a hardware dependency that never should have gated the mode. That is a
+  narrow, honest, reachable-sounding fix **once three linked clients exist at all** — which is
+  `G4`-era at the earliest.
+- **Decoupling physics from framerate / stable 120 Hz with double-rate physics (GT7-style):** this is
+  the most technically load-bearing request in the whole thread and the easiest to say "yes" to by
+  accident. It is **not a flag.** It means a fixed-timestep accumulator the guest's own timing respects,
+  which touches the scheduler, the frame pacing and every physics thread — the same machinery
+  `G6.7` (THE RUSH) needs for high-refresh mode. **Do not let this be answered with a frame cap.**
+- **The fence:** `OFF` must be exactly GT4's current framerate-locked behaviour. A "stable" mode that
+  silently changes how physics is stepped is a change to the game, not a setting.
+- **STATUS:** ⬜ registered, **not scheduled**. Both items depend on a running game and on the timing
+  work in `G6.7`; neither may set the order of anything.
+
+### ⬜ G6.15 — **THE BRAKE POINT** *(a racing line with braking zones, and a camera you can shape, 2026-10-01)*
+- **Where it came from:** u/StreetScientist5652 — *"a racing line (that shows braking zone) might be
+  nice. Obviously it should be toggleable. And maybe customizable camera too!"*
+- **Honest scope, so nobody is surprised:** this is **not** a simple overlay. A usable racing line means
+  GT4's own track geometry and corner data, **generated per track**, and a way to decide the line —
+  which is a racing-line *generator* (the classic shortest-path/curvature solution), not a hand-drawn
+  spline per track. That is real, bounded work, and it is genuinely useful, but it should be called
+  what it is rather than described as "a toggle".
+- **Braking zones are the cheaper half** and could ship first: they are derived from corner radius,
+  entry speed and the car's deceleration, so they can be drawn *from physics we already compute*.
+- **The camera half overlaps `G6.7`** — a customizable camera is the same camera state, so this is one
+  system with two consumers, not two features.
+- **The fence:** off by default (law 12); a racing line drawn on screen **must not** touch AI
+  behaviour, and must never be on in the "authentic" profile.
+- **STATUS:** ⬜ registered, **not scheduled**. Depends on the renderer and on track data.
+
+### ⬜ G6.16 — **THE OPPONENT THAT DRIVES LIKE A PERSON** *(better AI + a camera-stiffness slider, 2026-10-01)*
+- **Where it came from:** u/GTalaune — *"Better AI, is it even possible ? A slider to change the camera
+  stiffness like we can do now by using cheats."*
+- **Better AI is a research problem, not a toggle**, and it is the only item in this batch that would
+  make GT4 *stop* being GT4. GT4's AI has a character. Replacing it with a modern racing-line follower
+  would be a different game, so it needs the same fence as everything else (`OFF` = untouched 2005 AI)
+  **and** it needs the racing line from `G6.15` before it could even be attempted honestly.
+- **The camera-stiffness slider is the cheap, honest half** and is a small slice of `G6.7`: it changes
+  how fast the camera reaches the car's heading, nothing more. Worth saying yes to early because it
+  costs almost nothing and people demonstrably want it.
+- **STATUS:** ⬜ registered, **not scheduled**. Camera stiffness = a slice of `G6.7`. AI = research,
+  blocked behind `G6.15` and behind a decision about whether we want a different game.
+
+### ⬜ G6.17 — **THE SOUNDTRACK** *(the PAL soundtrack, 2026-10-01)*
+- **Where it came from:** u/musicallymotivated93 — *"The Spec II additions/tweaks and the PAL
+  soundtrack"*. (The Spec II half is already covered: `G5.1`.)
+- **What this actually is, so the entry is not a fantasy:** the PAL release of GT4 has its own licensed
+  music that the NTSC disc does not contain. Shipping it means **shipping music we do not have the
+  right to ship** — the same line law 1 draws for the game itself. So this entry exists to record the
+  wish honestly and to say where it lands:
+  - **Not on this project.** A recomp that ships the PAL soundtrack is a recomp that ships copyrighted
+    audio it has no licence for, and the repo carries no game data by rule.
+  - **What *is* ours** is `G6.1` (custom music) — if the captain's own music, or music the user
+    supplies from a disc they own, can be dropped in, the PAL question answers itself without us
+    distributing one byte of anyone's soundtrack.
+- **The honest reply to him, if one is sent:** "not from us — that music is licensed and we don't ship
+  game assets; what we're building is a custom-music slot so *you* can put a soundtrack in."
+- **STATUS:** ⬜ registered as a **documented no** for the PAL audio itself, with the substitution
+  (`G6.1`) named so the wish is answered rather than dismissed.
+
 ### ⬜ G7.0 — **DISTRIBUTION: code only. Assets come from the user's disc.** *(the captain's rule)*
 - **The captain, 2026-09-30:** *"We don't publish anything. Just the code. People have to bring their
   own iso file of the game — that's where we take assets."*

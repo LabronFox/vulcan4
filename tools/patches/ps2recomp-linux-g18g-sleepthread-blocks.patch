@@ -292,7 +292,7 @@ index 0000000..68018ac
 +#endif // PS2_GUEST_PROGRESS_H
 \ No newline at end of file
 diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
-index 4b9242c..ed8e7e8 100644
+index 4b9242c..fe6d457 100644
 --- a/ps2xRuntime/include/ps2_runtime.h
 +++ b/ps2xRuntime/include/ps2_runtime.h
 @@ -21,6 +21,8 @@
@@ -408,7 +408,7 @@ index 4b9242c..ed8e7e8 100644
  }
  
  class PS2Runtime
-@@ -390,10 +454,172 @@ public:
+@@ -390,10 +454,188 @@ public:
      void requestStop();
      bool isStopRequested() const;
  
@@ -539,6 +539,10 @@ index 4b9242c..ed8e7e8 100644
 +    // is the mistake W42's test caught: the mask a caller passes should be the bits it will see.
 +    void raiseInterrupt(uint32_t ipMask) noexcept
 +    {
++        // W43. Counters only. A boot log showed six raises in 30s with the delivery check never
++        // seeing a pending source, which is what turned out to be an ordering artefact rather than a
++        // raise bug -- so the raise path is not noisy by default.
++        ++m_interruptsRaised;
 +        m_pendingInterrupts |= ipMask & COP0_CAUSE_IP_MASK;
 +        m_cpuContext.cop0_cause |= ipMask & COP0_CAUSE_IP_MASK;
 +    }
@@ -554,12 +558,24 @@ index 4b9242c..ed8e7e8 100644
 +
 +    uint32_t pendingInterrupts() const noexcept { return m_pendingInterrupts; }
 +
++    // W43. EE timer n is Cause.IP bit (10 + n) on the R5900: IP0 (bit 10) is timer0, IP1 (bit 11)
++    // timer1, and so on through the four EE timers the PS2 has. The timers here report a mask with
++    // bit n set per timer, so the shift is what puts a timeout on the bit the CPU's handler expects.
++    // Getting this wrong would deliver to the wrong IP and look like a working interrupt, which is
++    // why it has its own assertion rather than being folded into the delivery test.
++    static constexpr uint32_t eeTimerInterruptToIp(uint32_t timerMask) noexcept
++    {
++        return (timerMask << 10) & COP0_CAUSE_IP_MASK;
++    }
++
 +    // Deliver if a raised interrupt is now unmasked. Returns true when the guest has been vectored
 +    // to the interrupt handler and must be re-entered rather than resumed.
 +    // Defined in ps2_runtime.cpp: it has to vector through raiseCop0Exception(), which lives in that
 +    // file's anonymous namespace alongside the TLB/break/trap call sites, and a second declaration
 +    // in this header would be an ambiguous overload rather than a shared one.
 +    bool servicePendingInterrupt() noexcept;
++
++    uint64_t interruptsRaised() const noexcept { return m_interruptsRaised; }
 +
 +    uint64_t interruptsDelivered() const noexcept { return m_interruptsDelivered; }
 +
@@ -581,17 +597,18 @@ index 4b9242c..ed8e7e8 100644
      [[noreturn]] void eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc);
  
      struct EeExitHandlerRegistration
-@@ -432,6 +658,9 @@ public:
+@@ -432,6 +674,10 @@ public:
      }
  
  public:
 +    uint32_t m_pendingInterrupts = 0u;
++    uint64_t m_interruptsRaised = 0u;
 +    uint64_t m_interruptsDelivered = 0u;
 +
      inline R5900Context &cpu() { return m_cpuContext; }
      inline const R5900Context &cpu() const { return m_cpuContext; }
  
-@@ -508,6 +737,21 @@ private:
+@@ -508,6 +754,21 @@ private:
      mutable std::mutex m_guestHeapMutex;
      mutable std::mutex m_asyncCallbackStackMutex;
      std::vector<GuestHeapBlock> m_guestHeapBlocks;
@@ -666,7 +683,7 @@ index 0f19c9f..84c551e 100644
  #define READ128(addr) ([&]() -> __m128i {                     \
      uint32_t _addr = (uint32_t)(addr);                        \
 diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
-index f247ff9..793d37f 100644
+index f247ff9..d78de44 100644
 --- a/ps2xRuntime/include/runtime/ee_scheduler.h
 +++ b/ps2xRuntime/include/runtime/ee_scheduler.h
 @@ -93,6 +93,16 @@ enum class GuestInvocationKind : uint8_t
@@ -786,7 +803,25 @@ index f247ff9..793d37f 100644
      [[nodiscard]] bool hasInvocation(GuestInvocationKind kind, uint64_t tag) const;
      [[nodiscard]] uint32_t invocationStackTop();
  
-@@ -382,8 +478,11 @@ private:
+@@ -334,6 +430,17 @@ public:
+     void dispatchIrq(bool dmac, uint32_t cause);
+     void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
+     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
++
++    // W43. Drain pending interrupts and events from the guest's own checkpoint.
++    //
++    // dispatchIrq does not vector the CPU: it calls the guest's handler DIRECTLY, with the cause in
++    // $a0. Those calls happen in processPendingEvents, which until now was reachable only from inside
++    // EeScheduler -- so a guest spinning on a backward edge (GT4's `ei` loop at 0x10113e8) never ran
++    // it and could never be woken, whatever `ei` did to STATUS.IE. This is the narrow public door
++    // onto that drain.
++    //
++    // Always mayWait=false: the caller is mid-function and the generated code expects to resume.
++    void servicePendingEventsAtCheckpoint() noexcept;
+     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
+ 
+     [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
+@@ -382,8 +489,16 @@ private:
      void makeReady(GuestThread &thread, int result, bool interruptSafe);
      void requestPreemptionIfHigher(const GuestThread &readyThread, bool interruptSafe);
      void applyPendingPreemption();
@@ -795,12 +830,17 @@ index f247ff9..793d37f 100644
 +    // G1.8g: mayWait is false for a service call. run() is the dispatcher and models time, so
 +    // pacing itself to the next VBlank host deadline is correct there; a service call is invoked
 +    // from inside a driver's step, and sleeping there burns wall clock without running the guest.
++    //
++    // W43: processPendingEvents stays private, and servicePendingEventsAtCheckpoint() above is the
++    // narrow public door onto it. It was briefly removed while adding that door, which broke the two
++    // internal callers below -- a reminder that "make it reachable" is not the same edit as "delete
++    // the declaration".
 +    void processPendingEvents(bool mayWait = true);
 +    void processDueDeadlines(bool mayWait);
      void processEvent(const EeEvent &event);
      void finishEventWaiters(EeEventFlag &flag, bool interruptSafe);
      [[nodiscard]] static bool eventCondition(uint32_t current, uint32_t requested, uint32_t mode);
-@@ -438,6 +537,13 @@ private:
+@@ -438,6 +553,13 @@ private:
      std::condition_variable m_eventCv;
      std::deque<EeEvent> m_events;
      std::vector<ScheduledEvent> m_deadlines;
@@ -814,7 +854,7 @@ index f247ff9..793d37f 100644
      std::deque<GuestInvocation> m_pendingInvocations;
      uint64_t m_eventSequence = 0;
      uint64_t m_invocationSequence = 0;
-@@ -448,6 +554,8 @@ private:
+@@ -448,6 +570,8 @@ private:
      uint32_t m_gsVSyncCallbackGp = 0;
      uint32_t m_gsVSyncCallbackSp = 0;
      std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
@@ -976,7 +1016,7 @@ index 0000000..4636c5e
 +
 +static const unsigned kSyscallNameCount = 58;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c4..bdab38a 100644
+index c5e31c4..d6e29cc 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -295,6 +295,24 @@ void EeScheduler::run()
@@ -1004,7 +1044,23 @@ index c5e31c4..bdab38a 100644
              m_guestExecuting.store(true, std::memory_order_release);
              function(m_rdram, &context, &m_runtime);
              m_guestExecuting.store(false, std::memory_order_release);
-@@ -1121,6 +1139,275 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+@@ -392,7 +410,14 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+ {
+     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
+     m_eeCycle += elapsed;
+-    m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
++    // W43. CORRECTION to my own first attempt at this line. I removed the OR into
++    // m_pendingEeTimerInterrupts on the belief that it was never cleared, and that was wrong:
++    // processPendingEvents() drains and zeroes it (see the dispatchIrq loop there, which maps timer
++    // n to IRQ 9+n through the interrupt controller). Dropping the OR would have silently deleted an
++    // existing, working IRQ path. The accumulator stays; the CPU-facing raise belongs where the INTC
++    // decides an IRQ is actually being signalled, not here where a timer merely latched a flag.
++    const uint32_t timerInterrupts = m_runtime.memory().advanceEeTimers(elapsed);
++    m_pendingEeTimerInterrupts |= timerInterrupts;
+     m_runtime.advanceIopEeCycles(elapsed);
+     if (m_pendingEeTimerInterrupts != 0u)
+     {
+@@ -1121,6 +1146,275 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
      throw EeDispatcherTransfer{};
  }
  
@@ -1280,7 +1336,7 @@ index c5e31c4..bdab38a 100644
  [[noreturn]] void EeScheduler::invokeCurrentSequence(std::vector<GuestInvocation> invocations)
  {
      assertExecutor();
-@@ -1456,23 +1743,49 @@ uint8_t *EeScheduler::rdram() const noexcept
+@@ -1456,23 +1750,49 @@ uint8_t *EeScheduler::rdram() const noexcept
  
  void EeScheduler::bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram)
  {
@@ -1338,7 +1394,7 @@ index c5e31c4..bdab38a 100644
      }
  }
  
-@@ -1490,6 +1803,13 @@ void EeScheduler::publishSnapshot()
+@@ -1490,6 +1810,13 @@ void EeScheduler::publishSnapshot()
      next.sliceEndCycle = m_sliceEndCycle;
      next.nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
      next.runningThreadId = m_currentThreadId;
@@ -1352,11 +1408,16 @@ index c5e31c4..bdab38a 100644
      next.threads.reserve(m_threads.size());
      for (const auto &[id, item] : m_threads)
      {
-@@ -1740,10 +2060,10 @@ void EeScheduler::applyPendingPreemption()
+@@ -1740,10 +2067,15 @@ void EeScheduler::applyPendingPreemption()
      m_timeSliceExpired = false;
  }
  
 -void EeScheduler::processPendingEvents()
++void EeScheduler::servicePendingEventsAtCheckpoint() noexcept
++{
++    processPendingEvents(false);
++}
++
 +void EeScheduler::processPendingEvents(bool mayWait)
  {
      assertExecutor();
@@ -1365,7 +1426,7 @@ index c5e31c4..bdab38a 100644
      const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
      m_pendingEeTimerInterrupts = 0u;
      for (uint32_t timer = 0u; timer < 4u; ++timer)
-@@ -1773,7 +2093,7 @@ void EeScheduler::processPendingEvents()
+@@ -1773,7 +2105,7 @@ void EeScheduler::processPendingEvents()
      applyPendingPreemption();
  }
  
@@ -1374,7 +1435,7 @@ index c5e31c4..bdab38a 100644
  {
      for (;;)
      {
-@@ -1798,7 +2118,10 @@ void EeScheduler::processDueDeadlines()
+@@ -1798,7 +2130,10 @@ void EeScheduler::processDueDeadlines()
                  return;
              }
  
@@ -1982,10 +2043,24 @@ index c289ba0..6eda301 100644
          }
      }
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
-index 37b6a4d..43165bf 100644
+index 37b6a4d..7d667d9 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp
 +++ b/ps2xRuntime/src/lib/ps2_memory.cpp
-@@ -567,6 +567,18 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
+@@ -466,6 +466,13 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+             timer.count = static_cast<uint32_t>((oldCount + ticks) & 0xFFFFu);
+         }
+ 
++        // W43. Do NOT report a bit for a timer that did not actually fire. `advanceEeTimers` is
++        // OR-ed into m_pendingEeTimerInterrupts, so reporting bit 0 for a timer that was not armed
++        // keeps that bit latched for the rest of the run: it re-raised every call, it re-armed the
++        // checkpoint flag every call, and it was the reason accountCycles kept the guest
++        // checkpointing constantly. `ticks == 0` is the continue-above case, and for an unarmed timer
++        // the enable bits are clear so neither arm below can set anything anyway -- but the guard is
++        // explicit here because "the mask means a real timeout" is the whole contract.
+         if (compareReached && (timer.mode & kEeTimerModeCmpe) != 0u && (timer.mode & kEeTimerModeEquf) == 0u)
+         {
+             timer.mode |= kEeTimerModeEquf;
+@@ -567,6 +574,18 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
  
  uint32_t PS2Memory::translateAddress(uint32_t virtualAddress)
  {
@@ -2004,7 +2079,7 @@ index 37b6a4d..43165bf 100644
      if (isScratchpad(virtualAddress))
      {
          return ps2ScratchpadOffset(virtualAddress);
-@@ -586,7 +598,48 @@ uint32_t PS2Memory::translateAddress(uint32_t virtualAddress)
+@@ -586,7 +605,48 @@ uint32_t PS2Memory::translateAddress(uint32_t virtualAddress)
          return Ps2DirectMappedPhysicalAddress(virtualAddress);
      }
  
@@ -2055,7 +2130,7 @@ index 37b6a4d..43165bf 100644
      {
          return virtualAddress;
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..363b796 100644
+index 45cb9d2..f369291 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -327,6 +327,7 @@ namespace
@@ -2338,7 +2413,7 @@ index 45cb9d2..363b796 100644
      m_guestHeapLimit = limit;
      m_guestHeapConfigured = true;
  }
-@@ -2209,6 +2424,39 @@ void PS2Runtime::postEeEvent(EeEvent event)
+@@ -2209,9 +2424,71 @@ void PS2Runtime::postEeEvent(EeEvent event)
      m_eeScheduler->postEvent(event);
  }
  
@@ -2377,8 +2452,41 @@ index 45cb9d2..363b796 100644
 +
  bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
  {
-     return m_eeScheduler->checkpointDue(cycles);
-@@ -2285,6 +2533,14 @@ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, ui
+-    return m_eeScheduler->checkpointDue(cycles);
++    const bool due = m_eeScheduler->checkpointDue(cycles);
++
++    // W43. THE ACTUAL WIRING. Two deliveries were possible here and I hooked the wrong one first.
++    //
++    // This runtime does NOT vector a CPU interrupt for an EE IRQ. EeScheduler::dispatchIrq calls the
++    // guest's handler DIRECTLY, as a function call, with the cause in $a0 -- see the
++    // SET_GPR_U32(&invocation.context, 4, cause) at the end of dispatchIrq. Those calls are made from
++    // processPendingEvents(), which runs only from two places inside EeScheduler itself.
++    //
++    // So the guest's semaphore spin at 0x10113e8 (`ei`; `bnez $a0, -0x34`) could never be woken: it
++    // is a backward edge inside a generated function, it never yields to the scheduler, and therefore
++    // never reaches processPendingEvents. `ei` set STATUS.IE and nothing ever acted on it.
++    //
++    // The fix is to drain pending events at the guest's own checkpoint, which is where the guest is
++    // provably able to stop. mayWait=false: this must never sleep, because the caller is mid-function
++    // and the generated code expects to resume promptly. That constraint is already documented on
++    // processPendingEvents.
++    if (due)
++    {
++        m_eeScheduler->servicePendingEventsAtCheckpoint();
++    }
++
++    // Keep the vectored path too. It is correct, it is what a guest that arms an interrupt and takes
++    // it through the normal CPU path needs, and it costs one already-cached check. If it fires, the
++    // generated caller `return`s and the harness re-enters at ctx->pc, which is now the vector.
++    if (due && servicePendingInterrupt())
++    {
++        return true;
++    }
++    return due;
+ }
+ 
+ [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
+@@ -2285,6 +2562,14 @@ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, ui
      }
      const uint32_t guestAddress = static_cast<uint32_t>(address);
      std::memcpy(rdram + guestAddress, &handler, sizeof(handler));
@@ -2942,7 +3050,7 @@ index 0b22fe0..9e1b3a4 100644
          {
              PS2Memory mem;
 diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
-index 4772f3f..900e936 100644
+index 4772f3f..f772a99 100644
 --- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
 +++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
 @@ -309,6 +309,77 @@ namespace
@@ -3114,7 +3222,7 @@ index 4772f3f..900e936 100644
          tc.Run("lookupFunction rejects internal resume PCs without exact registration", [](TestCase &t)
          {
              PS2Runtime runtime;
-@@ -1086,6 +1241,339 @@ void register_ps2_runtime_expansion_tests()
+@@ -1086,6 +1241,385 @@ void register_ps2_runtime_expansion_tests()
              t.IsTrue(threw, "syscall from delay slot should throw to preserve block atomicity");
          });
  
@@ -3416,6 +3524,52 @@ index 4772f3f..900e936 100644
 +            runtime.clearInterrupt(kIp0);
 +            t.IsTrue(runtime.pendingInterrupts() == 0u, "clearInterrupt must clear the source");
 +            t.IsTrue((ctx.cop0_cause & 0x0000FC00u) == 0u, "cleared sources must leave Cause.IP clear");
++        });
++
++        tc.Run("an EE timer overflow raises the CPU's IP bit, not just a scheduler flag", [](TestCase &t)
++        {
++            // W43. W42 built the delivery path and the 45s boot delivered ZERO interrupts. The
++            // reason is here: the EE timers have always computed a per-timer interrupt mask (bit n
++            // for timer n) and EeScheduler has always accumulated it in m_pendingEeTimerInterrupts --
++            // but that mask only set m_checkpointPending. It never reached the CPU, so Cause.IP never
++            // showed a timer and nothing was ever deliverable.
++            //
++            // On the R5900 EE timer n is Cause.IP bit (10 + n): IP0=bit10 is timer0, IP1 is timer1,
++            // and so on. This asserts that mapping, because a mask that arrives with the wrong bit
++            // positions would be delivered to the wrong handler and look like a working interrupt.
++            PS2Runtime runtime;
++            R5900Context &ctx = runtime.cpu();
++
++            constexpr uint32_t kTimer2Count = 0x10001000u;
++            constexpr uint32_t kTimer2Mode = 0x10001010u;
++            constexpr uint32_t kCue = 1u << 7u;
++            constexpr uint32_t kOvfe = 1u << 9u;
++            constexpr uint32_t kOvff = 1u << 11u;
++            constexpr uint32_t kBusClockDiv256 = 2u;
++
++            t.IsTrue(runtime.memory().initialize(), "PS2Memory initialize should succeed");
++
++            // Nothing pending before the timer is armed.
++            t.IsTrue(!runtime.servicePendingInterrupt(), "an idle timer must not deliver");
++
++            runtime.memory().writeIORegister(kTimer2Count, 0xFFFFu);
++            runtime.memory().writeIORegister(kTimer2Mode, kBusClockDiv256 | kCue | kOvfe | kOvff);
++
++            // The scheduler's cycle accounting is what samples the timers, so drive it the way the
++            // run loop does rather than calling the timer directly: the bug was in the wiring.
++            const uint32_t timerMask = runtime.memory().advanceEeTimers(512u);
++            t.IsTrue(timerMask == (1u << 2u), "timer2 overflow must raise the timer-2 bit");
++
++            // Now the wiring under test: timer bit n -> Cause.IP bit 10+n, via the runtime.
++            runtime.raiseInterrupt(PS2Runtime::eeTimerInterruptToIp(timerMask));
++            t.IsTrue(runtime.pendingInterrupts() == (1u << 12u),
++                     "timer 2 must land on Cause.IP bit 12 (IP2)");
++            t.IsTrue((ctx.cop0_cause & 0x0000FC00u) != 0u, "the timer must appear in Cause.IP");
++
++            // And it must now actually be taken, since reset leaves IE|EIE set.
++            t.IsTrue(runtime.servicePendingInterrupt(), "a timed-out EE timer must be deliverable");
++            t.IsTrue((ctx.cop0_cause & 0x7Cu) == 0u, "Cause.ExcCode must be Int (0)");
++            t.IsTrue(runtime.interruptsDelivered() == 1u, "the timer interrupt must be counted");
 +        });
 +
 +        tc.Run("handleSyscall reports nesting depth, and unwinds it when it throws", [](TestCase &t)

@@ -3903,3 +3903,75 @@ candidates, and it already separates noise from signal:
 **`.rodata` PSMT8 at `0x040180` (and the seven after it) is the item-4 candidate: real indexed pixel
 data from the game's own ELF, with a gradient and entropy a flat fill cannot fake.** Next: name its
 dimensions and format from the surrounding data, find its CLUT, and render it through our GS.
+
+## W38 — ITEM 4: found the guest's own embedded-file table, and it decodes cleanly
+
+The gate is "a PNG whose pixels come from a real GT4 texture, with the source texture's offset,
+dimensions **and format** named." I have three of the four from the game's own bytes, and I am not
+going to invent the fourth.
+
+### The guest has an embedded-file table, and it is at guest `0x01041948`
+
+Searching `.data` for a pointer to `.rodata`'s base found exactly one reference, at file offset
+`0x42948` = guest `0x01041948`, and the record around it reads:
+
+```
++0x00  0x01036D80   pointer into .rodata
++0x04  0x00037D80   offset within the image
++0x08  0x00009478   size in bytes
++0x0C  0x00000040   type
+```
+
+`0x37D80` is the **file offset of `.rodata`**, `0x9478` is `.rodata`'s **exact size** from `readelf`,
+and `0x01036D80` is `.rodata`'s **load address**. Three independent numbers agreeing is what makes
+this a real table rather than a coincidence. The record type `0x40` is the only one of its neighbours
+that has all three fields pointing at real data, so the table is sparse.
+
+### The embedded asset is a named game file: `.in.notice2005.img`
+
+The record points at a gzip member whose FNAME field is literally `.in.notice2005.img` — **a name
+from the game, not one I chose.** It decompresses to **118,160 bytes**, and its first four bytes are
+the magic **`Tex1`**, with **118,160 also stored at offset +12**. Self-consistent, so the container
+is understood at the header level.
+
+```
+Tex1 container (.in.notice2005.img), 118,160 bytes
+  +0x00  "Tex1"                        magic, 4 bytes
+  +0x0C  u32 LE 118,160                total size, matches exactly
+  +0x12  u16 LE 461                    count of something (NOT a width — see below)
+  +0x14  u16 LE 1
+  +0x16  u16 LE 4
+  +0x18  u16 LE 48
+  +0x1C  u16 LE 88
+```
+
+### What is proven, and what I am refusing to guess
+
+- **Offset: `0x37D80` in `SCUS_973.28`, compressed 38,008 bytes, decompressing to 118,160.** Proven.
+- **Format: `Tex1`, a versioned container wrapping gzip'd assets.** Proven by the magic and the
+  self-declared size.
+- **Dimensions: NOT yet established, and this is the honest gap.** `+0x12 = 461` looks width-ish but
+  is a **count**: with a 96-byte header at 2 bytes/pixel the body is 59,032 pixels, and
+  59,032 / 461 = **128.05** — 461 × 128 + 16. That is a chunk count of 128 rows' worth, not a width.
+  Every `(width, height)` pair that divides the body evenly is 188×157, 157×188, 314×94, 94×314 and so
+  on — all plausible, none distinguished. **Naming one would be inventing the answer**, which this
+  project's rules forbid more than a slow dish does.
+
+### Two scans I ran that produced nothing, recorded so they are not repeated
+
+- **A 256-entry CLUT hunt over `notice2005.img` found only runs of zero bytes.** My "quantised
+  channels" heuristic scored `(0,0,0,0)` as a perfect palette match, so it reported hundreds of
+  matches that were all padding. The heuristic was worthless, not the data.
+- **`GT4.VOL`'s filenames are not ASCII.** The disc's 2.4 GB volume has a real index — I decoded its
+  shape as `[u32 dirId][u32 count][u32 nameLen=0x14][count × u32 fileOffset]` at VOL+`0x78`, and the
+  offsets match its own header table — but the name strings it points at are packed or encoded. So
+  **the VOL is not a shortcut to a named texture file**, and I stopped rather than reverse-engineering
+  a proprietary filesystem to serve one PNG.
+
+### The next concrete step for item 4
+
+**Find the guest's `Tex1` parser and read the container format off its own code**, the same way W36
+read `sub_01003E10` instead of guessing at the path. `Tex1` is referenced by name inside the MC-open
+struct at `0x1051a10`, so the loader is reachable from `sub_01005148`'s call graph. One function
+decode gives the header's field meanings and the pixel format, and then the dimensions fall out of
+the data instead of out of a guess.

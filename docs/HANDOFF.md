@@ -3746,3 +3746,73 @@ around it.** If a writer is our own decoder, (b). If the value only ever arrives
 
 `sceMcOpen`'s `-4` still stands, and is still correct for a path the guest cannot resolve. Do not
 "fix" it, and do not normalise `05 80` — that would be inventing the answer.
+
+## W36 — `0x010519C0` DECODED: it is `/BASCUS-97328GAMEDATA`, and the caller is `0x100E66C`
+
+W35 left one measurement: watch `[0x010519C0,0x010519CC)` and name every writer. It answered more
+than the question, and it is the most useful thing found so far.
+
+### What writes `0x010519C0` — the guest, building a host path, in plain ASCII
+
+```
+n=6 pc=0x1003d9c addr=0x10519c0 size=1  value=0x2f                       -> '/'
+n=7 pc=0x1003dac addr=0x10519c1 size=2                                  -> 'BA'
+n=8 pc=0x1003dc4 addr=0x10519c3 size=10   53 43 55 53 2d 39 37 33 32 38  -> 'SCUS-97328'
+n=9 pc=0x1003de0 addr=0x10519cd size=9    47 41 4d 45 44 41 54 41        -> 'GAMEDATA'
+n=17 pc=0x1004078 addr=0x10519f0 size=5    2f 74 6d 70 00                 -> '/tmp'
+```
+
+**`0x010519C0` is the string `/BASCUS-97328GAMEDATA`** — the disc volume ID plus `GAMEDATA`, which is
+GT4's data root. `/tmp` at `0x10519f0` is our own `gt4.toml` scratch path. **So W35's "16-bit array
+that has never been decoded" is just this string, later overwritten by structure data.** The address
+is a reused scratch buffer: it holds a path during setup and a struct afterwards.
+
+### The struct `sceMcOpen` is actually handed
+
+`$a2 = 0x1051A10`, and that buffer contains:
+
+```
++0x00  00 14 00 00
++0x04  30 1a 05 01                  -> pointer 0x01051A30
++0x08  ff ff ff ff ff ff ff ff      -> -1, -1
++0x10  05 80 2f 05 80 2f 65 2e 67 74 34
+...   ... 54 65 78 31               -> "Tex1"
+...   ... 4d 30 3a 5c 3b 31         -> "M0:;1"
+```
+
+`Tex1` and `M0:;1` are **GT4's own data files**, the same `Tex1` blob found at file offset `0x37d80`
+in `SCUS_973.28`. **The guest is assembling a path out of the data root plus a file name, and handing
+it to the memory-card open.**
+
+### Who asks, and with what
+
+```
+[MC] Open ra=0x100e66c guestpc=0x100e66c a0(port)=0 a1(slot)=0 a2(buf)=0x1051a10 a3(mode)=0x1
+[MC] Open ra=0x100e66c guestpc=0x100e66c a0(port)=1 a1(slot)=0 a2(buf)=0x1051a10 a3(mode)=0x1
+```
+
+The caller is **`0x100E66C`, inside `sub_0100E730`** — the poller from W15, confirmed. Mode is
+`$a3 = 0x1` (`O_RDONLY`), slot 0, and **it tries port 0 and port 1**, roughly 10,238 times each.
+
+Note our own log reads `flags` from `$v1`, which is `0x0` garbage on a direct stub call. The real mode
+is `$a3`. That is a logging defect, not a behaviour defect — it does not affect the `-4`.
+
+### The filename really is a save-file name
+
+The path `sceMcOpen` reads ends in `65 2e 67 74 34` = **`e.gt4`**, five characters, and W35's copy log
+separately shows the guest pasting the static string **`core.gt4`** (`63 6f 72 65 2e 67 74 34`, from
+`.rodata` `0x103d1d8`). **Those are GT4's own filenames**, not garbage. Several candidates are tried in
+the same reused buffer.
+
+### What is still unknown, stated plainly
+
+**`0x8005` remains undecoded.** It appears as a 2-byte token immediately before a `/`, twice, in front
+of `e.gt4`. It is not ASCII, it is not a byte swap of `..`, and no structure in this project
+establishes what a 2-byte token in front of `/` means. **I am not going to guess it.** It is the one
+thing left, and it is a decode, not a fix.
+
+### The next measurement
+
+**Decode the function containing `0x1003D9C`** — the routine that assembles `/BASCUS-97328GAMEDATA`
+component by component. It is where the `/` separators and the 2-byte token are produced, so its
+decode will say what `0x8005` is. One function, and it decides the wall.

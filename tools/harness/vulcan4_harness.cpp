@@ -81,14 +81,17 @@ namespace
 // nothing had to be recompiled. The observer fires on EVERY guest store, so the filter is one
 // unsigned compare and the printing is capped: an uncapped print would dominate the run and change
 // the very throughput it is measuring.
-// W33: narrowed to the four bytes that actually change. The path is built as "../../e.gt4" and
-// something rewrites the leading ".." as 0x8005; only these four bytes differ, so watching only
-// them makes the corrupting write unmistakable. Every write prints the resulting bytes, so the step
-// where 2e 2e becomes 05 80 is visible rather than inferred.
-constexpr uint32_t kWatchLo = 0x01051A10u;
+// W36. The boot path's components come from 0x010519C0, whose contents are
+//     05 80 00 00 00 00 00 00 41 00 00 00 -- a 16-bit array, never ASCII. This address sits 16 bytes
+//     past the destination of the one-time 16,410,192-byte copy (0x10519AC -> 0x10519B0), so it may be
+//     ring-buffer content rather than a decoded field. Those two explanations need different fixes,
+//     and the writer tells them apart: if the bytes arrive through the big copy the ring buffer's
+//     stream is mis-decoded, and if our own decoder writes here then a field offset or width on our
+//     side is wrong. Watch 12 bytes so a 32-bit store is not split across a boundary we chose blind.
+constexpr uint32_t kWatchLo = 0x010519C0u;
 constexpr uint32_t kWatchHi = 0x01051A16u;
 uint32_t g_watchStoreHits = 0;
-constexpr uint32_t kWatchStoreMax = 40;
+constexpr uint32_t kWatchStoreMax = 24;
 // W30: 1 MiB. Anything at least this big is a copy, not a field write.
 constexpr uint32_t kWatchBigCopy = 1024u * 1024u;
 uint32_t g_watchBigCopyHits = 0;

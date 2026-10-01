@@ -1452,7 +1452,7 @@ index d467c4b..8968f4b 100644
  
          uint32_t copied = 0u;
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
-index 564d873..4404d14 100644
+index 564d873..d12592f 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
 @@ -586,7 +586,6 @@ namespace ps2_stubs
@@ -1527,7 +1527,7 @@ index 564d873..4404d14 100644
                      if (guestPath == "/")
                      {
                          result = kMcResultDeniedPermit;
-@@ -1039,6 +1071,24 @@ namespace ps2_stubs
+@@ -1039,6 +1071,35 @@ namespace ps2_stubs
                  }
              }
              setMcCommandResultLocked(kMcCmdOpen, result);
@@ -1539,6 +1539,17 @@ index 564d873..4404d14 100644
 +            // acted on without knowing WHICH file and with WHICH flags. The flag matters: hardware
 +            // returns -4 only when neither sceMcFileCreateFile (0x0200) nor sceMcFileCreateDir
 +            // (0x0040) is set, so a 0x0200 open must create the entry rather than report it missing.
++            // W36. Which guest code is asking, and with which mode? The [MC] Open line already said
++            // the guest hands sceMcOpen a struct containing the disc data path (/BASCUS-97328 +
++            // GAMEDATA) and the file name "Tex1", which is not a memory-card file at all. Knowing
++            // the caller and $a3 separates "GT4 asks its IOP to open a disc file through a stub we
++            // mapped to sceMcOpen" from "GT4 really is opening a memory-card file and our
++            // normaliser built a nonsense path", and those two need opposite fixes.
++            RUNTIME_LOG("[MC] Open ra=0x" << std::hex << getRegU32(ctx, 31) << " guestpc=0x"
++                        << (ctx != nullptr ? ctx->pc : 0u) << std::dec
++                        << " a0(port)=" << static_cast<uint32_t>(getRegU32(ctx, 4)) << " a1(slot)="
++                        << static_cast<uint32_t>(getRegU32(ctx, 5)) << " a2(buf)=0x" << std::hex
++                        << getRegU32(ctx, 6) << " a3(mode)=0x" << getRegU32(ctx, 7) << std::dec);
 +            RUNTIME_LOG("[MC] Open v1=0x" << std::hex << getRegU32(ctx, 3) << std::dec << " port=" << port
 +                        << " slot=" << slot << " addr=0x" << std::hex
 +                        << pathAddr << std::dec << " bytes=[" << pathHex << "] '" << path

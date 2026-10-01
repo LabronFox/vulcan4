@@ -2285,3 +2285,65 @@ NEXT:   **The one question left on the CPU lane: on real hardware, what wakes ti
         on a wakeup that only its own later code issues, then tid1's spin is the bug and its loop
         condition must be read properly (all of it, not the edges).
         Items **4 (GS texture), 5 (pad read path), 6 (sceGs* inventory)** do not wait on this.
+
+### W16b — the spin is one 35-call cycle, and its hottest leaf is an indirect call through a `.data` pointer
+
+The W16 entry named the deadlock but not where the CPU goes. It does now, because the report
+carries a **top-N PC histogram with the share of all entries** — a new permanent line, added for
+the same reason as the wait reason: a loop that owns 99% of the run must not hide behind a function
+that owns 0.1%.
+
+```
+VULCAN4 PC HISTOGRAM distinct=113 top:
+  0x0101d3a0=349139(17.14%) 0x0101d3cc=349132(17.14%) 0x0101d420=349130(17.14%)
+  0x01003a84=174568( 8.57%) 0x01003e68=116387(5.71%) 0x0100549c=116387(5.71%)
+  0x01005480=116380(5.71%) 0x01000374=58193(2.86%) 0x01004ffc=58192(2.86%) ...
+```
+
+The shares are quantised at 17.14 / 8.57 / 5.71 / 2.86 % = 6 / 3 / 2 / 1 out of 35, so this is
+**one 35-call cycle repeating ~58,000 times**, and it accounts for essentially every one of the
+~2.04 M entries in 60 s. The guest is not exploring. It is in a loop.
+
+Decoding the top of it, from the generated unit's comments:
+
+- `0x0101d3a0` → `sub_0101D398`, `0x0101d3cc` → `sub_0101D3B8`, `0x0101d420` → `sub_0101D418`.
+  `sub_0101D3B8` ends with an **unconditional branch to `0x101d420`**, i.e. it tail-calls
+  `sub_0101D418`. So those three "functions" are one call site plus two of its callers.
+- `sub_0101D418` and `sub_0101D398` both do exactly one thing: `jal func_101D470`. **That makes
+  `func_101D470` the hottest leaf in the boot — ~34 % of every guest entry.**
+- **`func_101D470` is a bare indirect call through a function pointer in `.data`:**
+
+```
+0x101d474: lui  $v0, 0x103
+0x101d47c: lw   $v1, 0x4EC0($v0)     ; $v1 = *(0x1034EC0)
+0x101d480: jalr $v1
+```
+
+- Reading the ELF directly: `0x1034EC0` is inside PT_LOAD 2 (`vaddr=0x102dc80 filesz=0x13aa4`), at
+  file offset `0x35ec0`, and its **initial value is `0x1019be8`** — a valid guest address inside
+  PT_LOAD 1, so the pointer is sane as shipped. (`lw $v1, 0x4EC0($v0)` also explains why the
+  recompiler had no trouble here: an indirect call needs no translation.)
+- `sub_01019BE8` is a pure thunk (`ld $ra; j func_101E6B8`), so the chain is
+  `func_101D470` → `0x1019BE8` → `func_101E6B8`.
+- `func_101E6B8` is a **callback enqueue + dispatch** on a global at `0x1035270`: it walks
+  `*(0x1035270)+0x148` as a head pointer, `+0x4` as a count, entries of 4 bytes from `+0x8`,
+  `jalr`-ing each in a `bgezl` loop, then calls a tail callback at `+0x3C` and tail-jumps
+  `func_1000220`. On the register side it bumps the count and stores the callback into the slot.
+
+**What this buys the next session:** the loop is not the mutex code. The mutex/broadcast
+(`sub_01011508`, `sub_010116A8`) is real and decoded, but it is *not* where the CPU is — the
+histogram says the CPU is in a callback-queue dispatch reached through one `.data` function
+pointer. Two things are worth measuring next, in this order, and both are cheap:
+
+1. **Is the queue at `*(0x1035270)+0x148` growing?** `func_101E6B8` both enqueues and dispatches.
+   If the count climbs and never returns to its floor, the guest is enqueueing faster than it
+   drains and the loop is the symptom of that — which is a different bug from "it is waiting for
+   tid2", and it would explain why tid1 never gets to the code that wakes tid2.
+2. **What does `*(0x1034EC0)` hold at runtime, not at load time?** The ELF says `0x1019be8`; the
+   guest may have reassigned it, and if it points somewhere that returns without doing the work,
+   the loop spins inside a no-op.
+
+**Refused, not guessed:** past this point the `sub_0101E6B8` register path stops being readable
+with confidence — `$s1` is `$a0` *after* a call, so the value stored into the queue slot cannot be
+pinned down from the decode alone, and the queued value may be a function pointer or an opaque
+token. I will not guess which. Measure 1 and 2 above instead; both are one print each.

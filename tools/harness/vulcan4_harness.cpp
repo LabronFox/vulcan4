@@ -53,6 +53,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
@@ -513,6 +514,12 @@ int main(int argc, char *argv[])
     // ------------------------------------------------------------------ execute
     uint64_t functionsEntered = 0;
     uint64_t distinctPcs = 0;
+    // W16: distinct_pcs=167 says HOW MUCH code the guest visited and nothing about WHERE it spent
+    // its life. Every wall so far had to be located by reading call chains by hand out of the
+    // generated unit -- error-prone, and it guesses at edges instead of sampling the loop. The
+    // guest's entry PC is already in hand here, so counting it costs one hash per entry and turns
+    // "the guest cycles through 4 addresses" into "and here is the top of the cycle".
+    std::unordered_map<uint32_t, uint64_t> pcEntryCounts;
     uint64_t dispatcherTransfers = 0;
     std::size_t checkpointServiced = 0;
     uint64_t servicedInvocations = 0;
@@ -966,6 +973,7 @@ int main(int argc, char *argv[])
         }
 
         ++functionsEntered;
+        ++pcEntryCounts[ctx.pc];
 
         if (traceAll || (traceFirst && (functionsEntered <= traceFirst || functionsEntered % 100000 == 0)))
         {
@@ -1408,8 +1416,8 @@ int main(int argc, char *argv[])
         threadState += "tid" + std::to_string(thread.id) + ":status="
             + std::to_string(static_cast<int>(thread.status)) + ":wait="
             + waitReasonName(thread.waitReason) + "#" + std::to_string(thread.waitId) + ":woken="
-            + std::to_string(thread.wakeupCount) + ":pc=" + toHex(thread.pc) + ":invocations="
-            + std::to_string(thread.invocationDepth);
+            + std::to_string(thread.wakeupCount) + ":pc=" + toHex(thread.pc) + ":ra="
+            + toHex(thread.ra) + ":invocations=" + std::to_string(thread.invocationDepth);
     }
     for (const EeThreadSnapshot &thread : kernelSnapshot.threads)
     {
@@ -1427,6 +1435,28 @@ int main(int argc, char *argv[])
     }
     std::cout << "VULCAN4 BOOT REPORT functions_entered=" << functionsEntered << " halt=" << haltReason
               << " bios_files=" << biosFilesOpened << "\n";
+
+    // W16: where the guest actually spent its life. Top 24 by entry count, with the share of all
+    // entries, so a loop that owns 99% of the run cannot hide behind a function that owns 0.1%.
+    {
+        std::vector<std::pair<uint32_t, uint64_t>> ranked(pcEntryCounts.begin(), pcEntryCounts.end());
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const auto &left, const auto &right) { return left.second > right.second; });
+        std::cout << "VULCAN4 PC HISTOGRAM distinct=" << ranked.size() << " top:";
+        const std::size_t limit = std::min<std::size_t>(24, ranked.size());
+        for (std::size_t i = 0; i < limit; ++i)
+        {
+            const double share =
+                functionsEntered == 0 ? 0.0
+                                     : 100.0 * static_cast<double>(ranked[i].second) /
+                                           static_cast<double>(functionsEntered);
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), " %s=%llu(%.2f%%)", toHex(ranked[i].first).c_str(),
+                          static_cast<unsigned long long>(ranked[i].second), share);
+            std::cout << buf;
+        }
+        std::cout << "\n";
+    }
 
     std::cout << "VULCAN4 HARNESS detail=" << haltDetail << " pc=" << toHex(haltPc)
               << " distinct_pcs=" << distinctPcs << " checkpoint_serviced=" << checkpointServiced << " dispatcher_transfers=" << dispatcherTransfers

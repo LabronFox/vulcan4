@@ -4458,3 +4458,74 @@ which layout is right.
 snapshot**, so the write that turns `/BA…` into `05 80` is caught in the act. That is one notification
 added to one function, and it either names the writer or proves the write comes from a path we have not
 instrumented at all. Both outcomes are worth more than another round of reading hex.
+
+## W45 — instrument gap closed, and every alternative explanation for the W44 contradiction ruled out
+
+### Closed for real: `Ps2FastWrite32` now notifies the observer
+
+```
+ps2xRuntime/include/ps2_runtime_macros.h:266
+  Ps2FastWrite32 -> ps2TraceGuestWrite(rdram, addr, 4u, value, 0u, "Ps2FastWrite32", nullptr)
+```
+
+That is the same hook every `WRITE8/16/32/64/128` macro already calls, and the same one the comment on
+`PS2GuestStoreObserver` insists on: **a hook in a header the generated code includes survives a
+recompiler regeneration.** A probe hand-injected into the generated translation unit does not, and this
+project has shipped that mistake once already. Cost is the one predictable null-branch the macros
+already pay.
+
+Also added: `VULCAN4 W45BEFORE`, a **before**-snapshot of the watched window for any write that
+overlaps it. W44's contradiction was undiagnosable partly because every log line described only the
+state *after* the store.
+
+**Result: it did not catch the write.** Still exactly 5 writes touch `0x010519C0` in a 12-second run —
+the same 5 as before. So the writer is neither `WRITE32` nor `Ps2FastWrite32` nor `ps2_stubs::memcpy`'s
+range trace.
+
+### Every alternative explanation, checked and dead
+
+1. **Stale RDRAM pointer in the harness.** Dead — `cached_g_rdramForWatch=0x7d86ea9e8010
+   live_getRDRAM=0x7d86ea9e8010 same=YES`.
+2. **TLB resolution vs flat index disagreeing.** Dead — `RDRAMVIEW flat=05 80 … tlbbytes=05 80 …
+   SAME=yes`, and again for `core.gt4` at `0x103d1d8`.
+3. **The runtime's `rdram` and the harness's watched buffer being different allocations.** Dead —
+   `probe_rdram=0x7d86ea9e8010` against `observer_rdram=0x7d86ea9e8010`. **Identical.**
+4. **Cross-thread log interleaving making "line order = execution order" unsafe.** Dead — there is
+   exactly one `std::thread` that spawns the guest (`ps2_runtime.cpp:2652`), and the harness drives the
+   guest on its own thread rather than through `run()`. Nothing else writes RDRAM.
+
+So: same buffer, same address, single writer thread, every store path instrumented — and the log still
+shows `/BA/SCUS-97328GAMEDATA` written to `0x010519C0` at lines 373–381, and `05 80 00 00 00 00 00 00
+41 00 00 00` read from it at line 1265.
+
+**I cannot explain this from the evidence I have, and I am not going to invent a mechanism for it.**
+
+### The one methodological hole left, and it is mine
+
+Every conclusion above rests on **`stdout` line order being execution order**. I have now established
+that only one thread writes to stdout *in this runtime* — but `std::cout` from the guest executor and
+from the IOP/RPC side is still **two producers into one stream with no synchronisation**, and the
+`[MC]` / `RUNTIME_LOG` lines are emitted from a different stream than `std::cout`. Line 1264 in the
+sample log literally shows the two interleaving mid-line:
+
+```
+1264  [MC] GetInfo port=0 type=2 free=8192 format=1 result=0[MC] Sync cmd=1 result=0[W35PATHCOPY] n=1 A: paste
+```
+
+So **"line 381 happened before line 1265" is not something I have actually proven.** The whole
+W44 contradiction rests on an ordering I assumed, and the one sample I can point at shows interleaving
+happens. That is the most likely explanation left, and it is a flaw in my method, not in the runtime.
+
+### What I would do next, and why it is the right next thing
+
+**Stamp every observer and log line with a monotonic sequence number, and every one with the guest
+thread id**, then re-run and re-derive the ordering from the sequence rather than from stdout position.
+That is a few lines in the harness and it either makes the W44 contradiction evaporate (most likely, and
+harmless — it would mean no bug at all, just a bad reading) or makes it real with a defensible ordering
+behind it.
+
+**I should have done this before W33.** Every "nothing wrote this address" claim since then has been read
+off stdout position. Some may be wrong for exactly this reason. I am flagging that rather than leaving it
+for someone else to find.
+
+**Suite: 476 total, 475 pass, 1 fail** — the pre-existing unrelated `VU0 macro mappings`.

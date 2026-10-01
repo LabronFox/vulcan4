@@ -100,6 +100,15 @@ constexpr uint32_t kWatchPathStorePc = 0x01003E98u;
 uint32_t g_watchPathHits = 0;
 // W33: the observer needs RDRAM to read the candidate path strings. Set once, before boot.
 uint8_t *g_rdramForWatch = nullptr;
+
+// W45. Exposed so a probe inside the runtime can compare the buffer IT was handed against the buffer
+// the store observer is watching. Every internal consistency check so far (TLB vs flat index) proved
+// the two AGREE; none of them proved they agree with the OBSERVER. This is the only way to settle it,
+// and it costs one exported pointer.
+void *vulcan4HarnessWatchedRdram()
+{
+    return static_cast<void *>(g_rdramForWatch);
+}
 uint32_t g_watchPeek(uint32_t guestAddr)
 {
     if (g_rdramForWatch == nullptr || guestAddr + 4u > PS2_RAM_SIZE)
@@ -113,6 +122,32 @@ uint32_t g_watchPeek(uint32_t guestAddr)
 
 void watchGuestStoreForPath(uint32_t guestAddr, uint32_t size, uint64_t value, const R5900Context *ctx)
 {
+    // W45. BEFORE-SNAPSHOT. W44 found a write to 0x010519C0 that the observer never reported, so a
+    // log line describing only the state AFTER the store cannot say what was overwritten. Capturing
+    // the destination bytes first turns every line into a before/after pair, which is what makes the
+    // next occurrence of this event legible instead of another contradiction.
+    //
+    // Only for writes that actually overlap the watched window: the snapshot is 16 bytes of copying
+    // and the whole reason it is affordable is that the overlap test rejects almost everything.
+    const bool overlapsWatch = (guestAddr < kWatchHi) && ((guestAddr + size) > kWatchLo);
+    uint8_t before[kWatchHi - kWatchLo];
+    if (overlapsWatch && g_rdramForWatch != nullptr && g_watchStoreHits < kWatchStoreMax)
+    {
+        for (uint32_t k = kWatchLo; k < kWatchHi && k < PS2_RAM_SIZE; ++k)
+        {
+            before[k - kWatchLo] = g_rdramForWatch[k];
+        }
+        std::cout << "VULCAN4 W45BEFORE addr=0x" << std::hex << guestAddr << " size=" << std::dec << size
+                  << " op=" << ((ctx != nullptr) ? "guest" : "fastpath") << " bytes=";
+        for (uint32_t k = kWatchLo; k < kWatchHi && k < PS2_RAM_SIZE; ++k)
+        {
+            char byteText[4];
+            std::snprintf(byteText, sizeof(byteText), "%02x", before[k - kWatchLo]);
+            std::cout << byteText << " ";
+        }
+        std::cout << "\n";
+    }
+
     // W30. A RANGE write big enough to straddle most of RDRAM is not a field update, it is a copy
     // that ran away -- sub_01010EA8 computed a 16,410,192-byte length from two guest globals and
     // called the guest's own memcpy. Report those regardless of address: the destination and the

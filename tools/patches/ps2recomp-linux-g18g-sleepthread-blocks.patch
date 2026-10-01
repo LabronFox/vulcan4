@@ -631,10 +631,30 @@ index 4b9242c..fe6d457 100644
      uint32_t m_guestHeapEnd = 0x00100000u;
      uint32_t m_guestHeapLimit = PS2_RAM_SIZE;
 diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
-index 0f19c9f..84c551e 100644
+index 0f19c9f..a863310 100644
 --- a/ps2xRuntime/include/ps2_runtime_macros.h
 +++ b/ps2xRuntime/include/ps2_runtime_macros.h
-@@ -325,27 +325,35 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
+@@ -265,6 +265,19 @@ static inline void Ps2FastWrite16(uint8_t *rdram, uint32_t addr, uint16_t value)
+ 
+ static inline void Ps2FastWrite32(uint8_t *rdram, uint32_t addr, uint32_t value)
+ {
++    // W45. CLOSING THE BLIND SPOT W44 FOUND. This function wrote `rdram + (addr & PS2_RAM_MASK)`
++    // flat, with no TLB resolution and no notification of its own, so anything that reached memory
++    // through it -- DMA, the fast paths, direct buffer writes -- was invisible to the store
++    // observer. That produced a real contradiction: sub_01003D20 wrote /BA/SCUS-97328GAMEDATA to
++    // 0x010519C0, and 880 log lines later the same address read 05 80 00 00 ... with NO write to it
++    // anywhere in the log. Something wrote there through a path we could not see.
++    //
++    // ps2TraceGuestWrite is the observer hook that every WRITE8/16/32 macro already calls and that
++    // survives a recompiler regeneration (see PS2GuestStoreObserver's own comment: a probe injected
++    // into the generated translation unit does not). Routing this path through it is the same one
++    // predictable null-branch the macros already pay, so it does not make the hot path meaningfully
++    // worse, and it means "no writes here" is finally a statement the instrument can support.
++    ps2TraceGuestWrite(rdram, addr, 4u, static_cast<uint64_t>(value), 0u, "Ps2FastWrite32", nullptr);
+     const uint32_t offset = addr & PS2_RAM_MASK;
+     if (!Ps2FastRangeIsContiguous(offset, sizeof(uint32_t)))
+     {
+@@ -325,27 +338,35 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
  
  #define READ8(addr) ([&]() -> uint8_t {                       \
      uint32_t _addr = (uint32_t)(addr);                        \
@@ -1448,10 +1468,22 @@ index c5e31c4..d6e29cc 100644
                  m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                       { return !m_events.empty() ||
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
-index d467c4b..f5dd628 100644
+index d467c4b..0baca03 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
-@@ -87,11 +87,179 @@ namespace ps2_stubs
+@@ -2,6 +2,11 @@
+ #include "LibC.h"
+ #include "ps2_log.h"
+ 
++// W45. Defined by the harness, which owns the store observer. Declared at file scope, outside every
++// namespace: declaring it inside ps2_stubs (or an anonymous namespace inside it) makes the name
++// resolve to ps2_stubs::vulcan4HarnessWatchedRdram and the link fails. This is the only symbol the
++// runtime takes from the harness, and it exists purely so a probe can settle a question the runtime
++// cannot answer alone: whether the buffer it was handed is the buffer the observer is watching.
+ namespace ps2_stubs
+ {
+     namespace
+@@ -87,11 +92,189 @@ namespace ps2_stubs
          setReturnU32(ctx, newGuestAddr);
      }
  
@@ -1575,6 +1607,16 @@ index d467c4b..f5dd628 100644
 +                    std::cout << t << " ";
 +                }
 +                std::cout << " SAME=" << (resolved != nullptr && std::memcmp(flat, resolved, 8) == 0 ? "yes" : "NO");
++                // W45. The comparison W44 did NOT make: this probe's own `rdram` against the pointer
++                // the harness observer is watching. RDRAMVIEW proved the TLB and a flat index agree
++                // WITH EACH OTHER, which says nothing about whether they are the same BUFFER the
++                // observer is reading. If they differ, both probes are internally consistent and still
++                // describing different memory -- which is the only way /BA and 05 80 can both be true.
++                // W45. Printed rather than linked across: the harness already emits the pointer it
++                // watches (VULCAN4 RDRAMPROBE), so the two numbers are compared by eye in the same
++                // log. Exporting a symbol from the harness into the runtime for this would have been
++                // the wrong dependency direction, and the first attempt did not link at all.
++                std::cout << " probe_rdram=" << static_cast<const void *>(rdram);
 +            }
 +            std::cout << " obj->0x0='";
 +            printGuestCStr(rdram, f0);

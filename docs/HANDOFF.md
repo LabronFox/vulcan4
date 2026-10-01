@@ -6553,3 +6553,79 @@ is unconfirmed.** `RDRAMPROBE` and the flat-vs-TLB read in W64 were the two time
 are the only conclusions from this stretch that survived.
 
 Suite **482/482**. `VULCAN4 FRAME source=guest` has never printed.
+
+---
+
+## W76 — W74's wall was MY OWN `head -14`, and the "overlapping memcpy" hypothesis is dead
+
+### RETRACTION 1 — the wall W74 named does not exist
+
+W74 said: *"the store observer, all widths, 600,000 entries, sees exactly **four** in-window write events
+at `0x01051A10`... nothing traced ever writes `cdrom0:` into that buffer."*
+
+**Both halves are false, and the cause is mine.** `VULCAN4_WATCH_MAX` caps `W30WRITE` at 60 lines; my
+command piped it through `head -14` and I wrote *four* — not even the fourteen I could see — as a
+**measurement**. The instrument was answering; I cut off its answer and reported the cut.
+
+With the cap respected, one run, deduplicated by shape, in `seq` order — **the whole assembly recipe**:
+
+```
+ 84593  WRITE32  addr=0x1051a34 sz=4                     (a pointer, 0x1051a00)
+ 84601  WRITE32  addr=0x1051a30 sz=4
+ 374502 memcpy src=0x103d1d8 addr=0x1051a10 sz=9          "core.gt4"  <- from the disc image
+ 374632 memcpy src=0x10519c0 addr=0x1051a10 sz=2          2 bytes from 0x010519C0
+ 374635 WRITE8  addr=0x1051a12 sz=1                       '/'  (0x2f)
+ 374642 memcpy src=0x1051a10 addr=0x1051a13 sz=9          self-shift, dst = src + 3
+        memcpy src=0x103d558 addr=0x1051a10 sz=8          "cdrom0:\"  <- 7,727 times
+```
+
+**There is no untraced writer.** `memcpy src=0x103d558 addr=0x1051a10 size=8` appears **7,727 times** in
+a 600,000-entry run, fully traced, and it is the `cdrom0:\` constant from `0x0103D558`. The guest writes
+the device prefix correctly and visibly. W74's "the wall is an untraced write" is **withdrawn**.
+
+### RETRACTION 2 — the overlapping-memcpy hypothesis is dead too
+
+`memcpy src=0x1051a10 addr=0x1051a13 size=9` **is** self-overlapping (dst = src + 3), and
+`ps2_stubs::memcpy` does `::memcpy(hostDest, hostSrc, chunk)` with no overlap check, which is undefined
+behaviour in C. That is a real latent hazard and I expected it to be the wall.
+
+**Red test `W76` came back GREEN.** glibc's `memcpy` already copies backwards when `dst > src`, so the
+result is correct:
+
+```
+[Run]: W76: guest memcpy with dst > src and overlap must behave like memmove  [Passed]
+      bytes@a1=[63 6f 72 63 6f 72 65 2e 67]   src, clobbered by the shift -- which is correct memmove
+      bytes@dst=[63 6f 72 65 2e 67 74 34 00] "core.gt4\0", intact and correct
+```
+
+Kept as a regression guard — the hazard is real, glibc is merely kind today. **But the hypothesis is
+dead and I am not going to dress a green test as a fix.**
+
+### What is actually true, and the shape of the remaining question
+
+The guest assembles the path in five visible steps, and the device half is **right**:
+
+1. `core.gt4` (9 bytes) from `0x0103D1D8` — correct, right constant from the image.
+2. Two bytes pasted from `0x010519C0` over the head.
+3. `/` at offset 2.
+4. Self-shift of 9 bytes by 3 — the W35 "C: overlapping shift", and it is correct.
+5. `cdrom0:\` (8 bytes) from `0x0103D558` over the head — correct.
+
+Steps 1–4 are W35's whole `joined="?/?/e.gt4"` mystery, and step 5 is what turns a filename into a
+device path. **The buffer the open reads, `cdrom0:\CDROM0:\;1`, has the correct `cdrom0:\` head from
+step 5 and a tail from step 4's shift.** The tail is assembled from a **2-byte paste out of
+`0x010519C0`**, which W65 already measured as `05 80` and which is the last unexplained input.
+
+**So the wall is one 2-byte source: `0x010519C0`, and specifically what should have been in it.** W65
+proved the guest builds `/BASCUS-97328GAMEDATA` there and that it is later overwritten; W64 blamed the
+wrong function and W66 proved why; W71 withdrew the record-table reading. Nothing has yet named the
+**correct** writer of the correct value.
+
+### Next single step
+
+`0x010519C0` has been the un-named thing for four dishes. Stop watching `0x01051A10` and watch the
+**source**: `VULCAN4_WATCH_LO=0x010519C0`, and with the cap raised, find the LAST writer before the
+`memcpy src=0x103d1d8` at `seq=374502` — not the first. The first is the `/BASCUS-...` build everyone
+already knows. The one that matters is the last.
+
+Suite **482/483** — the +1 is the W76 overlap guard.

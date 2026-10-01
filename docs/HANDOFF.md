@@ -6259,3 +6259,43 @@ observer already covers every width (`Ps2FastWrite128` included), so this is a w
 wrong pointer there.
 
 Suite **482/482**. `VULCAN4 FRAME source=guest` has never printed.
+
+---
+
+## W71 — `obj` at `0x1fffe80` is a STACK FRAME, not a record table, and W65's "record table" is therefore suspect
+
+The window watch W70 asked for. `VULCAN4_WATCH_LO=0x1fffe80`, every observed write, verbatim:
+
+```
+n=1 pc=0x101d2bc ra=0x101d3cc addr=0x1fffe80 size=8 value=0x101d3cc
+n=3 pc=0x100ac18 ra=0x100acd0 addr=0x1fffe80 size=8 value=0x1
+n=5 pc=0x100ac28 ra=0x100acd0 addr=0x1fffe88 size=8 value=0x70002050
+```
+
+**The first write stores `0x101d3cc` — the return address of the very instruction doing the storing.**
+That is `sd $ra, 0($sp)`: a stack frame save. `0x1fffe80` is the top of the guest stack, and W65's
+"obj" is a live stack frame of a function in the `0x101d3xx` range, not a structure with named fields.
+
+### What that does and does not change
+
+- **It retires one framing.** W65 argued the span at `0x010519C0` was "fixed-stride records with a name
+  field at a fixed offset". That reading was made from a hex dump alone, and W65 already said so. The
+  `obj` the join dereferences is on the stack, so the `0x8005 / 0x41 / 0x03 / 0x42 / 0x1400 / 0x59`
+  words are **not** fields of the object the join walks, and the "record table" label should not be
+  carried forward. I am not replacing it with a better story; I am withdrawing it.
+- **It does not change the W70 finding.** `obj->0x0 = 0x01051A10` is still a stack-resident *pointer* to
+  the heap scratch buffer, and the join still ends up with the filename component empty. The
+  self-reference is real; only the thing it is self-referential *to* is a stack slot, not a struct.
+- **Note `0x70002050` at `+0x8`.** That is the same scratchpad pointer W66's `STRUCTSTORE` probe read
+  as `$s2` at `pc=0x100a45c`, so `0x1fffe80` is a frame belonging to `sub_0100A348` — the function W64
+  wrongly blamed for the clobber, and which this now places in the same call chain as the path join.
+
+### Honest next single step
+
+Not another dump. The two callers that assemble a path into `0x01051A10` — `0x01005008` (disc) and
+`0x0100E66C` (card) — are the thing to read, **from the generated unit's own comments**, never from a
+hand decode. W10 was decoded wrong four times by hand; CAMPAIGN.md is explicit that the generated
+`// 0xADDR: mnemonic` comments are the authority. `0x01005008`'s prologue and the store that puts
+`cdrom0:\` into the buffer is one function to read, and it is where the empty filename is born.
+
+Suite **482/482**. `VULCAN4 FRAME source=guest` has never printed.

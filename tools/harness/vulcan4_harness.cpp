@@ -171,6 +171,21 @@ void watchGuestStoreForPath(uint32_t guestAddr,
     // Only for writes that actually overlap the watched window: the snapshot is 16 bytes of copying
     // and the whole reason it is affordable is that the overlap test rejects almost everything.
     const bool overlapsWatch = (guestAddr < kWatchHi) && ((guestAddr + size) > kWatchLo);
+    // W57c. COMPACT UNFILTERED TRACE. The window filter is why this took so long: at W57b the
+    // observer's own dump changed between seq=409 and seq=416 -- the guest's memory went from an
+    // 8-byte string to an 11-byte one, and the Open agreed with the new value -- with NO event
+    // logged in between. The change was real; the write that made it was outside the window, so the
+    // dump could never show it. This prints every traced write's shape with no filtering and no
+    // window dump, so "the bytes changed and nothing was logged" stops being possible. Off unless
+    // VULCAN4_TRACE_WRITES is set, because it is one line per guest write.
+    static const bool kTraceAllWrites = watchEnv("VULCAN4_TRACE_WRITES", 0u) != 0u;
+    if (kTraceAllWrites && g_rdramForWatch != nullptr)
+    {
+        std::cout << "VULCAN4 WTRACE seq=" << ps2NextTraceSequence() << " op="
+                  << (op != nullptr ? op : "?") << " src=0x" << std::hex << srcAddr
+                  << " addr=0x" << guestAddr << " size=" << std::dec << size << " inwin="
+                  << (overlapsWatch ? 1 : 0) << "\n";
+    }
     uint8_t before[kWatchHi - kWatchLo];
     if (overlapsWatch && g_rdramForWatch != nullptr && g_watchStoreHits < kWatchStoreMax)
     {

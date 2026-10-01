@@ -5087,3 +5087,69 @@ write that does not go through guest memory at all.
   to be what this guest reads; needs a red test, not a guess.
 
 **STATUS: no frame.** Suite **478/478**. Boot `functions_entered=1253719`, `halt=wallclock_deadline`.
+
+---
+
+## 2026-10-01 — W57c: BYTE ACCOUNTING IS COMPLETE. The missing write was the guest copying its own string onto itself at +3
+
+### The instrument that finished it: a compact UNFILTERED write trace
+
+The window filter is what made this take three passes. At W57b the observer's **own dump** changed
+between seq=409 and seq=416 — the guest's memory went from an 8-byte string to an 11-byte one and the
+`Open` agreed with the new value — with **no event logged in between**. The change was real; the write
+that made it was outside the window, so the dump could never show it.
+
+`WTRACE` (new, `tools/harness/vulcan4_harness.cpp`, gated on `VULCAN4_TRACE_WRITES=1`) prints
+`seq / op / src / addr / size / inwin` for **every** traced write with no filtering and no window dump.
+One line per guest write, so it is off unless asked for. **This is the instrument that closed the
+question**, and it took one run.
+
+### The missing write, named from a real run
+
+```
+seq=374844  memcpy  src=0x010519C0 -> dst=0x01051A10  size=2    the 2-byte prefix
+seq=374845  WRITE8                         -> dst=0x01051A12  size=1    '/'  (0x2f)
+seq=374846  Ps2FastWrite8                   -> dst=0x01051A12  size=1
+seq=374848  memcpy  src=0x01051A10 -> dst=0x01051A13  size=9    <-- THE MISSING ONE
+```
+
+**The guest copies its own just-built 9 bytes onto itself at +3.** Counting from the unfiltered trace:
+`0x01051A13` is written **15,714** times, `0x01051A10` 47,142, `0x01051A12` 31,428 — and there were
+**15,714 Opens**. So it happens **exactly once per Open**. It is an overlapping copy (src inside dst
+range), which is why `memcpy` semantics matter here; our chunked forward copy produces exactly what the
+`Open` then reads. **Every byte of the 12-byte path is now accounted for.**
+
+**So the guest is building: `<2-byte prefix>` `/` `e.gt4`, then duplicating the whole thing at +3.**
+
+### What the 2-byte prefix is copied from, and the contradiction I have NOT resolved
+
+`0x010519C0` is built by the guest itself, early, and reads cleanly:
+
+```
+seq=18074  WRITE8  pc=0x1003D9C -> 0x010519C0 size=1     '/'
+seq=18080  memcpy  src=0x0103D638 -> 0x010519C1 size=2    "/B"
+seq=18083  memcpy  src=0x0103D650 -> 0x010519C3 size=10   "SCUS-97328"
+```
+
+i.e. **`/BASCUS-97328`** — GT4's own save directory, matching `/BASCUS-<id>GAMEDATA` in the wild.
+**No later write to `0x010519C0` appears in the windowed trace.** Yet the `Open` reads `05 80` at
+offsets 0–1, not `/B`. **That contradiction is unresolved and I am not going to resolve it by
+guessing.** It is exactly the question the next run must answer, and the reason the last run could not:
+`VULCAN4_TRACE_WRITES=1` alone left `VULCAN4_WATCH_MAX` at its default 120, so the windowed dump had
+long since stopped by the time the copy at seq≈374844 happened.
+
+### NEXT — one run, fully armed
+
+```
+VULCAN4_TRACE_WRITES=1 VULCAN4_WATCH_MAX=400000 xvfb-run -a ./vulcan4_harness <guest> <toml> 2000000 12
+```
+then read the `W30WRITE ... raw=` dump **at the copy seq**. That gives the true 2 bytes at
+`0x010519C0` at the moment of the copy, and therefore says whether the guest is copying a real prefix
+or a stale table — which is the whole of (a) versus (c).
+
+**Two real blind spots remain closed** (`Ps2FastWrite8/16/64/128`, `PS2Memory::write8..128`), red first,
+suite **478/478**. A 1.1 GB `WTRACE` log was produced and **deleted**; do not leave one on the SSD.
+
+**STATUS: no frame.** `VULCAN4 FRAME source=guest` has never printed. The card probe remains correct
+(`FIO_O_RDONLY` → `-4`, per `ps2mc_fio.c:724-726`) and the four-source search still runs steps 2 and 3
+without reaching step 4.

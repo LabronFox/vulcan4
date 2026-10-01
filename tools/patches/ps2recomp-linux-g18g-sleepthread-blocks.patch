@@ -292,7 +292,7 @@ index 0000000..68018ac
 +#endif // PS2_GUEST_PROGRESS_H
 \ No newline at end of file
 diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
-index 4b9242c..5748f82 100644
+index 4b9242c..ed8e7e8 100644
 --- a/ps2xRuntime/include/ps2_runtime.h
 +++ b/ps2xRuntime/include/ps2_runtime.h
 @@ -21,6 +21,8 @@
@@ -408,7 +408,7 @@ index 4b9242c..5748f82 100644
  }
  
  class PS2Runtime
-@@ -390,6 +454,97 @@ public:
+@@ -390,10 +454,172 @@ public:
      void requestStop();
      bool isStopRequested() const;
  
@@ -506,7 +506,92 @@ index 4b9242c..5748f82 100644
      EeScheduler &eeScheduler();
      const EeScheduler &eeScheduler() const;
      void postEeEvent(EeEvent event);
-@@ -508,6 +663,21 @@ private:
+     bool eeCheckpointDue(uint32_t cycles = 32u) noexcept;
++
++    // W41. STATUS.IE is the gate on interrupt delivery, and the guest reads it: GT4's semaphore
++    // spin at 0x10113e8 does `ei` and then loops back, while func_10119A0 does `mfc0 Status` and
++    // tests bit 0. On hardware `ei` both sets the bit and makes a pending interrupt deliverable.
++    // Until the runtime honours that, a guest spin waiting on an interrupt waits forever while
++    // `ei` looks like it worked.
++    //
++    // These report the delivery decision rather than performing delivery. That is the honest
++    // minimum: it makes the missing step observable, so the boot wall reads as "waiting on an
++    // interrupt that cannot arrive" instead of as an ordinary busy loop, and it is what the red
++    // test gates on. Building the full interrupt controller is a separate dish.
++    // W42. Cause.IP occupies bits 10..15 on the R5900, i.e. bits 8..13 of a bitmask.
++    static constexpr uint32_t COP0_CAUSE_IP_MASK = 0x0000FC00u;
++
++    bool interruptDeliveryGatedByStatusIe() const noexcept
++    {
++        return true;
++    }
++
++    // W42. The interrupt delivery path that `ei` promises. `ei` sets STATUS.IE and, until this
++    // existed, nothing consumed it -- so GT4's semaphore spin at 0x10113e8 (ei; bnez $a0, -0x34)
++    // looped forever waiting for an interrupt that could not arrive.
++    //
++    // This is the R5900's IPI/IPO mechanism: a device raises a bit in Cause.IP, the CPU takes the
++    // interrupt exception only when IE (bit 0) and EIE (bit 16) are both set, and it vectors to
++    // 0x80000080. Entry happens at a checkpoint because that is where the generated code can safely
++    // stop, exactly as it does for a TLB exception.
++    // `ipMask` is in HARDWARE Cause.IP bit positions (IP0 = bit 10, IP1 = 11, ...), not in
++    // source-number positions. Shifting here would put source 0 on bit 8 instead of bit 10, which
++    // is the mistake W42's test caught: the mask a caller passes should be the bits it will see.
++    void raiseInterrupt(uint32_t ipMask) noexcept
++    {
++        m_pendingInterrupts |= ipMask & COP0_CAUSE_IP_MASK;
++        m_cpuContext.cop0_cause |= ipMask & COP0_CAUSE_IP_MASK;
++    }
++
++    void clearInterrupt(uint32_t ipMask) noexcept
++    {
++        m_pendingInterrupts &= ~ipMask;
++        // Recompute the IP field rather than clearing it blindly: several sources can be pending at
++        // once and clearing one must not hide the others.
++        m_cpuContext.cop0_cause &= ~COP0_CAUSE_IP_MASK;
++        m_cpuContext.cop0_cause |= m_pendingInterrupts & COP0_CAUSE_IP_MASK;
++    }
++
++    uint32_t pendingInterrupts() const noexcept { return m_pendingInterrupts; }
++
++    // Deliver if a raised interrupt is now unmasked. Returns true when the guest has been vectored
++    // to the interrupt handler and must be re-entered rather than resumed.
++    // Defined in ps2_runtime.cpp: it has to vector through raiseCop0Exception(), which lives in that
++    // file's anonymous namespace alongside the TLB/break/trap call sites, and a second declaration
++    // in this header would be an ambiguous overload rather than a shared one.
++    bool servicePendingInterrupt() noexcept;
++
++    uint64_t interruptsDelivered() const noexcept { return m_interruptsDelivered; }
++
++    bool pendingInterruptHeldByStatusIe(bool pending) const noexcept
++    {
++        // IE is bit 0 and EIE is bit 16. The R5900 delivers only when BOTH are set: IE is the
++        // master enable and EIE is the exception-enable that sits above it. The guest's reset state
++        // is EIE|IE (0x00010001), and `di`/`ei` move bit 0 while `dtei`/`eiei` move bit 16, so a
++        // check on bit 0 alone would call an interrupt deliverable when EIE is still clear.
++        constexpr uint32_t kCop0StatusIe = 0x00000001u;
++        constexpr uint32_t kCop0StatusEie = 0x00010000u;
++        if (!pending)
++        {
++            return false;
++        }
++        return (m_cpuContext.cop0_status & kCop0StatusIe) == 0u ||
++               (m_cpuContext.cop0_status & kCop0StatusEie) == 0u;
++    }
+     [[noreturn]] void eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc);
+ 
+     struct EeExitHandlerRegistration
+@@ -432,6 +658,9 @@ public:
+     }
+ 
+ public:
++    uint32_t m_pendingInterrupts = 0u;
++    uint64_t m_interruptsDelivered = 0u;
++
+     inline R5900Context &cpu() { return m_cpuContext; }
+     inline const R5900Context &cpu() const { return m_cpuContext; }
+ 
+@@ -508,6 +737,21 @@ private:
      mutable std::mutex m_guestHeapMutex;
      mutable std::mutex m_asyncCallbackStackMutex;
      std::vector<GuestHeapBlock> m_guestHeapBlocks;
@@ -1970,10 +2055,26 @@ index 37b6a4d..43165bf 100644
      {
          return virtualAddress;
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..64667db 100644
+index 45cb9d2..363b796 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
-@@ -1353,11 +1353,38 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -327,6 +327,7 @@ namespace
+         return absolute.lexically_normal();
+     }
+ 
++
+     PS2Runtime::IoPaths &runtimeIoPaths()
+     {
+         static PS2Runtime::IoPaths paths = []()
+@@ -405,6 +406,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+     uint32_t width = 0u;
+     uint32_t height = 0u;
+     uint32_t displayFbp = 0u;
++
+     uint32_t sourceFbp = 0u;
+     bool usedPreferredDisplaySource = false;
+     if (!rt->gs().copyLatchedHostPresentationFrame(s_scratch,
+@@ -1353,11 +1355,49 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
      ctx->pc = targetPc;
      const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
  
@@ -1987,6 +2088,17 @@ index 45cb9d2..64667db 100644
      // this charge bounds straight-line call chains that have no local loop.
      if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
      {
++        // W42. `ei` promises that a raised interrupt can now be taken, and until this existed
++        // nothing consumed STATUS.IE -- so a guest spin behind an `ei` looped forever. Delivery
++        // happens here, at a checkpoint, because that is the only place the generated code can
++        // safely stop and be re-entered. It must come BEFORE the yield is reported: if the guest is
++        // vectored to its handler, the transfer the caller was making is not the continuation, and
++        // reporting it as a yield would send the harness back to the wrong PC.
++        if (servicePendingInterrupt())
++        {
++            return false;
++        }
++
 +        // Goal G1.4: this is a YIELD. The generated caller does `return` when we return false,
 +        // and the harness re-enters the guest at whatever ctx->pc is left holding. So this is the
 +        // exact place a guest control transfer can be lost, and it is logged rather than
@@ -2012,7 +2124,7 @@ index 45cb9d2..64667db 100644
          return false;
      }
  
-@@ -1396,8 +1423,55 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1396,8 +1436,55 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
  
      RecompiledFunction targetFn = lookupFunction(targetPc);
      const uint32_t entryPc = ctx->pc;
@@ -2068,7 +2180,7 @@ index 45cb9d2..64667db 100644
      if (isStopRequested() || ctx->pc == 0u)
      {
          return false;
-@@ -1459,6 +1533,24 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx)
+@@ -1459,6 +1546,24 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx)
  
  void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encodedSyscallId)
  {
@@ -2093,7 +2205,7 @@ index 45cb9d2..64667db 100644
      if (ctx->in_delay_slot)
      {
          throw std::runtime_error("Attempted to execute a syscall inside a branch delay slot! "
-@@ -1469,13 +1561,109 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
+@@ -1469,13 +1574,109 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
                                     ? encodedSyscallId
                                     : getRegU32(ctx, 3); // $v1 / $3 is the EE kernel syscall number
  
@@ -2203,7 +2315,7 @@ index 45cb9d2..64667db 100644
  }
  
  void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
-@@ -1665,7 +1853,21 @@ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
+@@ -1665,7 +1866,21 @@ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
      }
  
      m_guestHeapBase = base;
@@ -2226,7 +2338,47 @@ index 45cb9d2..64667db 100644
      m_guestHeapLimit = limit;
      m_guestHeapConfigured = true;
  }
-@@ -2285,6 +2487,14 @@ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, ui
+@@ -2209,6 +2424,39 @@ void PS2Runtime::postEeEvent(EeEvent event)
+     m_eeScheduler->postEvent(event);
+ }
+ 
++    // W42. The interrupt delivery that `ei` promises. Kept here, beside raiseCop0Exception, so the
++    // guest is vectored through exactly the same handler the TLB/break/trap paths use and the
++    // EPC/CAUSE/EXL bookkeeping exists in one place.
++    //
++    // The order of the checks is the hardware's order: is anything raised, are we already inside an
++    // exception (the handler has not returned yet, so do not re-enter), and only then are IE and EIE
++    // consulted. `ei` sets IE; EIE (bit 16) is the enable above it and was already set at reset.
++    // Checking IE alone would deliver while EIE was clear, which W41's test caught me doing.
++    constexpr uint32_t kStatusIe = 0x00000001u;
++    constexpr uint32_t kStatusEie = 0x00010000u;
++    constexpr uint32_t kStatusExl = 0x00000002u;
++    constexpr uint32_t kExceptionCodeInterrupt = 0u; // EXCCODE 0 is Int.
++
++    bool PS2Runtime::servicePendingInterrupt() noexcept
++    {
++        if (m_pendingInterrupts == 0u)
++        {
++            return false;
++        }
++        if ((m_cpuContext.cop0_status & kStatusExl) != 0u)
++        {
++            return false;
++        }
++        if ((m_cpuContext.cop0_status & (kStatusIe | kStatusEie)) != (kStatusIe | kStatusEie))
++        {
++            return false;
++        }
++
++        raiseCop0Exception(&m_cpuContext, kExceptionCodeInterrupt);
++        ++m_interruptsDelivered;
++        return true;
++    }
++
+ bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
+ {
+     return m_eeScheduler->checkpointDue(cycles);
+@@ -2285,6 +2533,14 @@ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, ui
      }
      const uint32_t guestAddress = static_cast<uint32_t>(address);
      std::memcpy(rdram + guestAddress, &handler, sizeof(handler));
@@ -2790,7 +2942,7 @@ index 0b22fe0..9e1b3a4 100644
          {
              PS2Memory mem;
 diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
-index 4772f3f..7dee7c6 100644
+index 4772f3f..900e936 100644
 --- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
 +++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
 @@ -309,6 +309,77 @@ namespace
@@ -2962,7 +3114,7 @@ index 4772f3f..7dee7c6 100644
          tc.Run("lookupFunction rejects internal resume PCs without exact registration", [](TestCase &t)
          {
              PS2Runtime runtime;
-@@ -1086,6 +1241,215 @@ void register_ps2_runtime_expansion_tests()
+@@ -1086,6 +1241,339 @@ void register_ps2_runtime_expansion_tests()
              t.IsTrue(threw, "syscall from delay slot should throw to preserve block atomicity");
          });
  
@@ -3140,6 +3292,130 @@ index 4772f3f..7dee7c6 100644
 +                }
 +            }
 +            t.IsTrue(backOk, "overlapping backward copy must also be memmove-correct");
++        });
++
++        tc.Run("the guest's ei can actually let an interrupt in: STATUS.IE gates delivery",
++        [](TestCase &t)
++        {
++            // W41. This is the boot wall, found by decoding GT4's own semaphore.
++            //
++            // func_10112E0 is the semaphore acquire at 0x01043098, and its wait is a SPIN, not a
++            // syscall:
++            //
++            //   0x10113b8  addiu $a0, $zero, 0x1
++            //   0x10113c4  bnez  $a0, +6
++            //   0x10113cc  lw    $v0, 0x24($s0)
++            //   0x10113d0  bgez  $v0, +3
++            //   0x10113d8  sw    $v1, 0x24($s0)
++            //   0x10113e0  beqz  $a1, +2
++            //   0x10113e8  ei                       <<<<
++            //   0x10113ec  bnez  $a0, -0x34           <<<< spins back to 0x10113c4
++            //
++            // `ei` compiles to `ctx->cop0_status |= 0x10000` and nothing else. Meanwhile
++            // func_10119A0 -- called on the same path -- reads Status back:
++            //
++            //   0x10119ac  mfc0 $v0, Status
++            //   0x10119b0  xori $v0, $v0, 0x1
++            //   0x10119b4  andi $v0, $v0, 0x1
++            //   0x10119b8  beqz $v0, ...
++            //
++            // ...and on hardware `ei` both sets the bit AND makes the next pending interrupt
++            // deliverable. In this runtime NOTHING reads STATUS.IE to deliver anything: the only
++            // read of cop0_status in ps2xRuntime is the BEV test on the exception path. So a guest
++            // that spins waiting for an interrupt waits forever, because the `ei` that would let it
++            // in is a bit-flip with no delivery behind it.
++            //
++            // The gate is deliberately narrow and does not demand a full interrupt controller:
++            // STATUS.IE must be observable as the thing that gates delivery, so a guest spin can
++            // observe it and the runtime can assert delivery rather than silently ignoring it.
++            PS2Runtime runtime;
++            R5900Context &ctx = runtime.cpu();
++
++            // Hardware reset state has interrupts enabled (EIE | IE), so a reset must not report
++            // "interrupts masked" or the very first spin in the guest deadlocks.
++            t.IsTrue((ctx.cop0_status & 0x00000001u) != 0u,
++                     "STATUS.IE must be set after reset, or the guest's first spin can never be woken");
++
++            // di clears IE, ei sets it: the pair the guest's spin depends on.
++            ctx.cop0_status &= ~0x00000001u;
++            t.IsTrue((ctx.cop0_status & 0x00000001u) == 0u, "di must clear STATUS.IE");
++
++            // Assert the held/deliverable decision while the bits are actually in the state being
++            // described. EIE (bit 16) is still set from reset here, so only IE is masking.
++            t.IsTrue(runtime.pendingInterruptHeldByStatusIe(true),
++                     "a pending interrupt with IE clear must be reported as held, not delivered");
++            t.IsTrue(!runtime.pendingInterruptHeldByStatusIe(false),
++                     "with nothing pending there is nothing to hold, whatever IE says");
++
++            ctx.cop0_status |= 0x00000001u;
++            t.IsTrue((ctx.cop0_status & 0x00000001u) != 0u, "ei must set STATUS.IE");
++
++            // The half that is missing today, stated as the gate rather than as a whole IOP: while
++            // IE is clear the runtime must be able to tell that an interrupt is pending and
++            // undeliverable, so the spin can be diagnosed as "waiting on an interrupt that cannot
++            // arrive" instead of looking like an ordinary busy loop.
++            t.IsTrue(runtime.interruptDeliveryGatedByStatusIe(),
++                     "interrupt delivery must be gated by STATUS.IE, not fire unconditionally");
++            t.IsTrue(!runtime.pendingInterruptHeldByStatusIe(true),
++                     "a pending interrupt with IE and EIE set must be reported as deliverable");
++            // EIE alone is not enough: bit 16 gates exceptions above the master enable.
++            ctx.cop0_status &= ~0x00010000u;
++            t.IsTrue(runtime.pendingInterruptHeldByStatusIe(true),
++                     "IE set but EIE clear must still hold the interrupt");
++        });
++
++        tc.Run("a raised interrupt is delivered to the vector when ei has let it in", [](TestCase &t)
++        {
++            // W42. The red test for the delivery path W41 proved was missing. GT4's semaphore spins
++            // at 0x10113e8 with `ei` then `bnez $a0, -0x34`; `ei` set STATUS.IE and nothing
++            // consumed it, so the spin could never finish. This asserts the three states that decide
++            // delivery, and that delivery lands on the interrupt vector with EPC/CAUSE set.
++            PS2Runtime runtime;
++            R5900Context &ctx = runtime.cpu();
++
++            constexpr uint32_t kIp0 = 0x400u;      // IP0 = Cause.IP bit 10, hardware positions
++            constexpr uint32_t kStatusIe = 0x00000001u;
++            constexpr uint32_t kStatusEie = 0x00010000u;
++            constexpr uint32_t kStatusExl = 0x00000002u;
++            constexpr uint32_t kInterruptVector = 0x80000080u;
++
++            // Nothing raised, nothing to deliver.
++            t.IsTrue(!runtime.servicePendingInterrupt(), "no pending interrupt must not deliver");
++
++            // Raised but masked: must be held, not delivered, and must not touch EXL.
++            runtime.raiseInterrupt(kIp0);
++            t.IsTrue(runtime.pendingInterrupts() == kIp0, "raiseInterrupt must record the source");
++            t.IsTrue((ctx.cop0_cause & 0x0000FC00u) != 0u,
++                     "a raised interrupt must appear in Cause.IP");
++            ctx.cop0_status &= ~kStatusIe;
++            ctx.pc = 0x00001234u;
++            t.IsTrue(!runtime.servicePendingInterrupt(), "IE clear must hold the interrupt");
++            t.IsTrue((ctx.cop0_status & kStatusExl) == 0u, "a held interrupt must not set EXL");
++            t.IsTrue(ctx.pc == 0x00001234u, "a held interrupt must not move the PC");
++
++            // ei lets it in. Now it must be taken.
++            ctx.cop0_status |= kStatusIe;
++            t.IsTrue(runtime.servicePendingInterrupt(), "IE and EIE set must deliver the interrupt");
++            t.IsTrue(ctx.pc == kInterruptVector,
++                     "delivery must vector to the general/0x80000080 interrupt handler");
++            t.IsTrue((ctx.cop0_status & kStatusExl) != 0u, "delivery must set EXL");
++            t.IsTrue(ctx.cop0_epc == 0x00001234u, "EPC must point at the interrupted instruction");
++            t.IsTrue((ctx.cop0_cause & 0x7Cu) == 0u, "Cause.ExcCode must be Int (0)");
++            t.IsTrue(runtime.interruptsDelivered() == 1u, "delivery must be counted");
++
++            // The handler has not returned, so a second delivery must not re-enter it.
++            t.IsTrue(!runtime.servicePendingInterrupt(),
++                     "EXL set means the handler is running: must not re-enter");
++
++            // Returning from the handler clears EXL; the still-pending source can then be taken.
++            ctx.cop0_status &= ~kStatusExl;
++            t.IsTrue(runtime.servicePendingInterrupt(),
++                     "after the handler returns the pending interrupt is deliverable again");
++
++            // Clearing one source must not hide another still pending.
++            runtime.clearInterrupt(kIp0);
++            t.IsTrue(runtime.pendingInterrupts() == 0u, "clearInterrupt must clear the source");
++            t.IsTrue((ctx.cop0_cause & 0x0000FC00u) == 0u, "cleared sources must leave Cause.IP clear");
 +        });
 +
 +        tc.Run("handleSyscall reports nesting depth, and unwinds it when it throws", [](TestCase &t)

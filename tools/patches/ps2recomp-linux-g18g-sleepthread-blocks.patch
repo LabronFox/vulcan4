@@ -1448,10 +1448,10 @@ index c5e31c4..d6e29cc 100644
                  m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                       { return !m_events.empty() ||
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
-index d467c4b..8968f4b 100644
+index d467c4b..f5dd628 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
-@@ -87,11 +87,145 @@ namespace ps2_stubs
+@@ -87,11 +87,179 @@ namespace ps2_stubs
          setReturnU32(ctx, newGuestAddr);
      }
  
@@ -1542,6 +1542,40 @@ index d467c4b..8968f4b 100644
 +                      << " memcpy(dest=0x" << std::hex << dest << " src=0x" << src << " size=" << std::dec
 +                      << size << ") first(s2)=0x" << std::hex << first << std::dec;
 +            printGuestCStr(rdram, first);
++            // W44. DECISIVE: read this address both ways at the same instant. The harness's store
++            // observer indexes `rdram + addr` flat; ps2_stubs::memcpy resolves through
++            // ps2ResolveGuestPointer (the TLB/stripmine). The store observer logged '/BASCUS-97328GA'
++            // at 0x10519C0 moments before, and this probe read '05 80' from it. Both read the same
++            // buffer -- the harness proved the cached pointer equals the live one -- so if the two
++            // disagree HERE, our guest-pointer resolution and a flat index are different views of
++            // memory, and every store observation this project has made is reading the wrong one.
++            {
++                uint8_t flat[8] = {0};
++                const uint8_t *resolved = getConstMemPtr(rdram, src);
++                for (uint32_t k = 0; k < 8u; ++k)
++                {
++                    if (src + k < PS2_RAM_SIZE)
++                    {
++                        std::memcpy(flat + k, rdram + src + k, 1u);
++                    }
++                }
++                std::cout << " RDRAMVIEW flat=";
++                for (uint32_t k = 0; k < 8u; ++k)
++                {
++                    char t[4];
++                    std::snprintf(t, sizeof(t), "%02x", flat[k]);
++                    std::cout << t << " ";
++                }
++                std::cout << " tlb=" << static_cast<const void *>(resolved)
++                          << " tlbytes=";
++                for (uint32_t k = 0; k < 8u && resolved != nullptr; ++k)
++                {
++                    char t[4];
++                    std::snprintf(t, sizeof(t), "%02x", resolved[k]);
++                    std::cout << t << " ";
++                }
++                std::cout << " SAME=" << (resolved != nullptr && std::memcmp(flat, resolved, 8) == 0 ? "yes" : "NO");
++            }
 +            std::cout << " obj->0x0='";
 +            printGuestCStr(rdram, f0);
 +            std::cout << "' src_raw=";

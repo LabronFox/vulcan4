@@ -5153,3 +5153,75 @@ suite **478/478**. A 1.1 GB `WTRACE` log was produced and **deleted**; do not le
 **STATUS: no frame.** `VULCAN4 FRAME source=guest` has never printed. The card probe remains correct
 (`FIO_O_RDONLY` → `-4`, per `ps2mc_fio.c:724-726`) and the four-source search still runs steps 2 and 3
 without reaching step 4.
+
+---
+
+## 2026-10-01 — W57d: the path is NOT an instrumentation artifact, and the prefix source is overwritten by something we still cannot see
+
+### Ruled out: the observer is not causing this
+
+With the store observer **completely off** (`VULCAN4_WATCH_MAX=0`; the run log contains **0**
+`W30WRITE` and **0** `WTRACE` lines), `sceMcOpen` still reads the identical string:
+
+```
+'\x05\x80/\x05\x80/e.gt4'      39 of 39 opens examined
+window +0x10: 05 80 2f 05 80 2f 65 2e 67 74 34 00
+```
+
+So the malformed prefix is **the guest's own output in a clean run**. Every earlier worry that the
+instrument perturbed the guest is withdrawn — I checked it, and it is not the case.
+
+### The prefix source, at the moment of the copy
+
+At the prefix copy (seq=405, `memcpy dst=0x01051A10 src=0x010519C0 size=2`):
+
+```
+source 0x010519C0 : 05 80 00 00 00 00 00 00
+dest   0x01051A10 : 05 80 72 65 2e 67 74 34 00     (post-copy; "e.gt4" already there)
+```
+
+**So the copy is faithful. `0x010519C0` really does hold `05 80` followed by zeros.** Our `memcpy`
+is not copying the wrong bytes; it is copying what is really there.
+
+### The contradiction, stated exactly
+
+Earlier in the same boot the guest builds that buffer readably and nothing else appears to touch it:
+
+```
+seq=21  WRITE8   pc=0x1003D9C  -> 0x010519C0 size=1   '/'      0x2f
+seq=23  Ps2FastWrite8                           -> 0x010519C0 size=1
+seq=25  memcpy   src=0x0103D638  -> 0x010519C1 size=2   "/B"
+seq=27  memcpy   src=0x0103D650  -> 0x010519C3 size=10  "SCUS-97328"
+```
+
+which is **`/BASCUS-97328`**, GT4's own save directory. **By seq=405 the first two bytes are `05 80`
+and the rest are zeros.** Something between seq 27 and seq 405 overwrote `0x010519C0` — and it did so
+**through an address my filters never matched**: the only writes I have been filtering on are those
+whose reported destination *starts* at `0x010519C0`, so any write that merely **spans** that address
+from below (a `memset`, a 16-byte `write128`, a bulk copy from `0x010519B0`) was invisible. **That is
+a filter in my analysis, not a gap in the runtime** — and it is exactly the kind of mistake that
+produced W44's "contradiction", so it is recorded rather than quietly corrected.
+
+### NEXT, one run
+
+`WTRACE` already prints every traced write unfiltered. Filter it by **span**, not by start address:
+
+```
+VULCAN4_TRACE_WRITES=1 ... ; then keep only rows where addr < 0x010519C0 AND addr+size > 0x010519C0
+```
+
+That names the writer of the prefix source with certainty, and it is the last unknown between here and
+a decision between (a) and (c). **Do not run it with `VULCAN4_WATCH_MAX` raised** — the windowed dump
+is not needed, and a `WTRACE` log reaches 2.3 GB; delete it afterwards and check `df -h`.
+
+### Where the wall stands
+
+- Byte accounting is **complete and every byte is named**, including the `+3` overlapping self-copy
+  (W57c). The guest builds `<2-byte prefix>` `/` `e.gt4` and duplicates the result at +3.
+- The 2-byte prefix is `05 80`, copied verbatim from `0x010519C0`, in a clean run.
+- `05 80` is **not** a PS2 device prefix (no such convention exists) and **not** a descriptor. **Its
+  meaning is still UNDECODED and is not being guessed.**
+- The card probe remains **correct**: `FIO_O_RDONLY` → `-4` per `ps2mc_fio.c:724-726`. The four-source
+  search (host, MCARD 0, MCARD 1, disc) still runs steps 2 and 3 and never reaches step 4.
+
+**STATUS: no frame, and the milestone is NOT met.** `VULCAN4 FRAME source=guest` has never printed.

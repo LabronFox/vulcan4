@@ -2430,3 +2430,70 @@ NEXT:   CPU lane is unchanged and still the priority: **what wakes tid2.** The p
         it — tid1 is doing real work in a job queue and separately spinning in the mutex broadcast,
         so the question is why the broadcast never issues `sce_WakeupThread`. Read tid1's loop
         condition in full, not its edges. Then items 4 (GS texture) and 6 (sceGs* inventory).
+
+## W18 — the PC histogram counts ENTRIES, and that makes it blind to exactly where the syscalls go
+
+Two corrections to my own work in this entry, because both were wrong and both would have cost the
+next session a day.
+
+### Correction 1 (retracted within minutes): the syscall tallies are NOT inflated
+
+I saw `sce_ChangeThreadPriority calls=1296791` against `functions_entered=1764586` in the same 45 s
+run, and the shim `sub_0101F2B0` arriving only **2** times at `0x0101f2b0`, and concluded the tally
+counts handler *invocations* — overcounting guest calls by ~650,000×. **That was wrong.** The
+recompiler emits `runtime->handleSyscall(...)` at **159** sites in the generated unit, including
+inline `syscall` instructions in the guest's own functions, so most guest syscalls never go through a
+shim function at all. `0x0101f2b0` being rare says only that the guest rarely *calls that shim*.
+**The CALLKIND counts are real guest syscall counts and W15/W16's analysis stands on them.**
+
+### Correction 2 (the one that matters): the histogram measures entries, not time
+
+Printing all 111 distinct PCs instead of a top-24 changed the reading completely. The top **16**
+addresses account for **100.00 %** of all 1,764,586 arrivals, and every other PC is ≤7 arrivals:
+
+```
+0x0101d420=302472(17.14%) 0x0101d3cc=302465(17.14%) 0x0101d3a0=302463(17.14%)
+0x01003a84=151234( 8.57%) 0x0100549c=100830( 5.71%) 0x01003e68=100830( 5.71%)
+0x01005480=100824( 5.71%) 0x01000374=50415( 2.86%) ... eight more at ~50.4K
+then: 0x0101f310=6  0x0101f2b0=2  0x01011508=3  0x0100ae78=2   <- everything else
+```
+
+**And not one of those 16 hot functions contains a single inlined syscall** (checked each of the 15
+containing `sub_0101D3xx` / `sub_01003xxx` / `sub_01004xxx` / `sub_01005xxx` against the unit: all
+`syscalls_inline=0`).
+
+So: the hot loop executes **no** syscalls, yet 3,025,850 syscalls are tallied in the same run. Both
+facts are true because **a guest function runs inline until it yields** — the harness says so at the
+entry site, and `pcEntryCounts` is incremented **once per entry, on the entry PC only**. A function
+entered *once* can spin through millions of instructions, and thousands of syscalls, internally,
+without ever appearing in this histogram more than once.
+
+**Therefore: the histogram is blind to time spent inside a function's internal loop.** It found the
+pump because the pump is made of many small functions that get entered over and over — but the
+syscall storm is happening *inside* a function entered a handful of times, and this diagnostic
+cannot see it. **Do not read the PC histogram as "where the guest spends its time".** It answers
+"which functions does the guest enter most often", which is a different and still useful question.
+
+### What this leaves, and the one thing to build
+
+The syscall mix is real and it is the strongest lead we have: `0x29 ChangeThreadPriority`=1,296,791
+and `0x2f GetThreadId`=1,729,059 in 45 s, against only 33 `sce_SleepThread` and **zero**
+`sce_WakeupThread`. Something is looping on those two syscalls **inside** a function body.
+
+To find it, the diagnostic has to count **basic-block arrivals**, not function entries — i.e. the
+generated code must bump a counter at each label, not only at each function entry. That is a change
+to the recompiler's code generator, so per law #8 it belongs in `tools/patches/` with the reason,
+and it must not be done by hand-editing the generated `.cpp`. Until that exists, the cheap way to
+localise the storm is to bisect by `$ra`: `handleSyscall` already records `tally.lastPc`, so a run
+that keeps only the syscall *sites* seen (not just the last) would name the function immediately.
+
+**Cheapest correct next step, in order:**
+
+1. Make `handleSyscall` tally the **set** of distinct PCs it was entered from, not just the last one.
+   That is one `unordered_set` per tally in `ps2_runtime.cpp`, and it names the guilty function in a
+   single 45 s run — no recompiler change needed.
+2. Then read that function's full body, and only its body, for the loop that calls 0x29/0x2f.
+3. Only then decide whether the fix is in the guest's expectations (a runtime service we owe) or in
+   our handling of those two syscalls.
+
+Do **not** re-run the `-O2` experiment; it is measured, kept, and does not move this wall.

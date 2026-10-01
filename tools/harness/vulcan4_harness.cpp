@@ -1442,8 +1442,14 @@ int main(int argc, char *argv[])
         std::vector<std::pair<uint32_t, uint64_t>> ranked(pcEntryCounts.begin(), pcEntryCounts.end());
         std::sort(ranked.begin(), ranked.end(),
                   [](const auto &left, const auto &right) { return left.second > right.second; });
+        // W17: print EVERY distinct PC, not just a top slice. The boot settles at ~113 distinct
+        // addresses, so the whole distribution is a couple of kilobytes -- and printing all of it is
+        // what settles an argument the top-24 could not: sce_ChangeThreadPriority tallies 2.24M while
+        // the whole run enters 2.04M functions, so either the syscall tally counts resumes as well
+        // as guest calls, or the shim arrivals have to be somewhere else in the table. Reading the
+        // shim's own arrival count out of the full list answers it; guessing from a slice does not.
         std::cout << "VULCAN4 PC HISTOGRAM distinct=" << ranked.size() << " top:";
-        const std::size_t limit = std::min<std::size_t>(24, ranked.size());
+        const std::size_t limit = std::min<std::size_t>(256, ranked.size());
         for (std::size_t i = 0; i < limit; ++i)
         {
             const double share =

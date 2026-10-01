@@ -5022,3 +5022,68 @@ the guest does not advance to the disc — and the first step is closing the `PS
 
 **STATUS: no frame.** Suite **477/477** + the new red test. Boot: `functions_entered=1253719`,
 `halt=wallclock_deadline`, 76,304 card opens, all correctly -4.
+
+---
+
+## 2026-10-01 — W57b: two blind spots CLOSED, and the missing bytes are STILL unwritten. Reported, not guessed
+
+### Fixed, red first, suite 478/478
+
+**Blind spot 1 — `Ps2FastWrite8/16/64/128` had no trace.** Only `Ps2FastWrite32` was ever instrumented
+(W45). Red test `G1.8j: every fast-write WIDTH reaches the store observer` in
+`ps2_memory_tests.cpp`: it fails 6/10 assertions before the fix and passes after. The generated code
+emits `ps2TraceGuestWrite(..., "WRITE8", ctx)` *before* `FAST_WRITE8`, so a guest `sb` was visible, but
+the runtime's own fast widths were not. After the fix the log shows the **paired** pattern for every
+width — `WRITE8`→`Ps2FastWrite8`, `WRITE16`→`Ps2FastWrite16`, `WRITE64`→`Ps2FastWrite64` — exactly as
+`WRITE32`→`Ps2FastWrite32` already did.
+
+**Blind spot 2 — `PS2Memory::write8/16/32/64/128` (`ps2_memory.cpp`) wrote `m_rdram` with no trace at
+all.** That is the runtime's own memory API, so every subsystem that goes through it (DMA, GS/VIF
+uploads, IOP copies) was invisible. Traced all five. *Measured consequence: `PS2Memory::writeN` never
+fires on this path — the ops histogram in a fresh run is `WRITE32` 687, `Ps2FastWrite32` 687,
+`WRITE8` 429, `Ps2FastWrite8` 429, `memcpy` 261, `WRITE64`/`Ps2FastWrite64` 2, `memset` 1,
+`WRITE16`/`Ps2FastWrite16` 1.*
+
+### The missing bytes are STILL missing. This is now a hard, reproducible fact.
+
+With both blind spots closed, in a fresh run (`VULCAN4_WATCH_MAX=2500`, cap reached at seq=**5163**,
+first Open at seq=**414** — so the observer was running throughout):
+
+- The guest writes **only** these name-field addresses: `0x1051A10`, `0x1051A12`, `0x1051A18`–`0x1051A20`.
+- **Zero** events address `0x01051A13`, `0x01051A14` or `0x01051A15` in the whole log.
+- Yet `sceMcOpen` reads **`05 80 2f 05 80 2f 65 2e 67 74 34 00`** — 11 characters, NUL at offset 11.
+
+**And the guest's own writes cannot produce that.** The 9-byte copy is `core.gt4\0`, so it places a NUL
+at offset 8; the 2-byte copy overwrites offsets 0–1; the `WRITE8` overwrites offset 2. A buffer built by
+exactly those three writes is **`05 80 2f 65 2e 67 74 34 00`** — **8 characters, NUL at offset 8** — and
+that is exactly what the shadow-buffer replay produces. **The real buffer is 3 bytes longer, and its
+`e.gt4` sits at offsets 6–10 rather than 3–7.**
+
+So the guest appears to perform the *same* `05 80` + `/` overwrite **twice** — at offsets 0–2 and again
+at 3–5 — and we see only the first. Reproduced identically in two independent runs. **Which code
+performs the second overwrite is NOT established, and I am not going to guess it.** Every traced guest
+write path is now closed, so the next step is not another observer: it is to find what writes
+`0x01051A13` — candidates that remain are an untraced host-side copy (the IOP `MCSERV` receive path
+runs on the `mcserv.cpp` side and this window is only reached through `ps2TraceGuestRangeWrite`) or a
+write that does not go through guest memory at all.
+
+### Where the wall actually stands, after this turn
+
+- **The card probe is CORRECT and must keep failing.** `mode=0x1` is `FIO_O_RDONLY` (ps2sdk
+  `io_common.h:29`) — our constant was *named* `FIO_F_READ`, which is a command opcode in a different
+  enum and is never passed to `sceMcOpen`. **Rename it.**
+  `-4` is right: `ps2mc_fio.c:724-726`, `if ((r==1) && ((flags & (CreateFile|CreateDir))==0)) return
+  sceMcResNoEntry;`. Real hardware does not create the file. **Do not "fix" this.**
+- **GT4 probes `CORE.GT4` on the card on purpose** — bootstrap+CORE design, four sources in order:
+  `host:/tmp/CORE.GT4`, MCARD 0, MCARD 1, then disc (Nenkai's GT modding hub,
+  `docs/ps2/executables.md`). It is the HD-loader/mod hook. So **(c) is refuted**: the card path is not
+  malformed, and **(b) is refuted**: no `O_CREAT` was requested.
+- **Measured:** ports 0 and 1 alternate **38,152 times each**, both correctly `-4`; `CORE.GT4` appears
+  **0** times against 76,304 card opens. **The search runs steps 2 and 3 and never reaches step 4.**
+- The disc file exists at `/mnt/ssd/gt4/work/CORE.GT4` and the G1 FileIO provider resolves `cdrom0:`.
+  The guest's disc open simply never arrives.
+- **Still open, and the honest next question:** `sceMcSync` returns a hardcoded `1` in `$v0` whatever the
+  result, where real libmc returns the fd (>=0) or the error (<0) (`libmc.h:227-237`). Not yet proven
+  to be what this guest reads; needs a red test, not a guess.
+
+**STATUS: no frame.** Suite **478/478**. Boot `functions_entered=1253719`, `halt=wallclock_deadline`.

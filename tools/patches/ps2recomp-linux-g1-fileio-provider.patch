@@ -518,6 +518,72 @@ index fe6d457..8c30c51 100644
      }
  }
  
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index a863310..1ca4bbf 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -244,11 +244,29 @@ static inline __m128i Ps2FastRead128(const uint8_t *rdram, uint32_t addr)
+ 
+ static inline void Ps2FastWrite8(uint8_t *rdram, uint32_t addr, uint8_t value)
+ {
++    // W57. CLOSING THE BLIND SPOT THE BYTE ACCOUNTING FOUND. Only Ps2FastWrite32 carried the trace,
++    // added when W45 closed a different gap; 8-, 16-, 64- and 128-bit fast writes went straight into
++    // guest memory and were invisible. Replaying every observed write into a shadow buffer and
++    // comparing it against the guest's real memory showed 4 bytes of a 12-byte path written before a
++    // guest call and reported by nothing. "The guest did not write this" was true of the observer and
++    // false of the guest -- which is what produced W44's contradiction, W45's "interleaving" and
++    // W56's "no race". One predictable null branch per write, the same cost the 32-bit path already
++    // pays, and now every width is visible.
++    ps2TraceGuestWrite(rdram, addr, 1u, static_cast<uint64_t>(value), 0u, "Ps2FastWrite8", nullptr);
+     rdram[addr & PS2_RAM_MASK] = value;
+ }
+ 
+ static inline void Ps2FastWrite16(uint8_t *rdram, uint32_t addr, uint16_t value)
+ {
++    // W57. CLOSING THE BLIND SPOT THE BYTE ACCOUNTING FOUND. Only Ps2FastWrite32 carried the trace,
++    // added when W45 closed a different gap; 8-, 16-, 64- and 128-bit fast writes went straight into
++    // guest memory and were invisible. Replaying every observed write into a shadow buffer and
++    // comparing it against the guest's real memory showed 4 bytes of a 12-byte path written before a
++    // guest call and reported by nothing. "The guest did not write this" was true of the observer and
++    // false of the guest -- which is what produced W44's contradiction, W45's "interleaving" and
++    // W56's "no race". One predictable null branch per write, the same cost the 32-bit path already
++    // pays, and now every width is visible.
++    ps2TraceGuestWrite(rdram, addr, 2u, static_cast<uint64_t>(value), 0u, "Ps2FastWrite16", nullptr);
+     const uint32_t offset = addr & PS2_RAM_MASK;
+     if (!Ps2FastRangeIsContiguous(offset, sizeof(uint16_t)))
+     {
+@@ -294,6 +312,15 @@ static inline void Ps2FastWrite32(uint8_t *rdram, uint32_t addr, uint32_t value)
+ 
+ static inline void Ps2FastWrite64(uint8_t *rdram, uint32_t addr, uint64_t value)
+ {
++    // W57. CLOSING THE BLIND SPOT THE BYTE ACCOUNTING FOUND. Only Ps2FastWrite32 carried the trace,
++    // added when W45 closed a different gap; 8-, 16-, 64- and 128-bit fast writes went straight into
++    // guest memory and were invisible. Replaying every observed write into a shadow buffer and
++    // comparing it against the guest's real memory showed 4 bytes of a 12-byte path written before a
++    // guest call and reported by nothing. "The guest did not write this" was true of the observer and
++    // false of the guest -- which is what produced W44's contradiction, W45's "interleaving" and
++    // W56's "no race". One predictable null branch per write, the same cost the 32-bit path already
++    // pays, and now every width is visible.
++    ps2TraceGuestWrite(rdram, addr, 8u, static_cast<uint64_t>(value), 0u, "Ps2FastWrite64", nullptr);
+     const uint32_t offset = addr & PS2_RAM_MASK;
+     if (!Ps2FastRangeIsContiguous(offset, sizeof(uint64_t)))
+     {
+@@ -310,6 +337,15 @@ static inline void Ps2FastWrite64(uint8_t *rdram, uint32_t addr, uint64_t value)
+ 
+ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
+ {
++    // W57. CLOSING THE BLIND SPOT THE BYTE ACCOUNTING FOUND. Only Ps2FastWrite32 carried the trace,
++    // added when W45 closed a different gap; 8-, 16-, 64- and 128-bit fast writes went straight into
++    // guest memory and were invisible. Replaying every observed write into a shadow buffer and
++    // comparing it against the guest's real memory showed 4 bytes of a 12-byte path written before a
++    // guest call and reported by nothing. "The guest did not write this" was true of the observer and
++    // false of the guest -- which is what produced W44's contradiction, W45's "interleaving" and
++    // W56's "no race". One predictable null branch per write, the same cost the 32-bit path already
++    // pays, and now every width is visible.
++    ps2TraceGuestWrite(rdram, addr, 16u, static_cast<uint64_t>(static_cast<uint64_t>(_mm_cvtsi128_si64(value))), 0u, "Ps2FastWrite128", nullptr);
+     const uint32_t offset = addr & PS2_RAM_MASK;
+     if (!Ps2FastRangeIsContiguous(offset, sizeof(__m128i)))
+     {
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
 index 0baca03..c7a813a 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
@@ -543,6 +609,24 @@ index 0baca03..c7a813a 100644
          }
  
          // returns dest pointer ($v0 = $a0)
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+index d12592f..8b5ca89 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+@@ -1090,7 +1090,12 @@ namespace ps2_stubs
+                         << " a0(port)=" << static_cast<uint32_t>(getRegU32(ctx, 4)) << " a1(slot)="
+                         << static_cast<uint32_t>(getRegU32(ctx, 5)) << " a2(buf)=0x" << std::hex
+                         << getRegU32(ctx, 6) << " a3(mode)=0x" << getRegU32(ctx, 7) << std::dec);
+-            RUNTIME_LOG("[MC] Open v1=0x" << std::hex << getRegU32(ctx, 3) << std::dec << " port=" << port
++            // W55. Stamped with the SAME causal sequence the store observer uses, so the question "does
++            // sceMcOpen read the name buffer before the guest has finished filling it?" is answerable
++            // instead of assumed. ps2NextTraceSequence is a relaxed atomic increment; ordering comes
++            // from the number, never from stdout position.
++            RUNTIME_LOG("[MC] Open seq=" << ps2NextTraceSequence() << " v1=0x" << std::hex
++                        << getRegU32(ctx, 3) << std::dec << " port=" << port
+                         << " slot=" << slot << " addr=0x" << std::hex
+                         << pathAddr << std::dec << " bytes=[" << pathHex << "] '" << path
+                         << "' flags=0x" << std::hex << flags << std::dec << " guest='" << guestPath
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
 index 70ae1ed..3836cdd 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
@@ -556,6 +640,71 @@ index 70ae1ed..3836cdd 100644
                  std::memcpy(destPtr, srcPtr, size);
              }
          }
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 7d667d9..bb2dc4f 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1,4 +1,5 @@
+ #include "runtime/ps2_memory.h"
++#include "ps2_runtime.h"
+ #include "runtime/ps2_address.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "ps2_log.h"
+@@ -925,6 +926,10 @@ __m128i PS2Memory::read128(uint32_t address)
+ 
+ void PS2Memory::write8(uint32_t address, uint8_t value)
+ {
++    // W57. This is the runtime's own memory-write API and it wrote m_rdram with NO trace, so every
++    // subsystem that goes through it (DMA, GS/VIF uploads, IOP copies) was invisible to the guest
++    // store observer. Byte accounting against the guest's real memory is what exposed it.
++    ps2TraceGuestWrite(m_rdram, address, 1u, static_cast<uint64_t>(value), 0u, "PS2Memory::write8", nullptr);
+     const bool scratch = isScratchpad(address);
+     uint32_t physAddr = translateAddress(address);
+ 
+@@ -964,6 +969,10 @@ void PS2Memory::write8(uint32_t address, uint8_t value)
+ 
+ void PS2Memory::write16(uint32_t address, uint16_t value)
+ {
++    // W57. This is the runtime's own memory-write API and it wrote m_rdram with NO trace, so every
++    // subsystem that goes through it (DMA, GS/VIF uploads, IOP copies) was invisible to the guest
++    // store observer. Byte accounting against the guest's real memory is what exposed it.
++    ps2TraceGuestWrite(m_rdram, address, 2u, static_cast<uint64_t>(value), 0u, "PS2Memory::write16", nullptr);
+     if (address & 1)
+     {
+         throw std::runtime_error("Unaligned 16-bit write at address: 0x" + std::to_string(address));
+@@ -1006,6 +1015,10 @@ void PS2Memory::write16(uint32_t address, uint16_t value)
+ 
+ void PS2Memory::write32(uint32_t address, uint32_t value)
+ {
++    // W57. This is the runtime's own memory-write API and it wrote m_rdram with NO trace, so every
++    // subsystem that goes through it (DMA, GS/VIF uploads, IOP copies) was invisible to the guest
++    // store observer. Byte accounting against the guest's real memory is what exposed it.
++    ps2TraceGuestWrite(m_rdram, address, 4u, static_cast<uint64_t>(value), 0u, "PS2Memory::write32", nullptr);
+     if (address & 3)
+     {
+         throw std::runtime_error("Unaligned 32-bit write at address: 0x" + std::to_string(address));
+@@ -1066,6 +1079,10 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
+ 
+ void PS2Memory::write64(uint32_t address, uint64_t value)
+ {
++    // W57. This is the runtime's own memory-write API and it wrote m_rdram with NO trace, so every
++    // subsystem that goes through it (DMA, GS/VIF uploads, IOP copies) was invisible to the guest
++    // store observer. Byte accounting against the guest's real memory is what exposed it.
++    ps2TraceGuestWrite(m_rdram, address, 8u, static_cast<uint64_t>(value), 0u, "PS2Memory::write64", nullptr);
+     if (address & 7)
+     {
+         throw std::runtime_error("Unaligned 64-bit write at address: 0x" + std::to_string(address));
+@@ -1122,6 +1139,10 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
+ 
+ void PS2Memory::write128(uint32_t address, __m128i value)
+ {
++    // W57. This is the runtime's own memory-write API and it wrote m_rdram with NO trace, so every
++    // subsystem that goes through it (DMA, GS/VIF uploads, IOP copies) was invisible to the guest
++    // store observer. Byte accounting against the guest's real memory is what exposed it.
++    ps2TraceGuestWrite(m_rdram, address, 16u, static_cast<uint64_t>(static_cast<uint64_t>(_mm_cvtsi128_si64(value))), 0u, "PS2Memory::write128", nullptr);
+     if (address & 15)
+     {
+         throw std::runtime_error("Unaligned 128-bit write at address: 0x" + std::to_string(address));
 diff --git a/ps2xTest/src/ps2_iop_tests.cpp b/ps2xTest/src/ps2_iop_tests.cpp
 index f1172e9..dfe82b5 100644
 --- a/ps2xTest/src/ps2_iop_tests.cpp
@@ -605,3 +754,61 @@ index f1172e9..dfe82b5 100644
          tc.Run("unknown SID remains unhandled without a loaded IRX", [](TestCase &t)
          {
              iop_test::Host host;
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 9e1b3a4..d0b5160 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -2291,5 +2291,53 @@ void register_ps2_memory_tests()
+             t.IsTrue(threwRead32, "unaligned read32 should throw");
+             t.IsTrue(threwWrite64, "unaligned write64 should throw");
+         });
++        // ---------------------------------------------------------------- G1.8j
++        tc.Run("G1.8j: every fast-write WIDTH reaches the store observer", [](TestCase &t)
++        {
++            // W57. Found by replaying every observed guest write into a shadow buffer and comparing
++            // it against the guest's real memory: 4 bytes of a 12-byte path were unaccounted for,
++            // written between seq=267 and the Open at seq=272, and reported by nothing.
++            //
++            // Only Ps2FastWrite32 ever carried the trace, added when W45 closed a different blind
++            // spot. Ps2FastWrite8, 16, 64 and 128 write straight into guest memory and are invisible,
++            // so "the guest did not write this" was a true statement about the OBSERVER and a false
++            // statement about the guest. That is what produced W44's contradiction, W45's
++            // "interleaving", and W56's "no race".
++            static int s_calls = 0;
++            static uint32_t s_size = 0;
++            s_calls = 0;
++            s_size = 0;
++            ps2SetGuestStoreObserver(
++                [](uint32_t, uint32_t size, uint64_t, const R5900Context *, const char *, uint32_t)
++                {
++                    ++s_calls;
++                    s_size = size;
++                });
++
++            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
++
++            Ps2FastWrite8(rdram.data(), 0x00200000u, 0x11u);
++            t.Equals(s_calls, 1, "an 8-bit fast write must reach the observer");
++            t.Equals(s_size, 1u, "and report its true width of 1 byte");
++
++            Ps2FastWrite16(rdram.data(), 0x00200010u, 0x2233u);
++            t.Equals(s_calls, 2, "a 16-bit fast write must reach the observer");
++            t.Equals(s_size, 2u, "and report its true width of 2 bytes");
++
++            Ps2FastWrite32(rdram.data(), 0x00200020u, 0x44556677u);
++            t.Equals(s_calls, 3, "a 32-bit fast write must still reach the observer");
++            t.Equals(s_size, 4u, "and report 4 bytes");
++
++            Ps2FastWrite64(rdram.data(), 0x00200030u, 0x8899AABBCCDDEEFFull);
++            t.Equals(s_calls, 4, "a 64-bit fast write must reach the observer");
++            t.Equals(s_size, 8u, "and report its true width of 8 bytes");
++
++            Ps2FastWrite128(rdram.data(), 0x00200040u, _mm_setzero_si128());
++            t.Equals(s_calls, 5, "a 128-bit fast write must reach the observer");
++            t.Equals(s_size, 16u, "and report its true width of 16 bytes");
++
++            ps2SetGuestStoreObserver(nullptr);
++        });
+     });
+ }
++

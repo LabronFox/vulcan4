@@ -6299,3 +6299,78 @@ hand decode. W10 was decoded wrong four times by hand; CAMPAIGN.md is explicit t
 `cdrom0:\` into the buffer is one function to read, and it is where the empty filename is born.
 
 Suite **482/482**. `VULCAN4 FRAME source=guest` has never printed.
+
+---
+
+## W72 — the disc open is `sceOpen` called from `sub_01004FB8`, and it is a generated forwarder
+
+Read from the generated unit's own comments, as W71 required, never hand-decoded.
+
+```
+// 0x1004ffc: 0x40202d   daddu  $a0, $v0, $zero
+// 0x1005000: 0xc40915c  jal    func_1024570
+// 0x1005004: 0x24050001 addiu  $a1, $zero, 0x1        (Delay Slot)
+// 0x1005008: 0x24060002 addiu  $a2, $zero, 0x2
+// 0x100500c: 0x40202d   daddu  $a0, $v0, $zero
+// 0x1005010: 0x27a50020 addiu  $a1, $sp, 0x20
+// 0x1005014: 0x441000a  bgez   $v0, . + 4 + (0xA << 2)
+// 0x1005018: 0xae020000 sw     $v0, 0x0($s0)          (Delay Slot)
+```
+
+`0x1005008` is the **delay slot** of the `jal` at `0x1005000`, so the `ra=0x01005008` in the W70 trace
+is exactly this call's return address. The arguments are unambiguous:
+
+| register | value | meaning |
+|---|---|---|
+| `$a0` | `$v0` | the path pointer, from a call earlier in `sub_01004FB8` |
+| `$a1` | `1` | `O_RDONLY` |
+| `$a2` | `2` | open mode |
+
+and the result is stored to `*$s0`, then tested with `bltz` **twice** (`0x1005064`, `0x100506c`) — the
+guest treats a negative descriptor as failure, which is correct and is why it retries.
+
+### `func_1024570` is `sceOpen`, and it IS the documented forwarder
+
+```
+register_functions.cpp:8369:  g_ps2RecompiledFunctionTable[37210] = sub_01024570_0x1024570; // 0x1024570
+...
+void sub_01024570_0x1024570(...) { ... ps2_stubs::sceOpen(rdram, ctx, runtime); }
+```
+
+`sub_01024570_0x1024570` is a generated function whose body is a **direct call to the stub**. So
+`WALL-INSTRUMENT.md`'s claim is now confirmed on the product rather than read off a disassembly: `sceOpen`
+bypasses `handleSyscall` entirely, which is why the syscall tally could never see an open. The
+registration also shows `entry_1024480_0x1024570` at slot 37150, i.e. `0x1024480` and `0x1024570` are
+**two entries of one body** — a function with two return points, which is why the register holds two
+slots for it.
+
+### The scratch buffer is on the stack, and `$s1` is built from it
+
+```
+// 0x1005010: addiu $a1, $sp, 0x20
+// 0x1005054: lbu   $v0, 0x21($sp)
+// 0x1005058: lbu   $v1, 0x20($sp)
+// 0x100505c: sll   $v0, $v0, 8
+// 0x1005060: or    $s1, $v1, $v0
+```
+
+`$s1 = sp[0x20] | (sp[0x21] << 8)` — a big-endian 16-bit value read out of the stack buffer at `$sp+0x20`.
+So `sub_01004FB8` builds something two bytes long on its own stack frame and hands it onward, *beside*
+the open. That is the same `,`-separated shape as the `M0:;1` of W65 and the `;1` of `CDROM0:;1`:
+**the guest is carrying a `;N` version suffix as two loose bytes rather than as a string**, and that is
+where the stray `;1` on an otherwise-empty filename comes from.
+
+### State, plainly
+
+- **Measured:** the disc open is `sceOpen` from `sub_01004FB8+0x1005000`, args `($v0, 1, 2)`, result to
+  `*$s0`, `fd=-1` every time, path literally `cdrom0:\CDROM0:\;1`.
+- **Measured:** the card open is `sceMcOpen` from `0x0100E66C` with `a2=0x01051A10`, the same buffer the
+  disc caller fills.
+- **Measured:** `rom0:ROMVER` opens with `fd=3` in the same run, so none of this is a broken filesystem.
+- **Still unknown:** what `$v0` — the path pointer — points at when the call is made, i.e. where
+  `cdrom0:\` and `CDROM0:\;1` are each written and by which instruction. That is the one remaining
+  question, and the stack-slot reader at `0x1005054` says the version suffix is assembled separately.
+- **Not the wall:** directories, mounts, prefix matching, case-insensitive retry, missing files, BIOS.
+  None can explain a path with no filename in it.
+
+Suite **482/482**. `VULCAN4 FRAME source=guest` has never printed.

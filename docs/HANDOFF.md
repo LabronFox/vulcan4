@@ -4581,3 +4581,37 @@ and stop; do not approximate it.
 
 **STATUS: the boot loop is NOT fixed and no frame printed.** The 8MB card image was deliberately not
 built. Suite unchanged.
+
+### W47 measurement: the seq stamping works, and it exposes the next instrument limit
+
+The two store observers now stamp `seq` and `tid` (`W30BIGCOPY`, `W33PATHSTORE`, plus `W45BEFORE`/
+`W30WRITE`), and a real run confirms it: **5** `W45BEFORE`, **5** `W30WRITE`, **4** `W33PATHSTORE`,
+**1** `W30BIGCOPY`, all with **`tid=1`**. So ordering is now derivable causally rather than from stdout
+position, which was the W45 goal.
+
+**But the probes cannot answer the question they were pointed at.** Each observer stops after 4–5 hits,
+and it burns that entire budget in the first moments of boot — thousands of guest functions before the
+path-build at `0x1003E80`. So "who wrote `0x8005`, and when relative to the name buffer" is still
+unmeasured. **The next instrument must raise or gate the hit budget** so a probe can be pointed at a
+LATER event, and it must print `seq` on every line it emits. Guessing here is exactly what W33→W36 did
+wrongly.
+
+**Also measured on this run:** `halt=stuck_in_syscall` (a new halt reason, from the W43 interrupt work),
+`functions_entered=2081818`, still no frame.
+
+**What 0x8005 is remains undecoded**, and two candidate readings have now been REFUTED, so nobody
+re-proposes them:
+- ~~`0x8005` is a PS2 device-prefix id (mc0)~~ — **no such convention exists.** PS2 device prefixes are
+  ASCII name + colon (`mc0:`, `cdrom0:`, `host:`), parsed by `iomanX.c` as a strcmp on the text before
+  the first `:`. There is no 0x8000-range path device table in ps2sdk, ps2link, uLaunchELF or PCSX2.
+- ~~`sceMcOpen` takes a device-prefixed path~~ — it does not. `libmc.h:237` is
+  `mcOpen(int port, int slot, const char *name, int mode)`; the device is the port/slot **arguments** and
+  `name` is card-root-relative, e.g. `/GAMEDATA/file`. There is no slot in the byte stream for `0x8005`.
+
+What survives, from our own W34 logs: the buffer at `0x1051A10` is **reused scratch** — it separately
+receives the static string `core.gt4` from `.rodata 0x103D1D8` and the device string `cdrom0`, and the
+halfword lands on `cor`. So the byte stream `05 80 2f 05 80 2f "e.gt4"` is most likely `core.gt4` with
+three leading bytes clobbered — i.e. **the guest is opening its own disc executable**, through the
+memory-card RPC (it genuinely arrives via `mcserv.cpp:291`, so the routing is not obviously wrong).
+Not proven. For the record, GT4's real *card* directory is `/BASCUS-97436GAMEDATA` (a later, different
+open), which is presumably where the brief's "/BA/SCUS-97328/GAMEDATA" came from.

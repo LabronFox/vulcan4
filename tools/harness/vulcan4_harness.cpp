@@ -1126,6 +1126,8 @@ int main(int argc, char *argv[])
         ++pcEntryCounts[ctx.pc];
         entryCallers[ctx.pc].insert(getRegU32(&ctx, 31));
 
+        // W43. Interrupt counters at the halt. "The delivery path works" and "the guest takes
+        // interrupts" are different claims; only the second matters to the boot, so both are printed.
         if (traceAll || (traceFirst && (functionsEntered <= traceFirst || functionsEntered % 100000 == 0)))
         {
             std::cout << "VULCAN4 TRACE entry=" << functionsEntered << " pc=" << toHex(ctx.pc)
@@ -1585,7 +1587,10 @@ int main(int argc, char *argv[])
         }
     }
     std::cout << "VULCAN4 BOOT REPORT functions_entered=" << functionsEntered << " halt=" << haltReason
-              << " bios_files=" << biosFilesOpened << "\n";
+              << " bios_files=" << biosFilesOpened
+              << " interrupts_raised=" << runtime.interruptsRaised()
+              << " interrupts_delivered=" << runtime.interruptsDelivered()
+              << " pending_ip=0x" << std::hex << runtime.pendingInterrupts() << std::dec << "\n";
 
     // W16: where the guest actually spent its life. Top 24 by entry count, with the share of all
     // entries, so a loop that owns 99% of the run cannot hide behind a function that owns 0.1%.

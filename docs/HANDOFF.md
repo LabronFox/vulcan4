@@ -4284,3 +4284,98 @@ narrow and entirely ours: **have the devices that already exist raise IP0** — 
 the `sioIntr`/`SIO2` chain the memory-card path already runs through — and **acknowledge/clear IP0 in
 the handler's `eret`**. That is the same shape as the `sioMcOpen` result path we already serve, so it
 is reachable from code that exists rather than from anything we would have to guess at.
+
+## W43 — the runtime's REAL interrupt design found: handlers are called directly, and the guest registers none
+
+W42 built a CPU-vectored interrupt path and the boot delivered nothing. This pass found out how this
+runtime actually delivers interrupts, why the guest takes none, and fixed a genuine reachability bug
+on the way. Two of my own errors are recorded because both nearly cost real work.
+
+### How interrupts really work here — not by vectoring the CPU
+
+`EeScheduler::dispatchIrq` does **not** take a CPU interrupt. It **calls the guest's handler as a
+function**, with the cause in `$a0`:
+
+```
+EeScheduler.cpp  dispatchIrq(bool dmac, uint32_t cause)
+  const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
+  if (cause < 32u && (mask & (1u << cause)) == 0u) return;
+  ...
+  SET_GPR_U32(&invocation.context, 4, cause);      // $a0 = cause
+  // then invokes the registered handler
+```
+
+And those invocations happen only in `processPendingEvents()`, which was reachable from **two places
+inside `EeScheduler` and nowhere else.** So the guest's semaphore spin at `0x10113e8` (`ei`;
+`bnez $a0, -0x34`) — a backward edge inside a generated function — could never be woken, whatever
+`ei` did to `STATUS.IE`. **W42's vectored path was correct but was not this runtime's path**, so it
+was correct and inert.
+
+### The real fix: the guest's checkpoint can now drain pending events
+
+```
+EeScheduler::servicePendingEventsAtCheckpoint() noexcept { processPendingEvents(false); }
+```
+
+a narrow public door onto the drain, called from `PS2Runtime::eeCheckpointDue` when a checkpoint is
+due. `mayWait=false` always: the caller is mid-function and the generated code expects to resume.
+**That is a genuine reachability bug fixed** — before it, no backward-edge spin could ever be woken.
+
+`processPendingEvents` stays private. Making it reachable is not the same edit as deleting its
+declaration, which I then did, and which broke both internal callers before I put it back.
+
+### Why the guest still takes none: it registers no handlers at all
+
+```
+VULCAN4 BOOT REPORT functions_entered=1616237 halt=stuck_in_syscall bios_files=0
+                 interrupts_raised=0 interrupts_delivered=0 pending_ip=0x0
+```
+
+`dispatchIrq` requires a **registered handler** for the cause. Registration goes through
+`Interrupt.cpp addHandler` → `EeScheduler::addIrqHandler`, and **the boot log contains zero
+`addHandler` calls.** The enable mask is not the problem (`m_enabledIntcMask = 0xFFFFFFFF` at reset).
+The guest simply has not registered anything, because **it never gets that far** — it is still in the
+memory-card `-4` retry.
+
+**So the interrupt work is real, tested, and upstream of nothing.** Fixing `-4` is the prerequisite:
+until the guest proceeds past the card open it will never arm a timer handler, and with no handler
+there is nothing for any delivery path to call. `interrupts_raised=0` is the honest number, and
+`pending_ip=0x0` confirms it is not a masking problem.
+
+### Two errors of mine, both recorded
+
+1. **I nearly deleted a working IRQ path.** I removed the `|=` into `m_pendingEeTimerInterrupts`
+   believing it was never cleared. It **is** cleared — `processPendingEvents` drains and zeroes it and
+   maps timer *n* to IRQ `9+n` through the controller. Dropping the OR would have silently removed an
+   existing, correct path. Reverted, with the correction in the comment.
+2. **I deleted a declaration I was only meant to wrap.** Removing `processPendingEvents`'s declaration
+   broke the two internal call sites. "Make it reachable" and "delete the declaration" are different
+   edits; the compiler caught the second one immediately, which is what it is for.
+
+Also fixed for real: the EE timer mask now reaches the CPU as well as the scheduler, via
+`PS2Runtime::eeTimerInterruptToIp` (timer *n* → `Cause.IP` bit `10+n`), red-tested
+("an EE timer overflow raises the CPU's IP bit, not just a scheduler flag"). A 30 s probe showed
+**six raises with `ip=0x1000` (IP2, timer2) and `status=0x10001` (IE|EIE set)** — so raising works; it
+simply had no registered handler to reach. That raise is now a counter rather than a log line.
+
+### State, measured
+
+```
+baseline (W33, 45s): functions_entered=1759628  distinct_pcs=152  vsync=31  [MC] -4 x ~104k
+W43       (45s):     functions_entered=1616237  halt=stuck_in_syscall  interrupts_raised=0
+```
+
+`distinct_pcs` has ranged 149–158 across these runs and the function count has gone **down** slightly
+against the W33 baseline. I am not claiming a throughput win and I am not hiding the regression: the
+checkpoint now drains events on every backward edge, which is extra work per checkpoint. It is the
+correct place for that work, but it has not paid for itself yet because there is nothing to deliver.
+
+**Suite: 476 total, 475 pass, 1 fail** — the pre-existing unrelated `VU0 macro mappings`.
+
+### The honest next step, and it is NOT more interrupt work
+
+**Go back to the `-4`.** Everything on the interrupt side is now built, tested and reachable; the one
+thing missing is a guest that gets far enough to use it. The `-4` and the undecoded `0x8005` in the
+filename are the wall, exactly as W42 concluded. Concretely: `sub_01005148` → `sub_0100E3C8`
+(`mceGetInfoApdx`) and `sub_01005430` → `sub_0100E610` (`sceMcOpen`) both take the same
+lock → `ei` → op → `bnez` retry shape, and both are blocked on the same filename bytes.

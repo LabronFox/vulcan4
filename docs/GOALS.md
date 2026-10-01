@@ -1171,6 +1171,83 @@ needed zero portability work. Evidence already banked: goal `G5.2a`.
   the clock.
 - **STATUS:** ⬜ post-playability, same lane as `G4`/`G6.1`–`G6.7`. Registry entry only — do not dispatch.
 
+### ⬜ G6.9 — **THE FEEL OF THE WHEEL** *(deeper force feedback, 2026-10-01 — asked for in public)*
+- **Where it came from:** the captain's first public post as **u/Professional-Bar6778** —
+  *"GT4 Recomp suggestions"* in r/granturismo4 (thread id `1wurol8`). A reader asked for *"more (in-depth)
+  force feedback settings/support"*, and the captain answered *"Noted."* **A promise was made in public, so
+  this entry exists to keep it.**
+- **What it is:** GT4's rumble is computed by the **guest's own pad code** and read out by the runtime we
+  supply. So this is not a new effect we invent — it is **exposing and shaping a signal the game already
+  produces**, the same shape as `G6.7`'s camera work: renderer/IO-side only, the guest's state untouched.
+- **Mechanism, in order:**
+  1. **Measure before touching.** Log what the guest actually publishes per frame (the pad port's motor
+     levels, or the buffer it fills), with a real wheel attached. **A dish that cannot name where the FFB
+     numbers come from does not get to write a slider** — the same rule `G6.7` uses for the camera state.
+  2. **Depth.** GT4 has a small fixed set of effects (kerb, gear, slip, off-track). The honest first win is
+     per-effect depth plus a master curve, because the raw signal already exists.
+  3. **A curve, not a cheat:** a low/high deadband and an overall intensity multiplier that maps the
+     guest's range onto a modern wheel's. **`0` must mean zero motors, not "subtle".**
+  4. **Only after that:** per-car and per-surface shaping, if the guest's data supports it.
+- **The fence:** off by default (law 12) — **a recomp that shakes your wheel without being asked is a
+  worse recomp**; it never lies about grip (no vibration invented where there is no slip event, ever); and
+  it must be a **real** force curve, not a cosmetic effect with a motor attached.
+- **Honest limits:** depends on `G4.1` (input) existing at all, and on the guest actually publishing motor
+  levels — **if GT4 computes rumble in VU1 microcode or a driver we do not yet own, this inherits
+  `G3.1`'s schedule**; some wheels need a vendor SDK we would have to ship separately; and a modern direct
+  -drive wheel is a genuinely different device from a PS2 DualShock, so an honest "this is what the game
+  intended" is the ceiling, not "this feels like a modern sim".
+- **DONE WHEN:** a connected wheel produces the game's own rumble with a real `0`, per-effect depth and a
+  curve, on a real kerb and a real slip, with the guest's published values named in the entry — and with the
+  feature switched off the wheel is completely silent.
+- **STATUS:** ⬜ post-playability, same lane as `G4.1` then `G6`. Registry entry only — do not dispatch.
+
+### ⬜ G6.10 — **MORE THAN SIX** *(bigger fields, 2026-10-01 — asked for in public)*
+- **Where it came from:** same thread, first reply of the whole post: *"Not sure if it'll be possible but I
+  would definitely love races with more than 6 cars"* — and the captain's public reply was *"Noted, i want
+  that too."*
+- **What it is:** GT4's grid is capped at six entries per race, in the **event data**, not in some hardcoded
+  array we have to fight. So this is the same shape as `G6.8`: a **number in a table we supply**.
+- **Mechanism, in order:** 1. name the field that caps the entry list (event entry record, or the AI
+  opponent list the event builds) — **no knob before that is located**; 2. raise the cap and prove 8 cars
+  load, render and race without touching the physics integrator; 3. **only then** consider AI skill/density,
+  because more cars at the same AI level is a wall of cars, not a better race.
+- **The fence:** off by default (law 12); the cap is raised in **our** event table only, never by editing the
+  game's own save; a field size that must be reallocated (car array, collision slots) is a **real memory
+  limit and must be measured, not assumed** — if the runtime has a fixed pool of car slots, "more than six"
+  is a pool-size goal, not a menu-number goal.
+- **Honest limits:** six is not arbitrary — it is what the PS2 could load, draw and shadow in one frame.
+  More cars means more draw calls (our GS is single-threaded today), more AI, more audio voices, and a
+  **frame-time measurement** on all three before this is claimed. A cap raise that drops the frame rate is
+  not the feature; the feature is more cars **at the same frame rate**.
+- **DONE WHEN:** an 8-car (and then 12) field runs a full race on our renderer with **measured** frame time
+  printed and unchanged within the stated budget, and a vanilla 6-car event is provably identical alongside
+  it.
+- **STATUS:** ⬜ post-playability. Registry entry only — do not dispatch.
+
+### ⬜ G6.11 — **VR** *(the wish the captain is unsure about — registered so it is not lost, not promised)*
+- **Where it came from:** the same thread, asked for alongside force feedback. The captain's answer in
+  public was *"Noted"* — and privately, on the same day: *"vr im not sure ill make but sure."*
+- **So this entry is deliberately weaker than its siblings and says so up front: this is a WISH, not a
+  commitment.** It is registered because the project already refuses to forget what the captain asked for
+  (see `G6.3`, `G6.5`, `G6.6` — all of which exist because he said a sentence in passing) and because the
+  one useful thing to do about an uncertain promise is to say out loud what it would cost.
+- **What it would actually take, honestly:** VR is the **largest** renderer change in the registry, not a
+  small one. Stereo rendering is easy. Everything VR implies is not: head tracking needs the camera state
+  `G6.7` must already own; **latency** is the whole game and would need the guest's tick decoupled from the
+  present; comfort (fixed-origin option, no forced camera motion) is a design decision, not a flag; and
+  **it depends on `G2` (a picture) and `G3.1` (the VU1) existing at all** — there is nothing to put in a
+  headset until a car and a track render.
+- **The honest position, stated plainly:** if `G6.7` happens, VR is *possible*. If it does not, VR is a
+  rewrite of the renderer for a game that does not render yet. **Therefore: do not let VR set the order of
+  anything.** It is last in this list, after the picture, the 3D and a drivable race.
+- **The fence, if it ever happens:** off by default (law 12); `OFF` must be exactly the flat renderer;
+  **a motion-sickness disclaimer and a real "reduce motion" toggle are requirements, not extras**; and no
+  tracked-camera assumption smuggled into the core renderer — VR must be a view mode over an unchanged
+  scene, exactly like `G6.7`.
+- **STATUS:** ⬜ **committed to nothing.** Registered at the captain's request so the answer exists on
+  paper. Not scheduled, not promised, not to be dispatched. Revisit only when `G6.7` has proven the camera
+  state can be read.
+
 ### ⬜ G7.0 — **DISTRIBUTION: code only. Assets come from the user's disc.** *(the captain's rule)*
 - **The captain, 2026-09-30:** *"We don't publish anything. Just the code. People have to bring their
   own iso file of the game — that's where we take assets."*

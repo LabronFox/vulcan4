@@ -88,6 +88,21 @@ constexpr uint32_t kWatchStoreMax = 600;
 // W30: 1 MiB. Anything at least this big is a copy, not a field write.
 constexpr uint32_t kWatchBigCopy = 1024u * 1024u;
 uint32_t g_watchBigCopyHits = 0;
+// W33: sub_01003E10's `sw $s1, 0x4($s4)` -- the store that caches the guest's built MC path.
+constexpr uint32_t kWatchPathStorePc = 0x01003E98u;
+uint32_t g_watchPathHits = 0;
+// W33: the observer needs RDRAM to read the candidate path strings. Set once, before boot.
+uint8_t *g_rdramForWatch = nullptr;
+uint32_t g_watchPeek(uint32_t guestAddr)
+{
+    if (g_rdramForWatch == nullptr || guestAddr + 4u > PS2_RAM_SIZE)
+    {
+        return 0u;
+    }
+    uint32_t v = 0u;
+    std::memcpy(&v, g_rdramForWatch + guestAddr, sizeof(v));
+    return v;
+}
 
 void watchGuestStoreForPath(uint32_t guestAddr, uint32_t size, uint64_t value, const R5900Context *ctx)
 {
@@ -105,6 +120,49 @@ void watchGuestStoreForPath(uint32_t guestAddr, uint32_t size, uint64_t value, c
                       << (ctx != nullptr ? ctx->pc : 0u) << " dst=0x" << guestAddr << " size="
                       << std::dec << size << "\n";
         }
+    }
+    // W33. Filter by SITE, not by address. sub_01003E10 stores its freshly built path with
+    // `sw $s1, 0x4($s4)` at pc=0x1003e98, where $s4 is the object it was called with. That one
+    // event gives BOTH halves of the question: addr-4 is `obj`, and the value is the heap buffer the
+    // guest built `<name>/<name>` into. Watching an address range could never find it because we do
+    // not know where the guest will allocate.
+    if (ctx != nullptr && ctx->pc == kWatchPathStorePc)
+    {
+        if (g_watchPathHits < 4u && g_rdramForWatch != nullptr)
+        {
+            ++g_watchPathHits;
+            const uint32_t obj = guestAddr >= 4u ? guestAddr - 4u : 0u;
+            const uint32_t f0 = obj + 4u <= PS2_RAM_SIZE ? g_watchPeek(obj + 0u) : 0u;
+            const uint32_t f4 = obj + 4u <= PS2_RAM_SIZE ? g_watchPeek(obj + 4u) : 0u;
+            const uint32_t buf = static_cast<uint32_t>(value);
+            std::cout << "VULCAN4 W33PATHSTORE n=" << g_watchPathHits << " obj=0x" << std::hex << obj
+                      << " obj->0x0=0x" << f0 << " obj->0x4=0x" << f4 << std::dec;
+            // Print both candidates' first bytes. Whichever one is the path the guest built is the
+            // one that reads as "<name>/<name>"; that settles it without any interpretation.
+            for (uint32_t k = 0; k < 2; ++k)
+            {
+                const uint32_t cand = k == 0 ? f0 : f4;
+                std::cout << " [" << (k == 0 ? "obj->0x0" : "obj->0x4") << "=0x" << std::hex << cand
+                          << std::dec << " '";
+                for (uint32_t j = 0; j < 24u; ++j)
+                {
+                    const uint32_t a = cand + j;
+                    if (a >= PS2_RAM_SIZE)
+                    {
+                        break;
+                    }
+                    const uint8_t ch = g_rdramForWatch[a];
+                    if (ch == 0u)
+                    {
+                        break;
+                    }
+                    std::cout << (ch >= 32 && ch < 127 ? static_cast<char>(ch) : '.');
+                }
+                std::cout << "']";
+            }
+            std::cout << " built=0x" << std::hex << buf << std::dec << "\n";
+        }
+        return;
     }
     if (guestAddr >= kWatchHi || guestAddr + size <= kWatchLo)
     {
@@ -453,6 +511,7 @@ int main(int argc, char *argv[])
     // W30: watch the guest buffer holding the memory-card path. Installed before the first guest
     // instruction so the one-time formatting write is caught, not just the reads that follow.
     ps2SetGuestStoreObserver(&watchGuestStoreForPath);
+    g_rdramForWatch = rdram;
 
     // Reset the parts of the console environment the runtime expects before the first guest
     // instruction, mirroring what PS2Runtime::run() does, minus the render loop.

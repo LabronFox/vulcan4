@@ -3521,3 +3521,93 @@ pointer at every Open.** That distinguishes "wrong field" from "wrong heap", and
 fixes. Everything else in this line is built, permanent and settled.
 
 Suite **472 total, 471 pass, 1 fail** (pre-existing VU0).
+
+## W33 — THE PATH IS `../../e.gt4`, and something overwrites the leading `..` with `0x8005`
+
+W32 named the measurement. It produced a complete answer and one sharp contradiction.
+
+### The guest's real path
+
+Filtering the store observer by **site** rather than address (we cannot watch an address we do not
+know) catches `sub_01003E10`'s `sw $s1, 0x4($s4)`, which caches the path the guest just built:
+
+```
+VULCAN4 W33PATHSTORE n=2 obj=0x1fffe80
+    obj->0x0 = 0x01051a10  ->  reads  '../../e.gt4'
+    obj->0x4 = 0x0
+    built   = 0x01051a10
+```
+
+**`obj` is `0x01FFFE80` — a guest stack address near the top of RDRAM — and the built path is
+`0x01051A10`, containing `../../e.gt4`.** So the path is **two `..` hops then `e.gt4`**, exactly the
+length (11) and shape of what `sceMcOpen` was reading.
+
+### The contradiction, and it is the finding
+
+Two readings of the **same address in the same run**:
+
+| when | who | bytes at `0x01051A10` |
+|---|---|---|
+| path build, once at init | `sub_01003E10` | `2e 2e 2f 2e 2e 2f 65 2e 67 74 34` = **`../../e.gt4`** |
+| every MC Open, 10,238× | `sceMcOpen` | `05 80 2f 05 80 2f 65 2e 67 74 34` |
+
+**The two leading `..` pairs are replaced by `0x8005`.** Everything after them — `/`, `/`, `e.gt4` —
+is intact. So W29's "`05 80` is an undecoded 2-byte token" was half right and half wrong: **it is not
+an encoding at all, it is the correct `..` after corruption.** The ASCII render is identical because
+`.` and the corrupted byte both print as `.`, which is exactly the kind of coincidence that produces
+a plausible-looking wrong answer.
+
+### And the thing doing the corrupting is visible
+
+The other object caught by the same filter:
+
+```
+VULCAN4 W33PATHSTORE n=1 obj=0x1051a0f
+    obj->0x0 = 0x2f8005ff
+    obj->0x4 = 0x652f8005
+```
+
+**`obj = 0x01051A0F` is one byte below the path, and it is UNALIGNED.** Its two 32-bit fields live at
+`0x01051A0F`–`0x01051A16`, which is to say **the object overlaps the path buffer by seven bytes**:
+
+| address | from the path | from `obj` |
+|---|---|---|
+| `0x1051a10` | `05` | `80` (top byte of `obj->0x0`) |
+| `0x1051a11` | `80` | `5f`? no — `obj->0x0` = `2f 80 05 ff` reads as `0xff058 02f` LE = `0xFF058 02F`… see below |
+| `0x1051a13` | `05` | low half of `obj->0x4` = `0x652f8005` → `05 80 2f 65` |
+| `0x1051a16` | `65` | — |
+
+`obj->0x4 = 0x652F8005` little-endian is the bytes `05 80 2f 65` — **which is exactly the path's
+`0x1051a13..0x1051a16`.** These are not two things that happen to agree; **they are the same four
+bytes, read two ways.**
+
+**So: an unaligned guest object at `0x01051A0F` sits on top of the path buffer at `0x01051A10`, and
+its field is what `sceMcOpen` reads as the first two path components.**
+
+### What that means, and the one measurement left
+
+GT4 wants to open `../../e.gt4` — a **relative** path with two parent hops. Our
+`normalizeGuestMcPathLocked` would resolve that cleanly against an empty currentDir:
+`..` pops nothing, `..` pops nothing, `e.gt4` is appended → `mc0/e.gt4`. **So with an intact path our
+own normaliser already does the right thing, and the failure is purely that the bytes it reads are not
+the bytes the guest wrote.**
+
+⇒ **The path is being corrupted between build and open, by an object at path−1.**
+
+The remaining question is narrow and it is ours or the guest's, not a matter of interpretation:
+
+- **Is `0x01051A0F` a real guest object, or is a pointer off by one?** An unaligned object is
+  suspicious. If `obj` should be `0x01051A10`, then `sub_01003E10` was handed a pointer one byte low,
+  and the guest's own bookkeeping says so.
+- **Or is `0x01051A0F` a *deliberate* byte-indexed structure** that legitimately overlaps? Then the
+  path buffer was never the guest's to keep and the corruption is a guest-side lifetime bug.
+
+**The measurement: watch writes to `[0x01051A10, 0x01051A16)` only** — the four bytes that matter —
+and report every writer with its PC, in order. The build writes `2e 2e`; whatever writes `05 80`
+afterwards is the culprit, named by address. Narrow the existing site-filtered watch to that four-byte
+range and the answer is one run.
+
+**Do not "fix" `-4`, and do not normalise `05 80`.** The path is `../../e.gt4`; the data is corrupt.
+
+Suite **472 total, 471 pass, 1 fail** (pre-existing VU0). The site-filtered store watch, the
+`W33PATHSTORE` report and the `$v1` in `[MC] Open` are permanent.

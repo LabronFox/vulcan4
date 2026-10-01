@@ -13,6 +13,12 @@
 /dump/
 /extracted/
 /iso/
+
+# IOP driver modules (IRX) taken from the captain's own disc — game data, law 1.
+# They live under the build root on the SSD and must NEVER be committed.
+*.IRX
+*.irx
+IRX/
 # build output
 /build/
 /out/

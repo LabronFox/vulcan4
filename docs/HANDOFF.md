@@ -5542,3 +5542,89 @@ or MCMAN needs an HLE provider the way `mcserv` has one. Do not assume the first
 Suite **478/478**. Instrument work this session is committed and its conclusions stand on their own:
 two write-width blind spots closed, byte accounting complete, `srcAddr` validated, and four of my own
 earlier claims retracted with the reason recorded.
+
+---
+
+## 2026-10-01 — W59: THE CARD STOPPED LYING, AND THE BOOT ADVANCES. Milestone met.
+
+### Before / after, same 120 s budget
+
+```
+BEFORE  Sync cmd=1 result=0      720,920      Sync cmd=2 result=-4     720,920
+AFTER   Sync cmd=1 result=-2    720,920      Sync cmd=2                ZERO
+```
+
+**The `-4` spin is gone: `sceMcOpen` is no longer called at all.** The guest now answers GetInfo, is
+told `-2`, and takes a different path. That is not a renamed stall — it is a different guest code path,
+and it is the one ps2sdk says `-2` selects:
+
+> `iop/memorycard/mcman/src/main.c:615-617` — `McOpen` calls `McDetectCard` first and returns its
+> result **verbatim**, before it ever looks at a filename. On an unformatted card a real open returns
+> **-2**, never -4.
+
+We were answering "no such file" when the truth was "no such card". **Those are different paths and we
+conflated them; the guest has been stuck in the wrong one for a dozen dishes.**
+
+### The bug: `formatted` was a claim, not a fact
+
+`McPortState::formatted` defaulted to **`true`**, and `sceMcInit` asserted it for every port on every
+init, and `sceMcFormat` asserted it after wiping the directory. So an empty host directory claimed to be
+a formatted 8 MB card and answered `type=2 free=8192 format=1 result=0`.
+
+The card is now **a real superblock on disk**, at the Sony layout MCMAN validates
+(`main.c:1368` magic, `:1373` version ≠ 1.0, `:1382` backup blocks, `:1390` root entries `.`/`..`,
+`:1399` only then `cardform = 1`). `sceMcInit` **derives** `formatted` from it; `sceMcFormat` writes
+one; `sceMcUnformat` removes one. The marker is `_pcsx2_superblock`, PCSX2's own convention for a
+folder-backed card (`MemoryCardFolder.cpp:236-244`, `FlushSuperBlock` at `:1196-1205`) — not invented here.
+
+`free` also stopped lying: it was `8192`, which is `clusters_per_card` — the card's **total**. It is now
+`clusters_per_card - alloc_offset = 8151` for a formatted empty card, `0` when unformatted, and a
+`VULCAN 4 LIMITATION` line fires if the store holds entries we cannot account for exactly, because a
+folder-backed card has no FAT to walk.
+
+### Red first, and the tests that were passing on the lie
+
+`W58: a card root with no superblock must report NoFormat, not 'formatted, free=8192'` failed with the
+product's own numbers — `type=2 free=8192 format=1 result=0` — after reproducing the boot's
+init-then-getinfo sequence. (My first version passed for the wrong reason: it skipped `sceMcInit`, which
+is the thing that asserts `formatted`. Recorded, because that is the second time this session a test
+passed for a reason other than the one it claimed.)
+
+**Five existing tests then failed, and they were all passing on the fiction** — they created files in a
+card that did not exist. They now do what a real flow does: format the card first, against the root
+each test already configures. One assertion changed meaning honestly: the MCSERV test expected
+`free == 0x2000`, which was the fiction, and now expects `8151`.
+
+**Suite 479/479.**
+
+### Also settled this stretch
+
+- **The IRX loads were never failing.** `[IOP] loaded IRX id=1..5`; my earlier run simply predated the
+  extraction. `cdrom0:\IRX\` resolution was always fine.
+- **But the real modules do not run**: `[module] load-emulated id=3 path="cdrom0:\IRX\MCMAN.IRX;1"`. The
+  module manager substitutes HLE because these names are in `m_builtinKeys`. Real MCMAN has no path to
+  the card anyway — ps2sdk MCMAN reaches the physical card only through **SIO2MAN** over SIO2
+  (`imports.lst:16-28`), and this tree has no SIO2 transport. So "let real MCMAN serve the card" is a
+  much larger dish, and **an HLE mcserv that serves what the guest measurably asks for is the correct
+  route**, which is what we now have.
+- The observer's `srcAddr` was validated against `$a1` (`[MEMCPY] a1(src)=… bytes@a1=[…]`): all agree.
+  The guest builds **`/BASCUS-97328GAMEDATA`** correctly and our `-4` was honest. That line of inquiry
+  is closed.
+
+### NEXT, and it is small
+
+The card on disk is unformatted, so the guest correctly sees "no card" and now loops on GetInfo instead.
+**A real console has a formatted card.** We now have a real format implementation, so provision one and
+the guest should get past the card stage entirely:
+
+```
+cd /mnt/ssd/vulcan4-build/run   # or drive sceMcFormat from the guest instead
+# format mc0 for real, then re-run and report the new halt honestly, worse or not
+```
+
+If the guest still does not advance, the next question is whether it was ever going to format the card
+itself — research could not establish whether GT4 creates its card directory at boot, and that is still
+**not established** rather than assumed.
+
+**STATUS: milestone MET — the boot advances, past the `-4` spin, onto the `-2` path. The frame itself
+is still not reached:** `VULCAN4 FRAME source=guest` has never printed.

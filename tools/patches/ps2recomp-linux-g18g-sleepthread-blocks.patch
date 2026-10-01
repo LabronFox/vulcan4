@@ -292,10 +292,18 @@ index 0000000..68018ac
 +#endif // PS2_GUEST_PROGRESS_H
 \ No newline at end of file
 diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
-index 4b9242c..31e8e3a 100644
+index 4b9242c..ff46128 100644
 --- a/ps2xRuntime/include/ps2_runtime.h
 +++ b/ps2xRuntime/include/ps2_runtime.h
-@@ -237,6 +237,59 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
+@@ -21,6 +21,7 @@
+ #include <filesystem>
+ #include <memory>
+ #include <unordered_map>
++#include <utility>
+ #include <unordered_set>
+ 
+ #include "ps2_log.h"
+@@ -237,6 +238,59 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
      return static_cast<uint8_t>((valueHi >> ((byteIndex - 8u) * 8u)) & 0xFFu);
  }
  
@@ -355,7 +363,7 @@ index 4b9242c..31e8e3a 100644
  inline void ps2TraceGuestWrite(uint8_t *rdram,
                                 uint32_t guestAddr,
                                 uint32_t size,
-@@ -246,13 +299,12 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
+@@ -246,13 +300,12 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                 const R5900Context *ctx)
  {
      (void)rdram;
@@ -373,7 +381,7 @@ index 4b9242c..31e8e3a 100644
  }
  
  inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
-@@ -390,6 +442,39 @@ public:
+@@ -390,6 +443,49 @@ public:
      void requestStop();
      bool isStopRequested() const;
  
@@ -393,6 +401,16 @@ index 4b9242c..31e8e3a 100644
 +        // because the interesting site was not the last one to run. Naturally bounded: there is
 +        // one entry per distinct PC, and only ~159 syscall sites exist in a generated unit.
 +        std::unordered_set<uint32_t> entryPcs;
++        // W21. The RETURN ADDRESS ($ra) at each issue. entryPcs tells you which instruction issued
++        // the syscall; this tells you WHICH FUNCTION it was issued from, which is the datum that
++        // was missing: a recompiled basic block runs inline and issues syscalls without ever
++        // re-entering its function, so function-entry counts cannot see it. $ra names the function.
++        std::unordered_set<uint32_t> entryRas;
++        // W21. The same addresses as entryRas, but COUNTED. Three distinct $ra values tells you
++        // where a syscall came from; it does not tell you which of them is the one being issued
++        // 1.3 million times. Linear scan, because a generated unit has ~159 syscall sites and this
++        // list stays tiny however hard the guest is hammered.
++        std::vector<std::pair<uint32_t, uint64_t>> entryRaCounts;
 +    };
 +    uint64_t syscallCallCount() const { return m_syscallCallCount; }
 +    // W19. How deep handleSyscall has ever been nested. A guest syscall that blocks and is then
@@ -413,7 +431,7 @@ index 4b9242c..31e8e3a 100644
      EeScheduler &eeScheduler();
      const EeScheduler &eeScheduler() const;
      void postEeEvent(EeEvent event);
-@@ -508,6 +593,14 @@ private:
+@@ -508,6 +604,14 @@ private:
      mutable std::mutex m_guestHeapMutex;
      mutable std::mutex m_asyncCallbackStackMutex;
      std::vector<GuestHeapBlock> m_guestHeapBlocks;
@@ -481,7 +499,7 @@ index 0f19c9f..84c551e 100644
  #define READ128(addr) ([&]() -> __m128i {                     \
      uint32_t _addr = (uint32_t)(addr);                        \
 diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
-index f247ff9..ddfbfca 100644
+index f247ff9..065f6b5 100644
 --- a/ps2xRuntime/include/runtime/ee_scheduler.h
 +++ b/ps2xRuntime/include/runtime/ee_scheduler.h
 @@ -93,6 +93,16 @@ enum class GuestInvocationKind : uint8_t
@@ -501,7 +519,22 @@ index f247ff9..ddfbfca 100644
  struct GuestInvocation
  {
      GuestInvocationKind kind = GuestInvocationKind::Interrupt;
-@@ -318,6 +328,77 @@ public:
+@@ -226,6 +236,14 @@ struct EeKernelSnapshot
+     std::vector<EeThreadSnapshot> threads;
+     std::vector<EeSemaphoreSnapshot> semaphores;
+     std::vector<EeEventFlagSnapshot> eventFlags;
++    // W20. How many guest invocations have been RUN, by kind. GT4's boot services ~221,000
++    // invocations for 31 VBlanks, and 3,033,254 syscalls execute inside them -- none of which the
++    // harness's own entry counters can see, because serviceInvocations() runs guest code through
++    // the scheduler rather than through the function table. Without this split, "the scheduler is
++    // handed work every checkpoint" is a suspicion; with it, a fact. Indexed by
++    // GuestInvocationKind, sized to cover every kind.
++    uint64_t invocationsRun = 0;
++    uint64_t invocationsRunByKind[4] = {0, 0, 0, 0};
+ };
+ 
+ enum class EeEventType : uint8_t
+@@ -318,6 +336,77 @@ public:
      void queueInvocation(GuestInvocation invocation);
      [[noreturn]] void invokeCurrent(GuestInvocation invocation);
      [[noreturn]] void invokeCurrentSequence(std::vector<GuestInvocation> invocations);
@@ -579,7 +612,7 @@ index f247ff9..ddfbfca 100644
      [[nodiscard]] bool hasInvocation(GuestInvocationKind kind, uint64_t tag) const;
      [[nodiscard]] uint32_t invocationStackTop();
  
-@@ -382,8 +463,11 @@ private:
+@@ -382,8 +471,11 @@ private:
      void makeReady(GuestThread &thread, int result, bool interruptSafe);
      void requestPreemptionIfHigher(const GuestThread &readyThread, bool interruptSafe);
      void applyPendingPreemption();
@@ -593,7 +626,18 @@ index f247ff9..ddfbfca 100644
      void processEvent(const EeEvent &event);
      void finishEventWaiters(EeEventFlag &flag, bool interruptSafe);
      [[nodiscard]] static bool eventCondition(uint32_t current, uint32_t requested, uint32_t mode);
-@@ -448,6 +532,8 @@ private:
+@@ -438,6 +530,10 @@ private:
+     std::condition_variable m_eventCv;
+     std::deque<EeEvent> m_events;
+     std::vector<ScheduledEvent> m_deadlines;
++
++    // W20: guest invocations actually RUN, total and by kind. See EeKernelSnapshot.
++    uint64_t m_invocationsRun = 0;
++    uint64_t m_invocationsRunByKind[4] = {0, 0, 0, 0};
+     std::deque<GuestInvocation> m_pendingInvocations;
+     uint64_t m_eventSequence = 0;
+     uint64_t m_invocationSequence = 0;
+@@ -448,6 +544,8 @@ private:
      uint32_t m_gsVSyncCallbackGp = 0;
      uint32_t m_gsVSyncCallbackSp = 0;
      std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
@@ -755,10 +799,31 @@ index 0000000..4636c5e
 +
 +static const unsigned kSyscallNameCount = 58;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c4..b23312d 100644
+index c5e31c4..9794d0d 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-@@ -1121,6 +1121,275 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+@@ -295,6 +295,20 @@ void EeScheduler::run()
+         try
+         {
+             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
++            // W20. Count invocations as they are RUN, by kind, here -- the one place that knows both
++            // that an invocation is attached and what kind it is. GT4's boot runs ~221,000 of these
++            // for 31 VBlanks and issues ~3M syscalls inside them, none of it visible to the
++            // harness's entry counters. Indexed by kind, clamped so a new kind cannot write past
++            // the end of the array.
++            if (!running->invocations.empty())
++            {
++                ++m_invocationsRun;
++                const size_t kind = static_cast<size_t>(running->invocations.back().kind);
++                if (kind < 4u)
++                {
++                    ++m_invocationsRunByKind[kind];
++                }
++            }
+             m_guestExecuting.store(true, std::memory_order_release);
+             function(m_rdram, &context, &m_runtime);
+             m_guestExecuting.store(false, std::memory_order_release);
+@@ -1121,6 +1135,275 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
      throw EeDispatcherTransfer{};
  }
  
@@ -1034,7 +1099,7 @@ index c5e31c4..b23312d 100644
  [[noreturn]] void EeScheduler::invokeCurrentSequence(std::vector<GuestInvocation> invocations)
  {
      assertExecutor();
-@@ -1456,23 +1725,49 @@ uint8_t *EeScheduler::rdram() const noexcept
+@@ -1456,23 +1739,49 @@ uint8_t *EeScheduler::rdram() const noexcept
  
  void EeScheduler::bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram)
  {
@@ -1092,7 +1157,19 @@ index c5e31c4..b23312d 100644
      }
  }
  
-@@ -1740,10 +2035,10 @@ void EeScheduler::applyPendingPreemption()
+@@ -1490,6 +1799,11 @@ void EeScheduler::publishSnapshot()
+     next.sliceEndCycle = m_sliceEndCycle;
+     next.nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+     next.runningThreadId = m_currentThreadId;
++    next.invocationsRun = m_invocationsRun;
++    for (size_t i = 0; i < 4; ++i)
++    {
++        next.invocationsRunByKind[i] = m_invocationsRunByKind[i];
++    }
+     next.threads.reserve(m_threads.size());
+     for (const auto &[id, item] : m_threads)
+     {
+@@ -1740,10 +2054,10 @@ void EeScheduler::applyPendingPreemption()
      m_timeSliceExpired = false;
  }
  
@@ -1105,7 +1182,7 @@ index c5e31c4..b23312d 100644
      const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
      m_pendingEeTimerInterrupts = 0u;
      for (uint32_t timer = 0u; timer < 4u; ++timer)
-@@ -1773,7 +2068,7 @@ void EeScheduler::processPendingEvents()
+@@ -1773,7 +2087,7 @@ void EeScheduler::processPendingEvents()
      applyPendingPreemption();
  }
  
@@ -1114,7 +1191,7 @@ index c5e31c4..b23312d 100644
  {
      for (;;)
      {
-@@ -1798,7 +2093,10 @@ void EeScheduler::processDueDeadlines()
+@@ -1798,7 +2112,10 @@ void EeScheduler::processDueDeadlines()
                  return;
              }
  
@@ -1533,7 +1610,7 @@ index 37b6a4d..43165bf 100644
      {
          return virtualAddress;
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..3ef4685 100644
+index 45cb9d2..127f1f1 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1358,6 +1358,28 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
@@ -1629,7 +1706,7 @@ index 45cb9d2..3ef4685 100644
      if (ctx->in_delay_slot)
      {
          throw std::runtime_error("Attempted to execute a syscall inside a branch delay slot! "
-@@ -1469,13 +1539,29 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
+@@ -1469,13 +1539,42 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
                                     ? encodedSyscallId
                                     : getRegU32(ctx, 3); // $v1 / $3 is the EE kernel syscall number
  
@@ -1646,6 +1723,19 @@ index 45cb9d2..3ef4685 100644
 +    tally.lastPc = ctx->pc;
 +    // W18. Keep every site, not just the last: see SyscallTally::entryPcs.
 +    tally.entryPcs.insert(ctx->pc);
++    // W21. See SyscallTally::entryRas -- names the function a syscall was issued from.
++    const uint32_t ra = getRegU32(ctx, 31);
++    tally.entryRas.insert(ra);
++    auto raIt = std::find_if(tally.entryRaCounts.begin(), tally.entryRaCounts.end(),
++                             [ra](const std::pair<uint32_t, uint64_t> &entry) { return entry.first == ra; });
++    if (raIt != tally.entryRaCounts.end())
++    {
++        ++raIt->second;
++    }
++    else
++    {
++        tally.entryRaCounts.emplace_back(ra, 1u);
++    }
 +
      if (ps2_syscalls::dispatchNumericSyscall(syscallId, rdram, ctx, this))
      {
@@ -1659,7 +1749,7 @@ index 45cb9d2..3ef4685 100644
  }
  
  void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
-@@ -1665,7 +1751,21 @@ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
+@@ -1665,7 +1764,21 @@ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
      }
  
      m_guestHeapBase = base;
@@ -1682,7 +1772,7 @@ index 45cb9d2..3ef4685 100644
      m_guestHeapLimit = limit;
      m_guestHeapConfigured = true;
  }
-@@ -2285,6 +2385,14 @@ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, ui
+@@ -2285,6 +2398,14 @@ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, ui
      }
      const uint32_t guestAddress = static_cast<uint32_t>(address);
      std::memcpy(rdram + guestAddress, &handler, sizeof(handler));

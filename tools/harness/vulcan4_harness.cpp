@@ -1539,6 +1539,14 @@ std::cout << "\n";
               << " service_frames=" << serviceFrames
               << " serviced_with_progress=" << servicedWithProgress
               << " blocked_on_servicing=" << blockedOnServicing
+              // W20: guest invocations run by kind. service_frames counts how OFTEN we serviced;
+              // these count what we RAN, and on GT4 they are ~221,000 against 31 VBlanks -- three
+              // million syscalls executing in here, none of them visible to functions_entered.
+              << " invocations_run=" << kernelSnapshot.invocationsRun
+              << " inv_by_kind=[intr=" << kernelSnapshot.invocationsRunByKind[0]
+              << ",dmac=" << kernelSnapshot.invocationsRunByKind[1]
+              << ",override=" << kernelSnapshot.invocationsRunByKind[2]
+              << ",other=" << kernelSnapshot.invocationsRunByKind[3] << "]"
               << " elapsed_ms=" << elapsed
               << " guest_phase_ms=" << guestElapsed
               << " harness_tail_ms=" << (elapsed - guestElapsed)
@@ -1608,6 +1616,45 @@ std::cout << "\n";
                 std::cout << ",+" << (sites.size() - limit);
             }
             std::cout << "]";
+        }
+        // W21. $ra at each issue names the FUNCTION the syscall came from -- the datum entryPcs
+        // cannot give, because a recompiled basic block runs inline and issues syscalls without
+        // re-entering its function, so no entry counter ever sees them.
+        if (!entry.second.entryRas.empty())
+        {
+            std::vector<uint32_t> ras(entry.second.entryRas.begin(), entry.second.entryRas.end());
+            std::sort(ras.begin(), ras.end());
+            std::cout << " from_fn=" << ras.size() << "ra[";
+            const std::size_t fnLimit = std::min<std::size_t>(ras.size(), 12);
+            for (std::size_t i = 0; i < fnLimit; ++i)
+            {
+                std::cout << (i == 0 ? "" : ",") << toHex(ras[i]);
+            }
+            if (ras.size() > fnLimit)
+            {
+                std::cout << ",+" << (ras.size() - fnLimit);
+            }
+            std::cout << "]";
+        }
+        // W21. The same addresses, COUNTED -- which of them is the one being issued millions of
+        // times. Sort by count so the dominant caller is first, not alphabetical.
+        if (!entry.second.entryRaCounts.empty())
+        {
+            std::vector<std::pair<uint32_t, uint64_t>> ranked(entry.second.entryRaCounts.begin(),
+                                                              entry.second.entryRaCounts.end());
+            std::sort(ranked.begin(), ranked.end(),
+                      [](const std::pair<uint32_t, uint64_t> &l, const std::pair<uint32_t, uint64_t> &r)
+                      { return l.second > r.second; });
+            std::cout << " ra_count=";
+            const std::size_t raLimit = std::min<std::size_t>(ranked.size(), 8);
+            for (std::size_t i = 0; i < raLimit; ++i)
+            {
+                std::cout << (i == 0 ? "" : ",") << toHex(ranked[i].first) << "x" << ranked[i].second;
+            }
+            if (ranked.size() > raLimit)
+            {
+                std::cout << ",+" << (ranked.size() - raLimit);
+            }
         }
         std::cout << "\n";
     }

@@ -2632,3 +2632,84 @@ invocation, not the guest's mutex code and not throughput.** Three measurements,
 `wait=<reason>#<id>:woken=<n>:ra=` line, and the syscall **entry-site set** (`from=1pc[...]`). The
 depth counters are permanent too. Together they took this wall from "tid1@prio3" to "our scheduler
 runs the interrupt handler 221,000 times".
+
+## W21 — SETTLED, and three of my own entries retracted. The spin is `sub_010112E0` ↔ `sub_01011508`, 844,500 times each
+
+The missing instrument was **`$ra` at the syscall, counted**. `SyscallTally` now carries
+`entryRas` (the set) and `entryRaCounts` (the same addresses, counted, sorted by count in the
+report). One 45 s run:
+
+```
+0x29 sce_ChangeThreadPriority calls=1266751  ra_count=0x0101134c x633375, 0x01011628 x633375, 0x01000a2c x1
+0x2f GetThreadId               calls=1689003  ra_count=0x01011314 x844500, 0x0101153c x844500, (+3 x1)
+```
+
+Resolving those `$ra` through the generated unit:
+
+| `$ra` | function | 0x29 count | 0x2f count |
+|---|---|---|---|
+| `0x0101134c` / `0x01011314` | `sub_010112E0` (0x10112e0–0x1011508) | 633,375 | 844,500 |
+| `0x01011628` / `0x0101153c` | `sub_01011508` (0x1011508–0x1011650) | 633,375 | 844,500 |
+| `0x01000a2c` / `0x01000a20` | `sub_01000940` | 1 | 1 |
+
+**The two functions alternate exactly — 844,500 times each in 45 seconds — and the totals balance to
+the single call** (633,375 + 633,375 + 1 = 1,266,751; 844,500 × 2 + 3 = 1,689,003). `sub_01000940`
+is straight-line thread creation (`sce_CreateThread`, then priority 3, then start) and runs **once**;
+it is not the loop.
+
+### Retractions — W18, W19 and W20 were wrong, and here is why
+
+**W15's original reading was correct.** It said the spin is "a balanced set/restore pair in TWO
+functions", and that is exactly what the counted `$ra` shows. I talked myself out of it three times
+with instruments that could not answer the question:
+
+- **W18** ("the histogram is blind, the syscall storm is inside a function entered a handful of
+  times") — the *conclusion* was sound as a caution about the histogram, but the **inference was
+  wrong**. The storm is not hidden inside a rarely-entered function; it is in two frequently-called
+  functions, and the PC histogram simply never showed them because `entryPcs` reports the
+  **continuation** the recompiler publishes before entering the runtime (`0x101f2b8`, the `jr $ra`
+  after the syscall), never the `jal` that got there.
+- **W19** ("this supersedes W15", "one entry producing unbounded handler runs") — **retracted.** The
+  shim entry count of 2 was beside the point: the recompiled guest calls the syscall **shim's
+  contents** from its own inline `syscall` sites, and `$ra` proves it by naming the real callers.
+  Nothing was looping unboundedly inside one entry.
+- **W20** ("the 3 M syscalls are inside `serviceInvocations()`, which the entry counter never sees",
+  "our scheduler runs the interrupt handler 221,000 times") — **retracted, and measured to be
+  false.** I built `invocationsRun` / `invocationsRunByKind` to test it and the answer was
+  **`invocations_run=0`**: `serviceInvocations()` ran guest code 130,105 times but never once with
+  an invocation attached. The arithmetic that "confirmed" it (221,338 × 13.7 ≈ 3.03 M) was me
+  fitting two unrelated numbers. Keep the counters — they are what proved me wrong in one run —
+  but do not believe the claim they were built for.
+
+### What is actually true, all of it measured
+
+1. The guest alternates `sub_010112E0` ↔ `sub_01011508` 844,500 times in 45 s and never leaves them.
+2. `sub_01011508` is the wait-list broadcast: raise self to priority 1, `sce_WakeupThread` every node
+   except self, restore the priority saved from `obj+0x1C`. `sub_010116A8` is the recursive-mutex
+   acquire around it.
+3. The wait list holds **only tid1's own frame**, so the `beq $v0,$s3` self-skip fires every pass and
+   **`sce_WakeupThread` (0x33) is issued zero times**.
+4. tid2 is `Waiting` on reason `sleep`, parked in `sce_SleepThread`, **`woken=0`** — never woken.
+5. The time slice is correct and IRQs are delivered; neither is the defect.
+
+### The one question left, and it is a real one
+
+**Why does `sub_01011508`'s wait list contain only tid1's own frame?** Two candidates, and they
+have very different fixes:
+
+- **The wait list is a different lock from the one tid2 waits on.** tid2 sleeps on a test-and-clear
+  word with bit `0x100` in `sub_0100AE78`; the broadcast walks a mutex's frame list. If they are
+  unrelated primitives, then tid1 legitimately has nobody to wake and the real question becomes
+  *what is tid1 waiting for*, which is `obj+0x20`'s owner tid.
+- **The frame was never linked.** tid2 blocked without leaving a frame on this mutex's list, so the
+  broadcast has nothing to walk. Then the defect is in whatever enqueues blocked threads onto that
+  list.
+
+**The measurement that discriminates, and it is one word of guest memory:** print `obj+0x20` (the
+owner tid) and `obj+0x0C` (the wait-list head) for the mutex `sub_01011508` is given, from the same
+W17-style dump that already reads guest globals. `obj` is `$a0` on entry to the broadcast, which is
+already in `$a0` at `ra=0x01011628`. Read it at that PC, once, at the halt.
+
+Also still open and cheap: `sub_010112E0` has never been decoded this session — it is the twin of
+`sub_01011508` and does the same GetThreadId + priority work, so whichever one owns the loop
+condition is the one to read first.

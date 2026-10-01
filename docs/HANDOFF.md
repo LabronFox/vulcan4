@@ -4822,3 +4822,55 @@ The instrument can answer that now that the window and caps are env-tunable.
 
 **STATUS: no frame.** Suite 477/477. Boot unchanged: `sceMcOpen` steady at ~2,128/s, all `-4`,
 `halt=wallclock_deadline`.
+
+---
+
+## 2026-10-01 — W55: the store observer now says WHICH writer and FROM WHERE. The disc path is identified.
+
+**THE INSTRUMENT IS FIXED.** `PS2GuestStoreObserver` now carries `op` (which path wrote) and `srcAddr`
+(the far end of a bulk copy), and `memcpy`/`syscallCopy` pass their real source. This was necessary
+because `ps2TraceGuestRangeWrite` forwards the **destination as the "value"** for a range write, so a
+2-byte `memcpy` and a 2-byte `sh` were indistinguishable — which is why "which writer?" has been
+ambiguous since W30.
+
+**A REAL BUILD HAZARD FOUND AND FIXED.** `rebuild_harness.sh` compiled only the harness and linked a
+pre-existing `ps2_recompiled_functions.o`. That object includes `ps2_runtime_macros.h`, so after any
+runtime-header change it held the **old 4-argument** observer call and handed the new harness garbage
+for `op` — **segfault on the first bulk write**, three runs in a row. The script now recompiles the
+generated unit. Any past "the harness crashes after a header change" is this, not the runtime.
+
+**WHAT THE GUEST IS ACTUALLY BUILDING — the `.rodata` strings, read off the ELF:**
+
+| guest address | bytes | copied to | size |
+|---|---|---|---|
+| `0x0103D1D8` | `core.gt4\0` | `0x01051A10` | 9 |
+| `0x0103D558` | `cdrom0:\` | `0x01051A10` | 8 |
+| `0x0103D568` | `;1` | `0x01051A20` | 3 |
+| `0x0103D548` | `GAMEDATA` | — | 8 |
+
+**So GT4 is assembling the DISC path `cdrom0:\GAMEDATA\core.gt4;1`** — its own executable, on the CD,
+with the ISO `;1` version suffix. `cdrom0:` is the ASCII device prefix our own
+`parsePs2Path` (`ps2_path.cpp:57`) already classifies as `Ps2PathDevice::Cdrom`, and the FileIO
+provider added in G1 resolves exactly that shape through `IopHost::translateGuestPath`/CdRoot.
+
+**AND THE 2-BYTE MYSTERY IS SOLVED.** The `05 80` in the name buffer is a 2-byte `memcpy` **from
+`0x010519C0`** (seq=265, causally after the 9-byte `core.gt4` copy at seq=254). At that instant
+`0x010519C0` does **not** hold `/BASCUS-97328` — the post-write dump shows non-printable bytes at +0
+and then `A` at +8, `B` at +0x10, `Y` at +0x20, `Z` at +0x30, `0` at +0x40. It is a **table**.
+
+**Which retires W49's headline.** `0x010519C0` is **reused scratch that holds different things at
+different moments** — a table at seq=265, the readable `/BASCUS-97328` later. W49 reported
+"the guest builds `/BASCUS-97328` and passes something else" as if the two were the same buffer's
+stable contents. They are not. The guest is concatenating pieces from `.rodata` and from whatever is
+in scratch, into `0x01051A10`, and we catch it **mid-sequence**: a later 8-byte copy of `cdrom0:\` to
+the same address (seq=336) and `;1` to `+0x10` (seq=354) follow the ones we sampled.
+
+**So the wall, stated honestly: the guest passes `sceMcOpen` a buffer it is still rewriting.** The
+`\x05\x80/\x05\x80/e.gt4` we see is not a string the guest means; it is one intermediate state of a
+buffer that is about to become `cdrom0:\...\GAMEDATA\core.gt4;1`. **Whether the guest opens the MC
+with that buffer, or whether our side reads the buffer before the guest finishes filling it, is NOT
+yet established** — and that is now the sharpest question we have, because our `sceMcOpen` reads the
+`name` pointer the instant it is called, and the guest's own copy sequence is still in flight.
+
+**STATUS: no frame.** Suite **477/477**. Boot unchanged: `sceMcOpen` steady ~2,128/s, all `-4`,
+`halt=wallclock_deadline`.

@@ -156,7 +156,12 @@ uint32_t g_watchPeek(uint32_t guestAddr)
     return v;
 }
 
-void watchGuestStoreForPath(uint32_t guestAddr, uint32_t size, uint64_t value, const R5900Context *ctx)
+void watchGuestStoreForPath(uint32_t guestAddr,
+                                       uint32_t size,
+                                       uint64_t value,
+                                       const R5900Context *ctx,
+                                       const char *op,
+                                       uint32_t srcAddr)
 {
     // W45. BEFORE-SNAPSHOT. W44 found a write to 0x010519C0 that the observer never reported, so a
     // log line describing only the state AFTER the store cannot say what was overwritten. Capturing
@@ -195,7 +200,8 @@ void watchGuestStoreForPath(uint32_t guestAddr, uint32_t size, uint64_t value, c
         if (g_watchBigCopyHits <= watchEnv("VULCAN4_BIGCOPY_MAX", 2u))
         {
             std::cout << "VULCAN4 W30BIGCOPY seq=" << ps2NextTraceSequence()
-                      << " tid=" << g_guestThreadId << " n=" << g_watchBigCopyHits << " pc=0x" << std::hex
+                      << " tid=" << g_guestThreadId << " op=" << (op != nullptr ? op : "?")
+                      << " src=0x" << std::hex << srcAddr << std::dec << " n=" << g_watchBigCopyHits << " pc=0x" << std::hex
                       << (ctx != nullptr ? ctx->pc : 0u) << " dst=0x" << guestAddr << " size="
                       << std::dec << size << "\n";
         }
@@ -215,7 +221,8 @@ void watchGuestStoreForPath(uint32_t guestAddr, uint32_t size, uint64_t value, c
             const uint32_t f4 = obj + 4u <= PS2_RAM_SIZE ? g_watchPeek(obj + 4u) : 0u;
             const uint32_t buf = static_cast<uint32_t>(value);
             std::cout << "VULCAN4 W33PATHSTORE seq=" << ps2NextTraceSequence()
-                      << " tid=" << g_guestThreadId << " n=" << g_watchPathHits << " obj=0x" << std::hex << obj
+                      << " tid=" << g_guestThreadId << " op=" << (op != nullptr ? op : "?")
+                      << " src=0x" << std::hex << srcAddr << std::dec << " n=" << g_watchPathHits << " obj=0x" << std::hex << obj
                       << " obj->0x0=0x" << f0 << " obj->0x4=0x" << f4 << std::dec;
             // Print both candidates' first bytes. Whichever one is the path the guest built is the
             // one that reads as "<name>/<name>"; that settles it without any interpretation.
@@ -253,7 +260,12 @@ void watchGuestStoreForPath(uint32_t guestAddr, uint32_t size, uint64_t value, c
         return;
     }
     ++g_watchStoreHits;
-    std::cout << "VULCAN4 W30WRITE seq=" << ps2NextTraceSequence() << " n=" << g_watchStoreHits << " pc=0x" << std::hex
+    // W50. op= names the write path and src= is the far end of a bulk copy. Without them a 2-byte
+    // syscallCopy and a 2-byte sh are indistinguishable, because ps2TraceGuestRangeWrite forwards
+    // the DESTINATION as "value" for a range write.
+    std::cout << "VULCAN4 W30WRITE seq=" << ps2NextTraceSequence()
+              << " op=" << (op != nullptr ? op : "?") << " src=0x" << std::hex << srcAddr << std::dec
+              << " tid=" << g_guestThreadId << " n=" << g_watchStoreHits << " pc=0x" << std::hex
               << (ctx != nullptr ? ctx->pc : 0u) << " ra=0x" << (ctx != nullptr ? getRegU32(ctx, 31) : 0u)
               << " addr=0x" << guestAddr << std::dec << " size=" << size << " value=0x" << std::hex
               << static_cast<uint32_t>(value) << std::dec << " now='";

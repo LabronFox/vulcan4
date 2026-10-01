@@ -443,10 +443,10 @@ index 0000000..596d3d4
 +}
 \ No newline at end of file
 diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
-index fe6d457..9b6f1e3 100644
+index fe6d457..8c30c51 100644
 --- a/ps2xRuntime/include/ps2_runtime.h
 +++ b/ps2xRuntime/include/ps2_runtime.h
-@@ -250,6 +250,28 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
+@@ -250,10 +250,39 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
  //
  // It is a plain function pointer, not a std::function, and it is checked for null on every store:
  // the null case costs one predictable branch and changes nothing about the hot path.
@@ -472,11 +472,54 @@ index fe6d457..9b6f1e3 100644
 +    return ps2TraceSequenceCounter().fetch_add(1u, std::memory_order_relaxed) + 1u;
 +}
 +
++// W50. `op` and `srcAddr` were added because the observer could not tell a scalar store from a
++// bulk copy: ps2TraceGuestRangeWrite forwards the DESTINATION as the "value" (a range write has no
++// single value), so a 2-byte memcpy and a 2-byte sh looked identical. Every "which writer?" question
++// since W30 has been ambiguous for that reason. `op` names the path ("syscallCopy", "WRITE16",
++// "fioRead", ...) and `srcAddr` is the other end of a bulk copy (0 when not applicable).
  using PS2GuestStoreObserver = void (*)(uint32_t guestAddr,
                                         uint32_t size,
                                         uint64_t value,
+-                                       const R5900Context *ctx);
++                                       const R5900Context *ctx,
++                                       const char *op,
++                                       uint32_t srcAddr);
+ 
+ inline PS2GuestStoreObserver g_ps2GuestStoreObserver = nullptr;
+ 
+@@ -302,10 +331,9 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
+ {
+     (void)rdram;
+     (void)valueHi;
+-    (void)op;
+     if (g_ps2GuestStoreObserver != nullptr)
+     {
+-        g_ps2GuestStoreObserver(guestAddr, size, valueLo, ctx);
++        g_ps2GuestStoreObserver(guestAddr, size, valueLo, ctx, op, 0u);
+     }
+ }
+ 
+@@ -313,7 +341,8 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
+                                     uint32_t guestAddr,
+                                     uint32_t size,
+                                     const char *op,
+-                                    const R5900Context *ctx)
++                                    const R5900Context *ctx,
++                                    uint32_t srcAddr = 0u)
+ {
+     (void)rdram;
+     (void)op;
+@@ -329,7 +358,7 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
+     // wanted the value has to say so by watching a narrower range.
+     if (g_ps2GuestStoreObserver != nullptr)
+     {
+-        g_ps2GuestStoreObserver(guestAddr, size, static_cast<uint64_t>(guestAddr), ctx);
++        g_ps2GuestStoreObserver(guestAddr, size, static_cast<uint64_t>(guestAddr), ctx, op, srcAddr);
+     }
+ }
+ 
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
-index 0baca03..ade840f 100644
+index 0baca03..c7a813a 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
 @@ -173,7 +173,7 @@ namespace ps2_stubs
@@ -488,6 +531,31 @@ index 0baca03..ade840f 100644
                        << " obj->0x0=0x" << f0 << " obj->0x4=0x" << f4 << " lenA(s0)=0x"
                        << getRegU32(ctx, 16) << " lenB(s3)=0x" << getRegU32(ctx, 19) << std::dec
                        << " memcpy(dest=0x" << std::hex << dest << " src=0x" << src << " size=" << std::dec
+@@ -305,7 +305,10 @@ namespace ps2_stubs
+ 
+         if (copied != 0u)
+         {
+-            ps2TraceGuestRangeWrite(rdram, destAddr, copied, "memcpy", ctx);
++            // W50. curSrc has been advanced past the copy by the time we get here, so pass the
++            // source the call STARTED from. Without this the observer reported src=0 for every
++            // guest memcpy, which is the one field that says where the bytes came from.
++            ps2TraceGuestRangeWrite(rdram, destAddr, copied, "memcpy", ctx, srcAddr);
+         }
+ 
+         // returns dest pointer ($v0 = $a0)
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 70ae1ed..3836cdd 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -1134,7 +1134,7 @@ namespace ps2_syscalls
+             const uint8_t *srcPtr = getConstMemPtr(rdram, src);
+             if (destPtr && srcPtr)
+             {
+-                ps2TraceGuestRangeWrite(rdram, dest, size, "syscallCopy", ctx);
++                ps2TraceGuestRangeWrite(rdram, dest, size, "syscallCopy", ctx, src);
+                 std::memcpy(destPtr, srcPtr, size);
+             }
+         }
 diff --git a/ps2xTest/src/ps2_iop_tests.cpp b/ps2xTest/src/ps2_iop_tests.cpp
 index f1172e9..dfe82b5 100644
 --- a/ps2xTest/src/ps2_iop_tests.cpp

@@ -2497,3 +2497,70 @@ that keeps only the syscall *sites* seen (not just the last) would name the func
    our handling of those two syscalls.
 
 Do **not** re-run the `-O2` experiment; it is measured, kept, and does not move this wall.
+
+## W19 — the syscall site set is in, and it names a contradiction that is OURS, not the guest's
+
+The W18 next-step is built and gated. `PS2Runtime::SyscallTally` now carries
+`std::unordered_set<uint32_t> entryPcs` — **every distinct guest PC a syscall was entered from**,
+not just the last — recorded in `handleSyscall`, red-tested first in
+`ps2xTest/src/ps2_runtime_expansion_tests.cpp` ("handleSyscall tallies every distinct PC it was
+entered from, not only the last"). That test failed its first green run on its own expectation
+(`lastPc` after a third call from the *first* site is that site again, not the second), which is
+exactly why it was worth writing. Suite: **469 total, 468 pass, 1 fail** — the same pre-existing
+`VU0 macro mappings` failure. Patch regenerated from `git diff --cached`, 28 files / 28 headers,
+`ps2_runtime.h` + `ps2_runtime.cpp` both present.
+
+### What one 45 s run now says
+
+```
+0x29 sce_ChangeThreadPriority calls=1300771 last_pc=0x0101f2b8 from=1pc[0x0101f2b8]
+0x2f sce_unnamed_syscall       calls=1734365 last_pc=0x0101f318 from=1pc[0x0101f318]
+0x32 sce_SleepThread           calls=33      last_pc=0x0101f348 from=1pc[0x0101f348]
+```
+
+Each syscall has **exactly one entry site**. So these are not a guest calling from many places —
+they are one call site each, hammered.
+
+### And here is the contradiction, which is the actual finding
+
+- The PC histogram says the shim's **entry** `0x0101f2b0` was entered **2** times in 45 s, and
+  `0x0101f310` **6** times.
+- The syscall tally says `handleSyscall` ran **1,300,771** times for 0x29 and **1,734,365** for 0x2f,
+  each from a **single** site — and that site is `0x0101f2b8` / `0x0101f318`, which is the shim's
+  `jr $ra`, i.e. the instruction **after** the syscall, not the syscall itself.
+
+**So one guest function entry is producing hundreds of thousands of syscall handler entries, at the
+continuation PC.** Only two readings fit, and both are defects on our side of the line:
+
+1. **A guest syscall is re-handled without being re-executed.** A syscall that blocks (and
+   `sce_ChangeThreadPriority` blocks whenever it causes a reschedule) is being resumed by
+   re-invoking `handleSyscall` at the published continuation instead of resuming at the
+   continuation *instruction*. The guest then never advances past its own syscall.
+2. Something invokes `handleSyscall` outside the guest's instruction stream. The runtime declares
+   only the two `handleSyscall` overloads and the generated unit has **159** call sites, so a
+   non-guest caller would have to be one of the 159 with the wrong `ctx->pc`.
+
+**This supersedes the W15 story.** W15 read 2.24M `sce_ChangeThreadPriority` as "a guest busy-wait
+pairing priority set and restore in a loop", and W16/W17 built on that. The site set says it is not a
+loop at all: it is one entry into one shim producing an unbounded number of handler runs. **Do not
+go looking for the mutex loop any further — the premise was wrong.**
+
+### Red test owed, and it is specific
+
+`handleSyscall` must run **once per executed guest syscall instruction**. The shape to write:
+
+- Enter `sub_0101F2B0`-equivalent shim state, run one `handleSyscall`, and assert
+  `runtime.syscallCounts()[0x29].count == 1`.
+- Then force the blocking case — a `ChangeThreadPriority` that actually reschedules — resume it,
+  and assert the count is still `1` and `ctx->pc` has advanced **past** the syscall instruction to
+  the continuation. **Count > 1 after one guest instruction, or `ctx->pc` still on the syscall, is
+  the bug.**
+- Cover the resume path explicitly, because the existing thread tests (`ps2_thread_block_tests.cpp`)
+  already exercise blocked-syscall resumption for `sce_SleepThread` and pass — which means the
+  defect, if it is (1), is specific to a syscall whose handler **reschedules** rather than blocks,
+  and that is the specific thing to test.
+
+Do not attempt a fix from the current evidence. The one measurement that discriminates (1) from (2)
+is cheap: put a recursion-depth counter in `handleSyscall` and print it at the halt. If the depth
+ever exceeds 1, it is (1) — re-handling through the dispatcher — and the fix is in the resume path.
+If it never does, the 1.3M entries are flat and (2) is true.

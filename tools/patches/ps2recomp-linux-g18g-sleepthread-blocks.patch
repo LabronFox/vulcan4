@@ -292,7 +292,7 @@ index 0000000..68018ac
 +#endif // PS2_GUEST_PROGRESS_H
 \ No newline at end of file
 diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
-index 4b9242c..d41002c 100644
+index 4b9242c..28eab3b 100644
 --- a/ps2xRuntime/include/ps2_runtime.h
 +++ b/ps2xRuntime/include/ps2_runtime.h
 @@ -237,6 +237,59 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
@@ -373,7 +373,7 @@ index 4b9242c..d41002c 100644
  }
  
  inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
-@@ -390,6 +442,26 @@ public:
+@@ -390,6 +442,33 @@ public:
      void requestStop();
      bool isStopRequested() const;
  
@@ -386,6 +386,13 @@ index 4b9242c..d41002c 100644
 +    {
 +        uint64_t count = 0;   // how many times the guest issued this syscall
 +        uint32_t lastPc = 0;  // guest PC of the most recent one
++        // W18: the SET of distinct guest PCs this syscall was entered FROM. lastPc alone is
++        // useless the moment one syscall is issued from two places -- and a guest hammering one
++        // syscall from several places is exactly what a runaway loop looks like. Recording only
++        // the last PC hid the function responsible for 1,296,791 sce_ChangeThreadPriority calls,
++        // because the interesting site was not the last one to run. Naturally bounded: there is
++        // one entry per distinct PC, and only ~159 syscall sites exist in a generated unit.
++        std::unordered_set<uint32_t> entryPcs;
 +    };
 +    uint64_t syscallCallCount() const { return m_syscallCallCount; }
 +    uint32_t lastSyscallId() const { return m_lastSyscallId; }
@@ -400,7 +407,7 @@ index 4b9242c..d41002c 100644
      EeScheduler &eeScheduler();
      const EeScheduler &eeScheduler() const;
      void postEeEvent(EeEvent event);
-@@ -508,6 +580,11 @@ private:
+@@ -508,6 +587,11 @@ private:
      mutable std::mutex m_guestHeapMutex;
      mutable std::mutex m_asyncCallbackStackMutex;
      std::vector<GuestHeapBlock> m_guestHeapBlocks;
@@ -1517,7 +1524,7 @@ index 37b6a4d..43165bf 100644
      {
          return virtualAddress;
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..21292a8 100644
+index 45cb9d2..c6ec4d4 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1358,6 +1358,28 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
@@ -1588,7 +1595,7 @@ index 45cb9d2..21292a8 100644
      if (isStopRequested() || ctx->pc == 0u)
      {
          return false;
-@@ -1469,13 +1521,27 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
+@@ -1469,13 +1521,29 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
                                     ? encodedSyscallId
                                     : getRegU32(ctx, 3); // $v1 / $3 is the EE kernel syscall number
  
@@ -1603,6 +1610,8 @@ index 45cb9d2..21292a8 100644
 +    SyscallTally &tally = m_syscallCounts[syscallId];
 +    ++tally.count;
 +    tally.lastPc = ctx->pc;
++    // W18. Keep every site, not just the last: see SyscallTally::entryPcs.
++    tally.entryPcs.insert(ctx->pc);
 +
      if (ps2_syscalls::dispatchNumericSyscall(syscallId, rdram, ctx, this))
      {
@@ -1616,7 +1625,7 @@ index 45cb9d2..21292a8 100644
  }
  
  void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
-@@ -1665,7 +1731,21 @@ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
+@@ -1665,7 +1733,21 @@ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
      }
  
      m_guestHeapBase = base;
@@ -1639,7 +1648,7 @@ index 45cb9d2..21292a8 100644
      m_guestHeapLimit = limit;
      m_guestHeapConfigured = true;
  }
-@@ -2285,6 +2365,14 @@ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, ui
+@@ -2285,6 +2367,14 @@ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, ui
      }
      const uint32_t guestAddress = static_cast<uint32_t>(address);
      std::memcpy(rdram + guestAddress, &handler, sizeof(handler));
@@ -2203,7 +2212,7 @@ index 0b22fe0..9e1b3a4 100644
          {
              PS2Memory mem;
 diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
-index 4772f3f..b7031a4 100644
+index 4772f3f..9be2944 100644
 --- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
 +++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
 @@ -309,6 +309,77 @@ namespace
@@ -2375,6 +2384,54 @@ index 4772f3f..b7031a4 100644
          tc.Run("lookupFunction rejects internal resume PCs without exact registration", [](TestCase &t)
          {
              PS2Runtime runtime;
+@@ -1086,6 +1241,47 @@ void register_ps2_runtime_expansion_tests()
+             t.IsTrue(threw, "syscall from delay slot should throw to preserve block atomicity");
+         });
+ 
++        tc.Run("handleSyscall tallies every distinct PC it was entered from, not only the last", [](TestCase &t)
++        {
++            // W18. The CALLKIND report carries one syscall's "last_pc", which is useless the moment
++            // the same syscall is issued from two places -- and a guest that issues a syscall from
++            // two places is exactly what a runaway loop looks like. Recording only the last PC hid
++            // the function responsible for 1.3M sce_ChangeThreadPriority calls. The tally must keep
++            // the SET of entry PCs, so one run names every site.
++            PS2Runtime runtime;
++            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
++
++            R5900Context first{};
++            first.pc = 0x0100AAA0u;
++            runtime.handleSyscall(rdram.data(), &first, 0x83u);
++
++            R5900Context second{};
++            second.pc = 0x0100BBB0u;
++            runtime.handleSyscall(rdram.data(), &second, 0x83u);
++
++            // and a third from the first site again: a repeat must not create a new entry
++            R5900Context again{};
++            again.pc = 0x0100AAA0u;
++            runtime.handleSyscall(rdram.data(), &again, 0x83u);
++
++            const auto &counts = runtime.syscallCounts();
++            const auto it = counts.find(0x83u);
++            t.IsTrue(it != counts.end(), "syscall 0x83 should be tallied");
++            if (it == counts.end())
++            {
++                return;
++            }
++            t.Equals(it->second.count, static_cast<uint64_t>(3), "three issues should tally three");
++            // The third issue came from the FIRST site, so the most recent PC is that site again.
++            // (Writing this the other way round is how the first run of this test failed, which is
++            // the point of writing it at all.)
++            t.Equals(it->second.lastPc, 0x0100AAA0u, "lastPc should be the most recent PC");
++            t.Equals(it->second.entryPcs.size(), static_cast<size_t>(2),
++                     "two distinct entry PCs should be recorded, not three");
++            t.IsTrue(it->second.entryPcs.count(0x0100AAA0u) == 1, "first site should be in the set");
++            t.IsTrue(it->second.entryPcs.count(0x0100BBB0u) == 1, "second site should be in the set");
++        });
++
+         tc.Run("VIF MSCAL and MSCNT toggle DBF and keep TOPS/ITOPS coherent", [](TestCase &t)
+         {
+             PS2Memory mem;
 diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
 index 63b12d9..8140cd4 100644
 --- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
@@ -3128,10 +3185,10 @@ index 7242e65..4d8de05 100644
  }
 diff --git a/ps2xTest/src/ps2_thread_block_tests.cpp b/ps2xTest/src/ps2_thread_block_tests.cpp
 new file mode 100644
-index 0000000..6845991
+index 0000000..32e34fd
 --- /dev/null
 +++ b/ps2xTest/src/ps2_thread_block_tests.cpp
-@@ -0,0 +1,889 @@
+@@ -0,0 +1,904 @@
 +#include "MiniTest.h"
 +#include "ps2_runtime.h"
 +#include "ps2_runtime_macros.h"
@@ -3729,6 +3786,21 @@ index 0000000..6845991
 +            // list suspected. "At or above priority p" is the set {0..p} because smaller is higher, so
 +            // scanning `for (i = 0; i <= p; ++i)` asks the right question; scanning upward would ask
 +            // about threads LOWER than p.
++
++            // HONEST SCOPE, because a test that cannot fail on a regression is worse than no test.
++            // This one does NOT discriminate `>=` from `<=`. Measured, with `<=` applied to the guard
++            // ALONE: this test still passes and the suite falls to 465/468, and the three failures
++            // are the ones that actually pin the behaviour --
++            //   "starting a strictly higher-priority thread preempts immediately"
++            //   "semaphore waiters are FIFO and signal transfers one token directly"
++            //   "event waiters are FIFO and clear modes apply before testing the next waiter"
++            // Those three are the gate. Why `<=` slips past here: it is a full inversion rather than
++            // an equal-priority special case, and a preempt only ever re-selects through
++            // selectReady(), which walks m_readyQueues from index 0 upward and so hands the CPU back
++            // to the highest-priority READY thread regardless of which thread asked for it. With one
++            // Ready thread either way, both guards land on the same answer. What this test adds is
++            // the rule written down, plus the two cases a reader would otherwise have to reconstruct
++            // from the other three.
 +            //
 +            // Both threads' frames are parked at pc = 0 first. serviceInvocations() is NOT a neutral
 +            // "apply the flag" call -- it runs guest frames -- and three earlier versions of this test

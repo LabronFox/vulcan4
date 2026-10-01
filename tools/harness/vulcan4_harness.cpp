@@ -1586,7 +1586,28 @@ std::cout << "\n";
         std::cout << "  0x" << std::hex << std::setw(2) << std::setfill('0') << entry.first
                   << std::dec << std::setfill(' ') << " sce_" << syscallName(entry.first)
                   << " calls=" << entry.second.count
-                  << " last_pc=" << toHex(entry.second.lastPc) << "\n";
+                  << " last_pc=" << toHex(entry.second.lastPc);
+        // W18. last_pc is ONE site and it is the last one to run, which is the least useful one when
+        // a syscall is issued from several places -- and a guest hammering one syscall from several
+        // places is what a runaway loop looks like. So print every site it was entered from. This is
+        // what names the function responsible for 1.3M sce_ChangeThreadPriority calls in one run.
+        if (!entry.second.entryPcs.empty())
+        {
+            std::vector<uint32_t> sites(entry.second.entryPcs.begin(), entry.second.entryPcs.end());
+            std::sort(sites.begin(), sites.end());
+            std::cout << " from=" << sites.size() << "pc[";
+            const std::size_t limit = std::min<std::size_t>(sites.size(), 12);
+            for (std::size_t i = 0; i < limit; ++i)
+            {
+                std::cout << (i == 0 ? "" : ",") << toHex(sites[i]);
+            }
+            if (sites.size() > limit)
+            {
+                std::cout << ",+" << (sites.size() - limit);
+            }
+            std::cout << "]";
+        }
+        std::cout << "\n";
     }
 
     for (const auto &entry : mmio)

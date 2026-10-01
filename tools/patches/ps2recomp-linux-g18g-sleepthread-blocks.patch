@@ -1628,7 +1628,7 @@ index 37b6a4d..43165bf 100644
      {
          return virtualAddress;
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..227f7c0 100644
+index 45cb9d2..dc24d77 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1358,6 +1358,28 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
@@ -1724,10 +1724,38 @@ index 45cb9d2..227f7c0 100644
      if (ctx->in_delay_slot)
      {
          throw std::runtime_error("Attempted to execute a syscall inside a branch delay slot! "
-@@ -1469,13 +1539,81 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
+@@ -1469,13 +1539,109 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
                                     ? encodedSyscallId
                                     : getRegU32(ctx, 3); // $v1 / $3 is the EE kernel syscall number
  
++    // W24. The PS2 kernel does NOT restore $v1 on syscall return: the caller gets back the
++    // dispatcher's SCALED byte index, abs(number) * 4. yuias/PS2BiosRebuild docs/spec/04 EE-7e2
++    // ("$v1 is not restored ... a rebuild that helpfully puts the number back has changed the
++    // interface") and docs/spec/05 SYS-3a ("$v1 holds the number at the dispatcher, the scaled form
++    // at the handler"). EE-7b negates a negative number before the table lookup, so the index is the
++    // ABSOLUTE value scaled by four -- which is why the "i" (interrupt-safe) variants scale the same
++    // way as their positive twins. SYS-3c is the one exception: 0x7C (Deci2Call) restores its own
++    // frame and hands $v1 back as 0x7C.
++    //
++    // We were leaving $v1 holding whatever the guest put there -- the syscall number -- so any game
++    // that reads $v1 after a syscall saw the wrong value. GT4 is such a game.
++    //
++    // An RAII guard, not a plain assignment: a syscall that blocks leaves by throwing, and the
++    // hardware sets $v1 on the way OUT of the kernel either way. Setting it only on the normal
++    // return would make $v1 wrong for exactly the syscalls that yield, which is the worst case.
++    struct SyscallV1Guard
++    {
++        R5900Context *context;
++        uint32_t value;
++        ~SyscallV1Guard()
++        {
++            SET_GPR_U32(context, 3, value);
++        }
++    } v1Guard{ctx, (syscallId == 0x7Cu) ? 0x7Cu
++                                       : static_cast<uint32_t>((syscallId & 0x80000000u) ? (0u - syscallId)
++                                                                                           : syscallId)
++                                             * 4u};
++
 +    // Guest syscall accounting. A recomp that runs the guest's real code needs to be able to
 +    // answer "what did the guest ask the console for?", so the counts are recorded here and
 +    // exposed read-only. VULCAN 4 reads them to produce its no-BIOS backlog. The number and PC
@@ -1806,7 +1834,7 @@ index 45cb9d2..227f7c0 100644
  }
  
  void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
-@@ -1665,7 +1803,21 @@ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
+@@ -1665,7 +1831,21 @@ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
      }
  
      m_guestHeapBase = base;
@@ -1829,7 +1857,7 @@ index 45cb9d2..227f7c0 100644
      m_guestHeapLimit = limit;
      m_guestHeapConfigured = true;
  }
-@@ -2285,6 +2437,14 @@ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, ui
+@@ -2285,6 +2465,14 @@ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, ui
      }
      const uint32_t guestAddress = static_cast<uint32_t>(address);
      std::memcpy(rdram + guestAddress, &handler, sizeof(handler));
@@ -2393,7 +2421,7 @@ index 0b22fe0..9e1b3a4 100644
          {
              PS2Memory mem;
 diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
-index 4772f3f..6254c61 100644
+index 4772f3f..0988546 100644
 --- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
 +++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
 @@ -309,6 +309,77 @@ namespace
@@ -2565,7 +2593,7 @@ index 4772f3f..6254c61 100644
          tc.Run("lookupFunction rejects internal resume PCs without exact registration", [](TestCase &t)
          {
              PS2Runtime runtime;
-@@ -1086,6 +1241,80 @@ void register_ps2_runtime_expansion_tests()
+@@ -1086,6 +1241,114 @@ void register_ps2_runtime_expansion_tests()
              t.IsTrue(threw, "syscall from delay slot should throw to preserve block atomicity");
          });
  
@@ -2608,6 +2636,40 @@ index 4772f3f..6254c61 100644
 +                     "two distinct entry PCs should be recorded, not three");
 +            t.IsTrue(it->second.entryPcs.count(0x0100AAA0u) == 1, "first site should be in the set");
 +            t.IsTrue(it->second.entryPcs.count(0x0100BBB0u) == 1, "second site should be in the set");
++        });
++
++        tc.Run("a syscall returns the dispatcher's SCALED byte index in $v1 and preserves $a0-$a3", [](TestCase &t)
++        {
++            // W24. The PS2 kernel does NOT restore $v1: the caller gets back the dispatcher's
++            // scaled byte index, i.e. abs(number) * 4. yuias/PS2BiosRebuild docs/spec/04 EE-7e2:
++            // "a rebuild that helpfully puts the number back has changed the interface"; and
++            // docs/spec/05 SYS-3a: "$v1 holds the number at the dispatcher, the scaled form at the
++            // handler". EE-7b negates a negative number before the lookup, so the index is |n| * 4.
++            //
++            // We leave $v1 holding whatever the guest put there -- the syscall number -- so every
++            // game that reads $v1 after a syscall sees the wrong value. GT4 is a game that could.
++            //
++            // The second half is just as load-bearing: _syscall_entry sq_s all 32 GPRs into a
++            // 512-byte context and the return path restores them, so $a0-$a3 survive a syscall.
++            // A recompiler that clobbers an argument register diverges in a way a game can see.
++            PS2Runtime runtime;
++            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
++            R5900Context ctx{};
++            ctx.pc = 0x0100AAA0u;
++            setRegU32(ctx, 3, 0x83u);              // $v1 = syscall number, as the guest sets it
++            setRegU32(ctx, 4, 0x11111111u);         // $a0
++            setRegU32(ctx, 5, 0x22222222u);         // $a1
++            setRegU32(ctx, 6, 0x33333333u);         // $a2
++            setRegU32(ctx, 7, 0x44444444u);         // $a3
++
++            runtime.handleSyscall(rdram.data(), &ctx, 0x83u);
++
++            t.Equals(getRegU32(&ctx, 3), 0x83u * 4u,
++                     "$v1 must come back as the dispatcher's byte index, not the number");
++            t.Equals(getRegU32(&ctx, 4), 0x11111111u, "$a0 must survive a syscall");
++            t.Equals(getRegU32(&ctx, 5), 0x22222222u, "$a1 must survive a syscall");
++            t.Equals(getRegU32(&ctx, 6), 0x33333333u, "$a2 must survive a syscall");
++            t.Equals(getRegU32(&ctx, 7), 0x44444444u, "$a3 must survive a syscall");
 +        });
 +
 +        tc.Run("handleSyscall reports nesting depth, and unwinds it when it throws", [](TestCase &t)

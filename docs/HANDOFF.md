@@ -2987,3 +2987,39 @@ counts.
   is a red herring.
 
 Either way the `$v1` fix above is independent, safe, and worth doing now.
+
+## W25 — `$v1` on syscall return was the syscall number; hardware returns the dispatcher's scaled byte index
+
+Red-tested first in `ps2_runtime_expansion_tests.cpp` ("a syscall returns the dispatcher's SCALED
+byte index in `$v1` and preserves `$a0`-`$a3`"). It failed on the `$v1` half and **passed on all four
+`$a0`-`$a3` halves** — so our argument registers were already correct, and the divergence was exactly
+one register wide.
+
+```
+before: $v1 = 0x83          after: $v1 = 0x83 * 4 = 0x20C
+```
+
+Authority, quoted: `yuias/PS2BiosRebuild` `docs/spec/04-ee-kernel.md` **EE-7e2** — *"`$v1` is **not**
+restored. The caller gets back the dispatcher's byte index — `number × 4`, `spec/05` SYS-3a's scaled
+form — and both reference images agree. This is observable from outside the kernel, so a rebuild
+that helpfully puts the number back has changed the interface."* And `docs/spec/05` **SYS-3a** —
+*"`$v1` holds the number at the dispatcher, the scaled form at the handler."*
+
+**The absolute value, not the raw number.** EE-7b says a negative number is *negated*, not rejected,
+before the table lookup — so the "i" (interrupt-safe) variants scale the same way as their positive
+twins, and `abs(n) * 4` is the rule rather than `n * 4`. The one exception is implemented too:
+**SYS-3c** — `0x7C` (`Deci2Call`) restores its own frame and hands `$v1` back as `0x7C`.
+
+**Implemented as an RAII guard, not an assignment**, and that is the part worth arguing for: a
+syscall that blocks leaves by **throwing**, and hardware sets `$v1` on the way *out* of the kernel
+either way. A plain assignment would make `$v1` wrong for exactly the syscalls that yield — the worst
+possible subset.
+
+Suite **471 total, 470 pass, 1 fail** (pre-existing VU0). Nothing regressed.
+
+### And honestly: this did NOT move the wall
+
+45 s vs 60 s, same numbers within noise: `functions_entered` 1,759,560 (45 s) → 2,322,771 (60 s),
+`distinct_pcs` 164–167, and the same `tid1 Running / tid2 Waiting:sleep,woken=0`. **This is a
+fidelity fix, not progress toward a frame.** It matters because GT4 is a game that could observe it
+and because we are trying to be the console, not because it unblocked anything.

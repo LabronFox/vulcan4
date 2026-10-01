@@ -6197,3 +6197,65 @@ question as W36's answer and is the difference between "the guest is mis-assembl
 mis-reading the guest's buffer".
 
 Suite unchanged at **482/482**. `VULCAN4 FRAME source=guest` has never printed.
+
+---
+
+## W70 — the CD path and the memory-card path are the SAME guest buffer, `0x01051A10`, and it is self-referential
+
+The one probe W69 asked for, added and run. Distinct buffers, verbatim, from
+`/mnt/ssd/vulcan4-build/run/boot_w69.log`:
+
+```
+FIRST-FOR-THIS-BUFFER buf=0x103f498 callerPc=0x10185ec path="rom0:ROMVER"
+FIRST-FOR-THIS-BUFFER buf=0x1051a10 callerPc=0x1005008 path="cdrom0:\CDROM0:\;1"
+```
+
+### Two of this project's long-running walls are one buffer
+
+`buf=0x01051A10` is **exactly** the buffer `sceMcOpen` has been handed since W36:
+
+```
+[MC] Open ra=0x100e66c guestpc=0x100e66c a0(port)=0 a1(slot)=0 a2(buf)=0x1051a10 a3(mode)=0x1
+```
+
+The memory-card `-4` and the disc `fioOpen -1` are the same guest scratch buffer being filled by two
+different callers — `0x01005008` for the CD path, `0x0100E66C` for the card. That is why two days of
+work on the card produced no new information about the disc: **they were never two problems.**
+
+`rom0:ROMVER` sits at `0x0103F498` with caller `0x010185EC` — a `.rodata` constant, assembled nowhere.
+So the caller is genuinely assembling the CD path, into scratch, by hand.
+
+### The assembly is self-referential, and that is the finding
+
+W65 already measured the join's second component, from the generated code rather than by inference:
+
+```
+0x1003e4c: lw  $a0, 0x0($s4)     // $a0 = obj->0x0, the SECOND component
+```
+
+and W65 observed `obj=0x1fffe80 obj->0x0=0x1051a10`. **The second component IS the destination buffer.**
+So the guest is asking "what is the filename after this device prefix?" and the answer it has stored is
+*the buffer it is about to write into*. `cdrom0:` + `CDROM0:\;1` is what you get when the filename
+pointer is a pointer to the output: the device string is read as if it were the name, so the name comes
+out empty and the device prefix appears twice.
+
+### And W65's `M0:\;1` is the same string, one fragment later
+
+W65's span dump of this very buffer recorded `4d 30 3a 5c 3b 31` = **`M0:\;1`**. That is
+`CDROM0:\;1` with its first four characters gone — the same constant, caught mid-assembly at a
+different offset. Two walls, one buffer, one mis-pointed cursor, recorded twice by two instruments
+eight hours apart.
+
+### What is still unknown, and it is the whole wall
+
+Whether `obj->0x0` **should** hold a different pointer is not established, and I am not going to assume
+it is ours. It is a guest variable in guest memory, written by guest code we have not located. What is
+established: the guest's own path assembly reads a device-qualified string as a filename, in two
+different callers, in one buffer, and the filename component is empty in both.
+
+**Next single step:** find the guest instruction that WRITES `obj->0x0` at `0x1fffe80`. The store
+observer already covers every width (`Ps2FastWrite128` included), so this is a window watch on
+`0x1fffe80` with `VULCAN4_WATCH_LO/HI` — no new instrument, and it names the function that put the
+wrong pointer there.
+
+Suite **482/482**. `VULCAN4 FRAME source=guest` has never printed.

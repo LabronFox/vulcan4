@@ -85,9 +85,27 @@ constexpr uint32_t kWatchLo = 0x01051A10u;
 constexpr uint32_t kWatchHi = 0x01051A20u;
 uint32_t g_watchStoreHits = 0;
 constexpr uint32_t kWatchStoreMax = 600;
+// W30: 1 MiB. Anything at least this big is a copy, not a field write.
+constexpr uint32_t kWatchBigCopy = 1024u * 1024u;
+uint32_t g_watchBigCopyHits = 0;
 
 void watchGuestStoreForPath(uint32_t guestAddr, uint32_t size, uint64_t value, const R5900Context *ctx)
 {
+    // W30. A RANGE write big enough to straddle most of RDRAM is not a field update, it is a copy
+    // that ran away -- sub_01010EA8 computed a 16,410,192-byte length from two guest globals and
+    // called the guest's own memcpy. Report those regardless of address: the destination and the
+    // size are the whole question, and filtering them out by address is how they stayed invisible
+    // for this long. Two of them is plenty; the answer is in the first.
+    if (size >= kWatchBigCopy)
+    {
+        ++g_watchBigCopyHits;
+        if (g_watchBigCopyHits <= 2u)
+        {
+            std::cout << "VULCAN4 W30BIGCOPY n=" << g_watchBigCopyHits << " pc=0x" << std::hex
+                      << (ctx != nullptr ? ctx->pc : 0u) << " dst=0x" << guestAddr << " size="
+                      << std::dec << size << "\n";
+        }
+    }
     if (guestAddr >= kWatchHi || guestAddr + size <= kWatchLo)
     {
         return;
@@ -1725,6 +1743,17 @@ std::cout << "\n";
                 }
                 std::cout << "\n";
             }
+            // W30. sub_01010EA8 computed a 16,410,192-byte memcpy length from two guest globals:
+            //   s0 = (*(0x1033214) + 0xF) & ~0xF ; size = *(0x1033218) - s0
+            // and copied to 0x10519b0, which is 0x60 bytes BELOW the memory-card path buffer -- so
+            // the "path" sceMcOpen reads is residue from this copy, not something the guest wrote as
+            // a path. If these two globals hold garbage, the length is garbage and this is the root
+            // cause of everything in W29 and W30. Read them before theorising about the path.
+            std::cout << "VULCAN4 W30LEN *(0x1033214)=0x" << std::hex << qword(0x01033214u) << std::dec
+                      << " *(0x1033218)=0x" << std::hex << qword(0x01033218u) << std::dec
+                      << " copy_dst=0x10519b0 copy_size=16410192"
+                      << " big_copy_count=" << g_watchBigCopyHits << std::endl;
+
             // W30. The path GT4 hands sceMcOpen begins with the 2-byte token 05 80 and I am not
             // going to guess what it encodes. A SECOND example decodes it: scan RDRAM for every
             // occurrence of the same byte pair and print each with context. If the guest stores

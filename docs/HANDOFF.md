@@ -3359,3 +3359,73 @@ it on the strength of a guess.
 
 Suite **472 total, 471 pass, 1 fail** (pre-existing VU0). The `ps2TraceGuestRangeWrite` fix, the
 `[MC] Open` log with its guest-memory window, the RDRAM token scan and the store watch are permanent.
+
+## W31 — the path buffer is a MIXTURE: guest-written separators and a halfword, with `e.gt4` as copy residue
+
+Two measurements close W30's open question.
+
+```
+VULCAN4 W30LEN  *(0x1033214)=0x10519ac  *(0x1033218)=0x1ff8000
+                copy_dst=0x10519b0 copy_size=16410192  big_copy_count=1
+```
+
+1. **Those two globals are not a length.** `*(0x1033214) = 0x010519AC` is a **pointer**, and
+   `*(0x1033218) = 0x01FF8000` is **the top of RDRAM** (32 MB − 32 KB). So `sub_01010EA8` is doing
+   `memmove(dst = 0x10519b0, src = 0x10519ac, n = 0x01FF8000 − 0x10519a0)` — a 16 MB move
+   **shifted by 4 bytes**, which is a ring-buffer slide, not a field update.
+2. **`big_copy_count = 1`.** It happens **once**, during init. **So it is not a race and not the
+   cause of the per-iteration failure.** W30's "copy ran away and is trampling the path every frame"
+   is wrong, and I am retracting it here rather than leaving it standing.
+
+### So what the guest actually wrote, and what it did not
+
+The write-watch on `[0x1051a10, 0x1051a20)` is now complete, because the path is short and the
+buffer is small. Attribution of every byte:
+
+| offset | bytes | who wrote them |
+|---|---|---|
+| `0x1051a10` | `05 80` | **the guest** — `pc=0x1003e80`, a **2-byte store of `0x8005`** |
+| `0x1051a12` | `2f` `/` | **the guest** — `pc=0x1003e84`, 1-byte store |
+| `0x1051a13` | `05 80` | **the guest** — the same 2-byte store site, second component |
+| `0x1051a15` | `2f` `/` | **the guest** |
+| `0x1051a16`–`0x1051a1a` | `65 2e 67 74 34` = **`e.gt4`** | **NOT the guest — no write was ever observed here. It is residue from the one-off 16 MB move.** |
+| `0x1051a18`–`0x1051a1f` | `CDROM0:\` | **the guest** — `pc=0x1003c5c`, byte by byte |
+
+**`e.gt4` is not a filename the guest asked for.** It is whatever the 16 MB copy left at that
+offset, and W29's "GT4 wants to read a texture called e.gt4" was a misreading of adjacent memory.
+Same for the `Tex1` in the wider window: the same copy's residue.
+
+**The path the guest is genuinely passing is two components, each the halfword `0x8005`, separated by
+`/` — and then it runs into memory that is not its own.**
+
+### Which reframes the bug, and it is now small and specific
+
+`sceMcOpen` is not failing because it cannot find a file. **It is being handed a path whose
+components are the 16-bit value `0x8005`, twice.** Two readings, and they are very different:
+
+- **`0x8005` is a device/dir handle the guest's own higher-level layer resolves.** GT4 has a
+  device-name table at `0x0102DC90` (`DISK`, `MCARD 0`, `MCARD 1`, `HOST`), and it separately writes
+  `CDROM0:` into this same reused buffer. If `0x8005` is an index into such a table, then the raw
+  syscall never sees it on real hardware — the wrapper turns it into a real path first. **Then our
+  problem is that we are reaching the raw syscall with an unresolved path, which means the wrapper
+  step is being skipped.**
+- **`0x8005` is a literal the guest expects the kernel to understand.** Less likely, and I have no
+  authority for it.
+
+**The measurement that decides it, and it is one instruction of decode:** read `pc=0x1003e80` and
+`pc=0x1003c5c` — the two functions that write the halfword and the device name — and find out which
+one the MC path is supposed to go through. `pc=0x1003c5c` writing `CDROM0:` is *already* the device
+prefix, so the two writers are almost certainly the same "resolve a device" helper, and `0x8005` is
+what it emits when it cannot resolve one. **If that is right, the bug is upstream: the device table at
+`0x0102DC90` is not giving the resolver what it expects, and the fix is there — not in `sceMcOpen`,
+and certainly not by changing `-4`.**
+
+### Also worth carrying forward
+
+- `free=8192` from `sceMcGetInfo` is generic, not measured truth; a real freshly formatted 8 MB card
+  reports ~7505 free 1 KiB clusters.
+- Two of this session's "wins" were retractions, and both are recorded above rather than quietly
+  dropped: the scheduler-steps theory (W22b) and the runaway-copy theory (W30). The instruments that
+  killed them — `SCHED STEPS`, `big_copy_count` — are permanent.
+
+Suite **472 total, 471 pass, 1 fail** (pre-existing VU0).

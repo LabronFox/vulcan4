@@ -5420,3 +5420,57 @@ family of contradictions is closed. If they agree, the write is genuinely unrepo
 narrows to the RPC copy helpers.
 
 **STATUS: no frame, milestone NOT met.** `VULCAN4 FRAME source=guest` has never printed. Suite **478/478**.
+
+---
+
+## 2026-10-01 — W57i: the buffer is `/BASCUS-97328`, and I mis-attributed where the LENGTH comes from
+
+### The `.rodata` sources, read off the ELF — the buffer really is `/BASCUS-97328`
+
+```
+0x0103D638 -> 0x010519C1 size=2   b'BA'
+0x0103D650 -> 0x010519C3 size=10  b'SCUS-97328'
+             0x010519C0 size=1    b'/'      (WRITE8, pc=0x1003D9C)
+=> 0x010519C0 = '/' + 'BA' + 'SCUS-97328' = "/BASCUS-97328", 13 characters
+```
+
+So the buffer holds GT4's save directory, and `strlen` of it is **13**, not 2.
+
+### I mis-read the length's origin in W57h. Correcting it.
+
+```
+0x1003e40  lw    $s2, -0x2338($v0)   $s2 = *(0x0102DCC8)      the SOURCE pointer
+0x1003e44  jal   func_1013D68        $a0 = $s2                strlen(SOURCE) -> $v0
+0x1003e4c  lw    $a0, 0x0($s4)       $a0 = obj->0x0           the SECOND name
+0x1003e50  jal   func_1013D68        $a0 = obj->0x0           strlen(SECOND) -> $v0
+0x1003e54  (delay) daddu $s0, $v0    $s0 = strlen(SECOND)
+0x1003e68  daddu $a1, $s2, $zero     $a1 = $s2                SOURCE
+0x1003e70  daddu $a2, $s0, $zero     $a2 = $s0                LENGTH = strlen(SECOND NAME)
+0x1003e78  jal   func_101E81C        memcpy(dst=$s1, src=$s2, len=$s0)
+```
+
+**The length is `strlen(obj->0x0)` — the SECOND name — not the length of the buffer being copied.**
+`$s0` is set from the *second* `func_1013D68` call's return value; W57h attributed it to the first. That
+matters: a two-character second name is entirely ordinary, so **the observed 2-byte copy does not imply
+the source is short or corrupt.** It implies `obj->0x0` is a 2-character string.
+
+**And the source is `$s2 = *(0x0102DCC8)`, a guest global pointer.** The observer reported
+`src=0x010519C0`, so that global holds `0x010519C0` — and the bytes copied from it should be `/B`.
+**The observed bytes are `05 80`.** That contradiction survives every filter and every traced write
+path, and I am not going to explain it away.
+
+**What is left, stated honestly:** either `*(0x0102DCC8)` does not hold `0x010519C0` at the moment of
+the copy (and the observer's `srcAddr` is the value from a *different* call in the same cycle), or the
+two bytes at `0x010519C0` genuinely differ from the `/BASCUS-97328` that was written there. Both are
+one measurement apart:
+
+**NEXT, one run.** Print, at the copy, all three of: `$a1` (`src`), the bytes at `$a1` **read directly
+from rdram**, and `*(0x0102DCC8)`. If `$a1` is not `0x010519C0`, the observer's `srcAddr` is being
+reported for the wrong call and every source-based conclusion drawn from it is void. If `$a1` **is**
+`0x010519C0` and the bytes there are not `/B`, then something writes those two bytes on a path that
+reports nothing, and the only ones left are the RPC copy helpers.
+
+**This is the same fault line as W44 and W57d: an observer field (`srcAddr`) that has never been
+validated against the register it claims to report.** Validating it is cheaper than any further search.
+
+**STATUS: no frame, milestone NOT met.** `VULCAN4 FRAME source=guest` has never printed. Suite **478/478**.

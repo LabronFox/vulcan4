@@ -2713,3 +2713,91 @@ already in `$a0` at `ra=0x01011628`. Read it at that PC, once, at the halt.
 Also still open and cheap: `sub_010112E0` has never been decoded this session — it is the twin of
 `sub_01011508` and does the same GetThreadId + priority work, so whichever one owns the loop
 condition is the one to read first.
+
+## W22 — the objects are free, the loop is inside two functions, and the remaining step is precise
+
+Three more measurements, each of which corrected something I expected.
+
+### 1. The two objects the broadcast walks are FREE and EMPTY
+
+`$s0` is callee-saved, so at a syscall inside `sub_01011508` it still holds the value `$a0` had on
+entry — and that value is the object. Named by `$s0`, then read with the W17-style guest dump
+(`W22OBJ`), using `sub_01011508`'s layout read straight from the generated unit:
+
+```
+VULCAN4 W22OBJ obj=0x1047b4c +0x0=0x0 +0x4=0 +0xC(list)=0x0 +0x18=0xffffffff
+                   +0x1C(savedprio)=4294967295 +0x20(OWNER)=0 +0x24(depth)=4294967295
+VULCAN4 W22OBJ obj=0x1033098 (identical)
+```
+
+**`OWNER(+0x20) = 0` and `list(+0x0C) = 0` for both.** So the broadcast is *correctly* walking
+nothing: the lock is free and nobody is queued. That kills the "the wait list should contain tid2's
+frame" theory outright — there is no frame to be missing. `sce_WakeupThread` is zero because
+**there is nobody to wake, and the guest knows it.**
+
+### 2. `$a0` at those sites is a flag, not the object — my W21 prediction was wrong
+
+W21 predicted `$a0` would be the mutex. It is `1`. The decode explains why: at `0x1011538`,
+`lw $a0, 0x0($s0)` loads `obj+0x0` one instruction before the call, so `$a0` at the syscall is
+`obj+0x0`, not `obj`. Hence recording `$s0` as well. Prediction stated, measured, wrong, corrected —
+recorded here so nobody repeats it.
+
+### 3. The spin is inside `sub_010112E0`, which does loop — and it exits on `$a0`
+
+`sub_010112E0` (0x10112e0–0x1011508) is now decoded. Prologue: `s0 = a0` (obj), `s3 = a1` (flag),
+`s4 = -1`. Then `GetThreadId` → `s1` = my tid. Then:
+
+```
+0x1011320  beqz  $s3, ...            ; flag guards the priority+sleep block
+0x1011328  ChangeThreadPriority($s1,$s2)      <- ra 0x101132c
+0x1011330  SleepThread()                      (only 32 calls all run, so $s3 == 0 here)
+0x1011338  beqz  $s3, ...
+0x1011340  ChangeThreadPriority($s1, 1)       <- ra 0x1011344, sets priority to 1
+0x101134c  daddu $s2, $v0, $zero             <- our hot $ra, 642,644 times
+0x1011350  func_10284D8                       (critical section)
+0x1011358  lw   $v1, 0x20($s0)                ; owner
+0x1011360  bnez $v1, contended
+0x1011368  sw   $s1, 0x18($s0)                ; self tid
+0x1011370  sw   $s5, 0x20($s0)                ; owner = 1   ($s5 was set to 1 at 0x1011310)
+...
+0x10113e8  ei
+0x10113ec  bne  $a0, $zero, -52              ; LOOP BACK
+```
+
+`-52 << 2 = -208`, and `0x10113ec + 4 - 208 = 0x1011320`. **The loop edge is `0x1011320`**, i.e. it
+re-runs the flag test and the lock work, but **not** the `GetThreadId` above it.
+
+**And that is exactly the contradiction worth handing over:** `GetThreadId` is issued from
+`ra=0x01011314` — the delay slot of the `jal` at `0x101130c` — **856,860 times**, yet the guest
+arrives at `0x01011314` only **4** times, and the loop-back target is *below* it. So
+`sub_010112E0` is entered a handful of times and spins ~850,000 iterations **internally**, which
+means those 856,860 `GetThreadId` calls are being issued from an address the guest demonstrably
+does not re-reach.
+
+### The accounting lesson, stated once so it is not relearned
+
+**`pcEntryCounts` is keyed on the ARRIVAL PC, not on the containing function.** "Function X entered
+2 times" only ever counted arrivals at X's *entry* address. Arrivals at a resume PC inside X are
+counted under that PC. This is why "the shim was entered twice" and "the hot loop is invisible"
+were both artefacts of the same mistake, and it cost three entries of chasing.
+
+### The exact next step — no more guessing
+
+**Read the generated C++ control flow for `sub_010112E0`, not its instruction comments.** The
+comments give the decoded instructions; the thing in dispute is the *edge*, and the edge is decided
+by the `switch (ctx->pc)` case labels and the `goto` graph the recompiler emitted. Specifically:
+
+1. List the `case 0x1011xxx:` labels in `sub_010112E0` and the `goto` for each. That is the real set
+   of resume points, and it will show whether `0x1011314` is one — which would explain 856,860
+   `GetThreadId` calls from 4 arrivals at that PC, i.e. the guest being **re-entered at the delay
+   slot over and over**.
+2. If `0x1011314` **is** a resume label, the defect is ours and it is precise: something re-enters
+   the function at the *delay slot* of the `jal`, so `GetThreadId` re-runs without the loop
+   advancing. That is a resumable-basic-block bug — and this codebase already has that exact family
+   of bug documented (G1.8g/W8/W10), so it is worth the check before anything else.
+3. If it is **not** a resume label, then the 856,860 calls have another source and the next thing to
+   instrument is a per-block arrival counter in the generated code (a code-generator change, so
+   `tools/patches/` per law #8 — never hand-edit the generated `.cpp`).
+
+Both branches of that decision are cheap. **Do not re-run the `$ra`, entry-site, depth, caller-map or
+`-O2` experiments** — all are built, permanent, and settled.

@@ -63,6 +63,8 @@
 #include <string>
 #include <atomic>
 #include <thread>
+#include <tuple>
+#include <unordered_set>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -520,6 +522,12 @@ int main(int argc, char *argv[])
     // guest's entry PC is already in hand here, so counting it costs one hash per entry and turns
     // "the guest cycles through 4 addresses" into "and here is the top of the cycle".
     std::unordered_map<uint32_t, uint64_t> pcEntryCounts;
+    // W22. WHO calls each function: the distinct $ra values seen on entry, keyed by entry PC. The
+    // syscall site sets name where a syscall was issued from; this names the caller of a FUNCTION,
+    // which is the missing half. GT4 spins through sub_010112E0 <-> sub_01011508 844,500 times and
+    // both correctly do nothing (the mutex is free, its wait list empty), so the loop that matters
+    // is in whatever calls them -- and nothing in the report could name that until now.
+    std::unordered_map<uint32_t, std::unordered_set<uint32_t>> entryCallers;
     uint64_t dispatcherTransfers = 0;
     std::size_t checkpointServiced = 0;
     uint64_t servicedInvocations = 0;
@@ -974,6 +982,7 @@ int main(int argc, char *argv[])
 
         ++functionsEntered;
         ++pcEntryCounts[ctx.pc];
+        entryCallers[ctx.pc].insert(getRegU32(&ctx, 31));
 
         if (traceAll || (traceFirst && (functionsEntered <= traceFirst || functionsEntered % 100000 == 0)))
         {
@@ -1448,7 +1457,60 @@ int main(int argc, char *argv[])
         // the whole run enters 2.04M functions, so either the syscall tally counts resumes as well
         // as guest calls, or the shim arrivals have to be somewhere else in the table. Reading the
         // shim's own arrival count out of the full list answers it; guessing from a slice does not.
-        std::cout << "VULCAN4 PC HISTOGRAM distinct=" << ranked.size() << " top:";
+        // W22. Who calls the functions the spin runs through. General, not hardcoded: any function's
+    // entry PC with its distinct return addresses. This is what names the caller of a function the
+    // way the syscall site sets name the issuer of a syscall.
+    {
+        std::vector<std::pair<uint32_t, std::unordered_set<uint32_t>>> callers(entryCallers.begin(),
+                                                                              entryCallers.end());
+        // Hottest first, not most-callered-first: the functions worth naming are the ones the guest
+        // actually spends its life in, and a single-caller hot function is exactly the thing a
+        // "more than one caller" filter throws away.
+        std::sort(callers.begin(), callers.end(),
+                  [&pcEntryCounts](const std::pair<uint32_t, std::unordered_set<uint32_t>> &l,
+                         const std::pair<uint32_t, std::unordered_set<uint32_t>> &r)
+                  {
+                      const auto li = pcEntryCounts.find(l.first);
+                      const auto ri = pcEntryCounts.find(r.first);
+                      const uint64_t lc = li == pcEntryCounts.end() ? 0u : li->second;
+                      const uint64_t rc = ri == pcEntryCounts.end() ? 0u : ri->second;
+                      if (lc != rc)
+                      {
+                          return lc > rc;
+                      }
+                      return l.second.size() > r.second.size();
+                  });
+        std::cout << "VULCAN4 CALLER MAP functions=" << callers.size() << "\n";
+        std::size_t printed = 0;
+        for (const auto &[fn, ras] : callers)
+        {
+            // Only multi-caller or interesting entries, and never more than 32 lines: this is a map
+            // to consult, not a log to read.
+            if (printed >= 40u)
+            {
+                continue;
+            }
+            std::vector<uint32_t> sorted(ras.begin(), ras.end());
+            std::sort(sorted.begin(), sorted.end());
+            const auto hit = pcEntryCounts.find(fn);
+            std::cout << "  VULCAN4 CALLER fn=" << toHex(fn) << " entries="
+                      << (hit == pcEntryCounts.end() ? 0u : hit->second) << " from=" << sorted.size()
+                      << "ra[";
+            const std::size_t limit = std::min<std::size_t>(sorted.size(), 8);
+            for (std::size_t i = 0; i < limit; ++i)
+            {
+                std::cout << (i == 0 ? "" : ",") << toHex(sorted[i]);
+            }
+            if (sorted.size() > limit)
+            {
+                std::cout << ",+" << (sorted.size() - limit);
+            }
+            std::cout << "]\n";
+            ++printed;
+        }
+    }
+
+    std::cout << "VULCAN4 PC HISTOGRAM distinct=" << ranked.size() << " top:";
         const std::size_t limit = std::min<std::size_t>(256, ranked.size());
         for (std::size_t i = 0; i < limit; ++i)
         {
@@ -1530,6 +1592,29 @@ std::cout << "\n";
                     }
                 }
                 std::cout << "\n";
+            }
+            // W22. The two objects the wait-list broadcast is walking, 844,500 passes between them,
+            // named by $s0 at the syscall. sub_01011508's layout, read straight from the generated
+            // unit: +0x00 self/next, +0x04 node tid, +0x0C wait-list head, +0x18 owner-self check,
+            // +0x1C saved priority, +0x20 OWNER TID, +0x24 recursion depth. +0x20 and +0x0C are the
+            // two words that decide whether anybody is ever going to be woken.
+            for (uint32_t obj : {0x01047B4Cu, 0x01033098u})
+            {
+                if (obj + 0x28u > PS2_RAM_SIZE)
+                {
+                    std::cout << "VULCAN4 W22OBJ obj=0x" << std::hex << obj << std::dec
+                              << " OUT_OF_RDRAM\n";
+                    continue;
+                }
+                std::cout << "VULCAN4 W22OBJ obj=0x" << std::hex << obj << std::dec
+                          << " +0x0(next)=0x" << std::hex << qword(obj + 0x00u) << std::dec
+                          << " +0x4(tid)=" << std::dec << qword(obj + 0x04u)
+                          << " +0x8=" << qword(obj + 0x08u)
+                          << " +0xC(list)=0x" << std::hex << qword(obj + 0x0Cu) << std::dec
+                          << " +0x18=0x" << std::hex << qword(obj + 0x18u) << std::dec
+                          << " +0x1C(savedprio)=" << std::dec << qword(obj + 0x1Cu)
+                          << " +0x20(OWNER)=" << qword(obj + 0x20u)
+                          << " +0x24(depth)=" << qword(obj + 0x24u) << "\n";
             }
         }
 
@@ -1654,6 +1739,49 @@ std::cout << "\n";
             if (ranked.size() > raLimit)
             {
                 std::cout << ",+" << (ranked.size() - raLimit);
+            }
+            // W22. ra + the argument it was handed, counted, biggest first. In the broadcast
+            // sub_01011508 the argument IS the mutex object, so this names which object 844,500
+            // passes are walking -- and from there its owner tid and wait-list head are two guest
+            // reads away.
+            if (!entry.second.callSites.empty())
+            {
+                std::vector<std::tuple<uint32_t, uint32_t, uint64_t>> sites(entry.second.callSites.begin(),
+                                                                            entry.second.callSites.end());
+                std::sort(sites.begin(), sites.end(),
+                          [](const std::tuple<uint32_t, uint32_t, uint64_t> &l,
+                             const std::tuple<uint32_t, uint32_t, uint64_t> &r)
+                          { return std::get<2>(l) > std::get<2>(r); });
+                std::cout << " arg=";
+                const std::size_t siteLimit = std::min<std::size_t>(sites.size(), 6);
+                for (std::size_t i = 0; i < siteLimit; ++i)
+                {
+                    std::cout << (i == 0 ? "" : ",") << toHex(std::get<0>(sites[i])) << "/a0="
+                              << toHex(std::get<1>(sites[i])) << "x" << std::get<2>(sites[i]);
+                }
+                if (sites.size() > siteLimit)
+                {
+                    std::cout << ",+" << (sites.size() - siteLimit);
+                }
+            }
+            // W22. $s0 is callee-saved, so at a syscall inside the broadcast it still holds the
+            // OBJECT that sub_01011508 was entered with. That is the mutex whose owner tid and
+            // wait-list head decide whether anybody is ever going to be woken.
+            if (!entry.second.callSiteS0.empty())
+            {
+                std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> s0Sites(
+                    entry.second.callSiteS0.begin(), entry.second.callSiteS0.end());
+                std::sort(s0Sites.begin(), s0Sites.end(),
+                          [](const std::tuple<uint32_t, uint32_t, uint32_t> &l,
+                             const std::tuple<uint32_t, uint32_t, uint32_t> &r)
+                          { return std::get<2>(l) > std::get<2>(r); });
+                std::cout << " s0=";
+                const std::size_t s0Limit = std::min<std::size_t>(s0Sites.size(), 6);
+                for (std::size_t i = 0; i < s0Limit; ++i)
+                {
+                    std::cout << (i == 0 ? "" : ",") << toHex(std::get<0>(s0Sites[i])) << "/"
+                              << toHex(std::get<1>(s0Sites[i]));
+                }
             }
         }
         std::cout << "\n";

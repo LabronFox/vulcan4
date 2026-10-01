@@ -89,9 +89,9 @@ namespace
 //     stream is mis-decoded, and if our own decoder writes here then a field offset or width on our
 //     side is wrong. Watch 12 bytes so a 32-bit store is not split across a boundary we chose blind.
 constexpr uint32_t kWatchLo = 0x010519C0u;
-constexpr uint32_t kWatchHi = 0x01051A16u;
+constexpr uint32_t kWatchHi = 0x010519D0u;
 uint32_t g_watchStoreHits = 0;
-constexpr uint32_t kWatchStoreMax = 24;
+constexpr uint32_t kWatchStoreMax = 120;
 // W30: 1 MiB. Anything at least this big is a copy, not a field write.
 constexpr uint32_t kWatchBigCopy = 1024u * 1024u;
 uint32_t g_watchBigCopyHits = 0;
@@ -538,6 +538,21 @@ int main(int argc, char *argv[])
     // instruction so the one-time formatting write is caught, not just the reads that follow.
     ps2SetGuestStoreObserver(&watchGuestStoreForPath);
     g_rdramForWatch = rdram;
+
+    // W44. Two probes read the same guest address in the same process and DISAGREE: the store
+    // observer saw '/BA' written to 0x10519C0, while the copy probe in ps2_stubs::memcpy read '05 80'
+    // from that address. The only way both can be true is that they are not looking at the same
+    // memory, so the harness's cached RDRAM pointer is printed against the live one. If getRDRAM()
+    // can hand back a different buffer than the one the harness cached at startup, then every
+    // store observation this project has made is about a stale copy and the whole line of work is
+    // built on sand.
+    std::cout << "VULCAN4 RDRAMPROBE cached_g_rdramForWatch=" << static_cast<const void *>(g_rdramForWatch)
+              << " live_getRDRAM=" << static_cast<const void *>(runtime.memory().getRDRAM())
+              << " same=" << (static_cast<const void *>(g_rdramForWatch) ==
+                              static_cast<const void *>(runtime.memory().getRDRAM())
+                                 ? "YES"
+                                 : "NO")
+              << "\n";
 
     // Reset the parts of the console environment the runtime expects before the first guest
     // instruction, mirroring what PS2Runtime::run() does, minus the render loop.

@@ -4379,3 +4379,82 @@ thing missing is a guest that gets far enough to use it. The `-4` and the undeco
 filename are the wall, exactly as W42 concluded. Concretely: `sub_01005148` → `sub_0100E3C8`
 (`mceGetInfoApdx`) and `sub_01005430` → `sub_0100E610` (`sceMcOpen`) both take the same
 lock → `ei` → op → `bnez` retry shape, and both are blocked on the same filename bytes.
+
+## W44 — a CONFIRMED blind spot in our primary instrument, and the `0x8005` question re-opened honestly
+
+W43 said the next step is the `-4`. This pass chased it properly and ended up finding something more
+useful than the answer: **the store observer cannot see every write, and I can name where it goes
+blind.**
+
+### The contradiction, exactly
+
+Line numbers are from one 8-second run, and stdout order is execution order:
+
+```
+line  188  W30WRITE n=1  pc=0x1010eec  addr=0x10519b0 size=16410192   the one 16 MB copy
+line  373  W30WRITE n=2  pc=0x1003d9c  addr=0x10519c0 size=1 value=0x2f   -> '/'
+line  375  W30WRITE n=3  pc=0x1003dac  addr=0x10519c1 size=2              -> 'BA'
+line  378  W30WRITE n=4  pc=0x1003dc4  addr=0x10519c3 size=10             -> 'SCUS-97328'
+line  381  W30WRITE n=5  pc=0x1003de0  addr=0x10519cd size=9              -> 'GAMEDATA'
+line 1265  W35PATHCOPY n=2  src=0x10519c0 size=2   src_raw=05 80 00 00 00 00 00 00 41 00 00 00
+```
+
+So `sub_01003D20` wrote `/BA/SCUS-97328GAMEDATA` to `0x010519C0`, and **880 log lines later the same
+address reads `05 80 00 00 00 00 00 00 41 00 00 00`** — which is also why `strlen` returned **2** and
+why only 2 bytes were copied. **No write to `0x010519C0` appears in the observer log after line 381.**
+
+### I ruled out my own first explanation, and it was the obvious one
+
+Two probes read the same address and disagreed, so I tested the textbook cause: the harness caching a
+stale RDRAM pointer. It does not:
+
+```
+VULCAN4 RDRAMPROBE cached_g_rdramForWatch=0x7aca36ffd010 live_getRDRAM=0x7aca36ffd010 same=YES
+```
+
+And I tested the deeper cause — that `ps2_stubs::memcpy` resolves guest pointers through the TLB
+while the harness observer indexes RDRAM flat. Also wrong; they agree, byte for byte:
+
+```
+RDRAMVIEW flat=05 80 00 00 00 00 00 00  tlb=0x76387504e9d0  tlbytes=05 80 00 00 00 00 00 00  SAME=yes
+RDRAMVIEW flat=63 6f 72 65 2e 67 74 34  tlb=0x76387503a1e8  tlbytes=63 6f 72 65 2e 67 74 34  SAME=yes
+```
+
+**Both hypotheses dead, and the contradiction is real.** That is the finding.
+
+### Where the instrument goes blind, named
+
+- Generated-code stores go through `WRITE32`, which **does** call `ps2TraceGuestWrite` before
+  `FAST_WRITE32`. So ordinary `sw`/`sh`/`sb` are traced.
+- The real fast path is `Ps2FastWrite32` (`ps2_runtime_macros.h:266`), which writes
+  `rdram + (addr & PS2_RAM_MASK)` **flat, with no TLB resolution and no notification of its own.**
+  Anything that reaches memory through it — DMA, the fast paths, direct buffer writes — is invisible to
+  the observer unless the caller traced it separately.
+- `ps2_stubs::memcpy` **does** trace, but at the **end**: `ps2TraceGuestRangeWrite(rdram, destAddr,
+  copied, ...)` runs after the copy loop. So a 16 MB range write is reported once, after it lands, with
+  no way to see what was there before.
+
+**That is exactly the shape of the missing event.** A write large enough to come from a range path, or
+from `Ps2FastWrite32`, would restore `0x010519C0` to `05 80` without appearing in the log at all.
+
+**Consequence for everything since W30:** any conclusion of the form "nothing wrote this address"
+drawn from the store observer alone is not safe. That includes my own. I am not retracting W33–W36 on
+this basis — those conclusions did not rest on an absence — but the instrument's silence is not evidence,
+and it should not have been treated as such.
+
+### On `0x8005` itself: still undecoded, and I am not going to force it
+
+`05 80 00 00 00 00 00 00 41 00 00 00` is most naturally read as a **structure, not a string**: `0x8005`
+in the first `u16`, then zeros, then `0x0041`. It sits at the head of a region the guest also uses for
+paths, and `sub_01003D20` demonstrably overwrites it with a path. **So `0x010519C0` is a buffer the
+guest uses for two different things, and by the time the filename is built it holds the other one.**
+
+That is a real, evidenced statement. It is **not** yet a cause, and I am stopping rather than guessing
+which layout is right.
+
+### The next concrete step, and it is small and decisive
+
+**Log every `Ps2FastWrite32` and every range write that overlaps `0x010519C0`, with a before-and-after
+snapshot**, so the write that turns `/BA…` into `05 80` is caught in the act. That is one notification
+added to one function, and it either names the writer or proves the write comes from a path we have not
+instrumented at all. Both outcomes are worth more than another round of reading hex.

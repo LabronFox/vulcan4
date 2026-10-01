@@ -3975,3 +3975,69 @@ read `sub_01003E10` instead of guessing at the path. `Tex1` is referenced by nam
 struct at `0x1051a10`, so the loader is reachable from `sub_01005148`'s call graph. One function
 decode gives the header's field meanings and the pixel format, and then the dimensions fall out of
 the data instead of out of a guess.
+
+## W39 — RETRACTION of W38: `0x01041948` is a live STACK FRAME, not an embedded-file table
+
+W38 claimed the guest has an "embedded-file table" at guest `0x01041948`, with a record
+`{ptr=0x01036D80, off=0x37D80, size=0x9478, type=0x40}`, and called it "three independent numbers
+agreeing, so this is a real table rather than a coincidence." **That was wrong**, and it is worth
+being precise about why, because the reasoning error is the reusable part.
+
+### The proof it is a stack frame
+
+`0x01041948` has exactly one materialising reference in the entire recompiled program:
+
+```
+0x1000658  lui   $v0, 0x104
+0x100065c  addiu $s0, $s0, 0x1948      # $s0 = 0x01041948
+0x1000660  addiu $v0, $v0, -0x2DF8     # $v0 = 0x0101D208
+0x1000664  sw    $v0, 0x4($s0)
+0x1000668  sw    $sp, 0x0($s0)         # <<< THE STACK POINTER, STORED HERE
+0x100066c  jal   func_1009E98
+0x1000674  daddu $a0, $s1, $zero
+0x100067c  jal   func_10183B0          # ($a0=$s1, $a1=2, $a2=$s0=0x01041948)
+```
+
+`sw $sp, 0x0($s0)` is the giveaway: **the first word of that "record" is a stack pointer.** It is a
+thread's stack/control block that the runtime has pointed at `0x01041948`, and `func_10183B0` is
+handed the block (`$a2 = $s0`) to initialise it. `sub_01000558` is an EE-runtime initialiser, not a
+file loader.
+
+### Why W38's evidence fooled me — the exact mistake
+
+I found the pointer `0x01036D80` in `.data`, saw that `0x37D80` and `0x9478` matched `.rodata`'s
+offset and size from `readelf`, and called it confirmation. **But the "file offset" `0x37D80` is not
+an offset into anything — it is the `.rodata` section's file offset, and it is `0x01036D80`'s own
+home. `0x37D80` and `0x9478` are not data the guest recorded; they are the ELF section header's
+numbers, which I read once and then mistook for a second copy of the truth.** A section offset, a
+section size, and a pointer to that section are three values from **one** source, not three
+independent ones. I treated a tautology as corroboration. That is precisely the "plausible-looking
+wrong answer" the project's third law exists to catch, and it is now recorded as such.
+
+### What survives, and what does not
+
+- **RETRACTED:** "the guest has an embedded-file table at `0x01041948`." False. It is a stack block.
+- **RETRACTED:** "`{ptr, off, size, type}` is the guest's file-descriptor layout." False. The layout
+  is a thread control block; `+0x00` is `$sp`, `+0x04` is a vtable-ish `0x0101D208`, `+0x08` is zero.
+- **STILL TRUE, and independently sourced:** `.rodata` at file offset `0x37D80`, load address
+  `0x01036D80`, size `0x9478` — from `readelf -S`, not from the guest.
+- **STILL TRUE:** that `.rodata` begins with a gzip member whose **FNAME is `.in.notice2005.img`**,
+  which decompresses to **118,160 bytes** beginning with the magic **`Tex1`**, and `Tex1` also names
+  a file the guest passes to `sceMcOpen`. The asset is real and it is the game's own. **The claim
+  that a guest table points at it does not survive.**
+- **STILL TRUE:** item 4's honest gap — offset (`0x37D80`, 38,008 compressed) and container format
+  (`Tex1`) are proven; **dimensions are not**, and `+0x12 = 461` is a chunk count, not a width.
+
+### The lesson, written down so it is not repeated
+
+**"Three numbers agree" is only evidence when the numbers come from three independent places.** I had
+one place (the ELF section table) wearing three hats. Before calling anything corroborated, ask where
+each number came from — and if the answer is "the same header", it is one number.
+
+### Next step for item 4 — unchanged, because it was never affected
+
+**Decode the guest's `Tex1` parser.** The asset is real and named; what is missing is the format's
+field meanings, and the guest's own code is the authority for them. The trace to it is the filename
+`Tex1` inside the struct at `0x1051a10` that `sceMcOpen` receives, reached via
+`sub_01005148 → sub_0100E3C8` and `sub_01005430 → sub_0100E610`. Reading that code gives the pixel
+format and the dimensions from the data instead of from a division that happened to divide.

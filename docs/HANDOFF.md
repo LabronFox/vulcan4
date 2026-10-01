@@ -5690,3 +5690,58 @@ not a card question.
 
 **STATUS: milestone advanced, frame NOT reached.** `VULCAN4 FRAME source=guest` has never printed.
 Suite **479/479**.
+
+---
+
+## 2026-10-01 — W61: the first path component is a POINTER, and `0x8005` is finally explained
+
+Logged the two components separately at the call site instead of staring at one concatenated string:
+
+```
+[MC] OpenJoin pc=0x100e66c ra=0x100e66c a2(buf)=0x1051a10 a3(mode)=0x1
+        word@0x0102DCC8=0x10519c0 its4bytes=[192 25 5 1]  joined="?/?/e.gt4"  head8="??/??/e."
+```
+
+**`word@0x0102DCC8` is `0x010519C0` — an ADDRESS, not text.** And `0x010519C0` is the exact buffer
+where the guest built `/BASCUS-97328GAMEDATA`.
+
+The decoder agrees, and it is not a reading:
+
+```
+// 0x1003e40: 0x8c52dcc8  lw   $s2, -0x2338($v0)
+SET_GPR_S32(ctx, 18, (int32_t)FAST_READ32(0x102DCC8u));
+// 0x1003e44: 0xc404f5a   jal  func_1013D68        <- func_1013D68 IS the guest's SIMD strlen
+SET_GPR_U64(ctx, 4, GPR_U64(ctx, 18));              // $a0 = $s2  == 0x010519C0, a POINTER
+```
+
+So `sub_01003E10` does `strlen($s2)` and `memcpy(buf, $s2, len)` on **a pointer**, and `$s2` holds
+`0x010519C0`. **`0x8005` was never a token in a filename.** The `05 80` in the joined path is what
+`0x010519C0`'s own bytes look like when something treats the pointer's *value* as characters — which is
+precisely the class of mistake this campaign kept making by reading one concatenated string. **Retired
+for good: `0x8005` as a device id, as a token, as a struct field, and as anything the guest chose.**
+
+### What is NOT established, and I am not going to guess it
+
+The joined buffer is `05 80 / 05 80 / e.gt4`. If `strlen(0x010519C0)` returned the real length (21 for
+`/BASCUS-97328GAMEDATA`), the first `memcpy` would have copied `/BASCUS-…` and the join would read as
+`/BASCUS-97328GAMEDATA/<second>`. **It does not.** So either the guest's SIMD `strlen` returns a wrong
+length for this input, or the second component is not what W37 called it. I attempted to settle it with
+a standalone replica of the recompiled `strlen` (pceqb / pcpyud / `or $t0,$t2,$t1`, reading only the low
+64 bits of each vector slot) but **the replica crashed repeatedly and I stopped rather than ship a
+conclusion I could not reproduce** — a green result from a harness that dumps core is worth nothing.
+
+**Next, and it is one line of real measurement, not another replica:** log `$a0`, the loaded 16 bytes,
+the `pceqb` result, and the returned `$v0` inside `sub_01013D68` when it is called from `0x1003e44`.
+That answers "does the guest's strlen return 21" directly, on the product, and it is the last unknown
+between here and a correct filename.
+
+### The card work from W60 stands on its own
+
+`GetInfo` now answers `type=2 free=8151 format=1 result=0` from a real superblock, and the guest's open
+rate fell from ~6,000/s to ~2,036/s. The `-4` for `core.gt4` remains **correct** — the card holds no such
+file and a read-only open of a missing file returns -4 on hardware (`ps2mc_fio.c:724-726`). Suite
+**479/479**. Diagnostics added this turn (`[MC] OpenJoin`) are bounded to three lines per run, because
+the guest retries ~2,000/s and 130 identical lines prove nothing.
+
+**STATUS: no frame.** `VULCAN4 FRAME source=guest` has never printed. The open question is now one
+instruction, and it is named.

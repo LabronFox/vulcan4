@@ -679,7 +679,7 @@ index 0baca03..6ba21a3 100644
  
          uint32_t written = 0u;
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
-index d12592f..44af777 100644
+index d12592f..6321dff 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
 @@ -76,6 +76,7 @@ namespace ps2_stubs
@@ -888,7 +888,78 @@ index d12592f..44af777 100644
              }
          }
          ensureMcRootExists(0);
-@@ -1090,7 +1257,12 @@ namespace ps2_stubs
+@@ -993,6 +1160,70 @@ namespace ps2_stubs
+         // Dump a WINDOW, not just the string: the pointer lands 0x30 bytes below the 0x1051a40
+         // guest buffer the W7 entry already investigated, so the path is probably a field inside a
+         // larger structure and its siblings are what explain the encoding.
++        // W61. The filename the guest hands us is a JOIN of two components, built instruction by
++        // instruction in sub_01003E10 (verified in docs/HANDOFF.md W37):
++        //   0x1003e40  lw    $s2, -0x2338($v0)   $s2 = *(0x0102DCC8)   FIRST
++        //   0x1003e4c  lw    $a0, 0x0($s4)       $a0 = obj->0x0         SECOND
++        //   0x1003e84  sb    $v0, 0($s0)         writes the '/' separator
++        // so a malformed join is a guest-side fact and we must be able to SEE which half is wrong
++        // rather than staring at one concatenated string. Logged once: the guest retries ~2,000/s and
++        // 130 identical lines prove nothing.
++        {
++            static int pathJoinLogs = 0;
++            if (pathJoinLogs < 3)
++            {
++                ++pathJoinLogs;
++                // The two components, read from the addresses the guest BUILT them at rather than
++                // from registers, because by the time we are called the registers are the caller's,
++                // not sub_01003E10's ($s2 is long gone -- it reads 0 here). W37 measured:
++                //   first  component = *(0x0102DCC8)
++                //   second component = the guest's obj->0x0, cached into obj->0x4 by 0x1003e98
++                // so read the global, and dump the joined buffer's raw head with the separator visible.
++                // W61. THE COMPONENT IS A POINTER, NOT A STRING, and this is the first time anyone
++                // has looked. 0x1003e40 is `lw $s2, -0x2338($v0)` with $v0 = lui 0x103, so $s2 is the
++                // WORD at 0x0102DCC8 -- and the guest's very next act is `strlen($s2)` and
++                // `memcpy(buf, $s2, len)`. So the first component of the path is whatever 32-bit
++                // VALUE lives at 0x0102DCC8, treated by the guest as an address, and copied out.
++                //
++                // That is why the joined path is 05 80 / 05 80 / e.gt4: those are not bytes the guest
++                // chose, they are TWO COPIES OF THE SAME 16-BIT VALUE, printed as text. 0x0102DCC8
++                // holds 0x8005, and the guest faithfully builds "8005/8005/e.gt4" from it.
++                //
++                // Logged as the raw word, so the claim is checkable rather than a reading.
++                uint32_t firstWord = 0;
++                std::memcpy(&firstWord, rdram + (0x0102DCC8u & 0x01FFFFFFu), sizeof(firstWord));
++                uint8_t firstBytes[8] = {0};
++                std::memcpy(firstBytes, &firstWord, sizeof(firstWord));
++                std::string second;
++                if (const uint8_t *g = getConstMemPtr(rdram, pathAddr))
++                {
++                    second.assign(reinterpret_cast<const char *>(g), 64u);
++                    second = second.substr(0, second.find('\0'));
++                }
++                std::string sep;
++                for (uint32_t i = 0; i < 8u; ++i)
++                {
++                    char c[2] = {0, 0};
++                    if (const uint8_t *b = getConstMemPtr(rdram, pathAddr + i))
++                    {
++                        c[0] = (*b >= 32u && *b < 127u) ? static_cast<char>(*b) : '?';
++                        sep += c[0];
++                    }
++                }
++                RUNTIME_LOG("[MC] OpenJoin pc=0x" << std::hex << (ctx != nullptr ? ctx->pc : 0u)
++                            << " ra=0x" << (ctx != nullptr ? getRegU32(ctx, 31) : 0u) << std::dec
++                            << " a2(buf)=0x" << std::hex << pathAddr
++                            << " a3(mode)=0x" << getRegU32(ctx, 7)
++                            << " word@0x0102DCC8=0x" << std::hex << firstWord << std::dec
++                            << " its4bytes=[" << static_cast<uint32_t>(firstBytes[0]) << " "
++                            << static_cast<uint32_t>(firstBytes[1]) << " "
++                            << static_cast<uint32_t>(firstBytes[2]) << " "
++                            << static_cast<uint32_t>(firstBytes[3]) << "]"
++                            << " joined=\"" << second << "\""
++                            << " head8=\"" << sep << "\"");
++            }
++        }
++
+         std::string pathHex;
+         if (const uint8_t *raw = getConstMemPtr(rdram, pathAddr >= 0x10u ? pathAddr - 0x10u : 0u))
+         {
+@@ -1090,7 +1321,12 @@ namespace ps2_stubs
                          << " a0(port)=" << static_cast<uint32_t>(getRegU32(ctx, 4)) << " a1(slot)="
                          << static_cast<uint32_t>(getRegU32(ctx, 5)) << " a2(buf)=0x" << std::hex
                          << getRegU32(ctx, 6) << " a3(mode)=0x" << getRegU32(ctx, 7) << std::dec);
@@ -902,7 +973,7 @@ index d12592f..44af777 100644
                          << " slot=" << slot << " addr=0x" << std::hex
                          << pathAddr << std::dec << " bytes=[" << pathHex << "] '" << path
                          << "' flags=0x" << std::hex << flags << std::dec << " guest='" << guestPath
-@@ -1309,6 +1481,7 @@ namespace ps2_stubs
+@@ -1309,6 +1545,7 @@ namespace ps2_stubs
                  const std::filesystem::path root = getMcRootPath(port);
                  std::error_code ec;
                  std::filesystem::remove_all(root, ec);

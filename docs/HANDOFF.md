@@ -4671,3 +4671,55 @@ reason must be reported honestly even if it is worse than `stuck_in_syscall`.
 
 **STATUS: not fixed, no frame printed.** No code changed for this dish — it was spent establishing
 which half is wrong, as instructed. Suite untouched.
+
+---
+
+## 2026-10-01 — G1 FileIO provider landed. It is correct, and it is NOT the wall. Hypothesis REFUTED.
+
+**WHAT I BUILT.** `ps2xIOP/src/modules/fileio.cpp` — an HLE FileIO provider on SID `0x80000001`,
+on the libsd template, registered at `iop_subsystem.cpp:26`. It decodes `open/read/lseek/close/
+getstat` (ps2sdk fileio command numbers), resolves the device the guest actually named via
+`parsePs2Path` — **cdrom → `CdRoot`, host → `HostRoot`, mc → `MemoryCardRoot`** — and serves real bytes
+through `IopHost::readHostFile`. `write` is refused with a LIMITATION line (the user's disc is never
+written). `getstat` emits a real 88-byte `file_stat`. An unknown device and an unknown command both
+fail loudly rather than faking success.
+
+**This closes a real lie we were telling the guest:** `"fileio"` was in `m_builtinKeys`
+(`iop_module_manager.cpp:70`), so `sceSifLoadModule("fileio")` succeeded and the guest was told its
+filesystem driver loaded — while nothing served the SID. Now it does.
+
+**RED FIRST, HONESTLY:** the G1 test failed on exactly the two intended assertions (endpoint never
+activates, RPC unhandled) while the load itself passed. Suite **477/477** green after.
+
+**AND IT DID NOT FIX THE WALL. MY CAUSAL STORY WAS WRONG.** Measured, not assumed:
+
+- **The guest never loads fileio. `grep -c fileio` on the boot log returns `0`.** The whole
+  hypothesis — "the disc open goes unhandled so the guest falls back to the memory card" — is
+  **REFUTED**. There is no fallback, because FileIO was never in the path.
+- The -4 loop is **unchanged**: 253,695 `sceMcOpen` calls, every one `-4`, every one the same path
+  `/\x05\x80/\x05\x80/e.gt4`, at **2,114/s**. The pre-change run was 2,126/s. **Identical rate.**
+- `functions_entered` 4,197,047 at 34,975/s vs 2,081,818 at 34,697/s before — also **identical rate**.
+  The halt name moved `stuck_in_syscall` → `wallclock_deadline`, but that is budget-dependent, not
+  progress. **This is not a new halt further along. It is the same stall.**
+
+I am keeping the FileIO provider anyway: it is correct, it is tested, and it removes a false
+"succeeded" the guest was told. But it is **not** progress on this wall and must not be counted as
+such.
+
+**WHERE THE WALL ACTUALLY STANDS.** The guest calls `sceMcOpen` **directly** — never via FileIO —
+2,114 times a second, for the path `/\x05\x80/\x05\x80/e.gt4`, and gets a truthful `-4` from
+`sceMcSync` (which is itself correct: it reports the open's result and returns -1 when idle). So the
+`-4` genuinely drives the loop, and the guest genuinely believes it is talking to a memory card.
+
+**REFUTED — do not re-propose any of these:**
+- ~~"FileIO is unhandled so the guest falls back to the MC"~~ — fileio is never loaded. **Refuted.**
+- ~~"`0x8005` is a PS2 device-prefix id"~~ — no such convention exists. **Refuted.**
+- ~~"`sceMcOpen` takes a device-prefixed path"~~ — it does not; device is the port/slot args. **Refuted.**
+
+**STILL UNDECODED, and it is the whole wall now:** why does GT4 ask the *memory card* for a file whose
+buffer holds `core.gt4`? Our own W34 logs show that buffer is reused scratch that also receives
+`core.gt4` and `cdrom0`, with the halfword landing on `cor`. Whether the guest is deliberately reading
+a card file, or is reading a buffer it believes is a card path, is **not established**, and the
+instrument cannot answer it because every observer stops after 4–5 hits, far before this event.
+**NEXT:** raise the probe hit budget (the deferred instrument fix) so the writer of `0x8005` can be
+identified causally, then re-ask the question. Do not guess the path's meaning.

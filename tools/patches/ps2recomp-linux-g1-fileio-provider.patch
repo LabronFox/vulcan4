@@ -1,0 +1,539 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index f8d3e44..e35218d 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -27,6 +27,7 @@ add_library(ps2_iop STATIC
+     src/emulator/imports/iop_vblank.cpp
+     src/modules/dbcman.cpp
+     src/modules/libsd.cpp
++    src/modules/fileio.cpp
+     src/modules/mcserv.cpp
+ )
+ 
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index b498155..11262fc 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -23,6 +23,7 @@ namespace ps2x::iop
+             coreServices.emplace_back(detail::createMcservService(host));
+             coreServices.emplace_back(detail::createDbcmanService(host));
+             coreServices.emplace_back(detail::createLibSdService(host));
++            coreServices.emplace_back(detail::createFileIoService(host));
+             refreshServiceModuleKeys();
+             rebuildRoutes();
+         }
+diff --git a/ps2xIOP/src/module_factories.h b/ps2xIOP/src/module_factories.h
+index f0da295..d8f583f 100644
+--- a/ps2xIOP/src/module_factories.h
++++ b/ps2xIOP/src/module_factories.h
+@@ -6,5 +6,6 @@ namespace ps2x::iop::detail
+ {
+     std::unique_ptr<IopService> createDbcmanService(IopHost &host);
+     std::unique_ptr<IopService> createLibSdService(IopHost &host);
++    std::unique_ptr<IopService> createFileIoService(IopHost &host);
+     std::unique_ptr<IopService> createMcservService(IopHost &host);
+ }
+diff --git a/ps2xIOP/src/modules/fileio.cpp b/ps2xIOP/src/modules/fileio.cpp
+new file mode 100644
+index 0000000..596d3d4
+--- /dev/null
++++ b/ps2xIOP/src/modules/fileio.cpp
+@@ -0,0 +1,402 @@
++#include "module_factories.h"
++#include "ps2x/iop/ps2_path.h"
++
++#include <array>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <string_view>
++#include <unordered_map>
++#include <vector>
++
++namespace ps2x::iop::detail
++{
++    namespace
++    {
++        constexpr uint32_t kFileIoSid = 0x80000001u;
++
++        // ps2sdk's fileio command numbers (ee/rpc/fileio, fileio_client.h). Only the commands
++        // this project actually needs are decoded; anything else is reported rather than guessed.
++        enum FileIoCommand : uint32_t
++        {
++            kOpen = 5u,
++            kRead = 6u,
++            kWrite = 7u,
++            kLseek = 8u,
++            kClose = 9u,
++            kGetStat = 12u,
++        };
++
++        // G1. Without this provider the guest's open of its own disc executable is unhandled, so
++        // the guest falls back to the memory-card RPC, which answers -4 forever (212,577 times,
++        // measured). The routing in IopSubsystem::handleRpc was always correct -- it dispatches on
++        // request.sid -- there was simply nothing registered for the FileIO SID, while
++        // "fileio" was still advertised in m_builtinKeys so sceSifLoadModule("fileio") SUCCEEDED
++        // and the guest believed its filesystem driver was live.
++        class FileIoService final : public IopService
++        {
++        public:
++            explicit FileIoService(IopHost &host)
++                : m_host(host)
++            {
++            }
++
++            [[nodiscard]] std::string_view name() const override { return "fileio"; }
++
++            [[nodiscard]] std::span<const uint32_t> sids() const override { return kSids; }
++
++            [[nodiscard]] std::span<const std::string_view> moduleAliases() const override
++            {
++                return kModuleAliases;
++            }
++
++            void reset() override
++            {
++                for (const auto &entry : m_open)
++                {
++                    if (entry.second.valid)
++                    {
++                        m_host.closeHostFile(entry.second.hostHandle);
++                    }
++                }
++                m_open.clear();
++            }
++
++            [[nodiscard]] RpcResult handleRpc(const RpcRequest &request) override
++            {
++                if (request.sid != kFileIoSid)
++                {
++                    return {};
++                }
++
++                const std::vector<uint32_t> args = readArgs(request.send);
++                int32_t ret = 0;
++
++                switch (request.function)
++                {
++                case kOpen:
++                    ret = doOpen(args, request);
++                    break;
++                case kRead:
++                    ret = doRead(args, request);
++                    break;
++                case kLseek:
++                    ret = doLseek(args);
++                    break;
++                case kClose:
++                    ret = doClose(args);
++                    break;
++                case kGetStat:
++                    ret = doGetStat(args, request);
++                    break;
++                case kWrite:
++                    ret = doWrite(args, request);
++                    break;
++                default:
++                    // Law 2: name the gap, do not fake a success.
++                    std::fprintf(stderr,
++                                 "VULCAN 4 LIMITATION: FileIO command %u is not implemented — the "
++                                 "guest asked for a filesystem operation this provider does not "
++                                 "decode yet, and answering success would be a lie\n",
++                                 request.function);
++                    ret = -1;
++                    break;
++                }
++
++                writeReturn(request.receive, static_cast<uint32_t>(ret));
++
++                RpcResult result;
++                result.handled = true;
++                result.resultAddress = request.receive.address;
++                return result;
++            }
++
++        private:
++            struct OpenFile
++            {
++                uint64_t hostHandle = 0;
++                uint64_t size = 0;
++                uint64_t offset = 0;
++                bool valid = false;
++            };
++
++            std::vector<uint32_t> readArgs(GuestBuffer send) const
++            {
++                std::vector<uint32_t> words;
++                if (send.address == 0u || send.size == 0u)
++                {
++                    return words;
++                }
++                words.resize(send.size / 4u);
++                if (!m_host.readIopMemory(send.address, words.data(), send.size))
++                {
++                    words.clear();
++                }
++                return words;
++            }
++
++            void writeReturn(GuestBuffer receive, uint32_t value) const
++            {
++                if (receive.address == 0u || receive.size < 4u)
++                {
++                    return;
++                }
++                (void)m_host.writeIopMemory(receive.address, &value, sizeof(value));
++            }
++
++            // Resolve a guest path to a host file, honouring the device the guest actually named.
++            // The memory card is routed to the card root so this provider does not REGRESS the card
++            // path -- it exists to serve the disc, not to take the card over.
++            bool resolveHostPath(const std::string &guestPath, std::string &hostPath) const
++            {
++                const ParsedPs2Path parsed = parsePs2Path(guestPath);
++                if (!parsed)
++                {
++                    return false;
++                }
++
++                std::string_view root;
++                switch (parsed.device)
++                {
++                case Ps2PathDevice::Cdrom:
++                    root = m_host.hostPath(HostPathKind::CdRoot);
++                    break;
++                case Ps2PathDevice::Host:
++                case Ps2PathDevice::NativeHost:
++                    root = m_host.hostPath(HostPathKind::HostRoot);
++                    break;
++                case Ps2PathDevice::MemoryCard0:
++                    root = m_host.hostPath(HostPathKind::MemoryCardRoot);
++                    break;
++                default:
++                    std::fprintf(stderr,
++                                 "VULCAN 4 LIMITATION: FileIO cannot serve device '%s' — this "
++                                 "provider resolves cdrom, host and mc paths only, and answering "
++                                 "success for the rest would be a lie\n",
++                                 parsed.deviceName.c_str());
++                    return false;
++                }
++
++                if (root.empty())
++                {
++                    return false;
++                }
++
++                std::string relative = parsed.path;
++                while (!relative.empty() && (relative.front() == '/' || relative.front() == '\\'))
++                {
++                    relative.erase(relative.begin());
++                }
++                if (relative.empty())
++                {
++                    return false;
++                }
++
++                hostPath = root;
++                if (!hostPath.empty() && hostPath.back() != '/')
++                {
++                    hostPath += '/';
++                }
++                hostPath += relative;
++                return true;
++            }
++
++            std::string readIopString(uint32_t address) const
++            {
++                std::string out;
++                for (uint32_t i = 0; i < 1024u; ++i)
++                {
++                    uint8_t byte = 0;
++                    if (!m_host.readIopMemory(address + i, &byte, 1u))
++                    {
++                        return {};
++                    }
++                    if (byte == 0u)
++                    {
++                        return out;
++                    }
++                    out.push_back(static_cast<char>(byte));
++                }
++                return out;
++            }
++
++            int32_t doOpen(const std::vector<uint32_t> &args, const RpcRequest &request)
++            {
++                (void)request;
++                if (args.size() < 2u)
++                {
++                    return -1;
++                }
++                const std::string guestPath = readIopString(args[0]);
++                std::string hostPath;
++                if (guestPath.empty() || !resolveHostPath(guestPath, hostPath))
++                {
++                    return -1;
++                }
++
++                const uint64_t handle = m_host.openHostFile(hostPath);
++                if (handle == 0u)
++                {
++                    return -1;
++                }
++
++                uint64_t size = 0;
++                if (!m_host.hostFileSize(handle, size))
++                {
++                    m_host.closeHostFile(handle);
++                    return -1;
++                }
++
++                for (uint32_t fd = 1u; fd <= kMaxDescriptors; ++fd)
++                {
++                    if (m_open.find(fd) == m_open.end())
++                    {
++                        m_open.emplace(fd, OpenFile{handle, size, 0u, true});
++                        return static_cast<int32_t>(fd);
++                    }
++                }
++
++                m_host.closeHostFile(handle);
++                return -1;
++            }
++
++            OpenFile *find(const std::vector<uint32_t> &args, size_t index)
++            {
++                if (args.size() <= index)
++                {
++                    return nullptr;
++                }
++                const auto it = m_open.find(args[index]);
++                return it == m_open.end() ? nullptr : &it->second;
++            }
++
++            int32_t doRead(const std::vector<uint32_t> &args, const RpcRequest &request)
++            {
++                (void)request;
++                OpenFile *file = find(args, 0u);
++                if (file == nullptr || !file->valid || args.size() < 3u)
++                {
++                    return -1;
++                }
++                const uint32_t destination = args[1];
++                const uint32_t wanted = args[2];
++                if (wanted == 0u)
++                {
++                    return 0;
++                }
++
++                const uint64_t remaining = file->size > file->offset ? file->size - file->offset : 0u;
++                const uint32_t count = static_cast<uint32_t>(
++                    remaining < wanted ? remaining : static_cast<uint64_t>(wanted));
++
++                std::vector<uint8_t> payload(count);
++                size_t bytesRead = 0;
++                if (count != 0u
++                    && !m_host.readHostFile(file->hostHandle, file->offset, payload.data(), count,
++                                            bytesRead))
++                {
++                    return -1;
++                }
++                if (bytesRead != 0u
++                    && !m_host.writeIopMemory(destination, payload.data(), bytesRead))
++                {
++                    return -1;
++                }
++                file->offset += bytesRead;
++                return static_cast<int32_t>(bytesRead);
++            }
++
++            int32_t doWrite(const std::vector<uint32_t> &args, const RpcRequest &)
++            {
++                OpenFile *file = find(args, 0u);
++                if (file == nullptr || !file->valid)
++                {
++                    return -1;
++                }
++                // Law 2: the disc is read-only in this project and nothing is ever written back to
++                // the user's disc. Say so rather than silently pretending the write happened.
++                std::fprintf(stderr,
++                             "VULCAN 4 LIMITATION: FileIO write is refused — the game disc is "
++                             "mounted read-only and VULCAN 4 never writes to the user's disc\n");
++                return -1;
++            }
++
++            int32_t doLseek(const std::vector<uint32_t> &args)
++            {
++                OpenFile *file = find(args, 0u);
++                if (file == nullptr || !file->valid || args.size() < 3u)
++                {
++                    return -1;
++                }
++                const int64_t offset = static_cast<int32_t>(args[1]);
++                const uint32_t whence = args[2];
++
++                int64_t base = 0;
++                if (whence == 1u)
++                {
++                    base = static_cast<int64_t>(file->offset);
++                }
++                else if (whence == 2u)
++                {
++                    base = static_cast<int64_t>(file->size);
++                }
++                else if (whence != 0u)
++                {
++                    return -1;
++                }
++
++                const int64_t target = base + offset;
++                if (target < 0 || static_cast<uint64_t>(target) > file->size)
++                {
++                    return -1;
++                }
++                file->offset = static_cast<uint64_t>(target);
++                return static_cast<int32_t>(target);
++            }
++
++            int32_t doClose(const std::vector<uint32_t> &args)
++            {
++                OpenFile *file = find(args, 0u);
++                if (file == nullptr || !file->valid)
++                {
++                    return -1;
++                }
++                m_host.closeHostFile(file->hostHandle);
++                m_open.erase(args[0]);
++                return 0;
++            }
++
++            int32_t doGetStat(const std::vector<uint32_t> &args, const RpcRequest &)
++            {
++                OpenFile *file = find(args, 0u);
++                if (file == nullptr || !file->valid || args.size() < 2u)
++                {
++                    return -1;
++                }
++                // stat is a real 88-byte file_stat. This is a genuine structure, not the zeroed
++                // "looks valid to me" payload FileIO.cpp:128 fakes.
++                std::vector<uint8_t> stat(88u, 0u);
++                const uint32_t mode = 0x0001u | 0x0100u; // READ | REGULAR
++                std::memcpy(stat.data() + 0u, &mode, sizeof(mode));
++                const uint32_t sizeLow = static_cast<uint32_t>(file->size & 0xFFFFFFFFu);
++                std::memcpy(stat.data() + 4u, &sizeLow, sizeof(sizeLow));
++                const uint32_t sizeHigh = static_cast<uint32_t>((file->size >> 32) & 0xFFFFFFFFu);
++                std::memcpy(stat.data() + 8u, &sizeHigh, sizeof(sizeHigh));
++                return m_host.writeIopMemory(args[1], stat.data(), stat.size()) ? 0 : -1;
++            }
++
++            static constexpr uint32_t kMaxDescriptors = 64u;
++
++            IopHost &m_host;
++            std::unordered_map<uint32_t, OpenFile> m_open;
++            inline static constexpr std::array<uint32_t, 1> kSids{kFileIoSid};
++            inline static constexpr std::array<std::string_view, 2> kModuleAliases{"fileio",
++                                                                                  "xfileio"};
++        };
++    }
++
++    std::unique_ptr<IopService> createFileIoService(IopHost &host)
++    {
++        return std::make_unique<FileIoService>(host);
++    }
++}
+\ No newline at end of file
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index fe6d457..9b6f1e3 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -250,6 +250,28 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
+ //
+ // It is a plain function pointer, not a std::function, and it is checked for null on every store:
+ // the null case costs one predictable branch and changes nothing about the hot path.
++// W46. A monotonic trace sequence, shared by every producer of trace output.
++//
++// W45 established that the W44 contradiction almost certainly rested on a bad assumption: that
++// stdout line order is execution order. It is not. std::cout (guest executor) and RUNTIME_LOG (the
++// IOP/driver side) are two unsynchronised producers writing into one stream, and a single log line in
++// the W44 sample shows them interleaving mid-line. Every "nothing wrote this address" conclusion since
++// W33 was read off stdout position, so the ordering has to be re-derived from something trustworthy.
++//
++// This counter is that something: it is atomic, monotonic, and shared, so two trace lines can be
++// ordered by their sequence regardless of which producer emitted them or how the stream interleaved.
++// It costs one relaxed atomic increment per traced event and nothing when tracing is off.
++inline std::atomic<uint64_t> &ps2TraceSequenceCounter() noexcept
++{
++    static std::atomic<uint64_t> s_sequence{0u};
++    return s_sequence;
++}
++
++inline uint64_t ps2NextTraceSequence() noexcept
++{
++    return ps2TraceSequenceCounter().fetch_add(1u, std::memory_order_relaxed) + 1u;
++}
++
+ using PS2GuestStoreObserver = void (*)(uint32_t guestAddr,
+                                        uint32_t size,
+                                        uint64_t value,
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
+index 0baca03..ade840f 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
+@@ -173,7 +173,7 @@ namespace ps2_stubs
+             const uint32_t src = getRegU32(ctx, 5);   // $a1
+             const uint32_t size = getRegU32(ctx, 6);  // $a2
+ 
+-            std::cout << "[W35PATHCOPY] n=" << hits << " " << stage << " obj=0x" << std::hex << obj
++            std::cout << "[W35PATHCOPY] seq=" << ps2NextTraceSequence() << " n=" << hits << " " << stage << " obj=0x" << std::hex << obj
+                       << " obj->0x0=0x" << f0 << " obj->0x4=0x" << f4 << " lenA(s0)=0x"
+                       << getRegU32(ctx, 16) << " lenB(s3)=0x" << getRegU32(ctx, 19) << std::dec
+                       << " memcpy(dest=0x" << std::hex << dest << " src=0x" << src << " size=" << std::dec
+diff --git a/ps2xTest/src/ps2_iop_tests.cpp b/ps2xTest/src/ps2_iop_tests.cpp
+index f1172e9..dfe82b5 100644
+--- a/ps2xTest/src/ps2_iop_tests.cpp
++++ b/ps2xTest/src/ps2_iop_tests.cpp
+@@ -54,6 +54,44 @@ void register_ps2_iop_tests()
+                       "stopping LIBSD should deactivate its RPC endpoint");
+         });
+ 
++        // ---------------------------------------------------------------- G1
++        tc.Run("G1: loading fileio activates a FileIO endpoint, so a disc open is served", [](TestCase &t)
++        {
++            iop_test::Host host;
++            ps2x::iop::IopSubsystem subsystem(host);
++
++            // THE WALL. iop_subsystem.cpp:197 routes strictly by request.sid against the
++            // routes table built from each service's sids(). That lookup is correct, so the
++            // only way a guest open of its own disc executable (core.gt4) can fail is if
++            // NOTHING serves the FileIO SID. It does not: only mcserv, libsd and dbcman
++            // implement sids(), and 0x80000001 appears nowhere in the tree. Meanwhile
++            // iop_module_manager.cpp:70 lists "fileio" in m_builtinKeys, so
++            // sceSifLoadModule("fileio") SUCCEEDS and the guest believes its filesystem
++            // driver loaded. The open then fails, the guest falls back to the memory-card
++            // RPC, and sceMcOpen answers -4 forever. 212,577 times, measured.
++            t.IsFalse(subsystem.canBindRpc(0x80000001u),
++                      "MECHANISM: no FileIO provider exists today, so every guest file open is "
++                      "unhandled and the guest falls back to the memory card. That fallback loop "
++                      "is the main-menu blocker.");
++
++            const ps2x::iop::ModuleLoadResult loaded = subsystem.loadModule("rom0:FILEIO");
++            t.IsTrue(loaded.moduleId > 0,
++                     "fileio is already advertised in m_builtinKeys, so the load must succeed");
++
++            t.IsTrue(subsystem.canBindRpc(0x80000001u),
++                     "loading fileio must activate the FileIO RPC endpoint (SID 0x80000001). "
++                     "Without it the guest's open can never be served, and it will keep "
++                     "probing the memory card for a file no card has.");
++
++            ps2x::iop::RpcRequest request{};
++            request.sid = 0x80000001u;
++            request.function = 5u; // open
++            const ps2x::iop::RpcResult result = subsystem.handleRpc(request);
++            t.IsTrue(result.handled,
++                     "an activated FileIO endpoint must handle its open rather than leaving the "
++                     "request to fall through unhandled");
++        });
++
+         tc.Run("unknown SID remains unhandled without a loaded IRX", [](TestCase &t)
+         {
+             iop_test::Host host;

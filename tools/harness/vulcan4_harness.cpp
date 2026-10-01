@@ -136,6 +136,9 @@ constexpr uint32_t kWatchPathStorePc = 0x01003E98u;
 uint32_t g_watchPathHits = 0;
 // W33: the observer needs RDRAM to read the candidate path strings. Set once, before boot.
 uint8_t *g_rdramForWatch = nullptr;
+// W77. The live runtime, so the shadow can ask whether the buffer it is watching is still the buffer
+// the code reads. RDRAMPROBE printed this ONCE at startup, where the two pointers necessarily agree.
+PS2Runtime *g_runtimeForShadowProbe = nullptr;
 
 // W45. Exposed so a probe inside the runtime can compare the buffer IT was handed against the buffer
 // the store observer is watching. Every internal consistency check so far (TLB vs flat index) proved
@@ -320,7 +323,23 @@ void watchGuestStoreForPath(uint32_t guestAddr,
             {
                 if (shadowChanges < watchEnv("VULCAN4_SHADOW_MAX", 8u))
                 {
-                    std::cout << "VULCAN4 SHADOWCHANGE #" << shadowChanges
+                    // W77. Is the BUFFER the same one the shadow was primed from? The shadow array is
+                // initialised once; if g_rdramForWatch is ever repointed -- a memory reset, a second
+                // loadELF -- then every byte that differs between the old and new buffer is reported
+                // as a "change" and no write ever happened at all. Printing the pointer next to the
+                // change is the only way to tell a real write from a buffer swap, and RDRAMPROBE only
+                // ever printed once, at startup, where both pointers necessarily agreed.
+                std::cout << "VULCAN4 SHADOWCHANGE #" << shadowChanges
+                              << " watched=" << static_cast<const void *>(g_rdramForWatch)
+                              << " live="
+                              << static_cast<const void *>(
+                                     g_runtimeForShadowProbe->memory().getRDRAM())
+                              << " swapped="
+                              << ((static_cast<const void *>(g_rdramForWatch) !=
+                                   static_cast<const void *>(
+                                       g_runtimeForShadowProbe->memory().getRDRAM()))
+                                      ? "YES"
+                                      : "no")
                               << " at addr=0x" << std::hex << (kWatchLo + k)
                               << " now=0x" << static_cast<uint32_t>(g_rdramForWatch[kWatchLo + k])
                               << " was=0x" << static_cast<uint32_t>(shadow[k])
@@ -814,6 +833,7 @@ int main(int argc, char *argv[])
     ps2SetGuestStoreObserver(&watchGuestStoreForPath);
     ps2SetGuestBranchObserver(&watchGuestCallForPath);
     g_rdramForWatch = rdram;
+    g_runtimeForShadowProbe = &runtime;
 
     // W44. Two probes read the same guest address in the same process and DISAGREE: the store
     // observer saw '/BA' written to 0x10519C0, while the copy probe in ps2_stubs::memcpy read '05 80'

@@ -6629,3 +6629,92 @@ wrong function and W66 proved why; W71 withdrew the record-table reading. Nothin
 already knows. The one that matters is the last.
 
 Suite **482/483** — the +1 is the W76 overlap guard.
+
+---
+
+## W77 — the untraced writer is narrowed to `RPC.cpp`, and the swap check is now permanent
+
+Continuing W76's step: watch the SOURCE, find the last writer. Three measurements, in order.
+
+### 1. The cap was not the problem this time — there really are only six writes
+
+`VULCAN4_WATCH_MAX=5000` (not 10, not a `head`), one 600,000-entry run, window
+`[0x010519C0, 0x010519D0)`:
+
+```
+op=memset src=0x0     pc=0x1010eec addr=0x10519b0 sz=16410192
+op=WRITE8            pc=0x1003d9c addr=0x10519c0 sz=1  val=0x2f
+op=Ps2FastWrite8     pc=0x0      addr=0x10519c0 sz=1  val=0x2f
+op=memcpy src=0x103d638 pc=0x1003dac addr=0x10519c1 sz=2
+op=memcpy src=0x103d650 pc=0x1003dc4 addr=0x10519c3 sz=10
+op=memcpy src=0x103d548 pc=0x1003de0 addr=0x10519cd sz=9    "GAMEDATA"
+```
+
+**Six, and the last is the `GAMEDATA` copy.** So the window was never truncated here — W74's error was
+purely my `head -14`, and correcting it did not find a writer.
+
+### 2. It is not a buffer swap — and that is now checked on every change forever
+
+The shadow array is primed **once**. If `g_rdramForWatch` were ever repointed, every differing byte
+would read as a "change" and **no write would ever have happened**. `RDRAMPROBE` only ever printed once,
+at startup, where the two pointers necessarily agree — so it could never catch this. The shadow now
+prints `watched=`, `live=` and `swapped=` on every change:
+
+```
+32 SHADOWCHANGE lines, all: swapped=no, watched == live
+#16 0x10519c0 now=5  was=2f pc=0x100a45c
+#17 0x10519c1 now=80 was=42 pc=0x100a45c
+```
+
+**Buffer-swap hypothesis: dead.** The byte really does change in the same buffer, and the transition is
+reproducible. Kept as a permanent guard, because a shadow diff with no buffer check is not evidence.
+
+### 3. Not an alias, and the pc is not the writer
+
+`grep 'WTRACE.*addr=0x810519c0'` and every other alias that masks to `0x010519C0`: **0 each.** So it is
+not a kseg1 write reported under a different string. And `pc=0x100a45c` is **not** the writer — W66
+already proved that instruction stores to `$s2+0x98` = `0x700020e8`, the **scratchpad**. It is the next
+*traced* store to happen after an *untraced* one, which is exactly the off-by-one W65 and W75 described.
+
+### The sweep, and it names a file
+
+Every `getMemPtr(rdram, …)` write site in `ps2xRuntime` and `ps2xIOP`, by file:
+
+| sites | file |
+|---|---|
+| **19** | **`Kernel/Syscalls/RPC.cpp`** |
+| 11 | `Kernel/Stubs/LibC.cpp` (traced) |
+| 11 | `Kernel/Stubs/Font.cpp` (traced) |
+| 7 | `Kernel/Stubs/CD.cpp` |
+| 5 | `Kernel/Syscalls/System.cpp` |
+| 5 | `Kernel/Stubs/MPEG.cpp` |
+| 4 | `Kernel/Stubs/Pad.cpp` |
+| 3 each | `SIF.cpp`, `GS.cpp`, `FileIO.cpp` |
+
+**`RPC.cpp` is the largest untraced concentration and I never instrumented it.** `rpcCopyToRdram` *is*
+traced, but the SIF-RPC bookkeeping is not — it writes through **typed pointers**:
+
+```cpp
+RPC.cpp:169  int32_t *hostResult = reinterpret_cast<int32_t *>(getMemPtr(rdram, resultAddr));
+RPC.cpp:172  *hostResult = stoppedByEmulator ? moduleResult : (knownModule ? 0 : -1);
+RPC.cpp:362  client->server = serverPtr;
+RPC.cpp:363  client->buf = sd ? sd->buf : 0;
+RPC.cpp:364  client->cbuf = sd ? sd->cbuf : 0;
+```
+
+Those are struct-field stores through a reinterpret_cast, so they never see an observer. **Every one of
+the five IRX modules loads through this path**, so an RPC writing a buffer the guest then reads as a
+path is not a stretch — and the bytes at `0x010519C0` after the change,
+`0x8005 / 0x0041 / 0x0003 / 0x0042 / 0x1400 / 0x0059`, are the shape of a **card directory entry
+table**, entry 0 being the PS2 free-clusters marker `0x8005`.
+
+### Next single step
+
+Instrument the typed-pointer stores in `RPC.cpp` through `ps2TraceGuestRangeWrite` — the same fix W64
+applied to the card module, applied to the file with the most untraced sites. Then one run either names
+the writer of `0x010519C0` or removes the largest remaining candidate.
+
+That is now a **red test first**: a test that a `sceSifRpc` call which sets a result field is visible
+to the store observer. It will fail today, which is correct.
+
+Suite **482/483**.

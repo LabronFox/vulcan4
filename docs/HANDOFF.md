@@ -4920,3 +4920,105 @@ value we supplied, and that pointer is `0x010519C0`, we will see it.
 
 **STATUS: no frame.** Suite **477/477**. Boot unchanged: ~2,128 `sceMcOpen`/s, all `-4`,
 `halt=wallclock_deadline`.
+
+---
+
+## 2026-10-01 — W57: byte accounting COMPLETE. It refutes W56, names the blind spot, and the wall is the search never reaching the disc
+
+### 1. W56's "no race" is REFUTED — the observer missed writes
+
+Replaying every observed write into a shadow buffer and comparing it with the guest's actual memory
+showed **4 bytes of a 12-byte path unaccounted for**. Then, using the `raw=` hex dump each event
+carries, the exact moment of the discrepancy is visible:
+
+```
+seq=254  memcpy   9 -> 0x01051A10        raw: 63 6f 72 65 2e 67 74 34 00   "core.gt4."
+seq=265  memcpy   2 -> 0x01051A10        raw: 05 80 72 65 2e 67 74 34 00   "..re.gt4."
+seq=267  WRITE8   1 -> 0x01051A12        raw: 05 80 72 65 2e 67 74 34 00
+seq=272  [MC] Open  reads  05 80 2f 05 80 2f 65 2e 67 74 34 00   "../../e.gt4"
+seq=274  WRITE32  4 -> 0x01051A30        raw: 05 80 2f 05 80 2f 65 2e 67 74 34 00
+```
+
+**Bytes at offsets 3,4,5 changed between seq=267 and seq=274 and NO event was reported for them.** The
+observer was not capped there — `max n = 900` and the last event is at seq=**1875**, far later. So the
+writes happened, before the Open, and were invisible.
+
+**The blind spot is in OUR runtime, and it is now named by exclusion:**
+- the recompiler's guest stores all trace — generated code emits
+  `ps2TraceGuestWrite(..., "WRITE8", ctx)` *before* `FAST_WRITE8`, so a guest `sb` is visible (120 uses);
+- `IopHost::writeGuest` traces (`ps2mc`-side copies are visible);
+- **`PS2Memory::write8/write16/write32/write64/write128` (`ps2_memory.cpp:925`, `:1153`) write `m_rdram`
+  with NO trace at all**, and **`Ps2FastWrite8/16/64/128` in `ps2_runtime_macros.h` likewise**. Only
+  `Ps2FastWrite32` was ever instrumented (W45).
+
+So the writer of those 4 bytes is on a `PS2Memory::writeN` or `Ps2FastWrite{8,16,64,128}` path. Which
+subsystem is guilty is **not yet established** — closing the trace is what will show it.
+
+### 2. libmc authority — our -4 is CORRECT, and the mode name was wrong
+
+From ps2sdk (`common/include/io_common.h:29-38`, `common/include/libmc-common.h:189-210`) and
+`iop/memorycard/mcman/src/ps2mc_fio.c`:
+
+- **`mode = 0x1` is `FIO_O_RDONLY`** — "open existing, read access". It is **NOT** `FIO_F_READ`;
+  `FIO_F_READ` is a *command opcode* in a different enum (`fileio-common.h:24-42`) and is never passed
+  to `sceMcOpen`. Our constant name was wrong by coincidence of value. **Rename it.**
+- **`sceMcFileCreateFile = 0x0200` (= `FIO_O_CREAT`)** and **`sceMcFileCreateDir = 0x0040`** — both
+  confirmed at `libmc-common.h:203,205`.
+- **-4 (`sceMcResNoEntry`) IS the correct answer for a read-only open of a missing file.** The exact
+  path is `ps2mc_fio.c:724-726`: `if ((r == 1) && ((flags & (CreateFile|CreateDir)) == 0)) return
+  sceMcResNoEntry;`. Real hardware does **not** create the file. **Do not "fix" this.**
+- With `0x0200` set, mcman **would** create it (`ps2mc_fio.c:988-1022`), returning a non-negative fd,
+  with entry mode `0x8417`, length 0, `cluster = -1`, then `McFlushCache`. The directory case returns
+  **0**, not an fd (`ps2mc_fio.c:986`).
+
+### 3. THE BIG ONE — opening `core.gt4` on the card is CORRECT, by design
+
+Nenkai's GT modding hub, `docs/ps2/executables.md`: GT3/GT4/TT are **bootstrap + CORE**. The bootstrap
+launches/verifies `CORE.GT4` through four sources **in order**:
+
+1. `HostSource` — `host:/tmp/CORE.GT4`
+2. `CardSource` — `MCARD 0`  ← **the card open we are watching**
+3. `CardSource` — `MCARD 1`
+4. `DiskSource` — `CORE.GT4` at the root of the disc
+
+This is the HD-loader / mod hook: run a patched CORE from the card. **So a card open of `core.gt4`
+returning -4 is the expected negative result of step 2, not a symptom of a corrupted path.** It also
+matches our own `.rodata`: `core.gt4` (0x0103D1D8), `cdrom0:\` (0x0103D558), `;1` (0x0103D568),
+`GAMEDATA` (0x0103D548), and `/tmp` immediately after `;1` — which is the **HostSource** string.
+
+### 4. MEASURED: the search IS advancing — and then stops one step short
+
+```
+ports: {'0': 38152, '1': 38152}     slots: {'0': 76304}     modes: {'1': 76304}
+76,304  [MC] Sync cmd=1 result=0      <- GetInfo SUCCEEDS: our card reports present+formatted
+76,304  [MC] Sync cmd=2 result=-4     <- Open fails, correctly, on both cards
+```
+
+**Ports 0 and 1 alternate perfectly, 38,152 each.** GT4 is doing exactly steps 2 and 3. **It never
+performs step 4:** `CORE.GT4` appears **0** times in the log, against 76,304 card opens (`cdrom0` only
+267 times, and no `GAMEFILE`, no `VULCAN 4 LIMITATION`, no `[IOP:load-failed]`).
+
+**And the disc file is right here:** `/mnt/ssd/gt4/work/CORE.GT4`, with `cdRoot` defaulting to the
+ELF's own directory. **The G1 FileIO provider already resolves `cdrom0:` through
+`parsePs2Path` → `Ps2PathDevice::Cdrom` → `CdRoot`.** So the last step is *reachable* — the guest's
+disc open is simply not arriving.
+
+### 5. A REAL FIDELITY GAP found next to it
+
+`sceMcSync` ends `MemoryCard.cpp:1300` with **`setReturnS32(ctx, 1)` unconditionally** — it returns 1 in
+`$v0` whether the command succeeded or failed, and reports the outcome only through `resultPtr`. Real
+libmc returns **the file descriptor (>= 0) on success or the error code (< 0) on failure** in `$v0`
+(`ee/rpc/memorycard/include/libmc.h:227-237`). A guest that reads `$v0` is being told every card
+command succeeded. **Not yet proven to be what this guest reads** — needs a red test, not a guess.
+
+### VERDICT
+
+**None of (a)/(b)/(c) as posed.** (b) is refuted by authority: `mode` has no `O_CREAT`, so no card
+implementation should create anything. (c) is refuted by the Nenkai source: the card probe is designed
+to fail. What is left is the honest statement: **the four-source search runs steps 2 and 3 correctly
+and never reaches step 4**, and our disc file is present and servable. The next dish must find out why
+the guest does not advance to the disc — and the first step is closing the `PS2Memory::writeN` /
+`Ps2FastWrite{8,16,64,128}` trace gap, which is what made "the guest wrote nothing here" untrue.
+
+**STATUS: no frame.** Suite **477/477** + the new red test. Boot: `functions_entered=1253719`,
+`halt=wallclock_deadline`, 76,304 card opens, all correctly -4.

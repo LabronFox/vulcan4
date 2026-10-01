@@ -4775,3 +4775,50 @@ our own runtime writes the same bytes immediately after the guest does. W45's in
 real, and there are exactly two producers.
 
 **STATUS: no frame.** `VULCAN4 FRAME source=guest` has never printed. The wall stands unchanged.
+
+---
+
+## 2026-10-01 — W49: I WAS WRONG at W48, and the correction is the actual finding
+
+**RETRACTION.** W48 claimed the store observer's window was "watching the wrong address" and re-aimed
+it from `0x010519C0` to `0x01051A10`. **That was wrong.** `0x010519C0` is exactly where the guest
+writes a perfectly readable path — W45 saw `/BA/SCUS-97328GAMEDATA` there because the window was
+correct, not by luck. I moved the window away from the address that holds the path because I had
+assumed the `sceMcOpen` argument was the only path in play. There are two.
+
+**THE REAL FINDING, measured in one run with a window covering both:**
+
+```
+0x010519C0   the guest BUILDS   "/BASCUS-97328"                       13 bytes, then padding
+0x01051A10   the guest PASSES   05 80 2f 05 80 2f "e.gt4"           to sceMcOpen, as its `name`
+```
+
+**The string the guest passes to `sceMcOpen` is NOT the string the guest built.** That is the whole
+wall, stated in one comparison, and it is not a decoding problem on our side — we pass through exactly
+the bytes we are given, and those bytes are `05 80 2f 05 80 2f 65 2e 67 74 34 00`.
+
+Two further facts that make this decidable:
+- `sceMcOpen(port=0, slot=0, name, mode=0x1)` takes the device as **arguments**, and both are 0, so
+  this is a genuine memory-card open on unit 0. `/BASCUS-97328` is the shape of GT4's own save
+  directory, consistent with the `/BASCUS-97436GAMEDATA` form found in GT4Hooks' `MStorage.c`.
+- The buffer at `0x01051A10` is **two identical structs chained by a pointer**: node A at `+0x00`
+  has `a1 = 0x01051A30` (node B) and `-1, -1`; node B at `+0x30` has the same shape and carries the
+  string `"Tex1"` at `+0x40`. So the guest is walking a two-entry list, and the name it hands us
+  comes from node A.
+
+**What is still UNDECODED, and I am not guessing it:** why the passed name reads `05 80 2f 05 80 2f
+"e.gt4"`. It is guest data (W48 proved the `0x8005` halfword is copied in by the guest's own memcpy,
+not produced by a store instruction we decoded). It is not a PS2 device prefix — that convention does
+not exist. Whether those bytes are a path we are reading at the wrong offset, a guest-side value that
+should have been something else, or a structure we are mis-walking is **not established**.
+
+**W48's "defect 2" stands and is unaffected:** the observer still reports memcpy return addresses as
+store sites (`0x1003a98` is `daddu`, `0x1003e80` is `addiu $v0,$zero,0x2F`, neither stores).
+
+**NEXT.** Now that both buffers are in one window, the question that can actually settle this is
+whether the guest ever writes `/BASCUS-97328` into the `0x01051A10` buffer and something later
+overwrites its head — i.e. which pc, in causal seq order, last writes each byte of the passed name.
+The instrument can answer that now that the window and caps are env-tunable.
+
+**STATUS: no frame.** Suite 477/477. Boot unchanged: `sceMcOpen` steady at ~2,128/s, all `-4`,
+`halt=wallclock_deadline`.

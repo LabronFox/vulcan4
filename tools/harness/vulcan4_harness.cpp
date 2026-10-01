@@ -88,14 +88,21 @@ namespace
 //     and the writer tells them apart: if the bytes arrive through the big copy the ring buffer's
 //     stream is mis-decoded, and if our own decoder writes here then a field offset or width on our
 //     side is wrong. Watch 12 bytes so a 32-bit store is not split across a boundary we chose blind.
-// W48. THE WINDOW WAS WATCHING THE WRONG ADDRESS, which is why W33-W45 kept concluding "the
-// guest did not write this". The address in question is the path buffer sceMcOpen is handed:
-// every one of the 253,695 opens passes a2(buf)=0x01051A10 (measured). This window was
-// 0x010519C0-0x010519D0 -- forty bytes BELOW it. The observer was reporting faithfully about an
-// address nobody was asking about, so every negative result drawn from it was worthless.
-// The window now covers the buffer the guest actually builds: 0x01051A10 through the second
-// string at +0x40. Both ends are env-overridable so the instrument can be re-aimed at the next
-// address instead of being recompiled each time.
+// W49. There are TWO guest path buffers, and the window has to cover both -- I got this wrong at
+// W48 and am correcting it.
+//
+//   0x010519C0  the guest BUILDS "/BASCUS-97328"          (13 bytes, then padding)
+//   0x01051A10  the path sceMcOpen is HANDED: 05 80 2f 05 80 2f "e.gt4"
+//
+// W48 claimed this window was "watching the wrong address" and re-aimed it at 0x01051A10 alone.
+// That was wrong: 0x010519C0 is where the readable path is, which is why W45 saw
+// "/BA/SCUS-97328GAMEDATA" written there. Both are now inside one window. Keeping them together
+// also means a single run shows the guest building one string and passing a DIFFERENT one, which is
+// the actual finding: the string it passes is not the string it built.
+constexpr uint32_t kWatchBuiltPathAddr = 0x010519C0u;  // where the guest writes "/BASCUS-97328"
+constexpr uint32_t kWatchPassedPathAddr = 0x01051A10u; // the buffer sceMcOpen is handed
+constexpr uint32_t kWatchLoDefault = kWatchBuiltPathAddr;
+constexpr uint32_t kWatchHiDefault = kWatchPassedPathAddr + 0x70u;
 uint32_t watchEnv(const char *name, uint32_t fallback)
 {
     const char *raw = std::getenv(name);
@@ -107,10 +114,6 @@ uint32_t watchEnv(const char *name, uint32_t fallback)
     const unsigned long value = std::strtoul(raw, &end, 0);
     return (end != nullptr && *end == '\0') ? static_cast<uint32_t>(value) : fallback;
 }
-
-constexpr uint32_t kWatchPathAddr = 0x01051A10u;
-constexpr uint32_t kWatchLoDefault = kWatchPathAddr - 0x10u;
-constexpr uint32_t kWatchHiDefault = kWatchPathAddr + 0x60u;
 const uint32_t kWatchLo = watchEnv("VULCAN4_WATCH_LO", kWatchLoDefault);
 const uint32_t kWatchHi = watchEnv("VULCAN4_WATCH_HI", kWatchHiDefault);
 uint32_t g_watchStoreHits = 0;

@@ -4041,3 +4041,91 @@ field meanings, and the guest's own code is the authority for them. The trace to
 `Tex1` inside the struct at `0x1051a10` that `sceMcOpen` receives, reached via
 `sub_01005148 → sub_0100E3C8` and `sub_01005430 → sub_0100E610`. Reading that code gives the pixel
 format and the dimensions from the data instead of from a division that happened to divide.
+
+## W40 — the retry's true shape: a **lock held across a failing MC open**, and my W37 reading was half wrong
+
+W37 said the guest "retries with no sleep, backoff, or give-up." **The retry is real; "no backoff" was
+my assumption, not a measurement.** Decoding the callees properly shows `func_10119A0` is **not** a
+delay at all, and the loop's real character is different — and worse — than I described.
+
+### `func_10119A0` is a LOCK primitive, not a delay
+
+I read its `addiu $a0, $zero, 0x7D0` (2000) as a sleep of 2000 ticks. **It is not.** In full:
+
+```
+0x10119a8  sync.p
+0x10119ac  mfc0  $v0, Status
+0x10119b0  xori  $v0, $v0, 0x1
+0x10119b4  andi  $v0, $v0, 0x1
+0x10119b8  beqz  $v0, ...              # if clear:
+           delay: addiu $a0, $zero, 0x7D0
+0x10119c4  j     func_1012E28
+```
+
+`func_1012E28` is a **mid-function jump into `sub_01012E30`**, which is:
+
+```
+0x1012e30  lui   $v1, 0x103
+0x1012e34  addiu $v1, $v1, 0x6B50     # $v1 = 0x01036B50
+0x1012e38  jr    $ra
+           delay: sw $v1, 0x0($a0)     # *(u32*)$a0 = 0x01036B50
+```
+
+**It writes a fixed constant through the caller's `$a0` and returns. No loop, no timer.** The decisive
+tell is that `sub_01012E40` — the full version, with `andi $a1, $a1, 0x1` — materialises **the same
+`0x01036B50`** and stores it through **the same `$a0`**. Two functions writing one constant through one
+argument is a lock idiom, not a delay. **`0x7D0` is a lock-state token, not a duration.**
+
+Supporting evidence: `func_10119A0` is called from **eight** call sites (`0x1000544`, `0x100e368`,
+`0x100e418`, `0x100e4c8`, `0x100e548`, `0x100e650`, `0x100e6e0`, `0x100e758`). A delay with one
+meaning does not get called from eight places; a lock does.
+
+### The loop, correctly resolved
+
+`sub_0100E610` in full, with the branch target computed rather than eyeballed
+(`target = (pc+4) + (imm<<2)`, so `bnez $v0, -0x8` at `0x100e66c` targets **`0x100e650`**):
+
+```
+0x100e624  addiu $a0, $s4, 0x3098      # the shared lock object, 0x01043098
+0x100e640  jal   func_1011650          # LOCK
+0x100e650  jal   func_10119A0          # <-- the retry target: lock-state init
+0x100e664  jal   func_1016F88          # sceMcOpen(port, slot, buffer, mode)
+0x100e66c  bnez  $v0, 0x100e650        # FAILURE -> back to 0x100e650, i.e. RETRY
+0x100e674  jal   func_100E730          # SUCCESS path only: sceMcSync wait
+0x100e67c  jal   func_1011688          # SUCCESS path only: UNLOCK
+0x100e684  lw    $v0, 0x4($sp)         # return the result
+0x100e6a0  jr    $ra
+```
+
+`sub_0100E3C8` (the `mceGetInfoApdx` caller) has the **identical shape**: `jal func_10119A0`,
+`jal func_10178D8`, `bnez $v0` back, and unlock `func_1011688` only after falling through.
+
+### The real defect, and it is a lock defect
+
+**The unlock (`func_1011688`) is on the SUCCESS path only. The failure path branches back to
+`0x100e650` and re-enters the lock without ever releasing it.** So a failing `sceMcOpen` retries
+*while holding the lock at `0x01043098`* — and the guest's own `func_1011650 → func_10112E0` acquire
+is what then contends.
+
+That is a different wall from "a missing backoff", and it is the first thing in this whole line of
+work that is **about the lock rather than about the `-4`**. It also explains the W15 symptom honestly:
+`sub_0100E730`'s `sceMcSync` polls only on the success path, so a permanently-failing open never
+reaches it, never yields, and never lets the scheduler run — which is exactly the tid2-asleep signature
+W16 recorded, from the other end.
+
+### What this does and does not change
+
+- **Unchanged:** the `-4` from `sceMcOpen` is still correct for the filename the guest built, and
+  `0x8005` is still undecoded. Fixing the lock shape does not make a bad filename open.
+- **New and actionable:** `func_1011650`/`func_10112E0` (acquire) and `func_1011688` (release) are now
+  named as a **pair to verify against our runtime**, exactly as item 1 framed preemption. The gate is
+  the same shape: a red test that a failed operation still releases, and a boot comparison.
+- **Corrected:** W37's "no backoff in the guest's own code" is retracted. There is no *timed* backoff;
+  what there is instead is a lock held across a retry, which is worse and was invisible until the
+  callees were decoded rather than assumed.
+
+### Next concrete step — the acquire/release pair, red-tested
+
+**Read `func_10112E0` (acquire) and `func_1011688` (release) to completion and check them against
+`ps2xRuntime`'s own lock at `0x01043098`.** If our acquire cannot be re-entered while held, or our
+release does not clear it, that is our bug and it is fixable without touching `0x8005` at all.

@@ -6496,3 +6496,60 @@ address — the byte writes came from a **32-bit write at `0x01047B68`**, a diff
 that is the address to read in the generated unit. One function, read from its own comments.
 
 Suite **482/482**. `VULCAN4 FRAME source=guest` has never printed.
+
+---
+
+## W75 — RETRACTION: W74's "next step" was built on a field that is not a guest address
+
+W74 ended by pointing at `0x01047B68`. **That address does not exist in the guest.**
+
+```
+grep -c "1047b68" ps2_recompiled_functions.cpp   ->  0
+highest generated address                         ->  0x0102DBE8
+```
+
+`0x01047B68` is **above the end of the entire generated code region.** It cannot be an instruction
+address, so it is not the guest writing `core.gt4`. It came from the shadow's `culpritaddr` field, which
+is the previous observer call's `guestAddr` — and W65 already established that **this attribution is
+unreliable**, because a traced store is announced *before* it is applied, so the change seen at call *N*
+was made by the write announced at *N-1*, and naming that write is a guess.
+
+I built a next step on it anyway. That is the same mistake as W61 and W64, in a third costume: an
+unreliable field read as a fact. **W74's pointer to `0x01047B68` is withdrawn.**
+
+### What survives W74, and it is the important half
+
+Two of W74's fields are read directly from memory and are not attributions:
+
+- `now=63 6f 72 65 2e 67 74` — the actual bytes at `0x01051A10` at that moment, i.e. `core.gt4`.
+- `pc=0x1003a98` — `ctx->pc` at the moment the change was observed, a real guest PC inside the
+  generated region.
+
+So this stands, and it is the finding of the night:
+
+> **At `pc=0x01003A98` the guest writes `core.gt4` into `0x01051A10`, correctly, byte by byte. At the
+> `sceOpen` call at `0x01005000` the same buffer reads `cdrom0:\CDROM0:\;1`. Both are measured.**
+
+And this also stands: the store observer, all widths, 600,000 entries, records exactly four in-window
+write events at that address, and **none of them writes `cdrom0:`**, yet the open reads it from there.
+
+### The corrected next single step
+
+Not a chase after an address. **Make the shadow's culprit attribution trustworthy first**, or stop using
+it: the fix is to diff the window *before* a store is announced rather than at the next observer call,
+so the reported write is the one that actually changed the bytes. That is a small change to the harness
+observer and it is the same class of fix as W64's alias-resolving window filter.
+
+With that in hand, one run answers it: the first writer of `cdrom0:` into `0x01051A10`, named, with a
+pc that is in the generated region.
+
+### A note on the pattern, because it has now happened three times
+
+W61 (strlen replica crashed), W64 (`$s2+0x98` was scratchpad, not the path), W75 (an address outside the
+image). In all three I built a conclusion on a field I had not validated, and in all three the
+disagreement was between two of my own instruments. The rule that would have caught all three: **before
+building on a number from an instrument, make a second instrument agree with it, or say plainly that it
+is unconfirmed.** `RDRAMPROBE` and the flat-vs-TLB read in W64 were the two times I did that, and those
+are the only conclusions from this stretch that survived.
+
+Suite **482/482**. `VULCAN4 FRAME source=guest` has never printed.

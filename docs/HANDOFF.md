@@ -5276,3 +5276,45 @@ is missed**, and both W44's "contradiction" and this one are that mistake. Filte
 
 **STATUS: no frame, milestone NOT met.** `VULCAN4 FRAME source=guest` has never printed. The 2.3 GB and
 1.4 GB `WTRACE` logs were deleted; `df -h /mnt/ssd` back to 109 G free.
+
+---
+
+## 2026-10-01 — W57f: the runaway memset's operands are named — and the destination is the HEAP BASE
+
+```
+[MEMSET] pc=0x1010eec ra=0x1010eec a0(dst)=0x10519b0 a1(val)=0x0 a2(len)=16410192
+         a3=0x0 t0=0x1000228 t1=0x0 t2=0x0 s0=0x10519b0 s1=0xfa6650
+```
+
+**Measured, in one line, from a real run:**
+
+- caller `pc = 0x1010EEC` (W30 guessed `0x1010EA8`; it is `0x1010EE8`/`0x1010EEC` — **off by four**)
+- **`$s0 = 0x010519B0` = the destination**, and it is the same value the guest passes in `$a0`
+- **`$s1 = 0xFA6650` = 16,410,192 = the length**, and it is the same value passed in `$a2`
+- value byte `0x00`, `t0 = 0x01000228`, `t1`/`t2`/`a3` all zero
+
+**And `0x010519B0` is the HEAP BASE.** From the very first boot report of this campaign:
+`[SetupHeap] base=0x10519ac alignedBase=0x10519b0`. So the guest is asking to zero **16.4 MB starting
+at the base of its own heap** — which wipes every allocation it has made, including the buffer where it
+had just built `/BASCUS-97328` (W57e).
+
+**So the length and the destination are both guest register values, faithfully delivered by us.** Two
+readings remain and they need different fixes:
+
+1. **The guest is clearing a 16.4 MB scratch region it owns**, and on our layout that region overlaps
+   its heap because `SetupHeap` placed the heap at `0x010519B0`. Then the bug is upstream of us: the
+   heap is where the guest asked for it, and the guest's own scratch choice collides with it. **Real
+   hardware would behave identically**, so this cannot be the whole story unless our `SetupHeap` honours
+   a different base than the game expects.
+2. **One of `$s0`/`$s1` holds a value it should not** — i.e. an upstream defect wrote a wrong register,
+   the same class as W41 (`STATUS.IE` set, nothing delivered). Then the guest is faithfully issuing a
+   clear it computed from bad inputs.
+
+**These are distinguishable and cheap: print the instructions that set `$s0` and `$s1` immediately
+before `0x1010EE8`.** Our generated code already carries the translation with comments, so the two
+producer instructions can be read directly out of `ps2_recompiled_functions.cpp` — no run needed.
+
+**DO NOT clamp the length.** `sanitizeMemTransferSize` let 16.4 MB through and that is correct: it is
+inside the 32 MB RDRAM. Clamping would hide the symptom and destroy the evidence.
+
+**STATUS: no frame, milestone NOT met.** `VULCAN4 FRAME source=guest` has never printed. Suite **478/478**.

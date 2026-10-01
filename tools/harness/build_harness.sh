@@ -33,8 +33,24 @@ for unit in "harness:/home/or/vulcan4/tools/harness/vulcan4_harness.cpp:harness.
     nice -n 10 g++ -std=c++20 -O1 -msse4.1 $INC $DEFS -c "$src" -o "$obj"
 done
 
-# The generated unit is the biggest translation unit in the project; -O0 keeps the
-# build inside a sane time and costs nothing at 20M guest entries a second.
+# The generated unit is the biggest translation unit in the project, so its optimisation level is
+# a measured decision, not a habit.
+#
+# It used to be -O0, justified here by "costs nothing at 20M guest entries a second". That claim was
+# never measured and it is false by three orders of magnitude: a 45 s boot enters 1,501,874 guest
+# functions, i.e. ~33K/s. Measured head to head at the same 45 s wall clock, same binary otherwise:
+#
+#   -O0 : functions_entered=1501874  distinct_pcs=149  vsync_tick=27
+#   -O2 : functions_entered=1747058  distinct_pcs=152  vsync_tick=31     (+16.3 %)
+#
+# So -O2 is a strict improvement -- more work done and slightly further into the guest -- and it is
+# what this script now uses. But note what 16% means: the translated arithmetic is NOT the
+# bottleneck, or -O2 would have won by much more. The per-entry cost is dominated by the dispatch
+# machinery, and above all by the generated code's habit of writing `ctx->pc` on EVERY guest
+# instruction -- a store per instruction that the optimiser cannot remove because `ctx` escapes. If
+# throughput ever becomes the wall rather than correctness, that store is the thing to attack, not
+# this flag. Do not "optimise" this line again on a hunch; re-run the 45 s pair above and put the
+# numbers in docs/HANDOFF.md.
 #
 # G1.8h, and it is the SAME trap this script was written to kill, one level deeper: the .cpp is
 # not the only input. Every READ32/READ64/WRITE32 expands a macro from
@@ -43,7 +59,7 @@ done
 # old object, and a probe built into the macros then never fires -- which reads exactly like "the
 # guest never does the thing", which is the most expensive kind of wrong.
 if [ ! -f ps2_recompiled_functions.o ] || [ "$G/ps2_recompiled_functions.cpp" -nt ps2_recompiled_functions.o ] || [ "$R/ps2xRuntime/include/ps2_runtime_macros.h" -nt ps2_recompiled_functions.o ] || [ "$R/ps2xRuntime/include/ps2_runtime.h" -nt ps2_recompiled_functions.o ]; then
-    nice -n 10 g++ -std=c++20 -O0 -msse4.1 $INC $DEFS -c "$G/ps2_recompiled_functions.cpp" -o ps2_recompiled_functions.o
+    nice -n 10 g++ -std=c++20 -O2 -msse4.1 $INC $DEFS -c "$G/ps2_recompiled_functions.cpp" -o ps2_recompiled_functions.o
 fi
 
 FFMPEG=$(pkg-config --libs libavcodec libavformat libavutil libswresample libswscale)

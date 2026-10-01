@@ -2347,3 +2347,86 @@ pointer. Two things are worth measuring next, in this order, and both are cheap:
 with confidence — `$s1` is `$a0` *after* a call, so the value stored into the queue slot cannot be
 pinned down from the decode alone, and the queued value may be a function pointer or an opaque
 token. I will not guess which. Measure 1 and 2 above instead; both are one print each.
+
+### W17 — the callback queue is NOT growing, the pointer was never reassigned, and the loop is a work pump
+
+The W16b entry named two things to measure. Both are measured, and **one of my two hypotheses was
+wrong**, which is the useful part.
+
+```
+VULCAN4 W17DISPATCH fn_ptr(0x1034EC0)=0x1019be8 elf_initial=0x1019be8 reassigned=no
+               owner(0x1035270)=0x1034f80 head=0x10350cc count=16994660 tail_cb=0x0
+VULCAN4 W17QUEUE blk=0x10350cc blk_count=1 slots: [0]=0x1019a48
+```
+
+- **`fn_ptr` was never reassigned.** It is still `0x1019be8`, exactly the ELF's initial value. So
+  the hot indirect call always goes to `sub_01019BE8` → `func_101E6B8`; it is not a pointer that
+  drifted somewhere useless, and it is not calling a no-op.
+- **The queue is not growing.** `blk_count=1` — **one** live entry — and the count field the
+  dispatcher actually loops on lives at `head+0x04` (`lw $s0, 0x4($s2)` at `0x101e7a0`), which is
+  1. The `count=16994660` I printed from `owner+0x04` is a different field and I mislabelled it in
+  the first draft of this note; the queue is empty of backlog. **Enqueue-outpaces-drain is
+  REFUTED.**
+- **The single queued entry is `0x1019a48`, real code.** Decoded: `sub_01019A48` is a **work pump** —
+  it walks the pending-job list at `0x1034EB8`, pops one entry per iteration (`head = cur + 4`),
+  `jalr`s its handler, repeats until the list is empty, then does a one-shot init if the flag at
+  `0x1034EBC` is still clear (`func_101B750`, guarded so it runs once).
+
+**So the 35-call cycle is GT4 pumping its own job queue, not a deadlock inside it.** The guest is
+alive and doing real work. That does not make the wall go away — tid1 still ends up in the mutex
+spin and tid2 is still asleep with `woken=0` — but it means the loop is not the bug, and that the
+thing to fix is whatever stops tid1 reaching the code that wakes tid2.
+
+## The generated unit was compiled `-O0`, on a comment that was never measured
+
+`tools/harness/build_harness.sh` compiled the 216,329-line generated unit at `-O0`, justified by
+"keeps the build inside a sane time and **costs nothing at 20M guest entries a second**".
+
+**That claim was false by three orders of magnitude.** The boot actually enters ~33K functions per
+second, not 20M. Measured head to head, same 45 s wall clock, identical binary otherwise:
+
+| build | functions_entered | distinct_pcs | vsync_tick |
+|---|---|---|---|
+| `-O0` (was) | 1,501,874 | 149 | 27 |
+| `-O2` (now) | 1,759,628 | 152 | 31 |
+
+**+17.2 % throughput, and slightly further into the guest.** The `-O0` object and binary are kept
+as `ps2_recompiled_functions_O0.o` / `vulcan4_harness_O0` for re-measurement. The compile is
+**1m38s** wall (`nice -n 10`, one job), so the "keeps the build sane" half of the justification was
+also unfounded — the cost was never the problem.
+
+**Read the 17 % correctly, because it is the useful part: the translated arithmetic is NOT the
+bottleneck**, or `-O2` would have won by far more. The per-entry cost is the dispatch machinery,
+and above all the generated code's habit of `ctx->pc = <addr>` on **every guest instruction** — a
+store per instruction the optimiser cannot remove, because `ctx` escapes. **If throughput ever
+becomes the wall rather than correctness, that store is the thing to attack, not this flag.**
+
+**And the wall did not move:** same `tid1:status=0 ... tid2:status=2:wait=sleep#0:woken=0`, same
+`ra` values, same 35-call cycle. So W16 is a correctness/ordering wall, not a speed wall. Do not
+sell `-O2` as progress toward a frame — it is 17 % more of the same loop.
+
+## Item 5 (pad read path) — gate MET, no new work needed
+
+Checked before writing anything, and the gate is already satisfied by existing tests, so per this
+list's own rule ("do not pad the list, do not invent work") nothing was added.
+
+- **The pad config source is the guest's own**, not ours: the guest calls `scePadPortOpen`,
+  `scePadSetMainMode` and `scePadSetButtonInfo`, and those guest-issued calls are what the tests use
+  to configure the pad.
+- **A synthetic press reaches the guest's own read**: `setPadOverrideState` injects it, the guest's
+  `scePadRead` writes it into the guest's DMA buffer, and the test reads the guest's bytes back.
+  Passing, with the real bytes in the log:
+  - `scePadRead uses override state` → `data2=0xf7 data3=0xbf` (active-low)
+  - `scePadRead button bits are active-low` → `data2=0xfe data3=0xff`
+  - `scePadRead fills pressure bytes and honors button info mask` → `data2=0x6f data3=0xa9`
+- **The mode transition is covered too**: `pads open in digital mode and switch to analog on
+  scePadSetMainMode` asserts `data[1]` is `0x41` at open and `0x73` after the guest switches, and
+  that `scePadInfoMode` CURID then returns 7 (DualShock).
+
+Suite after all of this: **468 total, 467 pass, 1 fail** — `VU0 macro mappings cover all S1/S2
+enums`, pre-existing and unrelated.
+
+NEXT:   CPU lane is unchanged and still the priority: **what wakes tid2.** The pump result narrows
+        it — tid1 is doing real work in a job queue and separately spinning in the mutex broadcast,
+        so the question is why the broadcast never issues `sce_WakeupThread`. Read tid1's loop
+        condition in full, not its edges. Then items 4 (GS texture) and 6 (sceGs* inventory).

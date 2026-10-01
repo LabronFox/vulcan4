@@ -1455,8 +1455,77 @@ int main(int argc, char *argv[])
                           static_cast<unsigned long long>(ranked[i].second), share);
             std::cout << buf;
         }
-        std::cout << "\n";
-    }
+std::cout << "\n";
+        }
+
+        // W17: the W16b histogram put ~34% of every guest entry into func_101D470, which is one
+        // indirect call through *(0x1034EC0), and its target is func_101E6B8 -- a callback enqueue
+        // + dispatch on the global at 0x1035270 (head at +0x148, count at +0x4, 4-byte entries from
+        // +0x8). Two things must be measured, not inferred:
+        //   1. is the queue growing? A count that climbs and never returns to its floor means the
+        //      guest enqueues faster than it drains, and the loop is the SYMPTOM of that -- which
+        //      would also explain why tid1 never reaches the code that wakes tid2.
+        //   2. what does *(0x1034EC0) hold at RUNTIME? The ELF says 0x1019be8 at load time, but the
+        //      guest may have reassigned it, and a pointer to something that returns without doing
+        //      the work would spin inside a no-op.
+        // Printed only at the halt, once, so it costs nothing on a run that gets past this.
+        {
+            auto qword = [&](uint32_t a) {
+                uint32_t w = 0u;
+                if (a + 4u <= PS2_RAM_SIZE)
+                {
+                    std::memcpy(&w, rdram + a, sizeof(w));
+                }
+                return w;
+            };
+            const uint32_t fnPtr = qword(0x01034EC0u);
+            const uint32_t owner = qword(0x01035270u);
+            std::cout << "VULCAN4 W17DISPATCH fn_ptr(0x1034EC0)=0x" << std::hex << fnPtr << std::dec
+                      << " elf_initial=0x1019be8"
+                      << " reassigned=" << (fnPtr != 0x01019BE8u ? "YES" : "no")
+                      << " owner(0x1035270)=0x" << std::hex << owner << std::dec;
+            if (owner == 0u || owner + 0x14Cu > PS2_RAM_SIZE)
+            {
+                std::cout << " queue=UNREADABLE(owner out of RDRAM)\n";
+            }
+            else
+            {
+                const uint32_t head = qword(owner + 0x148u);
+                const uint32_t count = qword(owner + 0x04u);
+                const uint32_t tailCb = qword(owner + 0x3Cu);
+                std::cout << " head=0x" << std::hex << head << std::dec << " count=" << std::dec
+                          << count << " tail_cb=0x" << std::hex << tailCb << std::dec << "\n";
+                // The queued values are what the dispatcher jalr's. If they are 0 or 1 rather than
+                // code addresses, the dispatch is calling a token, not a function -- and saying so
+                // here beats guessing at the register path.
+                std::cout << "VULCAN4 W17QUEUE";
+                if (head == 0u)
+                {
+                    std::cout << " empty (head=0)";
+                }
+                else if (head + 8u > PS2_RAM_SIZE)
+                {
+                    std::cout << " head=0x" << std::hex << head << std::dec << " OUT_OF_RDRAM";
+                }
+                else
+                {
+                    const uint32_t entries = qword(head + 0x04u);
+                    std::cout << " blk=0x" << std::hex << head << std::dec << " blk_count=" << std::dec
+                              << entries << " slots:";
+                    const uint32_t limit = std::min<uint32_t>(entries, 8u);
+                    for (uint32_t i = 0; i < limit; ++i)
+                    {
+                        const uint32_t slot = qword(head + 0x08u + i * 4u);
+                        std::cout << " [" << i << "]=0x" << std::hex << slot << std::dec;
+                    }
+                    if (entries > limit)
+                    {
+                        std::cout << " ...(" << (entries - limit) << " more)";
+                    }
+                }
+                std::cout << "\n";
+            }
+        }
 
     std::cout << "VULCAN4 HARNESS detail=" << haltDetail << " pc=" << toHex(haltPc)
               << " distinct_pcs=" << distinctPcs << " checkpoint_serviced=" << checkpointServiced << " dispatcher_transfers=" << dispatcherTransfers

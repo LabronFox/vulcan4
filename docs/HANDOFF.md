@@ -4218,3 +4218,69 @@ exist (timer, VSync, and the `sceMcSync`/`sioIntr` chain the MC path uses), chec
 `STATUS.IE`/`STATUS.EIE` at the checkpoint, taking the branch to `cop0_epc` with the CAUSE register
 populated. That is the piece `ei` promises and nothing currently provides — and unlike `0x8005`, it
 is entirely ours to build, so it does not require decoding anything we have refused to guess at.
+
+## W42 — the interrupt delivery path BUILT and TESTED; and W41's "the spin is the wall" is retracted
+
+### What landed
+
+`ei` now has something on the other end of it. `PS2Runtime` gained the R5900's IPI/IPO mechanism:
+
+- `raiseInterrupt(ipMask)` / `clearInterrupt(ipMask)` / `pendingInterrupts()` — `ipMask` is in
+  **hardware Cause.IP bit positions** (IP0 = bit 10), not source numbers.
+- `servicePendingInterrupt()` — delivers when a raised source is unmasked, vectors through the
+  **existing** `raiseCop0Exception()` (same handler as TLB/break/trap, so EPC/CAUSE/EXL bookkeeping
+  exists in exactly one place), and refuses to re-enter while EXL is set.
+- Called from `dispatchGuestBranch`'s checkpoint, **before** the yield is reported: if the guest is
+  vectored to its handler, the caller's pending transfer is not the continuation, and reporting it as
+  a yield would resume the harness at the wrong PC.
+- Counters: `interruptsDelivered()`.
+
+Red test first: `"a raised interrupt is delivered to the vector when ei has let it in"` — nothing
+pending does not deliver; raised-but-masked is **held** (no EXL, PC unmoved); `ei` then delivers to
+**`0x80000080`** with `EPC` = the interrupted PC, `ExcCode` = 0, EXL set, delivery counted; EXL set
+blocks re-entry; clearing one source does not hide another still pending.
+
+**It caught a real bug of mine:** `raiseInterrupt` originally did `(ipMask << 8) & IP_MASK`, which put
+source 0 on Cause bit **8** instead of IP0's bit **10**. The test found it. The API now takes hardware
+bit positions directly, so a caller passes the bits it will actually see.
+
+**Suite: 475 total, 474 pass, 1 fail** — the pre-existing unrelated `VU0 macro mappings`.
+
+Two build-order notes worth keeping: the definition could not live in the header (it needs
+`raiseCop0Exception`, which sits in the `.cpp`'s anonymous namespace — a second declaration there is an
+ambiguous overload, not a shared one), and it had to be placed *outside* that namespace, which is why it
+now sits beside `PS2Runtime::eeCheckpointDue`.
+
+### RETRACTION: W41's "the spin is the wall" is wrong
+
+W41 concluded the boot wall was GT4 spinning at `0x10113e8` behind an `ei` for an undeliverable
+interrupt. **The 45-second run contradicts that:**
+
+```
+baseline (W33):  functions_entered=1759628  distinct_pcs=152  vsync=31
+now (W42):functions_entered=1604300  distinct_pcs=149  vsync=29
+interrupts delivered:  0
+[MC] Open:  196,878 x result=-4
+```
+
+The guest **is** entering the semaphore — `0x1011314` (right after `jal func_101F310`) and
+`source_pc=0x101130c` both appear in the branch trace — and it is **making progress** (1.6 M function
+entries in 45 s). A spin that never completed would produce far less. **So the semaphore is being
+acquired and released, not deadlocked**, and W41 misread a real mechanism as the wall.
+
+W41's *mechanism* finding stands and is now fixed: `ei` genuinely had nothing behind it, and that was
+a real hole. It simply was not what the guest was stuck on. **The wall is still the `-4` and the
+undecoded `0x8005`**, at 196,878 opens per 45 s.
+
+Also worth noting so nobody re-derives it: `0x10113ec` never appears in the trace, and **that proves
+nothing** — backward edges inside a generated function charge `eeCheckpointDue()`, not
+`dispatchGuestBranch`, so they are invisible to the yield trace by construction.
+
+### The honest gap this exposes, which is now the sharpest thing on the board
+
+**The delivery path is complete and provably correct, and no device raises an interrupt.** `0`
+delivered. So a guest `ei` still waits forever for a source that nobody sets. The missing half is
+narrow and entirely ours: **have the devices that already exist raise IP0** — the EE timer, VSync, and
+the `sioIntr`/`SIO2` chain the memory-card path already runs through — and **acknowledge/clear IP0 in
+the handler's `eret`**. That is the same shape as the `sioMcOpen` result path we already serve, so it
+is reachable from code that exists rather than from anything we would have to guess at.

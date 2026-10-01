@@ -3611,3 +3611,75 @@ range and the answer is one run.
 
 Suite **472 total, 471 pass, 1 fail** (pre-existing VU0). The site-filtered store watch, the
 `W33PATHSTORE` report and the `$v1` in `[MC] Open` are permanent.
+
+## W34 — the corruption caught in the act; the guest is building `cdrom0` + `core.gt4`, and `obj->0x0` is the bug
+
+W33 named a four-byte watch. It caught the corrupting write with the resulting bytes printed after
+every store, so the step where `..` becomes `0x8005` is now **seen**, not inferred:
+
+```
+n=2 pc=0x1003a98 size=9  now='core.g'   raw=63 6f 72 65 2e 67     <- writes "core.gt4"
+n=3 pc=0x1003e80 size=2  now='..re.g'  raw=05 80 72 65 2e 67     <- 0x8005 lands on "co"
+n=4 pc=0x1003e84 size=1  value=0x2f                              <- '/' at 0x1051a12
+n=9 pc=0x1003c10 size=8  now='cdrom0'  raw=63 64 72 6f 6d 30     <- the DEVICE name
+```
+
+### What the guest is actually doing
+
+- `pc=0x1003a98` writes **9 bytes, `core.g`** — the real filename is **`core.gt4`**. That is GT4's
+  PlayStation core file, and it is what GT4 is trying to open.
+- `pc=0x1003c10` writes **8 bytes, `cdrom0`** — the device prefix.
+- `pc=0x1003e80` writes **2 bytes, `0x8005`**, on top of `co`.
+
+So the buffer holds several candidate `device/name` combinations in rotation, and `0x8005` is the
+head of one of them.
+
+### `obj->0x0` is the bug, and it is now provable from one instruction
+
+`sub_01003E10`, the path builder, in full for the second half:
+
+```
+0x1003e4c  lw    $a0, 0x0($s4)        # $a0 = obj->0x0
+0x1003e60  jal   func_101D3B8         # $s1 = malloc(2*len + 2)   -> the buffer
+0x1003e78  jal   func_101E81C         # memcpy(buf, strA, len)
+0x1003e84  sb    $v0, 0($s0)          # buf[len] = '/'
+0x1003e88  addiu $a0, $s0, 0x1        # dest = buf + len + 1
+0x1003e8c  addiu $a2, $s3, 0x1        # size = len + 1
+0x1003e90  jal   func_101E81C         # memcpy(...)
+0x1003e94  lw    $a1, 0x0($s4)        # delay slot: SOURCE = obj->0x0
+0x1003e98  sw    $s1, 0x4($s4)        # cache the built path
+```
+
+**And the measurement says `built == obj->0x0 == 0x01051A10`.**
+
+So the second `memcpy` is **`memcpy(buf + len + 1, buf, len + 1)` — the buffer copied onto itself**,
+whose trailing bytes are whatever the *previous* candidate left there. **That is where `0x8005`
+comes from: it is stale content of the reused buffer, faithfully copied by a `memcpy` that is doing
+exactly what it was told.**
+
+`obj->0x0` is supposed to point at the **second name** (the `core.gt4` string), and instead it points
+at the buffer the guest just allocated. **The fix is in whatever maintains `obj->0x0`, not in
+`memcpy`, not in `sceMcOpen`, and certainly not in `-4`.**
+
+### A hypothesis of mine that was WRONG, recorded so nobody repeats it
+
+I assumed the corruption was an overlapping-copy bug: `ps2_stubs::memcpy` copies strictly forward, and
+a forward copy of an overlapping forward-shift reads bytes it already wrote. **The red test I wrote
+for that is GREEN.** Suite **473 total, 472 pass, 1 fail** (pre-existing VU0); the new test
+"libc memcpy is overlap-safe" passes in both directions.
+
+The reason is worth keeping: for a 10-byte copy glibc's `memcpy` loads the source into registers
+before storing, so small overlaps are harmless. A larger overlapping copy could still differ, but **the
+overlap here is `dst - src >= size` (touching, not overlapping), so there is nothing to corrupt.**
+The `0x8005` is stale data being copied faithfully. I was wrong, and the test is what said so.
+
+### The one measurement left
+
+**Print `obj->0x0` immediately before `sub_01003E10` calls the allocator**, and print
+`*(0x102dcc8)` (the first name) plus where the second name lives. If `obj->0x0` already equals the
+buffer *before* the allocation, then the two fields are the same storage and the guest's object is
+being laid out differently than we assume. If `obj->0x0` held the second name before the allocation
+and holds the buffer after, then **something in our runtime overwrote `obj->0x0`** — and that
+something is ours.
+
+That distinction decides everything, and it is one run.

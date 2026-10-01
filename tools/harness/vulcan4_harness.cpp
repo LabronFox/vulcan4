@@ -81,10 +81,14 @@ namespace
 // nothing had to be recompiled. The observer fires on EVERY guest store, so the filter is one
 // unsigned compare and the printing is capped: an uncapped print would dominate the run and change
 // the very throughput it is measuring.
+// W33: narrowed to the four bytes that actually change. The path is built as "../../e.gt4" and
+// something rewrites the leading ".." as 0x8005; only these four bytes differ, so watching only
+// them makes the corrupting write unmistakable. Every write prints the resulting bytes, so the step
+// where 2e 2e becomes 05 80 is visible rather than inferred.
 constexpr uint32_t kWatchLo = 0x01051A10u;
-constexpr uint32_t kWatchHi = 0x01051A20u;
+constexpr uint32_t kWatchHi = 0x01051A16u;
 uint32_t g_watchStoreHits = 0;
-constexpr uint32_t kWatchStoreMax = 600;
+constexpr uint32_t kWatchStoreMax = 40;
 // W30: 1 MiB. Anything at least this big is a copy, not a field write.
 constexpr uint32_t kWatchBigCopy = 1024u * 1024u;
 uint32_t g_watchBigCopyHits = 0;
@@ -176,7 +180,26 @@ void watchGuestStoreForPath(uint32_t guestAddr, uint32_t size, uint64_t value, c
     std::cout << "VULCAN4 W30WRITE n=" << g_watchStoreHits << " pc=0x" << std::hex
               << (ctx != nullptr ? ctx->pc : 0u) << " ra=0x" << (ctx != nullptr ? getRegU32(ctx, 31) : 0u)
               << " addr=0x" << guestAddr << std::dec << " size=" << size << " value=0x" << std::hex
-              << static_cast<uint32_t>(value) << std::dec << "\n";
+              << static_cast<uint32_t>(value) << std::dec << " now='";
+    if (g_rdramForWatch != nullptr)
+    {
+        for (uint32_t a = kWatchLo; a < kWatchHi && a < PS2_RAM_SIZE; ++a)
+        {
+            const uint8_t ch = g_rdramForWatch[a];
+            std::cout << (ch >= 32 && ch < 127 ? static_cast<char>(ch) : '.');
+        }
+    }
+    std::cout << "' raw=";
+    if (g_rdramForWatch != nullptr)
+    {
+        for (uint32_t a = kWatchLo; a < kWatchHi && a < PS2_RAM_SIZE; ++a)
+        {
+            char byteText[4];
+            std::snprintf(byteText, sizeof(byteText), "%02x", g_rdramForWatch[a]);
+            std::cout << byteText << " ";
+        }
+    }
+    std::cout << "\n";
 }
 } // namespace
 

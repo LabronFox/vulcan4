@@ -2629,7 +2629,7 @@ index 0b22fe0..9e1b3a4 100644
          {
              PS2Memory mem;
 diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
-index 4772f3f..41482f6 100644
+index 4772f3f..7dee7c6 100644
 --- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
 +++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
 @@ -309,6 +309,77 @@ namespace
@@ -2801,7 +2801,7 @@ index 4772f3f..41482f6 100644
          tc.Run("lookupFunction rejects internal resume PCs without exact registration", [](TestCase &t)
          {
              PS2Runtime runtime;
-@@ -1086,6 +1241,153 @@ void register_ps2_runtime_expansion_tests()
+@@ -1086,6 +1241,215 @@ void register_ps2_runtime_expansion_tests()
              t.IsTrue(threw, "syscall from delay slot should throw to preserve block atomicity");
          });
  
@@ -2917,6 +2917,68 @@ index 4772f3f..41482f6 100644
 +            t.Equals(getRegU32(&ctx, 5), 0x22222222u, "$a1 must survive a syscall");
 +            t.Equals(getRegU32(&ctx, 6), 0x33333333u, "$a2 must survive a syscall");
 +            t.Equals(getRegU32(&ctx, 7), 0x44444444u, "$a3 must survive a syscall");
++        });
++
++        tc.Run("libc memcpy is overlap-safe: a forward-shifting copy must not read bytes it already wrote",
++        [](TestCase &t)
++        {
++            // W34. This is the boot wall. GT4's sub_01003E10 builds a path with
++            //     memcpy(buf, str, len);  then  memcpy(buf + len + 1, obj->0x0, len + 1);
++            // and buf IS obj->0x0, so the second call is memcpy(p + n, p, n) -- the strcpy idiom,
++            // source BELOW destination and overlapping.
++            //
++            // ps2_stubs::memcpy copied strictly forward, chunk by chunk. That is exactly the
++            // direction that corrupts an overlapping forward-shift: by the time it reaches the tail
++            // it is reading bytes it overwrote three chunks earlier. On GT4 this turned the path
++            // "../../e.gt4" into "\x05\x80/\x05\x80/e.gt4", sceMcOpen then answered -4, and the boot
++            // spun in a memory-card poll for 104,508 opens.
++            //
++            // Sony's libc copies such a region backwards, so the guest works on hardware. Ours must
++            // too, and the two halves are asserted separately because they fail differently.
++            PS2Runtime runtime;
++            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
++
++            constexpr uint32_t kBase = 0x00200000u;
++            // "ABCDEFGHIJ" at kBase, then shift it up by 3 in place.
++            const char *text = "ABCDEFGHIJ";
++            std::memcpy(rdram.data() + kBase, text, 10u);
++
++            R5900Context ctx{};
++            ctx.pc = 0x01000000u;
++            setRegU32(ctx, 4, kBase + 3u); // $a0 dest
++            setRegU32(ctx, 5, kBase);       // $a1 src  (below dest, overlapping)
++            setRegU32(ctx, 6, 10u);         // $a2 size
++            ps2_stubs::memcpy(rdram.data(), &ctx, nullptr);
++
++            // memmove semantics: the original 10 bytes shifted up by 3.
++            const char *want = "ABCDEFGHIJ";
++            bool tailOk = true;
++            for (uint32_t i = 0; i < 10u; ++i)
++            {
++                if (rdram[kBase + 3u + i] != static_cast<uint8_t>(want[i]))
++                {
++                    tailOk = false;
++                }
++            }
++            t.IsTrue(tailOk, "overlapping forward shift must yield the original bytes at dest");
++
++            // And the other direction must still work: destination BELOW source.
++            std::memcpy(rdram.data() + kBase, text, 10u);
++            R5900Context back{};
++            back.pc = 0x01000000u;
++            setRegU32(back, 4, kBase);      // dest below
++            setRegU32(back, 5, kBase + 3u);  // src above
++            setRegU32(back, 6, 7u);
++            ps2_stubs::memcpy(rdram.data(), &back, nullptr);
++            bool backOk = true;
++            for (uint32_t i = 0; i < 7u; ++i)
++            {
++                if (rdram[kBase + i] != static_cast<uint8_t>(text[i + 3]))
++                {
++                    backOk = false;
++                }
++            }
++            t.IsTrue(backOk, "overlapping backward copy must also be memmove-correct");
 +        });
 +
 +        tc.Run("handleSyscall reports nesting depth, and unwinds it when it throws", [](TestCase &t)

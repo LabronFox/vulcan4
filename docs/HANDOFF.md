@@ -6374,3 +6374,64 @@ where the stray `;1` on an otherwise-empty filename comes from.
   None can explain a path with no filename in it.
 
 Suite **482/482**. `VULCAN4 FRAME source=guest` has never printed.
+
+---
+
+## W73 — the guest's own disc strings, read out of the disc image, and the `;1` has no source
+
+Read the ELF directly (`SCUS_973.28`, data segment `PT_LOAD` vaddr `0x102dc80`, file offset `0x2ec80`,
+filesz `0x13aa4`). Every ASCII run in that segment matching the words this wall is about:
+
+| address | string |
+|---|---|
+| `0x0103D1D8` | `core.gt4` |
+| `0x0103D260` | `cdrom0:\IRX\` |
+| `0x0103D546` | `DlGAMEDATA` → the string proper, `GAMEDATA`, begins at `0x0103D548` |
+| `0x0103D558` | `cdrom0:\` |
+| `0x0103D660` | `cdrom0:\IOPRP300.IMG;1` |
+
+**There is no `CDROM0` string anywhere in the guest's data segment.** Not one, in any case.
+
+### This closes a loop that was open since W36
+
+W36 measured `memcpy src=0x103d548 size=9` and read it as `GAMEDATA`. It is indeed `GAMEDATA` at
+`0x0103D548`, and the nine bytes are real. `core.gt4` at `0x0103D1D8` likewise matches the `size=9`
+copy W35 logged. **Both of those guest-side copies were correct all along.** Everything that went wrong
+was in what happened to the buffer afterwards.
+
+### The joined path is the bare prefix glued to a string that does not exist
+
+The failing open is `cdrom0:\CDROM0:\;1`. Its first component is exactly `cdrom0:\` — **the constant at
+`0x0103D558`, verbatim, correct.** Its second component is `CDROM0:\;1`, and there is no such string in
+the image. So:
+
+- the device half of the path is right and comes from the right place;
+- the **filename half is not a string at all** — it is 10 bytes of something else, in a different case,
+  ending in a `;1` that the guest also keeps as two loose stack bytes (W72's `sp[0x20] | sp[0x21]<<8`).
+
+**The `;1` is not `IOPRP300.IMG;1`'s suffix being reused** — I checked, and the only `;1` in the whole
+segment belongs to `cdrom0:\IOPRP300.IMG;1` at `0x0103D660`. The `;1` in the failing path has no source in
+the guest's data, which is the strongest statement available: it is being **manufactured at runtime**.
+
+### The known gap is now located precisely, and it is not the wall
+
+`cdrom0:\IOPRP300.IMG;1` is a real guest string, and `IOPRP300.IMG` is genuinely absent from
+`/mnt/ssd/gt4/work`. But `fioOpen` never receives it — the 11,883 observed opens are all
+`cdrom0:\CDROM0:\;1`. So the IOP ROM gap is a *later* problem, and it is not what is stopping this boot.
+Noted, not claimed as a wall.
+
+### State, plainly
+
+**Measured:** the guest holds `cdrom0:\` at `0x0103D558` and opens a path that is that constant followed
+by `CDROM0:\;1`, 11,883 times, every one `fd=-1`. It also opens `rom0:ROMVER` with `fd=3`, so the
+filesystem is sound. `core.gt4` and `GAMEDATA` exist in the image and were copied by the guest correctly.
+
+**Still unknown:** where the ten bytes `CDROM0:\;1` come from. Not from the data segment, so they are
+built at runtime — and the caller already showed a stack scratch buffer and a two-byte `;N` field.
+
+**Next single step:** find who writes `0x01036A00`'s consumers — or, more directly, watch the guest
+buffer that holds the assembled `CDROM0:\;1` and name its first writer, exactly as W70's buffer probe
+named `0x01051A10`. The store observer already covers every width, so it is a `VULCAN4_WATCH_LO/HI`
+window once the address is known from the `$v0` passed to `sceOpen` at `0x01005000`.
+
+Suite **482/482**. `VULCAN4 FRAME source=guest` has never printed.

@@ -4874,3 +4874,49 @@ yet established** — and that is now the sharpest question we have, because our
 
 **STATUS: no frame.** Suite **477/477**. Boot unchanged: `sceMcOpen` steady ~2,128/s, all `-4`,
 `halt=wallclock_deadline`.
+
+---
+
+## 2026-10-01 — W56: NO RACE. The guest finishes writing before it calls, and our -4 is honest
+
+`[MC] Open` is now stamped with the same causal sequence as the store observer, so the question
+"do we read the name buffer before the guest finishes filling it?" is answered rather than assumed.
+
+**MEASURED. The first `[MC] Open` is seq=272, and exactly three writes to the name field precede it:**
+
+```
+seq=254  memcpy  src=0x0103D1D8 -> dst=0x01051A10  size=9   "core.gt4\0"
+seq=265  memcpy  src=0x010519C0 -> dst=0x01051A10  size=2   2 bytes from the scratch table
+seq=267  WRITE8                                    -> dst=0x01051A12  size=1
+seq=272  [MC] Open port=0 slot=0 -> reads 0x01051A10, gets -4
+```
+
+**and the identical three-write cycle repeats at seq=291 / 302 / 304, then another Open.** A fixed
+3-write-then-Open loop, 2,128 times a second.
+
+**CONCLUSIONS, both negative, both firm:**
+1. **There is no race.** The guest completes its writes and *then* calls `sceMcOpen`. We read exactly
+   the bytes it wrote. The mid-sequence reading proposed in W55 is **retracted** — the buffer is
+   stable at call time, and the `cdrom0:\` / `;1` copies that seemed to "follow" were simply the next
+   cycle's beginning seen from a different sample.
+2. **Our `-4` is correct.** `mode=0x1` is `FIO_F_READ` with no `O_CREAT`, so a read-only open of a
+   card file that does not exist must answer -4 — on hardware too. `sceMcOpen` faithfully reports
+   what the underlying operation returned. We are not lying and we are not broken here.
+
+**So the wall has moved, and it is now a CONTENT problem, not a plumbing problem.** GT4 asks the
+memory card for a file it does not have, with a path whose first component is copied from `0x010519C0`
+— which at that instant holds a **table** (non-printable at +0, then `A` +8, `B` +0x10, `Y` +0x20,
+`Z` +0x30, `0` +0x40), not a path. **Two possibilities, and we cannot yet choose between them:**
+- (a) the file genuinely belongs on the card, and we must provide it; or
+- (b) the guest expected `0x010519C0` to hold a path prefix at that moment, and something upstream in
+  **our** emulation failed to put one there — in which case the guest's own copy is faithful and the
+  input it copied was wrong.
+
+**NEXT, and it is decidable:** find what is *supposed* to be at `0x010519C0` before seq=265. The
+observer already proves who last wrote each of those bytes and from where; the question is which
+write *should* have produced a path there and did not. That is a guest-input question, so the load
+observer (`PS2GuestLoadObserver`) is the right instrument: if the guest reads a pointer and gets a
+value we supplied, and that pointer is `0x010519C0`, we will see it.
+
+**STATUS: no frame.** Suite **477/477**. Boot unchanged: ~2,128 `sceMcOpen`/s, all `-4`,
+`halt=wallclock_deadline`.

@@ -2852,3 +2852,71 @@ dispatch.
 Cheapest form: one counter in the harness around the existing call, or a counter in
 `PS2Runtime::dispatchGuestBranch` split by return value, printed at the halt. It is two counters
 and it discriminates immediately. **Write that red test first.**
+
+## W23 — the priority ping-pong is CORRECT (1 ↔ 3), which closes a hypothesis; and `$s1` is the loop's exit condition
+
+Two measurements, both permanent, both narrowing.
+
+### 1. The priorities are right. The "error ping-pong" theory is DEAD.
+
+GT4 raises itself to priority 1 and restores to priority 3, and it feeds the first call's return
+value straight back in as the second call's priority — so if the first call ever returned an error the
+priority would walk negative and the loop could never converge. It does not:
+
+```
+0x29 sce_ChangeThreadPriority calls=1155539
+    ra_count=0x0101134c x577769, 0x01011628 x577766, 0x01000a2c x1
+    a0=0x0101134c/0x00000001 x577769, 0x01011628/0x00000001 x577766
+    a1=0x0101134c/a1=0x00000001 x577769, 0x01011628/a1=0x00000003 x577766,
+       0x01011628/a1=0x00000001 x2, 0x01011628/a1=0x00000000 x1, 0x01000a2c/a1=0x00000003 x1
+```
+
+- `ra=0x0101134c` is `sub_010112E0`: `sce_ChangeThreadPriority(tid=1, prio=1)` — **raise**.
+- `ra=0x01011628` is `sub_01011508`: `sce_ChangeThreadPriority(tid=1, prio=3)` — **restore**.
+- The counts differ by exactly 3, and the leftover `a1=1 ×2`, `a1=0 ×1` account for it.
+
+So every priority value the guest ever passes is 0, 1 or 3 — **no negative walk, no error
+ping-pong**. W13's `oldPriority` return is behaving. **Stop chasing that.**
+
+### 2. `$s0` names the mutex, and tid1 is tid 1
+
+`s0=0x0101134c/0x01047b4c` — the object is `0x01047B4C` (and `0x01033098` on the other quarter of
+passes, both measured free and empty in W22). And `a0=0x00000001` everywhere means
+**`currentThreadId()` is 1**, which is why tid1 is tid1.
+
+### 3. The loop's exit condition is `$s1`, i.e. the value `GetThreadId` returned — and this is the
+###    one thing I could not settle, so it is handed over rather than guessed
+
+In `sub_010112E0` the loop test is `bne $a0, $zero, -52` at `0x10113ec`, and `$a0` is not an
+independent variable: the nearest writer before it is
+
+```
+0x1011340  daddu $a0, $s1, $zero      # $a0 = $s1 = the tid GetThreadId returned at 0x101130c
+0x10113b8  addiu $a0, $zero, 0x1      # ...and later, $a0 = 1
+```
+
+**So the loop spins while `$s1` is non-zero and would exit when `$s1` is zero — and `$s1` is the
+thread id captured once, before the loop.** With `currentThreadId() == 1` the condition can never
+become false. Two readings, and I am not going to pick one from the decode alone:
+
+- **It is a real PS2 kernel value.** `sceGetThreadId` on a real EE returns 0 in a window the guest
+  relies on — during CRT init, before the thread context is bound — and our runtime returns 1
+  throughout because `bindMainContextForSyscall` keeps a live current thread. Then the fix is in
+  **what `GetThreadId` reports before any thread owns the CPU**, not in the scheduler.
+- **The decode is wrong about the writer of `$a0`.** `$a0` may be reloaded from something else inside
+  an inlined callee, and the instruction comments do not show it because the inlining happens in the
+  generated C++ rather than in the decoded instruction stream.
+
+**The probe that settles it, and it is one register at one address:** have the harness sample
+**GPR 4 (`$a0`) and GPR 17 (`$s1`) on every entry into `sub_010112E0` and on every loop-back**, and
+report the distinct `(s1, a0)` pairs with counts. If `s1` is always 1 and `a0` is always 1, the loop
+is provably non-terminating **as decoded**, and the next question is what `sceGetThreadId` returns on
+real hardware before a thread owns the CPU — answerable from ps2sdk/NPCS2R, not from this binary. If
+`a0` is ever 0, the loop is terminating and the spin is somewhere else entirely.
+
+Do that before touching `GetThreadId`. Changing a syscall's return value on a hunch is exactly the
+move that cost this project four dishes on a pointer, and W21's `$a0`-is-the-object prediction is a
+reminder that my predictions in this loop have been wrong twice.
+
+Suite **470 total, 469 pass, 1 fail** (pre-existing VU0). Two counters added this entry
+(`callSiteArg1`, and the harness print restructured).

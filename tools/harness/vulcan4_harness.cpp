@@ -1682,10 +1682,9 @@ std::cout << "\n";
                   << std::dec << std::setfill(' ') << " sce_" << syscallName(entry.first)
                   << " calls=" << entry.second.count
                   << " last_pc=" << toHex(entry.second.lastPc);
+
         // W18. last_pc is ONE site and it is the last one to run, which is the least useful one when
-        // a syscall is issued from several places -- and a guest hammering one syscall from several
-        // places is what a runaway loop looks like. So print every site it was entered from. This is
-        // what names the function responsible for 1.3M sce_ChangeThreadPriority calls in one run.
+        // a syscall is issued from several places. So print every site it was entered from.
         if (!entry.second.entryPcs.empty())
         {
             std::vector<uint32_t> sites(entry.second.entryPcs.begin(), entry.second.entryPcs.end());
@@ -1702,88 +1701,93 @@ std::cout << "\n";
             }
             std::cout << "]";
         }
-        // W21. $ra at each issue names the FUNCTION the syscall came from -- the datum entryPcs
-        // cannot give, because a recompiled basic block runs inline and issues syscalls without
-        // re-entering its function, so no entry counter ever sees them.
-        if (!entry.second.entryRas.empty())
-        {
-            std::vector<uint32_t> ras(entry.second.entryRas.begin(), entry.second.entryRas.end());
-            std::sort(ras.begin(), ras.end());
-            std::cout << " from_fn=" << ras.size() << "ra[";
-            const std::size_t fnLimit = std::min<std::size_t>(ras.size(), 12);
-            for (std::size_t i = 0; i < fnLimit; ++i)
-            {
-                std::cout << (i == 0 ? "" : ",") << toHex(ras[i]);
-            }
-            if (ras.size() > fnLimit)
-            {
-                std::cout << ",+" << (ras.size() - fnLimit);
-            }
-            std::cout << "]";
-        }
-        // W21. The same addresses, COUNTED -- which of them is the one being issued millions of
-        // times. Sort by count so the dominant caller is first, not alphabetical.
+
+        // W21. $ra at each issue, COUNTED, biggest first -- which of them is the one being issued
+        // millions of times. Sorted by count so the dominant caller is first, not alphabetical.
         if (!entry.second.entryRaCounts.empty())
         {
-            std::vector<std::pair<uint32_t, uint64_t>> ranked(entry.second.entryRaCounts.begin(),
-                                                              entry.second.entryRaCounts.end());
-            std::sort(ranked.begin(), ranked.end(),
+            std::vector<std::pair<uint32_t, uint64_t>> rankedRa(entry.second.entryRaCounts.begin(),
+                                                                entry.second.entryRaCounts.end());
+            std::sort(rankedRa.begin(), rankedRa.end(),
                       [](const std::pair<uint32_t, uint64_t> &l, const std::pair<uint32_t, uint64_t> &r)
                       { return l.second > r.second; });
             std::cout << " ra_count=";
-            const std::size_t raLimit = std::min<std::size_t>(ranked.size(), 8);
+            const std::size_t raLimit = std::min<std::size_t>(rankedRa.size(), 8);
             for (std::size_t i = 0; i < raLimit; ++i)
             {
-                std::cout << (i == 0 ? "" : ",") << toHex(ranked[i].first) << "x" << ranked[i].second;
+                std::cout << (i == 0 ? "" : ",") << toHex(rankedRa[i].first) << "x" << rankedRa[i].second;
             }
-            if (ranked.size() > raLimit)
+            if (rankedRa.size() > raLimit)
             {
-                std::cout << ",+" << (ranked.size() - raLimit);
-            }
-            // W22. ra + the argument it was handed, counted, biggest first. In the broadcast
-            // sub_01011508 the argument IS the mutex object, so this names which object 844,500
-            // passes are walking -- and from there its owner tid and wait-list head are two guest
-            // reads away.
-            if (!entry.second.callSites.empty())
-            {
-                std::vector<std::tuple<uint32_t, uint32_t, uint64_t>> sites(entry.second.callSites.begin(),
-                                                                            entry.second.callSites.end());
-                std::sort(sites.begin(), sites.end(),
-                          [](const std::tuple<uint32_t, uint32_t, uint64_t> &l,
-                             const std::tuple<uint32_t, uint32_t, uint64_t> &r)
-                          { return std::get<2>(l) > std::get<2>(r); });
-                std::cout << " arg=";
-                const std::size_t siteLimit = std::min<std::size_t>(sites.size(), 6);
-                for (std::size_t i = 0; i < siteLimit; ++i)
-                {
-                    std::cout << (i == 0 ? "" : ",") << toHex(std::get<0>(sites[i])) << "/a0="
-                              << toHex(std::get<1>(sites[i])) << "x" << std::get<2>(sites[i]);
-                }
-                if (sites.size() > siteLimit)
-                {
-                    std::cout << ",+" << (sites.size() - siteLimit);
-                }
-            }
-            // W22. $s0 is callee-saved, so at a syscall inside the broadcast it still holds the
-            // OBJECT that sub_01011508 was entered with. That is the mutex whose owner tid and
-            // wait-list head decide whether anybody is ever going to be woken.
-            if (!entry.second.callSiteS0.empty())
-            {
-                std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> s0Sites(
-                    entry.second.callSiteS0.begin(), entry.second.callSiteS0.end());
-                std::sort(s0Sites.begin(), s0Sites.end(),
-                          [](const std::tuple<uint32_t, uint32_t, uint32_t> &l,
-                             const std::tuple<uint32_t, uint32_t, uint32_t> &r)
-                          { return std::get<2>(l) > std::get<2>(r); });
-                std::cout << " s0=";
-                const std::size_t s0Limit = std::min<std::size_t>(s0Sites.size(), 6);
-                for (std::size_t i = 0; i < s0Limit; ++i)
-                {
-                    std::cout << (i == 0 ? "" : ",") << toHex(std::get<0>(s0Sites[i])) << "/"
-                              << toHex(std::get<1>(s0Sites[i]));
-                }
+                std::cout << ",+" << (rankedRa.size() - raLimit);
             }
         }
+
+        // W22. The arguments each site was handed, counted, biggest first. For
+        // sceChangeThreadPriority $a1 IS the priority, and GT4 feeds one call's return value into
+        // the next call's priority -- so a priority walking negative here is the loop.
+        if (!entry.second.callSites.empty())
+        {
+            std::vector<std::tuple<uint32_t, uint32_t, uint64_t>> sites(entry.second.callSites.begin(),
+                                                                        entry.second.callSites.end());
+            std::sort(sites.begin(), sites.end(),
+                      [](const std::tuple<uint32_t, uint32_t, uint64_t> &l,
+                         const std::tuple<uint32_t, uint32_t, uint64_t> &r)
+                      { return std::get<2>(l) > std::get<2>(r); });
+            std::cout << " arg=";
+            const std::size_t siteLimit = std::min<std::size_t>(sites.size(), 6);
+            for (std::size_t i = 0; i < siteLimit; ++i)
+            {
+                std::cout << (i == 0 ? "" : ",") << toHex(std::get<0>(sites[i])) << "/a0="
+                          << toHex(std::get<1>(sites[i])) << "x" << std::get<2>(sites[i]);
+            }
+            if (sites.size() > siteLimit)
+            {
+                std::cout << ",+" << (sites.size() - siteLimit);
+            }
+        }
+
+        if (!entry.second.callSiteArg1.empty())
+        {
+            std::vector<std::tuple<uint32_t, uint32_t, uint64_t>> a1s(entry.second.callSiteArg1.begin(),
+                                                                      entry.second.callSiteArg1.end());
+            std::sort(a1s.begin(), a1s.end(),
+                      [](const std::tuple<uint32_t, uint32_t, uint64_t> &l,
+                         const std::tuple<uint32_t, uint32_t, uint64_t> &r)
+                      { return std::get<2>(l) > std::get<2>(r); });
+            std::cout << " a1=";
+            const std::size_t a1Limit = std::min<std::size_t>(a1s.size(), 8);
+            for (std::size_t i = 0; i < a1Limit; ++i)
+            {
+                std::cout << (i == 0 ? "" : ",") << toHex(std::get<0>(a1s[i])) << "/a1="
+                          << toHex(std::get<1>(a1s[i])) << "x" << std::get<2>(a1s[i]);
+            }
+            if (a1s.size() > a1Limit)
+            {
+                std::cout << ",+" << (a1s.size() - a1Limit);
+            }
+        }
+
+        // W22. $s0 is callee-saved, so at a syscall inside the broadcast it still holds the OBJECT
+        // that sub_01011508 was entered with -- the mutex whose owner tid and wait-list head decide
+        // whether anybody is ever going to be woken.
+        if (!entry.second.callSiteS0.empty())
+        {
+            std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> s0Sites(
+                entry.second.callSiteS0.begin(), entry.second.callSiteS0.end());
+            std::sort(s0Sites.begin(), s0Sites.end(),
+                      [](const std::tuple<uint32_t, uint32_t, uint32_t> &l,
+                         const std::tuple<uint32_t, uint32_t, uint32_t> &r)
+                      { return std::get<2>(l) > std::get<2>(r); });
+            std::cout << " s0=";
+            const std::size_t s0Limit = std::min<std::size_t>(s0Sites.size(), 6);
+            for (std::size_t i = 0; i < s0Limit; ++i)
+            {
+                std::cout << (i == 0 ? "" : ",") << toHex(std::get<0>(s0Sites[i])) << "/"
+                          << toHex(std::get<1>(s0Sites[i]));
+            }
+        }
+
         std::cout << "\n";
     }
 

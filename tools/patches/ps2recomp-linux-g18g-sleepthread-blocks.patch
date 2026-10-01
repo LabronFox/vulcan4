@@ -292,7 +292,7 @@ index 0000000..68018ac
 +#endif // PS2_GUEST_PROGRESS_H
 \ No newline at end of file
 diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
-index 4b9242c..a977c4c 100644
+index 4b9242c..0e42efe 100644
 --- a/ps2xRuntime/include/ps2_runtime.h
 +++ b/ps2xRuntime/include/ps2_runtime.h
 @@ -21,6 +21,8 @@
@@ -382,7 +382,7 @@ index 4b9242c..a977c4c 100644
  }
  
  inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
-@@ -390,6 +444,61 @@ public:
+@@ -390,6 +444,66 @@ public:
      void requestStop();
      bool isStopRequested() const;
  
@@ -419,6 +419,11 @@ index 4b9242c..a977c4c 100644
 +        // the frame was never linked. Recorded as a flat triple list; a generated unit has ~159
 +        // syscall sites, so this stays small.
 +        std::vector<std::tuple<uint32_t, uint32_t, uint64_t>> callSites;
++        // W23. The SECOND argument, counted, per site. GT4 ping-pongs sceChangeThreadPriority
++        // between two priorities and feeds the first call's return value straight back in as the
++        // second call's priority, so if the first call returns an error the priority argument walks
++        // negative and the loop can never converge. $a1 is what settles it.
++        std::vector<std::tuple<uint32_t, uint32_t, uint64_t>> callSiteArg1;
 +        // W22. Same sites again, but with $s0 (GPR 16). $s0 is callee-saved, so at a syscall deep
 +        // inside sub_01011508 it still holds the value $a0 had on ENTRY -- and that value is the
 +        // mutex object the broadcast is walking. $a0 at the syscall is only obj+0x0 (loaded one
@@ -444,7 +449,7 @@ index 4b9242c..a977c4c 100644
      EeScheduler &eeScheduler();
      const EeScheduler &eeScheduler() const;
      void postEeEvent(EeEvent event);
-@@ -508,6 +617,14 @@ private:
+@@ -508,6 +622,14 @@ private:
      mutable std::mutex m_guestHeapMutex;
      mutable std::mutex m_asyncCallbackStackMutex;
      std::vector<GuestHeapBlock> m_guestHeapBlocks;
@@ -1623,7 +1628,7 @@ index 37b6a4d..43165bf 100644
      {
          return virtualAddress;
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..542ea16 100644
+index 45cb9d2..227f7c0 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1358,6 +1358,28 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
@@ -1719,7 +1724,7 @@ index 45cb9d2..542ea16 100644
      if (ctx->in_delay_slot)
      {
          throw std::runtime_error("Attempted to execute a syscall inside a branch delay slot! "
-@@ -1469,13 +1539,68 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
+@@ -1469,13 +1539,81 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
                                     ? encodedSyscallId
                                     : getRegU32(ctx, 3); // $v1 / $3 is the EE kernel syscall number
  
@@ -1762,6 +1767,19 @@ index 45cb9d2..542ea16 100644
 +    {
 +        tally.callSites.emplace_back(ra, arg0, 1u);
 +    }
++    // W23. The second argument, counted per site. See SyscallTally::callSiteArg1.
++    const uint32_t arg1 = getRegU32(ctx, 5);
++    auto arg1It = std::find_if(tally.callSiteArg1.begin(), tally.callSiteArg1.end(),
++                               [ra, arg1](const std::tuple<uint32_t, uint32_t, uint64_t> &site)
++                               { return std::get<0>(site) == ra && std::get<1>(site) == arg1; });
++    if (arg1It != tally.callSiteArg1.end())
++    {
++        ++std::get<2>(*arg1It);
++    }
++    else
++    {
++        tally.callSiteArg1.emplace_back(ra, arg1, 1u);
++    }
 +    // W22. The callee-saved $s0, which at these sites still holds the object. See callSiteS0.
 +    const uint32_t s0 = getRegU32(ctx, 16);
 +    auto s0It = std::find_if(tally.callSiteS0.begin(), tally.callSiteS0.end(),
@@ -1788,7 +1806,7 @@ index 45cb9d2..542ea16 100644
  }
  
  void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
-@@ -1665,7 +1790,21 @@ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
+@@ -1665,7 +1803,21 @@ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
      }
  
      m_guestHeapBase = base;
@@ -1811,7 +1829,7 @@ index 45cb9d2..542ea16 100644
      m_guestHeapLimit = limit;
      m_guestHeapConfigured = true;
  }
-@@ -2285,6 +2424,14 @@ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, ui
+@@ -2285,6 +2437,14 @@ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, ui
      }
      const uint32_t guestAddress = static_cast<uint32_t>(address);
      std::memcpy(rdram + guestAddress, &handler, sizeof(handler));

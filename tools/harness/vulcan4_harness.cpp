@@ -1577,6 +1577,8 @@ std::cout << "\n";
     std::cout << "VULCAN4 GUEST CALL LIST (what the guest asked the runtime for)\n";
     std::cout << "  VULCAN4 CALLKIND syscalls=" << syscalls.size()
               << " total_syscall_calls=" << runtime.syscallCallCount()
+              << " syscall_depth=" << runtime.syscallCallDepth()
+              << " max_syscall_depth=" << runtime.maxSyscallCallDepth()
               << " distinct_mmio_addresses=" << mmio.size()
               << " total_mmio_accesses=" << runtime.memory().mmioAccessCount()
               << " missing_functions=" << missing.size() << "\n";

@@ -2564,3 +2564,71 @@ Do not attempt a fix from the current evidence. The one measurement that discrim
 is cheap: put a recursion-depth counter in `handleSyscall` and print it at the halt. If the depth
 ever exceeds 1, it is (1) — re-handling through the dispatcher — and the fix is in the resume path.
 If it never does, the 1.3M entries are flat and (2) is true.
+
+## W20 — WHERE the 3 million syscalls actually are: inside `serviceInvocations()`, which the entry counter never sees
+
+The discriminator named in W19 is built and gated, and it settles it.
+`PS2Runtime::syscallCallDepth()` / `maxSyscallCallDepth()` are maintained by an **RAII guard** in
+`handleSyscall` — an ordinary counter would leak on the throw path (delay-slot syscalls throw, and
+blocked syscalls unwind by throwing) and report a leak as a recursion. Red-tested first in
+`ps2_runtime_expansion_tests.cpp` ("handleSyscall reports nesting depth, and unwinds it when it
+throws"), including the throw path specifically. Suite **470 total, 469 pass, 1 fail** (pre-existing
+VU0). Patch regenerated, 28/28.
+
+```
+VULCAN4 CALLKIND syscalls=22 total_syscall_calls=3033254
+                 syscall_depth=0 max_syscall_depth=1 ...
+```
+
+### Result 1 — W19's reading (1) is REFUTED
+
+`max_syscall_depth=1`. **`handleSyscall` is never re-entered while another is in flight.** So the
+3,033,254 entries are 3,033,254 separate, flat executions — not a resume loop re-handling one
+syscall.
+
+### Result 2 — and W19's "this supersedes W15" was itself wrong
+
+`0x0101f2b8` **does not appear in the PC histogram at all.** Not once, in 111 distinct PCs and
+1.7 M arrivals. `0x0101f2b0` appears **2** times.
+
+So the guest **never arrives** at the PC that `handleSyscall` reports for all 1.3 M calls. Those calls
+are not guest instruction executions on the main loop.
+
+### Result 3 — the accounting gap, and it is ours
+
+The harness runs guest code two ways:
+
+- the main loop calls `g_ps2RecompiledFunctionTable[slot](rdram, &ctx, &runtime)` directly
+  (`vulcan4_harness.cpp:1013`) — **this** path increments `functionsEntered` and `pcEntryCounts`;
+- `runtime.eeScheduler().serviceInvocations()` runs guest code **through the scheduler**, for
+  interrupt handlers and syscall-override handlers — and that path increments **neither**.
+
+**The 3 million syscalls are executing inside `serviceInvocations()`.** The arithmetic agrees:
+`service_frames=221,338`, and 221,338 × ~13.7 = 3.03 M, i.e. each serviced invocation issues about
+fourteen syscalls — almost all of them `sce_ChangeThreadPriority` and `GetThreadId`.
+
+This is the same signature a comment in the harness already recorded and did not diagnose
+(`vulcan4_harness.cpp`, W12 note: *"798,251 calls to sce_ChangeThreadPriority, 1,064,347 to syscall
+0x2f, against only 223 distinct guest PCs"*). The numbers moved; the shape never changed.
+
+### So the wall is this
+
+**The guest's interrupt/vsync handler is being invoked ~221,000 times in 45 seconds and each
+invocation spins on priority syscalls.** For 31 VBlanks. That is 221,338 invocation services for 31
+vblanks — the scheduler is being handed work essentially every checkpoint and running it.
+
+**The next thing to look at is `EeScheduler::serviceInvocations()` and whatever re-queues the
+invocation, not the guest's mutex code and not throughput.** Three measurements, in this order:
+
+1. **Why is `serviceInvocations()` called 221,338 times when there are 31 vblanks?** Print, per
+   service, the invocation `kind` and the PC it was queued from. If 99 % are `Interrupt` kind, the
+   interrupt is being re-raised; if they are `SyscallOverride`, a guest override handler is
+   re-queueing itself.
+2. Then read that handler's guest body — now that it is *named*, not inferred.
+3. Only then decide whether the fix is interrupt delivery, invocation draining, or the priority
+   syscalls inside the handler.
+
+**Two diagnostics now exist that did not before, and both are permanent:** the per-thread
+`wait=<reason>#<id>:woken=<n>:ra=` line, and the syscall **entry-site set** (`from=1pc[...]`). The
+depth counters are permanent too. Together they took this wall from "tid1@prio3" to "our scheduler
+runs the interrupt handler 221,000 times".

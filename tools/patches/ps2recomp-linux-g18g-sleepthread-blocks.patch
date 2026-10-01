@@ -292,7 +292,7 @@ index 0000000..68018ac
 +#endif // PS2_GUEST_PROGRESS_H
 \ No newline at end of file
 diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
-index 4b9242c..28eab3b 100644
+index 4b9242c..31e8e3a 100644
 --- a/ps2xRuntime/include/ps2_runtime.h
 +++ b/ps2xRuntime/include/ps2_runtime.h
 @@ -237,6 +237,59 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
@@ -373,7 +373,7 @@ index 4b9242c..28eab3b 100644
  }
  
  inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
-@@ -390,6 +442,33 @@ public:
+@@ -390,6 +442,39 @@ public:
      void requestStop();
      bool isStopRequested() const;
  
@@ -395,6 +395,12 @@ index 4b9242c..28eab3b 100644
 +        std::unordered_set<uint32_t> entryPcs;
 +    };
 +    uint64_t syscallCallCount() const { return m_syscallCallCount; }
++    // W19. How deep handleSyscall has ever been nested. A guest syscall that blocks and is then
++    // resumed by RE-INVOKING handleSyscall -- rather than by resuming at the continuation
++    // instruction -- shows up here as a depth above 1, and that is the only cheap way to tell
++    // "one entry producing many handler runs" apart from "many entries". 0 until the first call.
++    uint32_t syscallCallDepth() const { return m_syscallCallDepth; }
++    uint32_t maxSyscallCallDepth() const { return m_maxSyscallCallDepth; }
 +    uint32_t lastSyscallId() const { return m_lastSyscallId; }
 +    const std::unordered_map<uint32_t, SyscallTally> &syscallCounts() const { return m_syscallCounts; }
 +
@@ -407,11 +413,14 @@ index 4b9242c..28eab3b 100644
      EeScheduler &eeScheduler();
      const EeScheduler &eeScheduler() const;
      void postEeEvent(EeEvent event);
-@@ -508,6 +587,11 @@ private:
+@@ -508,6 +593,14 @@ private:
      mutable std::mutex m_guestHeapMutex;
      mutable std::mutex m_asyncCallbackStackMutex;
      std::vector<GuestHeapBlock> m_guestHeapBlocks;
 +    uint64_t m_syscallCallCount = 0;
++    // W19. Nesting depth of handleSyscall, and the deepest it has ever been. See syscallCallDepth().
++    uint32_t m_syscallCallDepth = 0;
++    uint32_t m_maxSyscallCallDepth = 0;
 +    uint32_t m_lastSyscallId = 0;
 +    uint32_t m_activeSyscallId = kNoActiveSyscall;
 +    std::unordered_map<uint32_t, SyscallTally> m_syscallCounts;
@@ -1524,7 +1533,7 @@ index 37b6a4d..43165bf 100644
      {
          return virtualAddress;
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..c6ec4d4 100644
+index 45cb9d2..3ef4685 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1358,6 +1358,28 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
@@ -1595,7 +1604,32 @@ index 45cb9d2..c6ec4d4 100644
      if (isStopRequested() || ctx->pc == 0u)
      {
          return false;
-@@ -1469,13 +1521,29 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
+@@ -1459,6 +1511,24 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx)
+ 
+ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encodedSyscallId)
+ {
++    // W19. Nesting depth, maintained by an RAII guard because handleSyscall THROWS on a syscall
++    // from a delay slot and after a blocking syscall, and a depth counter that forgets to unwind on
++    // the exception path reports a leak as a recursion. Depth above 1 means a syscall was re-entered
++    // while another was still in flight -- which is the defect this exists to detect.
++    struct SyscallDepthGuard
++    {
++        PS2Runtime &runtime;
++        explicit SyscallDepthGuard(PS2Runtime &r) : runtime(r)
++        {
++            ++runtime.m_syscallCallDepth;
++            if (runtime.m_syscallCallDepth > runtime.m_maxSyscallCallDepth)
++            {
++                runtime.m_maxSyscallCallDepth = runtime.m_syscallCallDepth;
++            }
++        }
++        ~SyscallDepthGuard() { --runtime.m_syscallCallDepth; }
++    } depthGuard(*this);
++
+     if (ctx->in_delay_slot)
+     {
+         throw std::runtime_error("Attempted to execute a syscall inside a branch delay slot! "
+@@ -1469,13 +1539,29 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
                                     ? encodedSyscallId
                                     : getRegU32(ctx, 3); // $v1 / $3 is the EE kernel syscall number
  
@@ -1625,7 +1659,7 @@ index 45cb9d2..c6ec4d4 100644
  }
  
  void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
-@@ -1665,7 +1733,21 @@ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
+@@ -1665,7 +1751,21 @@ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
      }
  
      m_guestHeapBase = base;
@@ -1648,7 +1682,7 @@ index 45cb9d2..c6ec4d4 100644
      m_guestHeapLimit = limit;
      m_guestHeapConfigured = true;
  }
-@@ -2285,6 +2367,14 @@ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, ui
+@@ -2285,6 +2385,14 @@ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, ui
      }
      const uint32_t guestAddress = static_cast<uint32_t>(address);
      std::memcpy(rdram + guestAddress, &handler, sizeof(handler));
@@ -2212,7 +2246,7 @@ index 0b22fe0..9e1b3a4 100644
          {
              PS2Memory mem;
 diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
-index 4772f3f..9be2944 100644
+index 4772f3f..6254c61 100644
 --- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
 +++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
 @@ -309,6 +309,77 @@ namespace
@@ -2384,7 +2418,7 @@ index 4772f3f..9be2944 100644
          tc.Run("lookupFunction rejects internal resume PCs without exact registration", [](TestCase &t)
          {
              PS2Runtime runtime;
-@@ -1086,6 +1241,47 @@ void register_ps2_runtime_expansion_tests()
+@@ -1086,6 +1241,80 @@ void register_ps2_runtime_expansion_tests()
              t.IsTrue(threw, "syscall from delay slot should throw to preserve block atomicity");
          });
  
@@ -2427,6 +2461,39 @@ index 4772f3f..9be2944 100644
 +                     "two distinct entry PCs should be recorded, not three");
 +            t.IsTrue(it->second.entryPcs.count(0x0100AAA0u) == 1, "first site should be in the set");
 +            t.IsTrue(it->second.entryPcs.count(0x0100BBB0u) == 1, "second site should be in the set");
++        });
++
++        tc.Run("handleSyscall reports nesting depth, and unwinds it when it throws", [](TestCase &t)
++        {
++            // W19. Depth above 1 means a syscall was re-entered while another was still in flight.
++            // The guard must also unwind on the THROW path: handleSyscall throws for a delay-slot
++            // syscall, and a counter that leaks on that path reports a leak as a recursion.
++            PS2Runtime runtime;
++            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
++
++            R5900Context ok{};
++            ok.pc = 0x0100AAA0u;
++            runtime.handleSyscall(rdram.data(), &ok, 0x83u);
++            t.Equals(runtime.syscallCallDepth(), static_cast<uint32_t>(0),
++                     "depth should be back to 0 after a syscall returns");
++            t.Equals(runtime.maxSyscallCallDepth(), static_cast<uint32_t>(1),
++                     "a flat sequence of syscalls must never nest");
++
++            R5900Context bad{};
++            bad.pc = 0x0100CCC0u;
++            bad.in_delay_slot = true;
++            bool threw = false;
++            try
++            {
++                runtime.handleSyscall(rdram.data(), &bad, 0x3Cu);
++            }
++            catch (const std::runtime_error &)
++            {
++                threw = true;
++            }
++            t.IsTrue(threw, "delay-slot syscall should throw");
++            t.Equals(runtime.syscallCallDepth(), static_cast<uint32_t>(0),
++                     "depth must unwind on the throw path, or a leak reads as a recursion");
 +        });
 +
          tc.Run("VIF MSCAL and MSCNT toggle DBF and keep TOPS/ITOPS coherent", [](TestCase &t)

@@ -4529,3 +4529,55 @@ off stdout position. Some may be wrong for exactly this reason. I am flagging th
 for someone else to find.
 
 **Suite: 476 total, 475 pass, 1 fail** — the pre-existing unrelated `VU0 macro mappings`.
+
+---
+
+## 2026-10-01 — G1: the memory-card brief's premise is contradicted by measurement. Refused, reported.
+
+**THE ORDER.** Build a spec-compliant 8MB PS2 memory card image (superblock page 0, magic
+`Sony PS2 Memory Card Format `, page_len 512, pages_per_cluster 2, pages_per_block 16,
+clusters_per_card 8192, alloc_offset after the FAT, rootdir_cluster 0, 32 indirect FAT entries,
+bad blocks -1, 512-byte dir entries mode 0x34, name at 0x40, 3-byte ECC per 128-byte chunk) so that
+`sceMcOpen` of `/BA/SCUS-97328/GAMEDATA` returns 0 instead of -4 and the boot loop stops.
+Reference card: `/mnt/ssd/emulation-saves/ps2-memcards/gran.ps2`. `mymc` by Ross Ridge is the
+public-domain reference.
+
+**I am refusing to build that image, because it cannot achieve the milestone in this codebase, and
+building it would be a plausible-looking dead end.** Three measurements, all from real runs:
+
+1. **Nothing in this project reads a memory card image.** The string `Sony PS2 Memory Card Format`
+   appears in **zero** files under `tools/PS2Recomp`, and no code opens any `.ps2` file. Our "memory
+   card" is a **host filesystem directory** — `MemoryCard.cpp:115 getMcRootPath()` returns
+   `paths.mcRoot`, else `<elfDir>/mc0`, else `./mc0`, and it is created with
+   `std::filesystem::create_directories` (`MemoryCard.cpp:157`). A synthesised `.ps2` image would be a
+   file that **nothing reads**, so `sceMcOpen` would still answer -4, identically. I have not written it.
+
+2. **The path is not `/BA/SCUS-97328/GAMEDATA`.** From `boot_G18F3.log`, **212,577** `sceMcOpen`
+   calls, **every one** `-4`, and **every one** `parent=NO`. The buffer at `a2=0x1051a10` is a
+   **struct, not a C string**. Its raw bytes:
+   `00 14 00 00 | 30 1a 05 01 | ff ff ff ff | ff ff ff ff | 05 80 | 2f | 05 80 | 2f | "e.gt4" | 00 … | "Tex1" | …`
+   Read as a C string that is `/\x05\x80/\x05\x80/e.gt4` — and the two `05 80` pairs are **2-byte
+   device prefixes**, the `0x8005` PS2 path form. Per `LibC.cpp:131` (W35's decode of
+   `sub_01003E10`) the guest *builds* this itself as `<dev>/<dev>/e.gt4`. It is not a save file on a
+   card.
+
+3. **The reference card is version 1.2, not the 1.1 the brief describes.** `gran.ps2` is 8,650,752
+   bytes with magic `Sony PS2 Memory Card Format 1.2.` So the brief's field list would not match the
+   sample we were told to compare against anyway.
+
+**THE REAL DEFECT, and it is a good one.** We have **no PS2 device-prefixed path resolution at all**.
+`normalizeGuestMcPathLocked()` (`MemoryCard.cpp:207`) understands `mc0:`/`mc1:` as *text* prefixes and
+collapses `..`, but it has no concept of the `0x8000`-range device ids the guest actually uses, so it
+builds a nonsense path, the parent never exists, and the guest's boot loop retries 212,577 times.
+That is the wall — **not** the card format. Fixing it is required no matter which card backend we
+ever adopt, so it is the right next dish.
+
+**NEXT DISH (W47): resolve PS2 device-prefixed paths.** Decode the `0x8000`-range device table from an
+authoritative source (ps2sdk / ps2link / PCSX2; **not** guessed), implement it, and route the guest's
+open to the correct backing store. Red test first, on path resolution — assert that
+`0x8005`/`0x8006`/`0x8007`-style input resolves to the right device and that the guest's actual
+`e.gt4` path resolves to a real parent. If that table cannot be established authoritatively, say so
+and stop; do not approximate it.
+
+**STATUS: the boot loop is NOT fixed and no frame printed.** The 8MB card image was deliberately not
+built. Suite unchanged.

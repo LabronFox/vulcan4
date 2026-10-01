@@ -91,6 +91,13 @@ namespace
 constexpr uint32_t kWatchLo = 0x010519C0u;
 constexpr uint32_t kWatchHi = 0x010519D0u;
 uint32_t g_watchStoreHits = 0;
+
+// W45. Every "the guest did NOT write this" conclusion since W33 has been read off stdout
+// position, and that ordering is unproven: the guest executor and the IOP/RPC side are two
+// producers into one unsynchronised stream, and a sample log shows them interleaving
+// mid-line. So the observers now carry their own monotonic sequence number and the guest
+// thread id. Ordering comes from `seq`, which is causal, not from where a line landed.
+int g_guestThreadId = -1;
 constexpr uint32_t kWatchStoreMax = 120;
 // W30: 1 MiB. Anything at least this big is a copy, not a field write.
 constexpr uint32_t kWatchBigCopy = 1024u * 1024u;
@@ -137,7 +144,7 @@ void watchGuestStoreForPath(uint32_t guestAddr, uint32_t size, uint64_t value, c
         {
             before[k - kWatchLo] = g_rdramForWatch[k];
         }
-        std::cout << "VULCAN4 W45BEFORE addr=0x" << std::hex << guestAddr << " size=" << std::dec << size
+        std::cout << "VULCAN4 W45BEFORE seq=" << ps2NextTraceSequence() << " addr=0x" << std::hex << guestAddr << " size=" << std::dec << size
                   << " op=" << ((ctx != nullptr) ? "guest" : "fastpath") << " bytes=";
         for (uint32_t k = kWatchLo; k < kWatchHi && k < PS2_RAM_SIZE; ++k)
         {
@@ -158,7 +165,8 @@ void watchGuestStoreForPath(uint32_t guestAddr, uint32_t size, uint64_t value, c
         ++g_watchBigCopyHits;
         if (g_watchBigCopyHits <= 2u)
         {
-            std::cout << "VULCAN4 W30BIGCOPY n=" << g_watchBigCopyHits << " pc=0x" << std::hex
+            std::cout << "VULCAN4 W30BIGCOPY seq=" << ps2NextTraceSequence()
+                      << " tid=" << g_guestThreadId << " n=" << g_watchBigCopyHits << " pc=0x" << std::hex
                       << (ctx != nullptr ? ctx->pc : 0u) << " dst=0x" << guestAddr << " size="
                       << std::dec << size << "\n";
         }
@@ -177,7 +185,8 @@ void watchGuestStoreForPath(uint32_t guestAddr, uint32_t size, uint64_t value, c
             const uint32_t f0 = obj + 4u <= PS2_RAM_SIZE ? g_watchPeek(obj + 0u) : 0u;
             const uint32_t f4 = obj + 4u <= PS2_RAM_SIZE ? g_watchPeek(obj + 4u) : 0u;
             const uint32_t buf = static_cast<uint32_t>(value);
-            std::cout << "VULCAN4 W33PATHSTORE n=" << g_watchPathHits << " obj=0x" << std::hex << obj
+            std::cout << "VULCAN4 W33PATHSTORE seq=" << ps2NextTraceSequence()
+                      << " tid=" << g_guestThreadId << " n=" << g_watchPathHits << " obj=0x" << std::hex << obj
                       << " obj->0x0=0x" << f0 << " obj->0x4=0x" << f4 << std::dec;
             // Print both candidates' first bytes. Whichever one is the path the guest built is the
             // one that reads as "<name>/<name>"; that settles it without any interpretation.
@@ -215,7 +224,7 @@ void watchGuestStoreForPath(uint32_t guestAddr, uint32_t size, uint64_t value, c
         return;
     }
     ++g_watchStoreHits;
-    std::cout << "VULCAN4 W30WRITE n=" << g_watchStoreHits << " pc=0x" << std::hex
+    std::cout << "VULCAN4 W30WRITE seq=" << ps2NextTraceSequence() << " n=" << g_watchStoreHits << " pc=0x" << std::hex
               << (ctx != nullptr ? ctx->pc : 0u) << " ra=0x" << (ctx != nullptr ? getRegU32(ctx, 31) : 0u)
               << " addr=0x" << guestAddr << std::dec << " size=" << size << " value=0x" << std::hex
               << static_cast<uint32_t>(value) << std::dec << " now='";
@@ -982,6 +991,8 @@ int main(int argc, char *argv[])
         // So the frame is re-read from the scheduler EVERY iteration, not bound once. A reference
         // captured outside the loop would be a stale frame wearing the right name, which is worse
         // than the bug.
+        g_guestThreadId = runtime.eeScheduler().currentThreadId();
+
         R5900Context *const schedulerFrame = runtime.eeScheduler().currentContext();
         R5900Context &ctx = schedulerFrame != nullptr ? *schedulerFrame : runtime.cpu();
 

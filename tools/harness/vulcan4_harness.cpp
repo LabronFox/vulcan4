@@ -53,6 +53,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <execinfo.h>
+#include <cxxabi.h>
 #include <algorithm>
 #include <chrono>
 #include <fstream>
@@ -327,6 +329,67 @@ void watchGuestStoreForPath(uint32_t guestAddr,
     static uint32_t prevPc = 0u;
     static uint8_t shadow[4096];
     static bool shadowInit = false;
+    // W84. NAME THE SITE. A getMemPtr announcement says "a raw pointer covering this address was
+    // handed out" but not which of the ~40 call sites did it. When one covers the watch window, take a
+    // native backtrace and demangle it: that turns an anonymous memcpy into a named C++ function.
+    // Filter: a raw pointer that STARTS INSIDE the watch window is the guest building its own path
+    // (sub_01003D20, entirely legitimate, and named already). The dangerous case is a pointer that
+    // starts BELOW the window and reaches up into it -- 0x010519B0 is 0x10 below 0x010519C0, so the
+    // write lands in the window at a positive offset and nothing else about the announcement looks
+    // unusual. Only that case gets a backtrace.
+    if (op != nullptr && std::strcmp(op, "getMemPtr") == 0 && guestAddr < kWatchLo &&
+        guestAddr + 0x1000u > kWatchLo)
+    {
+        static uint32_t sTrace = 0;
+        if (sTrace < 6u)
+        {
+            ++sTrace;
+            void *frames[8];
+            const int n = ::backtrace(frames, 8);
+            char **syms = ::backtrace_symbols(frames, n);
+            std::cout << "VULCAN4 W84SITE seq=" << ps2TraceSequenceCounter().load(std::memory_order_relaxed)
+                      << " rawptr addr=0x" << std::hex << guestAddr << std::dec << "\n";
+            for (int f = 2; f < n && f < 7; ++f)
+            {
+                std::string sym = (syms != nullptr) ? syms[f] : "?";
+                const size_t open = sym.find('(');
+                if (open != std::string::npos)
+                {
+                    const size_t plus = sym.find('+', open);
+                    const std::string mangled = sym.substr(open + 1, (plus == std::string::npos ? sym.size() : plus) - open - 1);
+                    int status = 0;
+                    char *pretty = abi::__cxa_demangle(mangled.c_str(), nullptr, nullptr, &status);
+                    if (status == 0 && pretty != nullptr)
+                    {
+                        sym = pretty;
+                        std::free(pretty);
+                    }
+                }
+                std::cout << "    W84SITE#" << f << " " << sym << "\n";
+            }
+            if (syms != nullptr)
+            {
+                std::free(syms);
+            }
+        }
+    }
+
+    // W84. NAME THE TWO EVENTS. The observer is called BEFORE the store is applied, so when the shadow
+    // diff below notices a change, the store that CAUSED it is the one announced on the previous call.
+    // W82 could only report addresses; a ring of the last few announcements, each with its guest PC,
+    // turns "two events wide" into two named instructions. A pc of 0 means the announcement carried no
+    // ctx at all, i.e. it did not come from recompiled guest code.
+    struct W84Event
+    {
+        uint32_t seq;
+        uint32_t pc;
+        uint32_t addr;
+        uint32_t size;
+        const char *op;
+        bool hasCtx;
+    };
+    static W84Event g_w84Ring[8] = {};
+
     static uint32_t shadowChanges = 0;
     if (kShadow && g_rdramForWatch != nullptr)
     {
@@ -371,7 +434,20 @@ void watchGuestStoreForPath(uint32_t guestAddr,
                               << " culpritop=" << (prevOp != nullptr ? prevOp : "?")
                               << " culpritaddr=0x" << prevAddr
                               << " culpritsize=" << prevSize
-                              << " culpritpc=0x" << prevPc << std::dec << "\n";
+                              << " culpritpc=0x" << prevPc << std::dec
+                              << " | W84BRACKET";
+                    for (int r = 0; r < 8; ++r)
+                    {
+                        const W84Event &e = g_w84Ring[r];
+                        if (e.op == nullptr)
+                        {
+                            continue;
+                        }
+                        std::cout << " [seq=" << e.seq << " pc=0x" << std::hex << e.pc
+                                  << (e.hasCtx ? "" : "*NOCONTEXT*") << " op=" << e.op
+                                  << " addr=0x" << e.addr << " size=" << std::dec << e.size << "]";
+                    }
+                    std::cout << "\n";
                 }
                 ++shadowChanges;
                 shadow[k] = g_rdramForWatch[kWatchLo + k];
@@ -392,6 +468,18 @@ void watchGuestStoreForPath(uint32_t guestAddr,
                   << (op != nullptr ? op : "?") << " src=0x" << std::hex << srcAddr
                   << " addr=0x" << guestAddr << " size=" << std::dec << size << " inwin="
                   << (overlapsWatch ? 1 : 0) << "\n";
+    }
+
+    {
+        static uint32_t w84Cursor = 0;
+        g_w84Ring[w84Cursor].seq =
+            static_cast<uint32_t>(ps2TraceSequenceCounter().load(std::memory_order_relaxed));
+        g_w84Ring[w84Cursor].pc = (ctx != nullptr) ? ctx->pc : 0u;
+        g_w84Ring[w84Cursor].addr = guestAddr;
+        g_w84Ring[w84Cursor].size = size;
+        g_w84Ring[w84Cursor].op = op;
+        g_w84Ring[w84Cursor].hasCtx = (ctx != nullptr);
+        w84Cursor = (w84Cursor + 1u) & 7u;
     }
     // W64. This used to be a VLA sized by the watch window: `uint8_t before[kWatchHi - kWatchLo]`.
     // That is fine for the default ~0x70-byte window and a guaranteed stack overflow for any wide

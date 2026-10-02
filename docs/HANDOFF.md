@@ -7094,3 +7094,105 @@ Suite 486/486, run from tools/PS2Recomp/ps2xTest because "VU0 macro mappings cov
 reads instructions.h from the working directory and fails anywhere else. A 485/485 I quoted earlier in
 this session came from a binary I had not rebuilt, and a run from the build directory reads as a VU0
 regression when it is only a wrong cwd. Rebuild before you believe a suite number.
+## W84 - THE WRITER IS NAMED, AND IT IS NOT THE CARD. IT IS PMODE.
+
+The wall is closed. It took an instrument, not an argument, and the instrument is the thing worth
+keeping: a ring of the last eight guest-store announcements, each carrying its guest PC, printed
+whenever the shadow noticed a change. The observer runs BEFORE a store is applied, so the writer is the
+announcement one call back -- which is exactly the ambiguity W64 could not resolve, because it had
+addresses and no PCs. Two events wide became two named instructions.
+
+### The chain, every link measured
+
+boot_w84e.log, resolved with addr2line against the harness binary:
+
+    VULCAN4 W84SITE seq=35 rawptr addr=0x10519b0
+        W84SITE#2  getMemPtr(unsigned char*, unsigned int)
+        W84SITE#3  ps2_stubs::sceGsResetGraph(unsigned char*, R5900Context*, PS2Runtime*)
+        W84SITE#4  PS2Runtime::dispatchGuestBranch(...)
+        W84SITE#5  sub_0100A348_0x100a348(unsigned char*, R5900Context*, PS2Runtime*)
+
+sub_0100A348 -- the function W66 mapped, W72 read, W83 measured $s1 in -- is the caller. It issues a
+syscall that lands in sceGsResetGraph. That stub, with mode == 0, does:
+
+    uint32_t pktAddr = runtime->guestMalloc(128u, 16u);      // GS.cpp:814  -> 0x010519B0
+    uint8_t *pkt = getMemPtr(rdram, pktAddr);
+    uint64_t *q = reinterpret_cast<uint64_t *>(pkt);
+    ...
+    q[2] = pmode;                                             // GS.cpp:818
+
+and q[2] is at pktAddr + 0x10 = 0x010519C0. The path buffer. That is the writer.
+
+The value is not a guess either. Helpers/Support.h:1603 makePmode(1, 0, 0, 0, 0, 0x80) returns
+(1 & 1) << 0 | (1) << 2 | (0x80 & 0xFF) << 8 = 0x1 + 0x4 + 0x8000 = 0x8005. The shadow saw 0x2f -> 0x05
+and 0x42 -> 0x80, which is little-endian 0x8005. It matches to the bit.
+
+### THE CARD HYPOTHESIS IS WRONG, and I am retracting it
+
+0x8005 was read as the PS2 free-clusters marker, and "a card entry inside a CDROM0 path" was going to
+be the bug. It is not. 0x8005 is PMODE -- a GS pixel-mode register word, computed by our own
+makePmode helper, written by our own sceGsResetGraph stub. There is no memory card in this chain at
+all. The two things agreed on the number and I would have shipped a story about the card filesystem
+being asked to answer a disc request, which would have been false. Recorded here because the shape of
+the mistake is the thing to remember: a constant that means one thing in the guest's world meant
+something else in ours, and only the call chain settled it.
+
+### THE REAL DEFECT, and it is worse than an overwrite
+
+From the same boot log, the two PT_LOAD segments:
+
+    Loading segment: 0x1000000 - 0x102dc54 (filesz: 0x2dc54, memsz: 0x2dc54)
+    Loading segment: 0x102dc80 - 0x10519ac (filesz: 0x13aa4, memsz: 0x23d2c)
+
+The image ends at 0x010519AC. align(0x010519AC, 16) = 0x010519B0 -- and that is exactly the address
+guestMalloc(128, 16) returned. So our guest heap begins FOUR BYTES past the end of the loaded image,
+with kGuestHeapSafetyPad = 0x1000 nowhere in the result, and the path buffer at 0x010519C0 is 0x10
+bytes INTO a block we handed out.
+
+The guest is using 0x010519C0 as scratch. We decided that address was ours. Both are right, from their
+own side, and they collide. That is the wall: not a lost path, a shared page. Every subsequent read of
+`cdrom0:\CDROM0:\;1` is the guest reading back a GS packet we overwrote its buffer with, 11848 times,
+and no amount of fixing the path builder would ever have touched it.
+
+### THE INSTRUMENT, which is the durable part
+
+W84 did not find this by reading code. It found it by making an invisible write visible:
+
+  * ps2_memory.h getMemPtr() now announces the raw pointer it is about to expose, through a new
+    g_ps2RawPtrObserver hook declared there and set by ps2SetGuestStoreObserver, because
+    ps2_runtime.h includes ps2_memory.h and cannot be included back. One predictable null branch when
+    no observer is installed.
+  * It is an ATTRIBUTION, not an accounting event. getMemPtr does not know the length, and a READ
+    through the same pointer announces identically. It says "a raw pointer covering this address was
+    just handed out", which is how an anonymous memcpy gets a name.
+  * The harness rings the last eight announcements with their PCs and prints them on a shadow change;
+    for a raw pointer that starts BELOW the watch window it also takes a native backtrace and demangles
+    it. A pointer starting inside the window is the guest building its own path -- sub_01003D20,
+    legitimate, already named -- so the filter is the interesting case.
+
+This closes a CLASS, not a site. W64, W80 and W81 each found one untraced raw-pointer write and patched
+that one site: three sites, three dishes, and the fourth was still there when we started W84. There
+are roughly forty getMemPtr call sites in the runtime and a static scan for "traced within 8 lines"
+produces a list too noisy to act on. Instrumenting the source is what makes the rest of them
+attributable.
+
+### Tests, and one honest note about the order
+
+  * W84  "PS2Memory::write64 to an out-of-range address must not land inside RDRAM" -- PASSED, and it
+    is a REFUTATION, not a fix. I had W82's WRITE64 to 0x012001000 as the writer; it is not. The test
+    stays as the guard it was written to be.
+  * W84b "a write through a raw getMemPtr pointer is attributable" -- I instrumented BEFORE I wrote
+    this one, so it passed first time, which is the wrong order and I am not going to pretend
+    otherwise. I then proved it has teeth by disabling the hook and re-running: RED, 487/488,
+    "the observer must see that a raw pointer covering 0x010519C0 was handed out". Restored, 488/488.
+    A test that has never been seen red is a test of nothing, and this one now has been.
+
+Suite 488/488 from tools/PS2Recomp/ps2xTest.
+
+### What is still unknown
+
+Why the heap base is align(maxLoadedRdramEnd, 16) with no safety pad. ps2_runtime.cpp:963 computes
+paddedEnd = maxLoadedRdramEnd + kGuestHeapSafetyPad and assigns m_guestHeapSuggestedBase, and
+kGuestHeapSafetyPad is 0x1000 at line 92 -- so the pad is in the source and not in the result. Either
+m_guestHeapConfigured was already true when that block ran, or the base is being re-derived elsewhere.
+Not yet established, and it is the next single step.

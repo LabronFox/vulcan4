@@ -6948,3 +6948,105 @@ writes lands on `0x010519C0`, the wall is named — for the first time in five d
 that is known to work.
 
 Suite **484/484**. `VULCAN4 FRAME source=guest` has never printed.
+
+---
+
+## W82 — the overwrite is localised to TWO trace events, and I have read the gap
+
+Two results tonight: `CD.cpp` eliminated like `RPC.cpp`, and then the smallest possible window for the
+overwrite — the finest localisation this wall has ever had.
+
+### W81 — CD sector reads were invisible, and then CD was eliminated too
+
+**Red:** `ps2_runtime_io_tests.cpp`, **"W81: a CD sector read into guest memory is visible to the store
+observer"** — `sceCdRead` a 2048-byte sector, with two `CONTROL:` assertions that the data landed and
+the call succeeded, then assert the observer saw ≥ 2048 bytes at the buffer:
+
+```
+[Run]: W81: a CD sector read into guest memory is visible to the store observer  [Failed]
+      - ... today it is `readCdSectors(..., rdram + offset, bytes)` straight into guest memory with no
+        observer call anywhere in the path, so a 2 KB guest write is invisible.
+        Observed bytes at the buffer: 0
+```
+
+**`Observed bytes at the buffer: 0` for a 2 KB guest write.** Green after tracing all **three**
+`readCdSectors` call sites — `sceCdRead` (`CD.cpp:243`), `sceCdReadChain` (`:498`) and `sceCdStRead`
+(`:811`) — with tags `cdRead`, `cdReadChain`, `cdStRead`. All three, not the one the test names.
+
+### And then CD is eliminated as well
+
+`boot_w81.log`, after the fix:
+
+| trace | count |
+|---|---|
+| `op=cdRead` / `cdReadChain` / `cdStRead` | **0** |
+| `[fioOpen] path="cdrom0:\CDROM0:\;1" -> fd=-1` | 11,848 |
+| `[fioOpen] path="rom0:ROMVER" -> fd=3` | 1 |
+
+**The guest never reads a disc sector in this boot.** There is no `cdImage`; `cdRoot` is a directory, so
+`readCdSectors` has nothing to read. The whole CD read path is dead code here, exactly as the SIF-RPC
+layer was.
+
+**That is now two files in a row eliminated by the same reason, and it is a pattern worth naming: the HLE
+module manager substitutes all five IRX modules, so most of the SCE SDK surface this project spends its
+time instrumenting never executes.** The instrument work stands on its own — those writes really were
+invisible and a 2 KB write really was unobservable — but the sweep of untraced sites was chasing code
+that does not run. *Enumerating untraced write sites is not a strategy here.*
+
+### The real result: the overwrite is TWO trace events wide
+
+The shadow now prints `seq=`, which is the number that finally localises it. `boot_seq.log`:
+
+```
+#0  seq=18062  0x10519c0 now=2f was=0     <- the guest's build begins
+...
+#15 seq=18083  0x10519cf now=4d was=0     <- "/BASCUS-97328GAMEDATA" complete (4d = 'M')
+#16 seq=18289  0x10519c0 now=05 was=2f    <- OVERWRITTEN, 206 trace events later
+#17 seq=18290  0x10519c1 now=80 was=42
+```
+
+And the whole neighbourhood, deduplicated:
+
+```
+18084  memcpy src=0x103d548 addr=0x10519cd sz=9      the last piece of the path
+18087  WRITE32 addr=0x102dcc8 sz=4                  <- THE GLOBAL W61/W69 MEASURED
+18089+ WRITE64 to 0x1fffed0..0x1fffe30              a stack frame
+18279  WRITE8  addr=0x700020e9                      scratchpad
+18283  WRITE64 addr=0x700020b0                      scratchpad
+18285  WRITE64 addr=0x12001000
+18287  WRITE64 addr=0x12001000                      <- LAST TRACED WRITE BEFORE THE CHANGE
+18289  <the change is detected>                     <- 2 events
+```
+
+**`seq=18087 WRITE64 addr=0x12001000` and the change at `seq=18289`.** Two events. Inside
+`sub_0100A348` — the function W66 mapped to `pc=0x100a45c` and W72 read from the generated comments,
+where `0x100a448 sd $v1, 0x0($v0)` has `$v0 = 0x012001000`.
+
+### What I checked, and what I am NOT claiming
+
+- `0x012001000` resolves through `ps2ResolveGuestPointer` to **`0x12001000`** (masked with
+  `PS2_RAM_MASK = 0x1FFFFFFF`), which is `0x10FAF640` bytes from `0x010519C0`. **It is not the writer.**
+  I asserted this arithmetic wrong once already today and am recording the correct value.
+- That address is out of RDRAM, so `Ps2FastWrite64` takes its **wrapped** path:
+  `rdram[(offset + i) & PS2_RAM_MASK] = wrapped[i]` — a byte loop with **no observer call at all**. That
+  is a genuine blind spot and it is now named, but it writes to `0x12001000..7`, not to `0x010519C0`.
+- `sw $v0, 0x110($s1)` / `0x114` / `0x118` at `0x100a3e8` would hit `0x010519C0` exactly if
+  `$s1 == 0x010518B0`, and **I have not measured `$s1`**, so I am not claiming it. W71 measured `$s1`
+  as `0x010FFFE80`-ish in a different frame.
+
+### The wall, as tightly as it has ever been stated
+
+> **`sub_0100A348` overwrites the 21 bytes of `/BASCUS-97328GAMEDATA` at `0x010519C0` with card-directory
+> bytes, within two trace events of `seq=18287`, and the writing store does not appear anywhere in the
+> 13.9M-write trace.**
+
+**Next single step, and it is one register:** read `$s1` at `pc=0x100a3e8` inside `sub_0100A348`. Three
+stores live at `$s1+0x110`, `$s1+0x114`, `$s1+0x118` — twelve bytes, which is the size of the change
+that follows. If `$s1` is `0x010518B0` those three stores **are** the writer, and the only remaining
+question is why they are not traced. If it is not, the writer is elsewhere in those two events and the
+window is small enough to enumerate instruction by instruction from the generated comments.
+
+One line of instrumentation, `ctx->r[17]` at one pc, in the gap we have already bounded. That is
+cheaper than every sweep that preceded it.
+
+Suite **485/485**. `VULCAN4 FRAME source=guest` has never printed.

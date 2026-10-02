@@ -330,6 +330,7 @@ void watchGuestStoreForPath(uint32_t guestAddr,
                 // change is the only way to tell a real write from a buffer swap, and RDRAMPROBE only
                 // ever printed once, at startup, where both pointers necessarily agreed.
                 std::cout << "VULCAN4 SHADOWCHANGE #" << shadowChanges
+                              << " seq=" << ps2NextTraceSequence()
                               << " watched=" << static_cast<const void *>(g_rdramForWatch)
                               << " live="
                               << static_cast<const void *>(

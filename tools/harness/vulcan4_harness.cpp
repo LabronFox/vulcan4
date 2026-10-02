@@ -2633,6 +2633,13 @@ int main(int argc, char *argv[])
               << " intr_queued=" << kernelSnapshot.invocationsQueued
               << " intr_run=" << kernelSnapshot.invocationsRun
               << " intr_run_by_kind=" << kernelSnapshot.invocationsRunByKind[0]
+              // W107. LINK 1 OF THE DISPLAY CHAIN, as a number. The window stays magenta until this is
+              // non-zero: the guest has to deliver a FRAME register (0x04/0x05) to tell the GS which
+              // RDRAM address holds the picture, and nothing downstream can substitute for that.
+              << " gs_packets=" << runtime.gs().gsPacketsSeen()
+              << " gs_frame_reg_writes=" << runtime.gs().gsFrameRegWrites()
+              << " (ctx0=" << runtime.gs().gsFrameRegWritesCtx0()
+              << " ctx1=" << runtime.gs().gsFrameRegWritesCtx1() << ")"
               << " cop0_raised=INAPPLICABLE(" << runtime.interruptsRaised() << ")"
               << " cop0_delivered=INAPPLICABLE(" << runtime.interruptsDelivered() << ")"
               << " pending_ip=0x" << std::hex << runtime.pendingInterrupts() << std::dec << "\n";

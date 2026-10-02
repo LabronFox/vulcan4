@@ -299,6 +299,28 @@ void watchGuestStoreForPath(uint32_t guestAddr,
     // measured that store landing 0x05 0x80 0x2f into 0x01051A13 -- one byte into the buffer the
     // failing open reads, and 0x8005 is a GS register word. So: is $s4 really 0x01051A0F, and what is
     // $s1? Report the registers, not a story about them.
+    // W89. The guest is POLLING A FLAG BYTE, not branching on the sleep result. At 0x100afa8, which
+    // is where 23 of the 24 sleeps resume:
+    //     0x100afa8: lbu  $v1, 0x0($s0)
+    //     0x100afac: bnel $v1, $zero, ... -> back to 0x100af50
+    // The harness's own boot report guessed "the wall is the return value"; this is the measurement
+    // that says otherwise. So: what address is the flag on, and is anything ever writing it?
+    if (ctx != nullptr && ctx->pc == 0x0100AFA8u)
+    {
+        static int w89Logs = 0;
+        if (w89Logs < 2)
+        {
+            ++w89Logs;
+            const uint32_t s0 = getRegU32(ctx, 16);
+            RUNTIME_LOG("W89 POLL pc=0x100afa8 s0=0x" << std::hex << s0
+                        << " flagByte=" << std::dec
+                        << (g_rdramForWatch != nullptr && s0 < 0x02000000u
+                                ? static_cast<int>(g_rdramForWatch[s0 & 0x01FFFFFFu])
+                                : -1)
+                        << " v0(ret)=0x" << std::hex << getRegU32(ctx, 2) << std::dec);
+        }
+    }
+
     if (ctx != nullptr && ctx->pc == 0x01003E98u)
     {
         static int w86Logs = 0;

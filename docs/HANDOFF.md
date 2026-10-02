@@ -7513,3 +7513,66 @@ So the next single step is the return value: make the timed sleep resume with th
 microseconds rather than 0, and see whether the livelock at 0x0101F348 turns into progress. That is a
 guess about the guest's loop, not a measurement, and it is labelled as one -- the measurement to make
 first is what the guest actually does with v0 at 0x0101F348.
+## W89 - THE LIVELOCK IS A POLL LOOP ON A SCRATCHPAD FLAG, NOT THE SLEEP RETURN VALUE
+
+### The harness guessed, and the instruction says otherwise
+
+W88 ended by quoting the harness's own boot report:
+
+    VULCAN4 HARNESS detail=livelocked in SCE syscall 0x32 (SleepThread): 1736 of 2180 guest syscalls
+    were this one, at guest pc 0x0101f348 -- it is being retried, not satisfied, so the wall is the
+    return value
+
+So: the guest resumes from the sleep, does not like the answer, and sleeps again. 1736 times, at one pc.
+If that is true, sce_SleepThread's return value is the wall and the fix is to return the microseconds
+actually slept instead of makeReady's KE_OK = 0. I was about to write that.
+
+pc 0x0101F348 is `jr $ra` -- a trampoline, not the call site. The ledger's ra_count names the real ones:
+0x0100AFA8 (23 times) and 0x0100B680 (once). And the generated unit says:
+
+    // 0x100afa8: 0x92030000  lbu   $v1, 0x0($s0)
+    // 0x100afac: 0x5460ffe8  bnel $v1, $zero, . + 4 + (-0x18 << 2)
+
+`lbu` a byte through $s0, and branch back to 0x0100AF50 -- 0x60 bytes earlier -- if it is non-zero. That
+is a POLL LOOP on a flag byte. There is no comparison against v0 anywhere in it and no branch on the
+sleep's result. **The return-value theory is refuted by the instruction.** The guest sleeps 8us, wakes,
+looks at a flag, and if the flag is not ready it sleeps again. 1736 times is a legitimate wait loop
+waiting for something that never arrives.
+
+### What the flag is
+
+$s0 is not a RAM pointer. From the syscall ledger in boot_w88.log:
+
+    s0=0x0100afa8/0x70002085, 0x0100b680/0x70002050, 0x0100afa8/0x70002079
+
+The second field is the scratchpad. So `lbu $v1, 0($s0)` reads a flag byte at 0x70002085, or
+0x70002050, or 0x70002079 depending on the call site -- all inside the 0x70002000 scratchpad window that
+W83 already found in this function, and the same region W66 measured as $s2 + 0x98.
+
+That is legal on a PS2. The scratchpad is per-thread but threads may point at each other's, and a flag
+kept there and written by another thread is a normal pattern. The question is who is supposed to write
+it, and on this boot the answer appears to be nobody.
+
+### A methodological note, because it cost me a cycle
+
+My first move was to probe $s0 at pc=0x0100AFA8 from the store observer, and it printed nothing. The
+observer only fires on STORES, and 0x100AFA8 is `lbu` -- a load. Every "which instruction is running"
+question I have answered so far with the store observer has the same blind spot, and every one of them
+happened to be a store, which is exactly why it never came up. The shadow also only watches RDRAM, so
+the flag byte is invisible to it: g_rdramForWatch is RDRAM and the scratchpad is a separate 16 KB
+allocation (ps2_memory.cpp:344, m_scratchpad = new uint8_t[PS2_SCRATCHPAD_SIZE]).
+
+So the flag can be neither read by a store-observer probe nor watched by the shadow, and both facts fell
+out of one failed probe. Written down so the next dish does not spend the same cycle.
+
+### The next single step
+
+Watch the scratchpad byte at 0x70002085 and find who writes it, or prove that nobody does. The
+instrument is nearly built: PS2Memory::write8 already announces itself to the store observer with the
+op "PS2Memory::write8" and the raw address, and W84's getMemPtr hook covers the raw-pointer routes, so a
+scratchpad watch window plus the same bracket ring should name the writer -- or show an absence, which
+is the more useful answer. If nothing writes it, the wall is that whatever should be signalling this
+thread is not running, and the next question is which of sce_WaitSema's 32 calls and
+sce_SignalSema's 31 is the one that should have.
+
+State: functions_entered 567, the disc file open at fd = 4 and 5, no VULCAN4 FRAME source=guest.

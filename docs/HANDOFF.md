@@ -7050,3 +7050,47 @@ One line of instrumentation, `ctx->r[17]` at one pc, in the gap we have already 
 cheaper than every sweep that preceded it.
 
 Suite **485/485**. `VULCAN4 FRAME source=guest` has never printed.
+## W83 - $s1 is the SCRATCHPAD, and the OOB theory I built on it is WRONG
+
+The one register, measured. Probe in tools/harness/vulcan4_harness.cpp, keyed on ctx->pc == 0x0100A3E8
+inside sub_0100A348, printing getRegU32(ctx, 17). From boot_w83.log, verbatim:
+
+    W83 S1 pc=0x100a3e8 s1=0x70002000 +0x110=0x70002110 +0x114=0x70002114 +0x118=0x70002118 v0=0x5 isPathBuf=no
+
+$s1 = 0x70002000. That is the SCRATCHPAD base, not RDRAM. The three stores are 0x70002110,
+0x70002114 and 0x70002118 - all scratchpad, isPathBuf=no. THE THREE STORES ARE NOT THE WRITER. $s1 is
+irrelevant to the 0x010519C0 overwrite, and I am reporting that as the result rather than hunting for a
+nicer one. Only one line logged, so sub_0100A348 executes once in this boot. v0 = 0x5 at that store.
+
+Scratchpad cannot be an alias either: m_scratchpad = new uint8_t[PS2_SCRATCHPAD_SIZE] at
+ps2_memory.cpp:344, a separate heap allocation from m_rdram. A write there cannot reach 0x010519C0.
+
+THE OOB THEORY, AND WHY IT FAILED - a retraction, and the fourth in this project.
+
+W82 ended with "the last traced write before the change is WRITE64 addr=0x12001000 at seq 18287", and
+0x12001000 is 301,993,984 into a 33,554,432-byte buffer. That is a 268,439,560-byte overrun, it is the
+last traced write before an unexplained change, and it would have explained the whole wall. I built a red
+test for it, W83b in ps2_memory_tests.cpp, with a 4 KB poison canary after the RAM window so the
+overrun would be observable rather than argued about.
+
+It PASSED. Not because the canary survived a write past the end, but because there is no write past the
+end. PS2_RAM_MASK is PS2_RAM_SIZE - 1 at ps2_memory.h:27, which is 0x1FFFFFF - TWENTY EIGHT bits, 32 MB -
+and NOT 0x1FFFFFFF as W82's note recorded. So 0x012001000 & 0x1FFFFFF = 0x10000. The write the trace
+prints as addr=0x12001000 lands at rdram[0x10000], comfortably in bounds. No overrun, no corruption, not
+the writer.
+
+W82's PS2_RAM_MASK value was wrong by one hex digit, and I built an hour of arithmetic on it. The test
+is kept, not deleted: it is a real guard against the overrun, and it now documents the mask width for
+anyone who reads that address again.
+
+WHAT IS STILL MEASURED AND UNCHANGED: sub_0100A348 overwrites the 21 bytes of /BASCUS-97328GAMEDATA at
+0x010519C0 with card-directory bytes, within two trace events of seq=18287, and the writing store appears
+nowhere in the 13.9M-write trace. The neighbourhood is WRITE64 0x12001000 (= rdram[0x10000]) at 18285 and
+18287, then the change at 18289. The window is still two events. It is still small enough to enumerate
+instruction by instruction out of the generated comments, and now the three obvious $s1 stores are
+excluded by measurement rather than by arithmetic.
+
+Suite 486/486, run from tools/PS2Recomp/ps2xTest because "VU0 macro mappings cover all S1/S2 enums"
+reads instructions.h from the working directory and fails anywhere else. A 485/485 I quoted earlier in
+this session came from a binary I had not rebuilt, and a run from the build directory reads as a VU0
+regression when it is only a wrong cwd. Rebuild before you believe a suite number.

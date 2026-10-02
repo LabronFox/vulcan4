@@ -288,6 +288,28 @@ void watchGuestStoreForPath(uint32_t guestAddr,
     // VULCAN4_TRACE_WRITES is set, because it is one line per guest write.
     static const bool kTraceAllWrites = watchEnv("VULCAN4_TRACE_WRITES", 0u) != 0u;
 
+    // W83. THE ONE MEASUREMENT. $s1 (register 17) at pc=0x100a3e8 inside sub_0100A348, where the
+    // generated unit says `sw $v0, 0x110($s1)`. W82 bounded the overwrite of 0x010519C0 to two trace
+    // events; those three stores are twelve bytes, which is the size of the change. If $s1 is
+    // 0x010518B0 they are the writer. Report the register and the three computed addresses, and
+    // nothing that was not measured.
+    if (ctx != nullptr && ctx->pc == 0x0100A3E8u)
+    {
+        static int s1Logs = 0;
+        if (s1Logs < 4)
+        {
+            ++s1Logs;
+            const uint32_t s1 = getRegU32(ctx, 17);
+            RUNTIME_LOG("W83 S1 pc=0x100a3e8 s1=0x" << std::hex << s1
+                        << " +0x110=0x" << (s1 + 0x110u)
+                        << " +0x114=0x" << (s1 + 0x114u)
+                        << " +0x118=0x" << (s1 + 0x118u)
+                        << " v0=0x" << getRegU32(ctx, 2)
+                        << " isPathBuf=" << ((s1 + 0x110u) == 0x010519C0u ? "YES" : "no")
+                        << std::dec);
+        }
+    }
+
     // W64. SHADOW COMPARE. Tracing every write path and still seeing "the bytes changed and nothing
     // was logged" means enumerating writers is the wrong strategy: there is at least one left, and
     // the list is open-ended. So stop asking who wrote it. Keep a private copy of the watched window

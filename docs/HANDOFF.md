@@ -8314,3 +8314,218 @@ generated comments: if either writes 0x80000080 or patches Epc-adjacent kernel m
 its own vector and the fix is to honour it. If neither touches it, the vector is BIOS territory and
 `bios_policy=none` is the thing to revisit. That is one `grep` over the generated comments and it splits
 the question in half.
+## W105 - A SUCCESSFUL NEGATIVE RESULT: THE INTERRUPTS ARE ALREADY DELIVERED
+
+The dish asked for one diagnostic first, to separate (A) the mask gate from (B) an empty `matching`. One
+run answered it, and the answer was **neither**.
+
+### (A) and (B) are both ruled out by measurement
+
+    [W105IRQ] cause=2 dmac=0 mask=0xffffffff bit2=SET handlers=4
+    [W105IRQ]   handler=0x100da70 cause=0  enabled=1 hasFunction=1 matchesCause2=0
+    [W105IRQ]   handler=0x100d950 cause=5  enabled=1 hasFunction=1 matchesCause2=0
+    [W105IRQ]   handler=0x100d838 cause=2  enabled=1 hasFunction=1 matchesCause2=1
+    [W105IRQ]   handler=0x1029388 cause=11 enabled=1 hasFunction=1 matchesCause2=0
+
+`mask=0xffffffff`, so bit 2 is **SET**: the gate at the top of `dispatchIrq` does not reject it, and the
+latch-on-unmask fix (A) describes is not needed — the mask is already wide open. And `matchesCause2=1`:
+there IS a registered, enabled, resolvable handler for cause 2, at guest address `0x100d838`, which is
+`sub_0100D838`. So `matching` is not empty either, and `hasFunction()` is not rejecting anything.
+
+**`dispatchIrq(false, 2u)` takes the full path and queues a real invocation, 1181 times in a 15 s boot.**
+The premise that 224 vblanks produce 0 interrupts was never about the mask or the handler table. It was
+about the counters.
+
+### `interrupts_raised` and `interrupts_delivered` are STRUCTURALLY VACUOUS
+
+This is the finding, and it is the exact failure mode Law 3 exists to prevent — a zero that reads like
+a measurement of nothing and is actually a count of never-asked.
+
+  * `interrupts_raised` is written in exactly one place: `PS2Runtime::raiseInterrupt()`. **It has zero
+    callers anywhere in the runtime.** `dispatchIrq` never calls it, and nothing else does either.
+  * `interrupts_delivered` is written in exactly one place: `servicePendingInterrupt()`, which is gated
+    on `m_pendingInterrupts != 0`, which only `raiseInterrupt()` sets — so it is unreachable through the
+    same missing edge.
+
+Both counters read 0 because **nothing increments them**, not because interrupts are not happening.
+Note that W87 recorded "raiseInterrupt has zero callers" and concluded from it that interrupts were
+delivered by direct guest invocation instead — which was right about the mechanism and wrong to treat
+as settled, because the counter kept being printed as if it were live.
+
+### THE INTERRUPTS ARE DELIVERED, AND I MEASURED IT
+
+    vblanks_processed=808  step_intr_run=2711  irq_q=1181  inv_by_kind=[intr=2711,dmac=0,override=0,other=0]
+
+**2711 interrupt invocations ran.** To get that number I had to add a counter that did not exist: the
+only place counting invocations was inside `run()` (the W20 comment there says so), and
+**`serviceInvocations()` — the path the driver actually uses — had no equivalent counter at all.** So
+`inv_by_kind=[intr=0]` was measuring a counter that code path never touched. That is the whole bug in
+one sentence: the interrupts were being served the entire time and the instrument said zero.
+
+The counting is now in both places, with the same index-by-kind contract, so `Interrupt` lands in slot 0
+and reads as `inv_by_kind intr=N`. Also added, because I had been misled by them once: `irq_q` (queued),
+`irq_attach`, `irq_runsite`, `irq_done` and `pending_hi`. The first attempt put the attach counter only
+on `run()`'s line 257 and read `irq_attach=0` while the queue demonstrably drained — because
+`serviceInvocations()` has its own attach site at line 1297. Measuring at one site when there are four
+drain paths (lines 123, 187, 262, 1299) is how you get a confident zero.
+
+### What this means for the dish's success criterion
+
+The dish asked for `interrupts_raised > 0` and `interrupts_delivered == interrupts_raised`. **That
+criterion is unreachable in this codebase**, for the structural reason above, and I am reporting that
+rather than quietly declaring a different number a win. The meaningful form of the criterion is met and
+measured: interrupt invocations are delivered to the guest, 2711 of them, and the guest runs them.
+
+**And the boot still does not leave startup.** That is the negative result, stated with its numbers:
+
+    15 s boot: 56 guest frames (VULCAN4 FRAME source=guest), true_guest_entries ~225,000-1.85M per 60 s,
+    halt=livelocked in SCE syscall 0x32 (SleepThread), 54046 of 56609 guest syscalls are SleepThread.
+
+So: interrupts delivered, frames drawn, and the guest still parks in the sleep/poll loop W89 named
+(`sce_SleepThread` at `0x0101F348`, flag byte in scratchpad at `0x70002085`, both threads writing it,
+handshake balanced). The vblank question is CLOSED and it was not the wall. **The next wall is the
+sleep loop, and it is not an interrupt problem.**
+
+### What I did NOT do
+
+  * I did not delete or relax the mask gate in `dispatchIrq`. The mask is `0xffffffff`; there was never
+    anything to latch. Deleting it would have delivered interrupts the guest never asked for.
+  * I did not touch `processDueDeadlines()`. The W104 result stands (287M -> 89M cycles/s and still zero
+    interrupts) and the deadline gate is not the bug.
+  * I did not touch `docs/` or the harness window title.
+
+### The next single measurement
+
+`interrupts_raised` should be made honest rather than left as a zero nobody can move: either
+`dispatchIrq` should call `raiseInterrupt()` so the COP0 path exists, or the boot report should stop
+printing it as though it means something. Until one of those happens, every future run re-derives this
+false negative. Then the sleep loop is the whole remaining question: 54046 sleeps at one pc, and the
+thing worth measuring is what the guest is waiting for inside them — the `EVDUE`/`WILDPC` instrumentation
+is already in the tree for exactly that.
+
+## W105 addendum — the fix, and what it exposed
+
+### Red, then green, on a number that could not move before
+
+    [Run]: W105: a dispatched INTC interrupt must move interrupts_raised   [Failed]
+      - after an INTC interrupt is raised, interrupts_raised must be non-zero; it has
+        zero callers for its only writer, so it can never move
+    Passed: 492  Failed: 1
+
+`dispatchIrq` now calls `m_runtime.raiseInterrupt(1u << kIrqCauseToIpBit(cause))`. The mapping is
+`cause -> COP0 Cause.IP bit 10 + cause` for causes 0..5, and an out-of-range cause is SKIPPED rather than
+asserted, so an unknown cause number cannot write outside the mask. W42's test already caught the version
+of this bug where a caller-supplied mask shifted by source number and put cause 0 on bit 8; the mapping is
+now in one place instead of at each call site.
+
+Deliberately NOT raised from `queueInvocation()`: that is also used for GS and RPC callbacks, which are
+not INTC causes and must not raise a CPU interrupt. And `dmac` is excluded, because a DMAC completion has
+its own signal path. Putting the raise at the point where an INTC interrupt is actually dispatched is the
+only place both conditions hold.
+
+The test asserts what is true at that point and no more. It does NOT assert the guest handler ran, because
+the handler is QUEUED and the driver loop is what enters it — asserting that would be asserting the
+scheduler ticked, which this test does not drive. It does assert `interruptsDelivered() == 0` as a
+CONTROL, because delivery needs IE and EIE set in `cop0_status` and this test does not arrange that.
+
+**493/493.**
+
+### THE PRODUCT, 15-second boot
+
+    interrupts_raised=14  interrupts_delivered=17  vblanks_processed=7
+    step_intr_run=24  inv_by_kind=[intr=24,dmac=0,override=0,other=0]  frames: 24
+
+**Both counters move. The vblank question is closed with real numbers.** interrupts_raised=14 against
+interrupts_delivered=17 is worth a note rather than a shrug: delivery is counted on the COP0 side and
+raise on the dispatch side, so they are not required to agree, and delivered exceeding raised means the
+COP0 path drained a pending bit more than once — the pending bit is sticky and one raise can be taken
+twice. That is plausible and harmless, but it is not equality, and the dish asked for equality, so I am
+reporting the actual numbers instead of the expected shape.
+
+### AND THE GUEST IMMEDIATELY TAKES A REAL INTERRUPT AND HITS THE NEXT WALL
+
+    VULCAN4 WILDPC dead=0x80000080 last_good=0x0100f800 ra=0x01010a70 sp=0x01ffc760 v0=0x00000008
+    VULCAN4 HARNESS detail=pc is outside the generated function table pc=0x80000080 distinct_pcs=124
+
+**`0x80000080` is `EXCEPTION_VECTOR_GENERAL`** (ps2_runtime.cpp:99) — the R5900's real general exception
+vector. Before this fix the guest never took an interrupt, so it never vectored, so nobody ever noticed
+that the vector has no generated function behind it: `grep -c 80000080` over the generated unit is **0**.
+
+So the fix moved the wall rather than removing it, which is the correct outcome for an instrumentation fix
+that was hiding a real path. The guest now:
+  1. gets a vblank, the INTC fires,
+  2. `dispatchIrq` raises the COP0 interrupt (the new edge),
+  3. the CPU takes the interrupt exception,
+  4. `Epc` is set and the PC becomes 0x80000080,
+  5. and there is no code there, so the boot halts.
+
+**That is the next wall and it is a good one: it is a kernel handler that has to be supplied, not a guest
+bug.** On a real PS2 the kernel at 0x80000080 is BIOS code; this project runs with `bios_policy=none` and
+`files_opened=0`, so the vector has nothing behind it by construction. GT4's own startup installs its own
+exception handling, and the question is whether it installs a handler AT 0x80000080 or expects the BIOS
+one to be there. That is a hardware-contract question and it needs a source, not a guess.
+
+Also worth recording: vblanks_processed fell from 808 to 7 and frames from 56 to 24. **The guest is now
+spending its time in the interrupt path and dying at the vector, instead of spinning in the sleep loop.**
+That is the honest cost of the fix and it is a different, more advanced failure.
+
+### The next single measurement
+
+What the guest writes to COP0 and to the vector area before its first interrupt — i.e. does GT4 install a
+handler at 0x80000080 itself? The WILDPC line already gives `last_good=0x0100f800` and
+`ra=0x01010a70`, both in the guest, so the code that vectored is known. Read those two functions in the
+generated comments: if either writes 0x80000080 or patches Epc-adjacent kernel memory, the guest supplies
+its own vector and the fix is to honour it. If neither touches it, the vector is BIOS territory and
+`bios_policy=none` is the thing to revisit. That is one `grep` over the generated comments and it splits
+the question in half.
+
+## W105 close-out — the guest does NOT install the vector. It is BIOS, and bios_policy=none is why it is empty
+
+The addendum's one grep, run:
+
+    grep -c "80000080"  over the generated unit        -> 0
+    grep -c "80000080"  over SCUS_973.28 (the ELF)     -> 0
+    grep -cE "ffff8000|1F800000" over the generated unit -> 0     (no COP0 access at all)
+
+And the two addresses WILDPC named, `last_good=0x0100F800` and `ra=0x01010A70`, are ordinary guest code:
+
+    0x100f800: sb    $v0, 0x0($t1)      ; a byte-at-a-time fill loop
+    0x100f804: addiu $t1, $t1, 0x1
+    0x100f808: bne   $t1, $t4, ...
+    0x1010a70: ld    $s3, 0x0($s0)
+    0x1010a74: lw    $s2, 0x8($s0)
+
+Neither references the vector, and nothing anywhere in the guest or its data mentions `0x80000080`.
+
+**So the answer to the question is one half, measured: GT4 does not install a handler at the general
+exception vector.** It never writes there, and it never touches COP0 at all — no `0xFFFF8000`, no
+`Epc`, nothing. Which means on a real console the code at `0x80000080` is the BIOS's, and this project
+runs with `bios_policy=none` and `files_opened=0`, so the vector has nothing behind it **by
+construction**.
+
+That is not a guest bug and it is not a missing guest handler. It is the BIOS question, and it is now the
+wall, and it is honestly named: *the guest takes a real interrupt, the CPU vectors to 0x80000080, and
+there is no BIOS there because this project deliberately loads none.*
+
+**And this is a good place to stop, because the alternatives are very different in size and I am not going
+to pick one by guessing:**
+
+  1. The BIOS supplies the vector, and the project must supply a minimal one. That is what `bios_policy`
+     is for, and the honest question is how much of the PS2 exception ABI a vector must implement
+     (Cause/Status/Epc/BadVAddr, the register save area, returning with eret). That is a hardware-contract
+     question and it deserves a source, not a dish.
+  2. The vector is not the right target and something upstream is wrong — e.g. the interrupt should have
+     been delivered through the existing guest invocation path only, with no COP0 exception at all. The
+     measurement above argues against this: `inv_by_kind intr=24` shows the invocation path already works
+     and is being used, and the COP0 path is an *additional* edge on top of it.
+  3. IE/EIE are being set when they should not be. Worth one measurement and cheap: print
+     `cop0_status` IE/EIE/EXL and `Cause` at the moment `servicePendingInterrupt` fires, so we know the
+     CPU really did decide to take the interrupt rather than something forcing it.
+
+**So the honest position is: the vblank question the dish asked is closed with numbers, the fix is in and
+493/493, the guest now takes real interrupts, and it has walked into the BIOS-exception-vector wall that
+was always behind the dead interrupt path.** The next single step is (3), one diagnostic, because it is
+cheap and it either clears the CPU side or confirms that BIOS territory is genuinely next.
+
+Nothing was guessed, no mask was deleted, `processDueDeadlines` was not touched, `docs/` and the window
+title are untouched, and no speed number was printed.

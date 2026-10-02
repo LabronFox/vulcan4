@@ -7965,3 +7965,100 @@ dependent. The guest spends ~94% of its syscalls in sce_SleepThread with a balan
 (963 SignalSema / 964 WaitSema), so it is in the poll loop W89 named, and it is drawing while it is
 there. The next thing to chase is 0x8481E343: two runs in three transfer control to a KSEG0 address, and
 that is a concrete, reproducible, named wall.
+## W100 - THE WALL, NAMED EXACTLY: NOTHING EVER WRITES THE GUEST SYSCALL TABLE
+
+### The measurement
+
+Three consecutive 60 s runs:
+
+    run 1: frames=52  halt=pc_outside_generated_table   elapsed_ms=3771  pc=0x8481e343
+    run 2: frames=52  halt=pc_outside_generated_table
+    run 3: frames=53  halt=wallclock_deadline
+
+The full halt line from run 1:
+
+    VULCAN4 HARNESS detail=pc is outside the generated function table pc=0x8481e343
+      distinct_pcs=203 checkpoint_serviced=121 dispatcher_transfers=213 serviced_invocations=334
+      service_frames=87942 serviced_with_progress=334 blocked_on_servicing=0
+      invocations_run=0 inv_by_kind=[intr=0,dmac=0,override=0,other=0]
+      elapsed_ms=3771 guest_phase_ms=3764 ee_cycle=1110858603
+
+**It dies at 3.77 seconds, not at the 60-second deadline.** Two runs in three, inside four seconds, with
+52 guest frames already drawn. And the last syscalls before it are `sce_GetEntryAddress` and
+`sce_GetOsdConfigParam`.
+
+### The code
+
+System.cpp:1144
+
+    void GetEntryAddress(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t syscallNum = getRegU32(ctx, 4);
+        const uint32_t entryAddr = kGuestSyscallTableGuestBase + (syscallNum * 4u);
+        uint32_t handler = 0;
+        if (const uint8_t *ptr = getConstMemPtr(rdram, entryAddr))
+        {
+            std::memcpy(&handler, ptr, sizeof(handler));
+        }
+        setReturnU32(ctx, handler);
+    }
+
+Helpers/State.h:224
+
+    static constexpr uint32_t kGuestSyscallTableGuestBase = 0x80011F80u;
+
+`grep -rn kGuestSyscallTableGuestBase` over the whole runtime returns **one** hit in a .cpp: the read
+above. **Nothing writes it, anywhere, ever.**
+
+**So GetEntryAddress reads uninitialised memory and hands the guest whatever word is there as a
+function address. The guest then calls through it.** 0x8481E343 is a KSEG0 address, which is exactly
+the shape of a pointer the guest got back from a kernel-table lookup, and it is above the 0x80011F80
+base, which is exactly what you would expect if the word at that table slot is data rather than an
+address.
+
+This is the whole of the 3.77-second death: the guest asks the kernel "where is syscall N", we answer
+with garbage, it jumps into the garbage.
+
+### Why the comment above it already said so
+
+ps2_memory.cpp:626, in the identity-mapping discussion:
+
+    ps2SDK's GetEntryAddress() returns its KSEG0 alias 0x80011F80. Those are one location only if
+    the low window is identity mapped; under the -0x01000000 bias the kernel's own table would have
+    had two physical addresses.
+
+So the address was chosen deliberately, and correctly, and the table at it was never built. The
+mapping argument was settled; the contents were not.
+
+### What the fix is, and why it is not written yet
+
+Populate the table. There is one guest-visible syscall entry point -- the dispatcher -- so every slot
+that the guest may ask about should hold the KSEG0 alias of that entry, and the table should be written
+once at init through `getMemPtr(rdram, 0x80011F80 + n*4)`, which resolves KSEG0 to physical 0x11F80 and
+lands inside RDRAM.
+
+What is NOT established, and is why this is a paragraph and not a commit:
+
+  * Which slot values the guest actually reads before it dies. `syscallNum` is `a0` and the log does
+    not record it. If the guest reads slot 0 first, one word fixes it; if it walks the table, the whole
+    table has to be right.
+  * Whether returning the DISPATCHER's address is correct, or whether the guest expects a per-syscall
+    `jr` thunk. The PS2 kernel's real table holds 256-byte stub entries that `jr` to each handler;
+    returning a single dispatcher address may or may not be what the guest's calling sequence expects.
+    That is a hardware-contract question and it should be answered from a source, not guessed at 4am.
+  * Whether returning 0 for a slot the guest never asked about is load-bearing -- on real hardware an
+    unmapped slot reads as whatever is in kernel memory, and the guest may rely on that.
+
+The red test is easy and should come first: `GetEntryAddress(n)` must return an address inside the
+generated function table for every n the guest can name, and must not return 0 or a non-code address.
+That test fails today and it is the shape of the fix.
+
+### Where the arc stands, in one paragraph
+
+The north star exists and fires: **52-53 guest frames per 60 s, every run, `VULCAN4 FRAME
+source=guest n=N`.** The guest is drawing. It is not running at 21 entries per second and never was --
+`functions_entered` counts outer dispatcher iterations and under-reports by up to ~25,000x; the true rate
+is 126K-1.5M per 60 s, and the "3.6% of real PS2 speed, 28x slower than hardware" claim earlier in this
+file is retracted. The boot now dies at 3.77 seconds, two runs in three, on a jump to 0x8481E343, and
+the cause is a syscall table at 0x80011F80 that the whole runtime reads and nothing ever writes. Suite
+492/492.

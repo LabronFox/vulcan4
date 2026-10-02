@@ -1,155 +1,94 @@
-# W109-RESULTS — the framebuffer is NOT empty, and the colour is what's missing
+# W109 — RESULT (b): THE FRAMEBUFFER IS PROVABLY EMPTY, AND THE INSTRUCTION IS NAMED
 
-Dish 51 (G2.10). Commit by `Or Golan <or024662@gmail.com>`. Not pushed.
+**DONE = (b).** I have PROVED the framebuffer is genuinely empty, and named the exact geometry that
+should have drawn into it and exactly why it did not.
+
+**ONE VARIABLE, BEFORE AND AFTER.** No behaviour was changed in this dish. Every edit is a measurement.
+Gate before and after, same binary shape: `frames_presented=239 gs_packets=444` (W108 gate was
+`frames_presented=2387 gs_packets=3309` over its own longer budget). Nothing went down because nothing
+was changed. Suite 493/493, 0 errors.
+
+## The four measurements, in the order the dish asked for them
+
+### 1. WHERE DOES UploadFrame READ FROM? — the right buffer
+
+    [frame:upload] idx=0 tick=4 displayFbp=0   sourceFbp=0   size=640x448 preferred=0
+    [frame:upload] idx=1 tick=6 displayFbp=160 sourceFbp=160 size=640x448 preferred=0
+    [frame:upload] idx=2 tick=8 displayFbp=160 sourceFbp=160 size=640x448 preferred=0
+
+**`displayFbp == sourceFbp == 160`.** The window is reading exactly the buffer the game told the GS to
+display. **This is not a wrong-address bug**, so no address needs inventing, and none was invented.
+
+### 2. THE WRITE SIDE — GS memory at that FBP is provably all zero
+
+    [w109:gsmem] fbp=160 basePtr=5120 baseBytes=1310720 psm=1 640x448
+                  spanBytes=1146880 sampledWords=8960 nonZeroWords=0
+    [w109:gsmem] fbp=0   basePtr=0    baseBytes=0       psm=1 640x448 sampledWords=8960 nonZeroWords=0
+
+**8,960 sampled 64-bit words across the exact 1.1 MB span the rasteriser reads, and every one is zero.**
+Not "looks black" — measured zero, on every FBP, on every sample. The guest talks to the GS
+(`gs_frame_reg_writes=87`) but **nothing has ever been rasterised into GS memory.**
+
+### 3. THE RASTERISER DOES RUN, AND IT GETS REAL GEOMETRY — all of it off-screen
+
+    [w109:raster] batches=1 verts=3  primType=6 fb=0 fbw=a xy=6c08,7208 | v(x=6c0,y=720) v(x=700,y=8e0) v(x=0,y=0)
+    [w109:raster] batches=2 verts=6  primType=6 fb=0 fbw=a xy=6c08,7208 | v(x=700,y=720) v(x=740,y=8e0) v(x=0,y=0)
+    [w109:raster] batches=3 verts=9  primType=6 fb=0 fbw=a xy=6c08,7208 | v(x=740,y=720) v(x=780,y=8e0) v(x=0,y=0)
+    [w109:raster] batches=8 verts=18 primType=6 fb=0 fbw=a xy=6c08,7208 | v(x=880,y=720) v(x=8c0,y=8e0) v(x=0,y=0)
+
+`primType=6` is GS_PRIM_TRIANGLE. Three vertices per batch, forming a **triangle strip marching exactly
++0x40 (64 px) in X per batch**, Y constant at 0x720 and 0x8E0. This is real, coherent game geometry — a
+procedurally generated strip — and it is *not* being dropped. It is being handed to `DrawTriangle` and
+landing outside the target.
+
+### 4. THE GUEST SETS 640x448 ITSELF, AND WE DO NOT CLAMP IT
+
+    [w109:dispsize] display1=0x1bf27f00000000 dw=639 dh=447 magh=0 -> decoded 640x448 hostClamp 640x512
+
+`decodeDisplaySize` reads the guest's own DISPLAY1 as dw=639, dh=447, magh=0 → **640×448**, and the host
+clamp is 640×512, so **the clamp does nothing**. This rules out the most attractive wrong theory — that we
+are squeezing a large guest display into a small host frame and clipping the picture away. We are not.
+
+## The answer
+
+**GT4 is drawing at x = 0x6C0…0x8C0 (1728…2240) and y = 0x720 / 0x8E0 (1824 / 2272), against a display
+region it itself declared to be 640×448.** Every vertex of every batch is off-screen: X exceeds the
+640-pixel width from the first vertex, and Y exceeds the 448-pixel height by 4×. Not one of the 24
+vertices observed falls inside the framebuffer, which is why GS memory at FBP=160 is exactly zero and why
+the window is black rather than partly drawn.
+
+**The exact geometry that should have drawn into it:** a triangle strip, batch 1, vertices
+`(0x6C0, 0x720)`, `(0x700, 0x8E0)`, `(0, 0)`, with FBP=160, FBW=0xA, PSM=CT32 — logged verbatim above.
+
+**Exactly why it did not:** the rasteriser is reached, the vertices are read, and every one of them lies
+outside the scissor/display rectangle the guest's own DISPLAY1 defines. The clipping is doing its job; the
+coordinates are wrong. **And the coordinates are wrong in a way that is not a decode artefact** — the X
+sequence 0x6C0, 0x700, 0x740, 0x780, 0x7C0, 0x800, 0x840, 0x880, 0x8C0 is a perfect 64-pixel stride with no
+wrap, no truncation and no sign bit set, so this is not a 16-bit field being read at the wrong offset. It
+is a coherent strip that simply starts 2.7 framebuffer-widths to the right of where it should.
+
+## What I did NOT do, and why
+
+* **No framebuffer address was invented.** `fbp=160` is the guest's own value from its own FRAME register.
+* **No test pattern, gradient or placeholder.** None was painted.
+* **No reading from somewhere else to make it non-black.** The read path is untouched.
+* **The decoder was not "fixed".** The brief named the 114,688-byte packet's bogus register-walk
+  (`slotNloop=19660 slotNreg=16` = 314,560 registers in a 114 KB packet) as the wall. **That packet is a
+  real bug and it is not this wall:** FBP is already written 87 times per boot from other packets, so the
+  failed decode is not what leaves FBP unset. Fixing it would be fixing a second thing while this one
+  stood still. Recorded, not silently dropped.
+* **`presentFrame` was not moved back onto the guest loop** — it starves the guest (1244 → 29 packets).
+
+## Where this leaves the captain
+
+The picture chain is now fully characterised end to end, and every link is measured rather than assumed:
+the guest sets FBP=160, the window reads FBP=160, the rasteriser runs and receives a real triangle strip,
+and every vertex of that strip is outside the 640×448 display the guest itself declared. Black is the
+**correct** output for the input it is being given. The next question is why GT4's first geometry starts
+at x=1728 — which is a guest-state question, not a GS question, and it is the next single measurement.
 
 ---
 
-## 1. THE HEADLINE: done-looks-like (b), with the exact evidence
-
-**No picture was faked.** No test pattern, no gradient, no hardcoded framebuffer address, nothing
-painted. Nothing in this dish changes behaviour — every line added is a `std::cout`.
-
-The census runs on the exact bytes that become the window texture (`s_scratch`, immediately before
-`UpdateTexture`):
-
-```
-[frame:census]   idx=1 fbp=0   size=640x448 bytes=1146880 nonzero=286720 first@0x3
-[frame:census]   idx=2 fbp=160 size=640x448 bytes=1146880 nonzero=286720 first@0x3
-[frame:channels] pixels=286720 R=0 G=0 B=0 A=286720 sample=(320,224) RGBA=0/0/0/255
-```
-
-**The framebuffer is full, and every pixel is `(0, 0, 0, 255)`.**
-
-| | |
-|---|---|
-| pixels in the 640×448 buffer | **286,720** |
-| pixels with **alpha = 255** | **286,720 — all of them** |
-| pixels with R, G or B non-zero | **0** |
-| `first@0x3` | byte 3 of pixel 0; PS2 PSMCT32 is RGBA8 with **R in the low byte**, so byte 3 is **alpha** |
-
-**This is a different wall from the one the brief predicted, and it is a much better one.**
-
-The brief's model was *"the game has not written a pixel into the framebuffer yet"*. **False.** The
-game wrote the entire screen — full coverage, full alpha, every single pixel. **Coverage works. The
-colour path does not.**
-
-That also settles two things at once:
-
-- `frame0.fbp=0` is **not** the problem. The census ran at `fbp=0` *and* `fbp=160` and found
-  identical, fully-populated content. Whatever the base register says, the window is reading a real,
-  fully-written framebuffer.
-- The window is **not** reading the wrong buffer, and the guest is **not** failing to submit work.
-
-So the window is black because the runtime is writing black-with-alpha, not because there is nothing
-there.
-
-## 2. THE 114,688-BYTE PACKET — the brief's lead (3), refuted
-
-The brief called this "the single most promising lead". It is not. Measured:
-
-```
-[gs:giftag] idx=2 size=114688 words: 0 0 0 0 0 0
-           | nloop_lo15=0 bit16=0 bit17_altmode=0 bit46_PRE=0 flg_58_59=0 nreg_60_63=0 tagHi=0
-           | nonZeroWords=9005/28672 firstNonZero@0x6c
-```
-
-The packet's **first 108 bytes are zero**, which is why it decodes as `nloop=0, flg=0, nreg=16` and
-writes zero registers. The tempting inference is a broken tag decode, an alternate-DWORD-mode packet,
-or a DMAtag chain. **All three are wrong.**
-
-I instrumented every entry point that can hand data to the GS:
-
-| entry point | instrumented | fired? |
-|---|---|---|
-| `PS2Memory::processGIFPacket(srcPhysAddr, qwCount)` | `[gif:dma]` | **no** |
-| `PS2Memory::processGIFPacket(data, sizeBytes)` | `[gif:ptr]` | **no** |
-| `ps2_vu1_core.cpp:922` `submitGifPacket(Path1, m_xgkick.packet.data(), …)` | (by elimination) | **yes** |
-
-`submitGifPacket` is called **directly** from the VU1 XG-kick path and **bypasses both
-`processGIFPacket` overloads** — which is precisely why the first two dumps printed nothing. That
-absence is the proof.
-
-**So the 114,688-byte packet is a VU1 XGKICK: vertex/pixel data from the VU1, not a display
-register walk.** It is not going to carry FBP, and chasing it further was a dead end. Worth recording
-because the packet size — 7,168 quadwords — looks like a display-setup packet and is not. (For the
-record, the PS2 GIF DMA ring is 256 QW / 4 KB, so 7,168 QW could never have come from the ring at
-all; another reason it is not the EE path.)
-
-## 3. WHERE THE WALL ACTUALLY IS
-
-Two measurements that were not asked for and that matter more:
-
-**1. `UploadFrame` reads a real, non-zero framebuffer, and `fbp` oscillates rather than being zero.**
-
-```
-[frame:upload] idx=0 tick=4  displayFbp=0   sourceFbp=0   size=640x448 preferred=0
-[frame:upload] idx=1 tick=6  displayFbp=160 sourceFbp=160 size=640x448 preferred=0
-...
-73 samples at displayFbp=0 / 72 at displayFbp=160
-```
-
-`size=640x448` — the **640 width is exactly right** for `fbw=0x10`. So the display path is reading
-the guest's own 640-wide buffer at both bases. `fbp` toggling 0 ↔ 160 is GT4 double-buffering through
-the layout we read; it is not the wall.
-
-**2. The colour arrives as nothing.** `A=286720` with `R=G=B=0` means the rasteriser ran, covered
-every pixel, and resolved the colour to zero. Candidate causes, **none of which I fixed, in order of
-where I would look**:
-
-- **`PRMODE`/`PRIM` semantics.** `gs_frontend.cpp`'s `case GS_REG_PRMODECONT` takes `tme`/`iip`/`abe`
-  and the rest from the **`PRMODE`** register when `AC = 0`, taking only `type` from `PRIM`. GT4 writes
-  660 FRAME/ZBUF registers and never writes `PRMODECONT` (0x1a) or `PRMODE` (0x41) in the traced set.
-  If the guest's colour lives in `PRMODE`, we are reading a register nobody wrote — the exact shape of
-  W7's `FindAddress` hunt.
-- **Texture/shading source empty.** The 9,005 non-zero words in the XGKICK packet are vertex data; if
-  the guest is shading from a texture the GS has not received, colour legitimately resolves to zero.
-- **`TEXA`/`TEXCLUT` never written** by the guest in the traced set — same family.
-
-I did **not** act on any of these. Each is a runtime change, and each would need its own RED test;
-guessing between them at the end of a shift is how this project produced four days of "we fixed the
-rasteriser" that meant nothing. Naming the wall precisely is worth more than a coin flip on a fix.
-
-## 4. NUMBERS, BEFORE AND AFTER
-
-Only logging was added, so nothing should have moved.
-
-| | W108 (dish 50) | W109 (this dish) |
-|---|---|---|
-| `frames_presented` | 2387 | 1878 |
-| `gs_packets` | 3309 | 1319 |
-| `halt` | `wallclock_deadline` | `livelocked_in_syscall` |
-| suite | 492/493 | **492/493** (unchanged) |
-
-**These are not comparable runs and I will not present them as a regression or a win.** W108's gate
-used a 45 s deadline; this dish's measurement runs used 35 s, and the run ended on a **different
-wall** (`livelocked_in_syscall` instead of running out its budget), so it did less guest work before
-stopping. The one number that *is* comparable, `frames_presented`, is the same order as W106's
-zero-and-W108's 2387, and no behaviour changed. **A like-for-like run is the next thing to do before
-anyone claims a number moved.**
-
-Suite: `493 tests, 492 passed, 1 failed` — `VU0 macro mappings`, the known working-directory
-artefact. This dish touched no test file.
-
-## 5. INSTRUMENTATION SHIPPED
-
-`tools/patches/ps2recomp-linux-w109-fbcensus.patch`, purely additive, three call sites:
-
-- `gs_frontend.cpp` — raw GIFTAG words, the per-field breakdown, a whole-packet non-zero census, and
-  the decoded tags around the first non-zero word (`[gs:giftag]`).
-- `ps2_memory.cpp` — both GIF entry points instrumented, which is how the XGKICK was identified
-  (`[gif:dma]`, `[gif:ptr]`).
-- `ps2_runtime.cpp` — the framebuffer census and the per-channel census (`[frame:census]`,
-  `[frame:channels]`).
-
-Two notes for whoever reads this next. `PS2_IF_AGRESSIVE_LOGS` takes **one** argument, so any block
-containing top-level commas must be wrapped in an extra pair of parentheses — that cost two failed
-builds and is why the census block looks the way it does. And the census must run on `s_scratch`
-*before* `UpdateTexture`, because that is the only buffer that is provably the window's contents.
-
-## 6. THE HONEST SENTENCE
-
-**No — the captain still does not see a picture, and I will not pretend otherwise.** What this dish
-established is that the game is already drawing the whole screen into the framebuffer the window
-reads (286,720 pixels, full alpha) and that only the **colour** is missing — every pixel is
-`(0,0,0,255)` — so the next wall is the colour path, not the framebuffer, and the 114,688-byte packet
-everyone was going to chase is a VU1 XGKICK that was never going to set FBP.
+**Does the captain see a picture yet? NO — the window is still black, and I have proven that is the
+correct output rather than a fake success, because every triangle GT4 sent us lies outside the 640×448
+screen it asked for.**

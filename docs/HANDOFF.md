@@ -7289,3 +7289,75 @@ That is the thing to explain next and it is not yet explained: the guest is stor
 string buffer, one byte below where the string starts, and the number it stores is a GS register word.
 Whether $s4 is really 0x01051A0F, or whether the register decode upstream of this store is wrong, is
 not established. Suite 489/489.
+## W86 - THE DISC FILE OPENS. fd=4, fd=5, `cdrom0:\CORE.GT4;1`.
+
+### FIRST, A CORRECTION TO W85, AND IT IS THE SAME MISTAKE TWICE
+
+W85 ended with "the product did not move: 11576 cdrom opens before, 11576 after, same path, same fd".
+**That measurement was taken with a stale harness binary.** tools/harness/build_harness.sh relinks the
+harness against libps2_runtime.a, and I ran boot_w85c.log and boot_w85d.log without re-running it after
+the GS.cpp change. The static archive still had the old sceGsResetGraph. So the two runs that told me
+the fix did nothing were measuring the code I had already replaced.
+
+This is the second time in this session a stale binary produced a confident false reading -- the first
+was a 485/485 suite number off an un-rebuilt test binary, corrected in W83. The rule is now written into
+the wall: the harness is relinked, not recompiled on demand, and a run without a preceding
+build_harness.sh measures the previous dish. The build script's own comment says this and I read past it.
+
+### THE PRODUCT, three runs, identical
+
+boot_w86_a.log, boot_w86_b.log, boot_w86b.log:
+
+    1  path="rom0:ROMVER"        flags=0x1 -> fd=3
+    1  path="cdrom0:\CORE.GT4;1"  flags=0x1 -> fd=5
+    1  path="cdrom0:\CORE.GT4;1"  flags=0x1 -> fd=4
+
+fd=4 and fd=5. The game opened its own disc file, successfully, for the first time in this project. The
+11,548 / 11,576 / 11,882 `cdrom0:\CDROM0:\;1 -> fd=-1` lines that every earlier dish counted are GONE --
+not reduced, gone. W85's fix is what did it: sceGsResetGraph no longer takes its GS packet out of the
+guest's heap, so it stops writing pmode over the path buffer, so the path survives to the open.
+
+No frame yet. functions_entered=274, distinct_pcs=129, clean shutdown, BIOS none_required=true.
+
+### The path buffer, and a second one
+
+    [fioOpen] FIRST-FOR-THIS-BUFFER buf=0x103f498 ra=0x10185ec path="rom0:ROMVER"
+    [fioOpen] FIRST-FOR-THIS-BUFFER buf=0x10d1a50 ra=0x1005008 path="cdrom0:\CORE.GT4;1"
+    [fioOpen] FIRST-FOR-THIS-BUFFER buf=0x10d1a70 ra=0x1004e38 path="cdrom0:\CORE.GT4;1"
+
+0x010D1A50, not 0x01051A10. W85's shadow on 0x01051A10 was watching a buffer the guest had already
+stopped using by then, which is why it saw the path built correctly as "core.gt4" and then zeroed while
+the open was reading a different address entirely. Two buffers, one of them dead, and the wall moved
+while I was looking at it.
+
+### What the registers say, and two more things I got wrong
+
+W86 probe at pc=0x1003e98, from boot_w86.log:
+
+    W86 SW86 pc=0x1003e98 s4=0x1fffe80 s4+4=0x1fffe84 s1=0x10d1a50 v0=0x2f a0=0x10d1a66 a1=0x1051a10 a2=0x9 a3=0x1047b0c
+    W33PATHSTORE seq=10 op=WRITE32 obj=0x1fffe80 obj->0x0=0x1051a10 [obj->0x0=0x1051a10 'core.gt4'] built=0x10d1a50
+
+$s4 = 0x01FFFE80, the stack frame W71 identified long ago, and $s1 = 0x010D1A50 -- which is the buffer
+the successful open reads. So `sw $s1, 0x4($s4)` at 0x1003e98 stores into a stack slot, not into the path
+buffer, and W85's "new wall is a guest store at 0x1003e98" was wrong.
+
+Two errors in that, both mine, both recorded:
+
+  * The `pc=` on a SHADOWCHANGE line is the pc of the store being ANNOUNCED, and the observer runs
+    before the store applies, so it names the NEXT instruction rather than the writer. I wrote that
+    caveat into W82 and W84 and then read a pc off a SHADOWCHANGE line as the culprit anyway. Only the
+    W84BRACKET ring is attribution; the culprit fields are not.
+  * I decoded 0xae910004 as `sw $s2, 0x4($v0)` and briefly thought the recompiler had the wrong
+    registers in the generated unit. rs = 20 ($s4), rt = 17 ($s1). The emitted code was right.
+
+The instrument is now: a ring of the last eight announcements with their PCs, printed on a change, plus
+a deduplicated native backtrace for any getMemPtr covering the watch window. That combination named the
+W84 writer outright and it is what to reach for next.
+
+### Still unknown
+
+No guest frame. The disc file opens and then the boot runs 274 functions and shuts down, so whatever
+comes after the open is the next wall and it has not been looked at yet. Also unexplained: the same
+buffer address 0x01051A10 is still being written with "core.gt4" and then zeroed by a thread that is not
+the one that goes on to open the file, which may be the guest using one scratch buffer from two threads
+or may be us handing the same scratch to two of them.

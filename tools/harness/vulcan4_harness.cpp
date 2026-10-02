@@ -295,6 +295,30 @@ void watchGuestStoreForPath(uint32_t guestAddr,
     // events; those three stores are twelve bytes, which is the size of the change. If $s1 is
     // 0x010518B0 they are the writer. Report the register and the three computed addresses, and
     // nothing that was not measured.
+    // W86. $s4 and $s1 at pc=0x1003e98, which the generated unit says is `sw $s1, 0x4($s4)`. W85
+    // measured that store landing 0x05 0x80 0x2f into 0x01051A13 -- one byte into the buffer the
+    // failing open reads, and 0x8005 is a GS register word. So: is $s4 really 0x01051A0F, and what is
+    // $s1? Report the registers, not a story about them.
+    if (ctx != nullptr && ctx->pc == 0x01003E98u)
+    {
+        static int w86Logs = 0;
+        if (w86Logs < 3)
+        {
+            ++w86Logs;
+            const uint32_t s4 = getRegU32(ctx, 20);
+            RUNTIME_LOG("W86 SW86 pc=0x1003e98 s4=0x" << std::hex << s4
+                        << " s4+4=0x" << (s4 + 4u)
+                        << " s1=0x" << getRegU32(ctx, 17)
+                        << " v0=0x" << getRegU32(ctx, 2)
+                        << " a0=0x" << getRegU32(ctx, 4)
+                        << " a1=0x" << getRegU32(ctx, 5)
+                        << " a2=0x" << getRegU32(ctx, 6)
+                        << " a3=0x" << getRegU32(ctx, 7)
+                        << " isBuf=" << ((s4 + 4u) >= 0x01051A10u && (s4 + 4u) < 0x01051A40u ? "IN-WATCH" : "no")
+                        << std::dec);
+        }
+    }
+
     if (ctx != nullptr && ctx->pc == 0x0100A3E8u)
     {
         static int s1Logs = 0;
@@ -337,11 +361,27 @@ void watchGuestStoreForPath(uint32_t guestAddr,
     // starts BELOW the window and reaches up into it -- 0x010519B0 is 0x10 below 0x010519C0, so the
     // write lands in the window at a positive offset and nothing else about the announcement looks
     // unusual. Only that case gets a backtrace.
-    if (op != nullptr && std::strcmp(op, "getMemPtr") == 0 && guestAddr < kWatchLo &&
-        guestAddr + 0x1000u > kWatchLo)
+    if (op != nullptr && std::strcmp(op, "getMemPtr") == 0 && overlapsWatch)
     {
+        // W86. Dedupe by address: the path builder hands out a pointer per byte, and a backtrace per
+        // byte tells us nothing. One backtrace per distinct address is the whole signal.
+        static uint32_t sSeenAddrs[16];
+        static uint32_t sSeenCount = 0;
         static uint32_t sTrace = 0;
-        if (sTrace < 6u)
+        bool alreadySeen = false;
+        for (uint32_t q = 0; q < sSeenCount; ++q)
+        {
+            if (sSeenAddrs[q] == guestAddr)
+            {
+                alreadySeen = true;
+                break;
+            }
+        }
+        if (!alreadySeen && sSeenCount < 16u)
+        {
+            sSeenAddrs[sSeenCount++] = guestAddr;
+        }
+        if (!alreadySeen && sTrace < 16u)
         {
             ++sTrace;
             void *frames[8];

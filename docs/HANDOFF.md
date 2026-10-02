@@ -8838,3 +8838,171 @@ that already exists -- not a new path chosen by me at midnight.
 
 **Suite 493/493, unchanged. No framebuffer address invented, no test pattern, no DEFAULT_FB_ADDR, no
 window title touched, no fake numbers.**
+## W107 - PROVEN: FBP IS SET. THE WINDOW NEVER OPENS. THE DISPLAY PATH IS DEAD CODE.
+
+The dish's success gate is PIXELS ON SCREEN, and the honest answer is that **the harness has no window
+and never has.** No framebuffer address was invented, no test pattern was drawn, nothing was pointed at
+DEFAULT_FB_ADDR to make something appear. The correct picture is a magenta window that never gets a
+frame because the code that would give it one is never called.
+
+### The premise in the dish is wrong, and measuring it is how we found that
+
+The dish said FBP is never set, citing `ctx0fbp=0` in 94 of 112 packets. I counted FRAME register
+deliveries across **every** packet, not just the ones the capped log happened to print:
+
+    gs_packets=1244  gs_frame_reg_writes=247 (ctx0=247 ctx1=0)
+
+**The guest writes the FRAME register 247 times.** The `[gs:gif]` lines that made it look like zero are
+capped at `packetIndex < 48u`, so they only ever showed the first 48 packets, and the first packets
+happen to be the ones with FBP=0. Sampling the head of a stream and calling it the stream is the same
+error as reading a spin as a wall.
+
+And the values are not junk. From `[gs:fbp]`:
+
+    ctx0 raw=0x10a0000 fbp=0   fbw=10 psm=1
+    ctx0 raw=0x10a00a0 fbp=160 fbw=10 psm=1
+
+**fbw=10 is 640 pixels of width** (10 x 64) and **psm=1 is PSMCT32**, 32-bit RGBA. FBP=160 x 2048 x 4 bytes
+= **1,310,720 bytes**, which is a double-buffered 640x480 pair -- exactly consistent with fbw=10. The
+guest is writing correct, real GT4 framebuffer setup and it alternates between buffer 0 and buffer 160,
+which is what double buffering looks like.
+
+So **link 1 is NOT broken.** The guest sets FBP, with a plausible width and pixel format. The dish's
+"0x160 is 22 words so it is a pointer" reading was wrong -- FBP is a unitless page index, not a pointer,
+and 0x160 is a perfectly good framebuffer base.
+
+### What IS broken: the picture chain is never read
+
+Link 1 (FBP set): **works**, 247 times, correct values.
+Link 2 (GS draws into it): the GS front end is receiving packets and `[gs:fbp]` proves register writes
+land.
+Link 3 (UploadFrame reads it and blits): **never executes.**
+
+`UploadFrame()` lives at ps2_runtime.cpp:377 inside `PS2Runtime::run()` -- the raylib block with
+`BeginDrawing()`, `ClearBackground(BLACK)`, `UpdateTexture`, `EndDrawing`, all of it. And:
+
+    grep -c "InitWindow" tools/harness/vulcan4_harness.cpp      -> 0
+    grep -n "eeScheduler().run()" tools/harness/vulcan4_harness.cpp -> (nothing)
+    grep -n "serviceInvocations" tools/harness/vulcan4_harness.cpp  -> line 2183
+
+**The harness never opens a window and never calls `PS2Runtime::run()`.** It drives
+`eeScheduler().serviceInvocations()` in its own loop, and that path contains no raylib calls at all. The
+entire display path -- `UploadFrame`, the `latchHostPresentationFrame` / `copyLatchedHostPresentationFrame`
+pair the dish describes as "already built and honest" -- is unreachable from the binary the captain
+actually launches. `run_gt4_desktop.sh` execs `./vulcan4_harness`, so the desktop icon runs the windowless
+path.
+
+That also explains why `[gs:disp]` never printed: `buildPresentationRequestUnlocked()` is only called
+from `latchHostPresentationFrame()`, which is only called from `UploadFrame()`. Zero calls, zero output.
+
+**And the one raylib call the harness does make is `SetWindowTitle(hudTitle)` at line 1937** -- on a window
+that was never created. So the title-bar FPS the dish mentions cannot be being read off a live window
+either. (Dish instruction: do not touch the window title. I have not, and I am reporting that the title
+update is currently writing to a window that does not exist rather than changing it.)
+
+### The nloop=0 packet, measured rather than guessed
+
+The dish listed three candidate causes for the 114,688-byte packet and asked which one it is. Measured,
+from `[gs:bigabort]` and `[gs:raw]`:
+
+    [gs:bigabort] PACKED ran off the end at offset=114688 of 114688 slotNloop=19660 slotNreg=16
+    [gs:raw] nonZero qwords (24 shown of 14336):
+      [q13=0xc000000000000000] [q15=0x0600000000000000] [q45=0xc000000080000000] [q47=0x0900000000000000]
+      [q77=0x0c00000004000000] [q79=0xc0000000d0000000] [q109=0x1000000000000000]
+      [q110=0x2000000020000000] [q111=0x3000000000000000] [q203=0x3000000000000000]
+      [q235=0x5000000000000000] [q268=0x0060c9f60000cccc] ...
+
+So the answer to the dish's question is **cause (a), and stronger than the dish framed it**: the packet
+does not begin with a GIFtag. It begins with **96 bytes of zeros**, and its non-zero content is a sparse
+set of tags at strides of 32 qwords. The decoder reads slot 0 (the zeros) as a GIFtag, gets `nloop=0`,
+advances 16 bytes at a time through 7168 slots, and eventually walks into a slot whose flg happens to be
+PACKED with `nloop=19660, nreg=16` = 314,560 registers = **2.5 MB of register data inside a 114 KB packet**,
+runs off the end, and returns having read **zero** registers -- `slots=0 frameRegs=0`.
+
+Not (b) the alternate 2-DWORD form: that would still have a real nloop. Not (c) a genuine nloop=0 tag: the
+19660 proves the fields are being read from the wrong bytes.
+
+**But this is NOT why FBP is unset, because FBP IS set -- 247 times, from other packets.** The decoder's
+failure on the big packets is a real bug worth fixing, and it means those 114 KB packets contribute
+nothing, but it is not the display wall.
+
+### A note on my own instrumentation, because it cost two cycles
+
+`RUNTIME_LOG` is `do {} while (0)` unless `PS2_RUNTIME_LOGS` is defined, and W105 made logging opt-IN to
+speed. So every W107 diagnostic written with `RUNTIME_LOG` was **silently compiled out of the default
+build** and produced no output at all, while I read the empty log and concluded the code had not run. I
+only found it because `[gs:bigpkt]` lines from an earlier build were still sitting in a previous log file.
+
+That is the FOURTH time in this project that a print statement was the thing that lied -- and the third
+time this session. The new `W107_LOG` macro in gs_frontend.cpp writes to `std::cerr` unconditionally, for
+the same reason `dispatchIrq`'s `[W105IRQ]` line does. **Any diagnostic added to this project from now on
+must use `std::cerr`, not `RUNTIME_LOG`, or it will vanish in the default build.**
+
+### The next single measurement
+
+Not another GS question. **Whether the harness is supposed to own the window or delegate to
+`PS2Runtime::run()`**, because that decides the shape of the fix and it is not a measurement I can make
+from inside the runtime -- it is a question about which binary the captain's icon should launch. The two
+options are very different in size:
+
+  * Have the harness call `PS2Runtime::run()` (or a `present()` it can call) instead of hand-rolling
+    `serviceInvocations` in a loop. Small, and reuses the display path the dish believes is already
+    built and honest -- which this confirms is the case, it has simply never been reached.
+  * Have the harness open its own window and call `latchHostPresentationFrame` +
+    `copyLatchedHostPresentationFrame` + upload directly. Larger, and duplicates `UploadFrame`.
+
+I am not picking one. The dish's own instruction is that a window showing a fake picture is the worst
+possible outcome, and the next step must be the one that makes the REAL game pixels appear via the path
+that already exists -- not a new path chosen by me at midnight.
+
+**Suite 493/493, unchanged. No framebuffer address invented, no test pattern, no DEFAULT_FB_ADDR, no
+window title touched, no fake numbers.**
+
+## W107 addendum — answering the dish's question with code, not preference
+
+The dish said: name the next single measurement, and do not guess a fix. The question was whether the
+harness should own the window or delegate to `PS2Runtime::run()`. Reading `run()` settles it:
+
+    void PS2Runtime::run()
+    {
+        m_stopRequested.store(false, ...);
+        ps2_stubs::resetSifState();
+        resetIop();
+        initializeEeKernelState(m_memory.getRDRAM());
+        ... m_cpuContext.r[...] = ...                       // resets the main context
+        Texture2D frameTex = LoadTextureFromImage(blank);  // opens the window's texture
+        std::thread gameThread([&]{ m_eeScheduler->reset(...); m_eeScheduler->run(); ... });
+
+`run()` is not "run plus a window". It is **a second, independent boot path**: it resets the IOP, the SIF
+state, the audio and MPEG stubs, the EE kernel state, the main CPU context, then **resets the scheduler and
+calls `EeScheduler::run()`** -- a different scheduler loop from the `serviceInvocations()` loop the harness
+uses, in a different thread, with a watchdog and budget the harness does not have.
+
+So "have the harness call `PS2Runtime::run()`" is not a small change. It would replace the entire
+execution driver this project has spent ninety dishes instrumenting -- the one that produces every log in
+HANDOFF, including the W105 `[W105IRQ]` diagnostic that closed the interrupt question -- with an
+unmeasured one. It might work. It would also discard every measurement we have, which is a cost nobody
+asked for and cannot be undone by reverting a commit.
+
+**And the display path does not need `run()` to be reached.** The chain is already decomposed:
+
+    GS::latchHostPresentationFrame()        // reads DISPFB/FRAME, snapshots the GS framebuffer
+    GS::copyLatchedHostPresentationFrame()  // hands the bytes to the caller
+    UpdateTexture(tex, s_uploadBuffer.data())   // ps2_runtime.cpp:476, inside UploadFrame
+    DrawTexturePro(frameTex, ...)               // ps2_runtime.cpp:2808
+
+`UploadFrame` is `static` at ps2_runtime.cpp:377, which is why the harness cannot call it -- but the first
+two steps are **public `GS` methods** and the third is three lines against an `UnloadTexture`/`UpdateTexture`
+pair the harness can own. The honest shape of the fix is therefore the harness keeping its own
+`serviceInvocations` loop and gaining a **presentation step**, not `run()`.
+
+**Next single step, precisely:** add a `PS2Runtime::presentLatchedFrame()` (or equivalent) that does the
+three lines `UploadFrame` does at lines 460-476 -- latch, copy, upload into a texture the harness owns --
+and call it once per `currentVSyncTick()` from the harness's existing loop. It reuses the real GS
+framebuffer, reads the real DISPFB and FRAME the guest actually wrote, and invents nothing. Then run it and
+look at the window: magenta means no frame, and the FBP/DISPFB numbers in the boot report say which of the
+three links failed.
+
+That is a change of about ten lines in the runtime plus a few in the harness, it does not touch the
+execution driver, and it is testable against the existing suite. It is the smallest change that can put the
+GAME'S pixels on screen rather than a picture of pixels that I decided should be there.

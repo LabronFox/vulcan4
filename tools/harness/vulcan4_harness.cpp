@@ -47,6 +47,14 @@
 #include "Stubs/MPEG.h"
 #include "ps2_log.h"
 #include "runtime/syscall_names.h"
+// W101: SetWindowTitle(), so the game window can carry its own live vitals.
+#include "raylib.h"
+
+// W101. The north star's frame counter, defined in ps2xRuntime's gs_frontend.cpp inside an
+// anonymous namespace, so it cannot be included -- only declared. This binds the harness to a
+// private symbol; if a runtime refactor renames it, the LINK FAILS LOUDLY AT BUILD TIME, which is
+// the only acceptable failure mode here. A silent 0 would read as "the guest drew nothing".
+extern std::atomic<uint64_t> &guestFrameCounter() noexcept;
 #include "ps2_recompiled_stubs.h"
 
 #include <ps2_recompiled_functions.h>
@@ -1538,6 +1546,10 @@ int main(int argc, char *argv[])
     const char *haltReason = kHaltEntryBudget;
     uint32_t haltPc = entryPoint;
     std::string haltDetail;
+    // W103. The last PC that resolved to a real generated function, and whether there ever was
+    // one. Recorded on every successful table lookup so a wild jump can name its own origin.
+    uint32_t lastResolvedPc = 0;
+    bool lastResolvedPcValid = false;
 
     std::unordered_map<uint32_t, std::string> functionNames; // address -> name, first time seen
     std::map<uint32_t, GuestCall> missing;                  // address -> named call
@@ -1864,6 +1876,72 @@ int main(int argc, char *argv[])
             break;
         }
 
+        // ---- W101. THE TITLE BAR IS THE HUD.
+        //
+        // The captain asked for the game window itself to carry the speed and the frame rate,
+        // instead of a third terminal window that renamed it. Simpler, and more honest: these are
+        // read from the same atomics the PROGRESS line prints, in the same process, at the same
+        // instant. No second process tails a file, so nothing here can report another boot's
+        // numbers -- which is exactly the failure the captain was reading about in W67.
+        //
+        // FPS is measured across a wall-clock window, not per iteration. Iterations are
+        // microseconds apart, so a per-iteration delta is mostly noise; "frames in the last half
+        // second" is both smoother and the thing a human watching actually means by it.
+        //
+        // Speed is EE cycles per wall second against a 60 Hz NTSC PS2, reported as a multiplier and
+        // not a percentage. The guest spends nearly all of its time not drawing, so a percentage of
+        // "PS2 speed" would be a real number describing the wrong thing.
+        {
+            static uint64_t hudFramesAtMark = 0;
+            static uint64_t hudCyclesAtMark = 0;
+            static int64_t hudMarkNs = 0;
+
+            const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - start)
+                                      .count();
+            const uint64_t cyc = runtime.eeScheduler().snapshot().eeCycle;
+
+            if (hudMarkNs == 0)
+            {
+                hudMarkNs = nowNs;
+                hudFramesAtMark = guestFrameCounter().load();
+                hudCyclesAtMark = cyc;
+            }
+            else if (nowNs - hudMarkNs >= 500000000ll) // 0.5 s
+            {
+                const double secs = static_cast<double>(nowNs - hudMarkNs) / 1e9;
+                const uint64_t frames = guestFrameCounter().load();
+                const uint64_t deltaFrames = frames > hudFramesAtMark ? frames - hudFramesAtMark : 0u;
+                const uint64_t deltaCycles = cyc > hudCyclesAtMark ? cyc - hudCyclesAtMark : 0u;
+
+                const double fps = static_cast<double>(deltaFrames) / secs;
+                // kEeClockHz = 294,912,000 is how many EE cycles a real PS2 retires in ONE WALL
+                // SECOND. So (cycles retired per wall second) / kEeClockHz is exactly "PS2 seconds
+                // passing per wall second" -- the speed, as a multiplier. 1.0x means real time.
+                //
+                // It was briefly kEeClockHz/60, i.e. cycles per FRAME, which reports a 60x-too-high
+                // number: the first run printed 37.76x for a boot that was measurably dying at
+                // 3.77 s having retired 1,110,858,603 cycles -- 1,110,858,603 / 3.771 s is
+                // 294.6M/s, which is 1.00x. The honest figure for that boot is about 0.6x, not
+                // 37x. A "faster than the hardware" claim is exactly the kind of number that should
+                // never survive a unit check, and the only reason it did is that nothing compared it
+                // against the ee_cycle figure printed in the very same run.
+                constexpr double kEeCyclesPerPs2Second = 294912000.0;
+                const double speed =
+                    static_cast<double>(deltaCycles) / secs / kEeCyclesPerPs2Second;
+
+                char hudTitle[128];
+                std::snprintf(hudTitle, sizeof(hudTitle),
+                              "VULCAN 4 - FPS: %.1f | Speed: %.2fx PS2 | %llu frames",
+                              fps, speed, static_cast<unsigned long long>(frames));
+                SetWindowTitle(hudTitle);
+
+                hudFramesAtMark = frames;
+                hudCyclesAtMark = cyc;
+                hudMarkNs = nowNs;
+            }
+        }
+
         // ---- wall clock
         const auto elapsedSeconds = std::chrono::duration_cast<std::chrono::seconds>(
                                    std::chrono::steady_clock::now() - start)
@@ -1958,6 +2036,31 @@ int main(int argc, char *argv[])
             haltReason = kHaltOutOfTable;
             haltPc = ctx.pc;
             haltDetail = "pc is outside the generated function table";
+
+            // W103. NAME THE CULPRIT. The guest dies at some address it can never have meant to
+            // execute -- W100's was 0x8481e343, which is offset 0x481E343 = 72.1 MB into a 32 MB
+            // machine, i.e. a value that was never a code pointer at all. Knowing the dead address
+            // tells you the guest was already lost; it does NOT tell you which instruction threw
+            // it, and that instruction is the entire fix.
+            //
+            // So keep the last PC that resolved to a real generated function and its return
+            // address. On a crash the pair reads "the guest was inside <function>, and its
+            // $ra already held 0x8481e343" -- which is either a bad jr/jalr target, or a return
+            // onto a stack slot something else scribbled on. Those are two completely different
+            // bugs and the fix for one is worthless against the other.
+            // Registers are a raw __m128i r[32] with no named members, so they are read through
+            // the same accessor the rest of this harness uses. On the PS2 R5900: r0 is the zero
+            // register, r2 ($v0) is the return value, r29 ($sp), r31 ($ra).
+            const uint32_t raNow = getRegU32(&ctx, 31);
+            const uint32_t spNow = getRegU32(&ctx, 29);
+            const uint32_t v0Now = getRegU32(&ctx, 2);
+            const uint32_t s0Now = getRegU32(&ctx, 16);
+
+            std::cout << "VULCAN4 WILDPC dead=" << toHex(haltPc)
+                      << " last_good=" << (lastResolvedPcValid ? toHex(lastResolvedPc)
+                                                               : std::string("NONE"))
+                      << " ra=" << toHex(raNow) << " sp=" << toHex(spNow)
+                      << " v0=" << toHex(v0Now) << " s0=" << toHex(s0Now) << std::endl;
             break;
         }
 
@@ -1991,6 +2094,10 @@ int main(int argc, char *argv[])
         }
 
         // ---- enter the guest function. It runs inline until it yields at a guest branch.
+        // W103. Remember this PC: it is the last place the guest was verifiably executing real
+        // recompiled code, so if the next PC is garbage, this is where the guest went wrong.
+        lastResolvedPc = ctx.pc;
+        lastResolvedPcValid = true;
         if (functionNames.find(ctx.pc) == functionNames.end())
         {
             std::ostringstream name;
@@ -2008,8 +2115,21 @@ int main(int argc, char *argv[])
         // between watching the boot climb and guessing whether it is still climbing.
         if ((functionsEntered % 50000u) == 0u)
         {
+            // W101. FRAMES= is the live count from the same atomic the north star increments.
+            // The `VULCAN4 FRAME source=guest` line deliberately prints only the first 64 frames
+            // and then every 1000th, so counting those lines gives a frame rate that updates once
+            // every ~19 minutes at boot speed -- technically honest, practically useless, and it is
+            // the only way the captain can see the frame rate at all. Reading the counter itself
+            // costs one atomic load and makes this line the real heartbeat.
+            //
+            // The counter lives in an anonymous namespace inside gs_frontend.cpp, so it is declared
+            // here rather than included. That is a real coupling and it is the reason this is
+            // W101's smallest change and not a wider refactor: it binds the harness to a private
+            // symbol that a future runtime refactor can rename. If that rename ever happens, the
+            // link fails loudly at build time -- never silently at runtime.
             std::cout << "VULCAN4 PROGRESS entry=" << functionsEntered
                   << " TRUE_ENTRIES=" << ps2_log::entryCounter().load()
+                      << " FRAMES=" << guestFrameCounter().load()
                       << " distinct=" << distinctPcs
                       << " wall_ms="
                       << std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2884,6 +3004,18 @@ std::cout << "\n";
               // these count what we RAN, and on GT4 they are ~221,000 against 31 VBlanks -- three
               // million syscalls executing in here, none of them visible to functions_entered.
               << " invocations_run=" << kernelSnapshot.invocationsRun
+              << " vblanks_processed=" << kernelSnapshot.vblankStartProcessed
+              << " intr_queued=" << kernelSnapshot.invocationsQueued
+              << " intr_run=" << kernelSnapshot.invocationsRun
+              << " intr_run_by_kind=" << kernelSnapshot.invocationsRunByKind[0]
+              << " step_intr_run=" << kernelSnapshot.stepIntrRun
+              << " irq_q=" << kernelSnapshot.irqQueuedOnly
+              << " irq_attach=" << kernelSnapshot.irqAttached
+              << " irq_runsite=" << kernelSnapshot.irqRunSite
+              << " irq_done=" << kernelSnapshot.irqCompleted
+              << " pending_now=" << kernelSnapshot.pendingInvocationsNow
+              << " pending_hi=" << kernelSnapshot.pendingInvocationsHighWater
+              << " thread_attached=" << kernelSnapshot.threadInvocationsAttached
               << " inv_by_kind=[intr=" << kernelSnapshot.invocationsRunByKind[0]
               << ",dmac=" << kernelSnapshot.invocationsRunByKind[1]
               << ",override=" << kernelSnapshot.invocationsRunByKind[2]

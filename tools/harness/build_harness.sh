@@ -13,7 +13,11 @@ set -euo pipefail
 R=${VULCAN4_REPO:-/home/or/vulcan4}/tools/PS2Recomp
 B=${VULCAN4_BUILD:-/mnt/ssd/vulcan4-build}
 G=$B/recomp
-INC="-I$G -I$R/ps2xRuntime/include -I$R/ps2xRecomp/include -I$R/ps2xRuntime/src/lib/Kernel -I$R/ps2xIOP/include"
+# W101: raylib.h, so the harness can call SetWindowTitle() and put the live FPS/speed in the
+# game window's own title bar. It was already on the LINK line below (libraylib.a), it just
+# was never on the COMPILE line -- the runtime gets it transitively through
+# ps2_host_backend.h, but nothing outside the runtime can. Same library, both halves.
+INC="-I$G -I$R/ps2xRuntime/include -I$R/ps2xRecomp/include -I$R/ps2xRuntime/src/lib/Kernel -I$R/ps2xIOP/include -I$B/_deps/raylib-src/src"
 # W97. LOGGING IS OFF UNLESS ASKED FOR, AND THIS IS THE LARGEST COST IN THE PROGRAM.
 #
 # Measured with strace on a 20 s boot:

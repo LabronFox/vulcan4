@@ -8062,3 +8062,91 @@ is 126K-1.5M per 60 s, and the "3.6% of real PS2 speed, 28x slower than hardware
 file is retracted. The boot now dies at 3.77 seconds, two runs in three, on a jump to 0x8481E343, and
 the cause is a syscall table at 0x80011F80 that the whole runtime reads and nothing ever writes. Suite
 492/492.
+## W105 - A SUCCESSFUL NEGATIVE RESULT: THE INTERRUPTS ARE ALREADY DELIVERED
+
+The dish asked for one diagnostic first, to separate (A) the mask gate from (B) an empty `matching`. One
+run answered it, and the answer was **neither**.
+
+### (A) and (B) are both ruled out by measurement
+
+    [W105IRQ] cause=2 dmac=0 mask=0xffffffff bit2=SET handlers=4
+    [W105IRQ]   handler=0x100da70 cause=0  enabled=1 hasFunction=1 matchesCause2=0
+    [W105IRQ]   handler=0x100d950 cause=5  enabled=1 hasFunction=1 matchesCause2=0
+    [W105IRQ]   handler=0x100d838 cause=2  enabled=1 hasFunction=1 matchesCause2=1
+    [W105IRQ]   handler=0x1029388 cause=11 enabled=1 hasFunction=1 matchesCause2=0
+
+`mask=0xffffffff`, so bit 2 is **SET**: the gate at the top of `dispatchIrq` does not reject it, and the
+latch-on-unmask fix (A) describes is not needed — the mask is already wide open. And `matchesCause2=1`:
+there IS a registered, enabled, resolvable handler for cause 2, at guest address `0x100d838`, which is
+`sub_0100D838`. So `matching` is not empty either, and `hasFunction()` is not rejecting anything.
+
+**`dispatchIrq(false, 2u)` takes the full path and queues a real invocation, 1181 times in a 15 s boot.**
+The premise that 224 vblanks produce 0 interrupts was never about the mask or the handler table. It was
+about the counters.
+
+### `interrupts_raised` and `interrupts_delivered` are STRUCTURALLY VACUOUS
+
+This is the finding, and it is the exact failure mode Law 3 exists to prevent — a zero that reads like
+a measurement of nothing and is actually a count of never-asked.
+
+  * `interrupts_raised` is written in exactly one place: `PS2Runtime::raiseInterrupt()`. **It has zero
+    callers anywhere in the runtime.** `dispatchIrq` never calls it, and nothing else does either.
+  * `interrupts_delivered` is written in exactly one place: `servicePendingInterrupt()`, which is gated
+    on `m_pendingInterrupts != 0`, which only `raiseInterrupt()` sets — so it is unreachable through the
+    same missing edge.
+
+Both counters read 0 because **nothing increments them**, not because interrupts are not happening.
+Note that W87 recorded "raiseInterrupt has zero callers" and concluded from it that interrupts were
+delivered by direct guest invocation instead — which was right about the mechanism and wrong to treat
+as settled, because the counter kept being printed as if it were live.
+
+### THE INTERRUPTS ARE DELIVERED, AND I MEASURED IT
+
+    vblanks_processed=808  step_intr_run=2711  irq_q=1181  inv_by_kind=[intr=2711,dmac=0,override=0,other=0]
+
+**2711 interrupt invocations ran.** To get that number I had to add a counter that did not exist: the
+only place counting invocations was inside `run()` (the W20 comment there says so), and
+**`serviceInvocations()` — the path the driver actually uses — had no equivalent counter at all.** So
+`inv_by_kind=[intr=0]` was measuring a counter that code path never touched. That is the whole bug in
+one sentence: the interrupts were being served the entire time and the instrument said zero.
+
+The counting is now in both places, with the same index-by-kind contract, so `Interrupt` lands in slot 0
+and reads as `inv_by_kind intr=N`. Also added, because I had been misled by them once: `irq_q` (queued),
+`irq_attach`, `irq_runsite`, `irq_done` and `pending_hi`. The first attempt put the attach counter only
+on `run()`'s line 257 and read `irq_attach=0` while the queue demonstrably drained — because
+`serviceInvocations()` has its own attach site at line 1297. Measuring at one site when there are four
+drain paths (lines 123, 187, 262, 1299) is how you get a confident zero.
+
+### What this means for the dish's success criterion
+
+The dish asked for `interrupts_raised > 0` and `interrupts_delivered == interrupts_raised`. **That
+criterion is unreachable in this codebase**, for the structural reason above, and I am reporting that
+rather than quietly declaring a different number a win. The meaningful form of the criterion is met and
+measured: interrupt invocations are delivered to the guest, 2711 of them, and the guest runs them.
+
+**And the boot still does not leave startup.** That is the negative result, stated with its numbers:
+
+    15 s boot: 56 guest frames (VULCAN4 FRAME source=guest), true_guest_entries ~225,000-1.85M per 60 s,
+    halt=livelocked in SCE syscall 0x32 (SleepThread), 54046 of 56609 guest syscalls are SleepThread.
+
+So: interrupts delivered, frames drawn, and the guest still parks in the sleep/poll loop W89 named
+(`sce_SleepThread` at `0x0101F348`, flag byte in scratchpad at `0x70002085`, both threads writing it,
+handshake balanced). The vblank question is CLOSED and it was not the wall. **The next wall is the
+sleep loop, and it is not an interrupt problem.**
+
+### What I did NOT do
+
+  * I did not delete or relax the mask gate in `dispatchIrq`. The mask is `0xffffffff`; there was never
+    anything to latch. Deleting it would have delivered interrupts the guest never asked for.
+  * I did not touch `processDueDeadlines()`. The W104 result stands (287M -> 89M cycles/s and still zero
+    interrupts) and the deadline gate is not the bug.
+  * I did not touch `docs/` or the harness window title.
+
+### The next single measurement
+
+`interrupts_raised` should be made honest rather than left as a zero nobody can move: either
+`dispatchIrq` should call `raiseInterrupt()` so the COP0 path exists, or the boot report should stop
+printing it as though it means something. Until one of those happens, every future run re-derives this
+false negative. Then the sleep loop is the whole remaining question: 54046 sleeps at one pc, and the
+thing worth measuring is what the guest is waiting for inside them — the `EVDUE`/`WILDPC` instrumentation
+is already in the tree for exactly that.

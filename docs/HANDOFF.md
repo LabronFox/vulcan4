@@ -7842,3 +7842,126 @@ second, reaching the end of the boot is a matter of hours.
 
 So the main job is the one the goal asks for and the one nobody has ever done here: turn everything
 off, which is now the default, and let it run.
+## W99 - THE NORTH STAR EXISTS NOW, AND IT FIRES. ALSO: THE HEADLINE NUMBER WAS COUNTING THE WRONG THING.
+
+### 1. `VULCAN4 FRAME source=guest` was never implemented. Now it is, and it prints.
+
+    VULCAN4 FRAME source=guest n=1 bytes=128
+    VULCAN4 FRAME source=guest n=2 bytes=96
+    VULCAN4 FRAME source=guest n=3 bytes=114688
+    VULCAN4 FRAME source=guest n=4 bytes=96
+    VULCAN4 FRAME source=guest n=5 bytes=2048
+
+**53 guest frames in 90 s, and 52, 52, 53 in three separate 60 s runs.** Stable across every run
+attempted. A previous dish found that this marker had no code behind it anywhere in the repository and
+wrote it down; the consequence is that "no frame has ever come from the guest" was never a measurement.
+It was the absence of a string nothing emitted, and every boot has been called a black screen against a
+finish line that could not fire.
+
+It fires in GS::processGIFPacket(), because that is where the GUEST hands the GS a packet of drawing.
+A call there is the guest drawing, by definition, which is what "source=guest" is supposed to mean --
+as against a frame the runtime put up by itself, which is what this project's history has actually been
+showing. What is NOT claimed: that the picture is correct. The triangle oracle judges pixels and passed
+long ago (area 39936, error 0.000%). What was missing was any statement that the guest drew at all.
+
+**The guest is drawing. That is the first statement in this file that can be checked.**
+
+### 2. `functions_entered` was counting outer dispatcher iterations, not guest function entries.
+
+    60 s:  functions_entered=9,916     true_guest_entries=249,767,293
+    60 s:  functions_entered=1,971    true_guest_entries=126,303
+    60 s:  functions_entered=2,330    true_guest_entries=237,568
+    60 s:  functions_entered=22,350   true_guest_entries=1,501,065
+
+The harness increments `functionsEntered` once per OUTER DISPATCHER ITERATION, and the dispatcher
+inlines callees (W71), so one iteration can be tens of thousands of real function calls. **Every
+progress claim in this project, and every "wall" named from this number, has been measured with a
+counter that counts something else.** At its worst the gap is ~25,000x.
+
+`true_guest_entries` is a relaxed atomic increment inside PS_LOG_ENTRY, which is expanded at the top of
+every one of the 639 generated functions. It costs about a nanosecond.
+
+**Two placement mistakes, both mine, and both the same shape.** The counter first went inside
+`#if AGRESSIVE_LOGS`, so turning the logging off removed the counter -- a measurement placed where the
+thing it measures decides whether it exists. Then `PS_LOG_ENTRY` itself was `((void)0)` without logging,
+so the counter had no caller. It now always increments and only does I/O when logging is on, and the
+counters live outside the conditional entirely.
+
+**The numbers vary by ~12x between runs of the same binary, and the 249,767,293 outlier is 200x above
+any other run. I do not trust it and it is recorded rather than quoted.** The plausible figure is
+126K-1.5M per 60 s. The earlier claim in this file that the guest runs at 21 entries per second, and
+therefore at 3.6% of real PS2 speed and 28x slower than hardware, is WRONG and is retracted: it divided a
+wall-clock-second sample by a counter that was not counting function entries.
+
+### 3. The build script's staleness check was missing a header AND the compile flags.
+
+    build_harness: header newer than the generated object -- ps2_log.h
+
+The check named the .cpp and two headers. `ps2_log.h` was not one, so changing `PS_LOG_ENTRY` -- which is
+expanded inside every generated function -- did not rebuild the generated unit. The script's own
+comment, forty lines above, explains this exact failure mode and then misses a header. Worse, the flags
+were an input too and `DEFS` lives only in the script, so dropping `-DPS2_FUNCTION_LOG_TRACKER` also
+changed nothing on disk that the check was watching.
+
+**Two complete build-and-run cycles were lost to this, each reporting true_guest_entries=0 with a green
+build and no warning.** It is now a stamp file: the flags are written next to the object and compared,
+so DEFS, the frame-pointer knob, any runtime header, or the .cpp all trigger a rebuild, and none of
+them means the 640-function compile is not paid for.
+
+### 4. The trace flushed on every line.
+
+`log_entry` and `log_exit` both ended in `log_stream().flush()`, so tracing cost two `write(2)`
+syscalls per guest function entry on top of the ostream work. ofstream is a buffered stream; flushing
+it per line throws the buffering away. Now flushed on a line budget. Measured effect on guest
+throughput: none -- logging off changed 1287 to 1269 entries in 60 s, which is noise. The flush was
+still wrong and the fix stands, but it is not where the time went and I am not claiming it is.
+
+### 5. The new wall, and it is specific and reproducible.
+
+Three consecutive 60 s runs:
+
+    run 1: frames=52  halt=pc_outside_generated_table  pc=0x8481e343  syscalls=16442
+    run 2: frames=52  halt=pc_outside_generated_table  syscalls=22050
+    run 3: frames=53  halt=wallclock_deadline          syscalls=171203
+
+    VULCAN4 HARNESS detail=pc is outside the generated function table pc=0x8481e343
+
+**0x8481E343 is above 0x80000000, so it is a KSEG0 address** -- the direct-mapped kernel window, and
+with PS2_RAM_MASK 0x1FFFFFF it resolves to physical 0x0481E343, which is not RAM this machine has. The
+guest is transferring control to a kernel-range address where no generated function exists. That is a
+jump to a wrong address, not a missing feature, and two runs in three reach it inside 60 seconds.
+
+### 6. Things measured and retracted, because retracting them is the useful part
+
+  * W92's "697x regression" and "the observer costs 9x" were both 12-second-sample noise. Measured over
+    60 s on EE cycles, the store observer costs 7.7%. The observer and the raw-pointer announcements are
+    opt-in now, for the real reason in the code, but neither was ever a 9x.
+  * "843,367 write syscalls in 20 s, so 21,084 guest entries per second" was computed under `strace`,
+    which inflates syscall-heavy workloads without bound. Turning the logging off changed nothing
+    measurable, which is the disproof.
+  * The `1,747,058 entries in 45 s` benchmark in build_harness.sh has **no surviving log behind it**:
+    `grep -rloE "functions_entered=1[0-9]{6}"` over every log in the run directory returns nothing. Logs
+    get pruned here, so it is unconfirmed rather than false, and it is unconfirmed in a way that now has
+    an explanation: the number it measures is not function entries.
+
+### 7. Instrumentation the box refused, and what replaced it
+
+`perf_event_paranoid` is 4, so hardware events and call graphs are out, and `ptrace` is refused for
+`strace -p` too. Neither a system sysctl nor a security setting was touched. What replaced them: a
+SIGPROF/ITIMER_PROF sampler in the harness taking RIP from the ucontext, offsets from the exe base in
+/proc/self/maps, mappings named for anything outside the binary, ranked by COUNT (the first version
+ranked by address and was useless), and a copy-size histogram for the guest's memcpy/memset behind
+VULCAN4_COPY_SIZES. The profile put 75% of all CPU on one address in libc, which cannot be named from
+.dynsym because the memcpy/memset variants are local symbols; the histogram then showed the guest's own
+copies are 46 memsets totalling 24.5 MB, so that address is our C++ copying and not the game's.
+
+The histogram also re-found a live bug it had flagged before: a 16,410,192-byte memset from
+guest pc 0x1010EEC, $s1 = 0xfa6650, length = $s1 + 0x10. Still happening. Still wrong. Its own fix.
+
+### Where the arc stands
+
+Frames from the guest: 52-53 per 60 s, every run. True guest function entries: 126K-1.5M per 60 s, run
+dependent. The guest spends ~94% of its syscalls in sce_SleepThread with a balanced semaphore handshake
+(963 SignalSema / 964 WaitSema), so it is in the poll loop W89 named, and it is drawing while it is
+there. The next thing to chase is 0x8481E343: two runs in three transfer control to a KSEG0 address, and
+that is a concrete, reproducible, named wall.

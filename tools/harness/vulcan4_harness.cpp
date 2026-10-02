@@ -392,6 +392,10 @@ uint32_t g_watchPathHits = 0;
 // W33: the observer needs RDRAM to read the candidate path strings. Set once, before boot.
 uint8_t *g_rdramForWatch = nullptr;
 
+// W96. GS kick counter for the progress line. The GS layer prints [gs:kick] when diagnostics are on,
+// but the default run needs a progress signal and "kicks" is the one that means the game is drawing.
+uint64_t g_gsKickCount = 0;
+
 // W90. A SCRATCHPAD WATCH WINDOW, because the RDRAM one cannot see the thing we are looking for.
 //
 // W89 measured the livelock: the guest resumes from sce_SleepThread at 0x0100AFA8 and runs
@@ -1997,6 +2001,22 @@ int main(int argc, char *argv[])
         }
 
         ++functionsEntered;
+        // W96. PROGRESS, ON BY DEFAULT, ONE LINE PER 50,000 ENTRIES. With the store observer now
+        // opt-in the default run prints nothing at all until it ends, which makes a four-hour run
+        // indistinguishable from a hung one -- and "calling a slow run dead" is this project's most
+        // expensive documented habit. One line per 50,000 entries is free, and it is the difference
+        // between watching the boot climb and guessing whether it is still climbing.
+        if ((functionsEntered % 50000u) == 0u)
+        {
+            std::cout << "VULCAN4 PROGRESS entry=" << functionsEntered
+                  << " TRUE_ENTRIES=" << ps2_log::entryCounter().load()
+                      << " distinct=" << distinctPcs
+                      << " wall_ms="
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count()
+                      << " gs_kicks=" << g_gsKickCount << std::endl;
+        }
         ++pcEntryCounts[ctx.pc];
         entryCallers[ctx.pc].insert(getRegU32(&ctx, 31));
 
@@ -2468,7 +2488,15 @@ int main(int argc, char *argv[])
                                                                                         : "(ready)");
         }
     }
-    std::cout << "VULCAN4 BOOT REPORT functions_entered=" << functionsEntered << " halt=" << haltReason
+    // W97. true_guest_entries is the number that matters and functions_entered never was: the harness
+    // counter is incremented once per OUTER DISPATCHER ITERATION, and the dispatcher inlines callees
+    // (W71), so it under-reports real guest function entries by roughly a thousand. ps2_log's counter
+    // is incremented inside every recompiled function, so it counts what actually ran. Both are
+    // printed, and the honest one is labelled.
+    std::cout << "VULCAN4 BOOT REPORT functions_entered=" << functionsEntered
+              << " true_guest_entries=" << ps2_log::entryCounter().load()
+              << " true_guest_exits=" << ps2_log::exitCounter().load()
+              << " halt=" << haltReason
               << " bios_files=" << biosFilesOpened
               << " interrupts_raised=" << runtime.interruptsRaised()
               << " interrupts_delivered=" << runtime.interruptsDelivered()

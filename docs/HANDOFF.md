@@ -7196,3 +7196,96 @@ paddedEnd = maxLoadedRdramEnd + kGuestHeapSafetyPad and assigns m_guestHeapSugge
 kGuestHeapSafetyPad is 0x1000 at line 92 -- so the pad is in the source and not in the result. Either
 m_guestHeapConfigured was already true when that block ran, or the base is being re-derived elsewhere.
 Not yet established, and it is the next single step.
+## W85 - THE GUEST HEAP COLLISION, FIXED. THE PRODUCT DID NOT MOVE, AND HERE IS THE NEW WALL.
+
+### What W84's chain turned out to be attached to
+
+W84 named the writer of the 21 bytes at 0x010519C0: sceGsResetGraph, from sub_0100A348, writing
+q[2] = pmode at guestMalloc(128,16) + 0x10. That was true and it was ours. But 0x010519C0 is not the
+buffer the failing open reads. From boot_w85c.log:
+
+    [fioOpen] FIRST-FOR-THIS-BUFFER buf=0x1051a10 ra=0x1005008 path="cdrom0:\CDROM0:\;1"
+
+0x01051A10. And 0x01051A10 is 0x60 above 0x010519B0, so the old 128-byte pmode packet
+(0x010519B0..0x01051A30) covered it too. Both buffers were being destroyed by the same allocation.
+
+### Why guestMalloc must not be used for this, measured
+
+    [SetupHeap] base=0x10519ac alignedBase=0x10519b0 size=0xffffffff runtimeEnd=0x1f00000
+
+The GUEST chose that heap base. It is the end of its own image -- the last PT_LOAD ends at 0x010519AC --
+and 0x010519AC + 0x1000 would have been the safe base, which is what the runtime computed for itself:
+
+    [GUESTHEAP] load-time maxLoadedRdramEnd=0x10519ac safetyPad=0x1000 paddedEnd=0x10529ac suggestedHeapBase=0x10529b0 alreadyConfigured=0
+
+The pad is in the source and was in the result: 0x010529B0. The guest then overrode it with its own
+SetupHeap call. So the safety pad is NOT missing and the earlier suspicion in W84's closing note is
+retracted -- there was no bug in the pad, there was a guest that asked for less room.
+
+That makes the collision unavoidable from the guest heap's side and entirely ours from ours. Our
+allocator keeps its own block list and the guest never tells it what the guest allocated, so it
+returned offset 0 of a heap the game was actively using. A syscall that takes a transient internal
+buffer out of the game's heap will collide with the game eventually, and no bookkeeping on our side
+can prevent it.
+
+### The fix
+
+PS2Runtime::allocRuntimeScratch(size, alignment) -- a bump allocator over a 64 KB region at the top of
+the RAM window, kRuntimeScratchBase = PS2_RAM_SIZE - 64 KB = 0x01F00000. The guest's heap limit is
+0x01F00000, so that region is above every limit the guest heap is ever given and a guest allocation
+cannot reach it. It refuses rather than wrapping when it is exhausted, with an explicit
+VULCAN 4 LIMITATION line.
+
+sceGsResetGraph now allocates its packet there. The two guestFree(pktAddr) calls are gone: the buffer was
+never the guest's, and handing an address we do not own back to the guest's free list was wrong twice
+over.
+
+Red then green. "W85: sceGsResetGraph must not build its packet in the guest's heap" poisons
+0x010519B0..0x01051AAF, calls sceGsResetGraph with mode == 0, and asserts not one byte moved:
+RED, 488/489. GREEN after the fix, with the packet still built correctly --
+[gs:gif] idx=28 size=128 nloop=7 -- which is the part that matters, because a fix that stops the
+corruption by not building the packet would be a fix that changes behaviour.
+
+One honest note about the first run of that test: it passed vacuously. getRDRAM() on an uninitialised
+runtime is null, the test asserted that, and returned -- so it was testing nothing while reporting
+488/488. It now calls runtime.memory().initialize() first. A test that returns early on a null pointer
+is the exact shape of the vacuous zero this project keeps being bitten by, and it was mine.
+
+### The product, reported straight
+
+The corruption at 0x010519C0 is gone: the shadow change "now=0x05 was=0x2f" that W82 and W83 chased now
+occurs ZERO times in boot_w85c.log. And the open still fails:
+
+    11576  path="cdrom0:\CDROM0:\;1" flags=0x1 -> fd=-1
+        1  path="rom0:ROMVER"              flags=0x1 -> fd=3
+
+11576 cdrom opens before, 11576 after. Same path, same fd. No frame. The fix was a real corruption of
+real live memory and it is worth having, but it is NOT the thing that makes the open fail, and I am
+not going to dress it up as progress toward a frame.
+
+### THE NEW WALL, measured, and it is a guest store
+
+Watching the buffer the open actually reads, 0x01051A10, from boot_w85d.log:
+
+    at addr=0x1051a13 now=0x05 was=0x65 pc=0x1003e98
+    at addr=0x1051a14 now=0x80 was=0x2e pc=0x1003e98
+    at addr=0x1051a15 now=0x2f was=0x67 pc=0x1003e98
+
+pc = 0x1003e98, in the path builder, and the generated unit says:
+
+    // 0x1003e98: 0xae910004  sw  $s1, 0x4($s4)
+    WRITE32(ADD32(GPR_U32(ctx, 20), 4), GPR_U32(ctx, 17));
+
+So $s4 = 0x01051A0F -- one byte BELOW the buffer -- and the guest stores $s1, whose low bytes are
+05 80 2f, at $s4 + 4. I decoded 0xae910004 wrong on the first pass and thought the translation had the
+wrong registers; rs = 20 ($s4) and rt = 17 ($s1), the emitted code is correct, and the wrong decode was
+mine.
+
+The open bytes 0x65 0x2e 0x67 ("e.g") were replaced by 0x05 0x80 0x2f, which is the little-endian 0x8005
+again -- the same PMODE constant, this time written by the GUEST rather than by us, at +3 into the
+buffer the open reads, followed by 0x2f which is '/'.
+
+That is the thing to explain next and it is not yet explained: the guest is storing a NUMBER into a
+string buffer, one byte below where the string starts, and the number it stores is a GS register word.
+Whether $s4 is really 0x01051A0F, or whether the register decode upstream of this store is wrong, is
+not established. Suite 489/489.

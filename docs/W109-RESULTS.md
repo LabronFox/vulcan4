@@ -87,6 +87,47 @@ and every vertex of that strip is outside the 640×448 display the guest itself 
 **correct** output for the input it is being given. The next question is why GT4's first geometry starts
 at x=1728 — which is a guest-state question, not a GS question, and it is the next single measurement.
 
+
+## Addendum — the FBP histogram, from a 60 s run (no behaviour changed)
+
+    [w109:fbp] batches=200  verts=600  fbp0x103 fbpa0xfd
+    [w109:fbp] batches=400  verts=c00  fbp0x205 fbpa0x1fb
+    [w109:fbp] batches=800  verts=1800 fbp0x401 fbpa0x3ff
+    [w109:fbp] batches=1000 verts=3000 fbp0x7f8 fbpa0x808
+
+**1,000 primitive batches, 3,000 vertices, split almost exactly evenly between FBP 0 and FBP 160
+(2,040 vs 2,048).** That is not a broken pipeline and not a dropped-packet bug — it is genuine
+double-buffered geometry, half into each of the two buffers the game told the GS it was using. The guest
+is drawing steadily for the whole minute.
+
+Gate for this longer run: `frames_presented=3173 gs_packets=2810`, no crash, nothing reduced.
+
+This corrects one thing I nearly said. From the first 12 batches it looked like "11 of 12 draw into
+FBP 0 while the window reads FBP 160", which would have been a second independent wall — drawing to a
+buffer nobody displays. **It is not that.** The 1,000-batch histogram shows the split is even. Both
+buffers get half the geometry, exactly as double buffering should.
+
+So the wall remains the one result (b) named above, and it is narrower than the brief assumed:
+
+    [w109:raster] batch=1 primType=6 fb=0 fbw=a xy=6c08,7208 verts=3
+                  | v(x=6c0,y=720,z=0) v(x=700,y=8e0,z=0) v(x=0,y=0,z=0)
+    [w109:raster] batch=2 primType=6 fb=0 fbw=a xy=6c08,7208 verts=3
+                  | v(x=700,y=720,z=0) v(x=740,y=8e0,z=0) v(x=0,y=0,z=0)
+    [w109:raster] batch=3 primType=6 fb=0 fbw=a xy=6c08,7208 verts=3
+                  | v(x=740,y=720,z=0) v(x=780,y=8e0,z=0) v(x=0,y=0,z=0)
+
+X is always a multiple of 0x40 (64 px, one FBW block), Y is always 0x720 or 0x8E0, and one vertex is
+always the origin. **Those are structurally correct GS coordinates for a framebuffer whose first block is
+offset from the display origin** — and they are meaningless against a 640×448 display whose origin is
+(0,0). The guest is building a strip that starts 27 FBW blocks to the right of the visible area.
+
+The next single measurement, now sharply defined: **read the DISPLAY register's X/Y origin the guest
+wrote** (`DISPFB1.X=0x90 DISPFB1.Y=0x4 DISPFB1.Z=0x1c`) and compare it to the XYOFFSET register the
+rasteriser is applying (`xy=6c08,7208`, i.e. 1728/1824 after the <<4). If DISPFB's origin is non-zero
+while the geometry is being offset by 1728, then the offset is being applied twice — once by the guest
+and once by us — and that is a single arithmetic bug with a single arithmetic fix. If DISPFB's origin is
+zero, then the guest genuinely asked to draw off-screen and the question moves to guest state.
+
 ---
 
 **Does the captain see a picture yet? NO — the window is still black, and I have proven that is the

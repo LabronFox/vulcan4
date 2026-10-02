@@ -70,7 +70,12 @@ else:
 PY
 }
 
-log "nightwatch armed. interval=${INTERVAL}s giveup=${GIVEUP_H}h gate=$GATE"
+# DRY-RUN GUARD. Set NIGHTWATCH_DRY=1 and the script will exercise every step and print the
+# kanban body INSTEAD of creating a task. That is how the loop was tested without waking the
+# captain at 23am with a fake goal end -- and it is the mode to use when changing this script.
+DRY=${NIGHTWATCH_DRY:-0}
+
+log "nightwatch armed. interval=${INTERVAL}s giveup=${GIVEUP_H}h gate=$GATE dry=$DRY"
 start=$(date +%s)
 
 while :; do
@@ -107,7 +112,10 @@ while :; do
 
   gate_out="(gate not run yet)"
   if [ -x "$GATE" ]; then
-    gate_out=$("$GATE" 2>&1 | tail -8)
+    # HARD TIMEOUT. The gate boots the real game for up to 45 s, so an unbounded call would stall
+    # the whole watcher: the first dry run hung for 300 s on this line and had to be killed. The
+    # wake must never wait on a boot, because the boot is the thing being waited ON.
+    gate_out=$(timeout 90 "$GATE" 2>&1 | tail -8 || echo "(gate timed out after 90s)")
   fi
 
   # The captain asked twice for this: prove the thing still boots, and look for footage. A boot
@@ -178,6 +186,13 @@ DO THIS, IN THIS ORDER, IN THIS ONE TURN:
 DO NOT edit the code tree. He cooks, you supervise.
 EOF
 )
+
+  if [ "$DRY" = "1" ]; then
+    log "DRY RUN: would create a kanban task carrying the review brief below:"
+    printf '%s\n' "$body" | head -20 >>"$LOG"
+    log "DRY RUN: review brief is $(printf '%s' "$body" | wc -c) chars, gate=$gate_out"
+    continue
+  fi
 
   title="VULCAN 4 W$(date +%H%M): review Sanji, send next goal"
   out=$(hermes kanban create "$title" --assignee default --body "$body" --json 2>&1)

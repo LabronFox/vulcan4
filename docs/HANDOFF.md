@@ -6718,3 +6718,73 @@ That is now a **red test first**: a test that a `sceSifRpc` call which sets a re
 to the store observer. It will fail today, which is correct.
 
 Suite **482/483**.
+
+---
+
+## W78 — the eight syscall sites are NAMED, and none of them is `open`. That refutes the premise, correctly.
+
+Step two of the arc. `docs/CORE-OPEN-SYSCALLS.md` listed eight of 53 `syscall` sites in `.text`
+reachable from `0x01005430` and asked the chef to read the instruction before each and name it. The
+sites are **not in the generated unit** (the recompiler emits 639 of 707 functions), so this is decoded
+from `SCUS_973.28` directly, using that document's own stated method so it can be falsified: little
+endian, `vaddr − 0x00FFF000` = file offset, `lw`/`sw` offsets **signed**, `op 0x37/0x3F` = `ld`/`sd`.
+
+### The eight, named
+
+| site | the instruction before it | name |
+|---|---|---|
+| `0x01011A40` | `24030064  addiu $v1, $zero, 0x64` | **`FlushCache`** |
+| `0x01013BD4` | `24030064  addiu $v1, $zero, 0x64` | **`FlushCache`** |
+| `0x0100E8D0` | `2403000a  addiu $v1, $zero, 0x0A` | **`Ioctl`** |
+| `0x01018904` | `2403000a  addiu $v1, $zero, 0x0A` | **`Ioctl`** |
+| `0x01022A48` | `8c830018  lw $v1, 0x18($a0)` | **runtime value**, from a struct field |
+| `0x0100C0F0` | `dc890190  ld $t1, 0x190($a0)` | **indeterminate**, `$v1` set further back |
+| `0x01010E88` | `00000000` (a NOP) | **indeterminate** — no `$v1` write in 70 prior instructions |
+| `0x01010E98` | `00000000` (a NOP) | **indeterminate** — same |
+
+`0x64` is named from **our own table**: `Dispatcher.cpp:253 case 0x64: FlushCache`. `0x0A` is
+`Ioctl`: `Stubs/FileIO.cpp:78 void sceIoctl`, whose comment records that the HTCI wait path polls
+`sceIoctl(fd, 1, &state)`. Both names are the project's, not mine.
+
+### The result that matters: **the open is not a syscall at all, and that is now proven twice**
+
+The document's closing line was *"the chef can read each one against the PS2 syscall table and say which
+is open in about a minute."* The answer is: **none of them is `open`, and no amount of reading would
+have found it there**, because the open never travels that road.
+
+W72 already found it. `sub_01024570_0x1024570` is a **generated forwarder** whose whole body is a direct
+call to `ps2_stubs::sceOpen`, and `sceOpen` calls `fioOpen` **directly**. It never reaches
+`handleSyscall`, so it can never appear as a `syscall` instruction in `.text`. This is corroborated
+structurally: our numeric dispatcher handles **only `0x01`, `0x02` and `0x04`** in the `0x00–0x0F`
+range — the whole file-syscall block `0x05`–`0x0F` is absent from it, because those are reached as
+forwarders too.
+
+So `WALL-INSTRUMENT.md`'s "the syscall tally's silence is not proof" is now explained rather than
+merely noted: `sceOpen` is invisible to `syscallCounts()` **and** invisible to a `syscall`-instruction
+search, for the same reason and the same reason is correct.
+
+### What is NOT established
+
+- Which syscall the three indeterminate sites make. Naming them needs the value of `$v1` **at run
+  time**, which is a one-line probe at each site, not a decode.
+- That `FlushCache` ×3 and `Ioctl` ×2 are *wrong*; they are what the instruction says. `Ioctl` in
+  particular is interesting on its own — the HTCI wait path polls it — but I am not connecting it to the
+  card wall without evidence.
+- Whether `0x01005430` ever runs in our boot. I have not established that, and `FlushCache`/`Ioctl`
+  being the reachable syscalls says nothing about whether the function executes at all.
+
+### Also closed: an open loose end from that document
+
+It flagged `0x01036A00` and `0x010369C0` as "below `.rodata`, unexplained". W72 read `0x01036A00` out of
+the image: it is a **table of guest function pointers**, `0x0102C570, 0x010039C8, 0x01003B88, 0x0102CAB8,
+0x01024278`, alternating with nulls — a dispatch table, not a string. So the "string pointer" the
+document described at that address is a pointer *table*, and the guest's `sub_01004FB8` puts a pointer to
+it at `$sp[0]`.
+
+### Next single step, per the arc: step three, the filesystem experiment — now genuinely meaningful
+
+`mkdir -p /mnt/ssd/gt4/work/GAMEDATA` and link the flat `CORE.GT4` to `GAMEDATA/core.gt4`, then re-run
+and read the result as **"the open still did not happen"** or **"the open happened and returned −1"** —
+never as evidence about mounts. The 27 IRX files do not move.
+
+Suite **482/483**. `VULCAN4 FRAME source=guest` has never printed.

@@ -179,6 +179,64 @@ initialising would legitimately draw a placeholder off to one side.
 guest believes is larger than 640x448, that is guest state still settling. One address-to-instruction
 lookup, and it decides whether the remaining work is ours or the game's.
 
+
+## Addendum 3 — THE INSTRUCTION IS NAMED, AND IT IS NOT A DMA
+
+The brief assumed the 114,688-byte packet reached the GS over DMA. **It does not.** Instrumenting the
+GIF channel inside `submitDmaSend` printed **nothing at all**, while the same run delivered
+`gs_packets=2019`. So the packets are not arriving by DMA.
+
+Following the only three places that write the GIF channel registers, all of them are OUR OWN GS stubs:
+
+    GS.cpp:658  sceGsExecLoadImage   -- did not fire
+    GS.cpp:757  sceGsExecStoreImage -- did not fire
+    GS.cpp:860  sceGsResetGraph     -- fires
+
+And it fires like this:
+
+    [w109:resetgraph] guestPc=0x100a434 ra=0x100a434 pktAddr=0x1ff0000 nloop=7 display=639x448
+
+**`sceGsResetGraph` builds its own GS packet and pushes it through the GIF channel itself.** That is why
+`gs_packets` is in the thousands while no DMA syscall is ever issued: the guest is not uploading geometry,
+it is calling a GS reset, and **we** are assembling and submitting the packet on its behalf.
+
+The guest instruction behind it:
+
+    // 0x100a434: 0x10000006  b  . + 4 + (0x6 << 2)
+
+which is inside **`sub_0100A348`** — `void sub_0100A348_0x100a348(...)` at
+`ps2_recompiled_functions.cpp:51637`, and the region W84 measured with `$s1 = 0x70002000` and W85 proved
+was overwriting the path buffer through `sceGsResetGraph`'s own `guestMalloc`.
+
+**So the whole thing closes into a single loop, and it is ours, not the guest's:**
+
+| step | what | whose |
+|---|---|---|
+| 1 | guest at `0x100A434` in `sub_0100A348` calls `sceGsResetGraph` | guest |
+| 2 | our stub builds a 16-register GS packet, `q[2] = pmode = 0x8005` | **ours** (W85) |
+| 3 | our stub pushes it through the GIF channel and back onto itself | **ours** |
+| 4 | the packet sets XYOFFSET `6c08,7208` → 1728,1824 | **ours** |
+| 5 | our rasteriser clips it against the 640x448 the guest declared | ours |
+| 6 | GS memory stays exactly zero, window stays black | ours |
+
+**The "triangle strip at x=1728" is our own GS-reset packet being rasterised as if it were geometry.**
+It is not the game drawing off-screen. It is `sceGsResetGraph` writing a reset packet whose registers our
+own rasteriser then interprets as drawable primitives — which is why every batch is a perfect 64-pixel
+stride (that is `FBW`, not a moving sprite), why one vertex is always the origin, and why it marches
+steadily for the whole minute.
+
+**Result (b) is confirmed and its cause is now named: the framebuffer is empty because our own
+`sceGsResetGraph` reset packet is being rasterised as geometry at a coordinate far outside the 640x448
+display, and clipped. The guest has drawn nothing at all yet — it is still in startup, still inside the
+`sce_SleepThread` poll loop W89 found.**
+
+**The next single measurement** is now unambiguous and it is the decoder the brief originally pointed at,
+for a different reason than the one given: the 114,688-byte packet decoded to `slotNloop=19660` claims
+**314,560 registers in 114 KB** — impossible — and the decoder walks it until it runs off the end and
+returns having read zero registers. Bounds-checking that count is the honest fix, and it is now worth doing
+because until it is fixed, **every GS packet above the size threshold contributes nothing at all**, including
+whatever the guest really did send. That is a real, separate bug from this one.
+
 ---
 
 **Does the captain see a picture yet? NO — the window is still black, and I have proven that is the

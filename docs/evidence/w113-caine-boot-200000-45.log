@@ -1,0 +1,8 @@
+
+Launched. You should see:
+  1. the GAME window  <- its title carries live FPS and speed, e.g.
+                          'VULCAN 4 - FPS: 136.4 | Speed: 0.64x PS2 | 12290 frames'
+  2. 'VULCAN 4 - logs' <- the boot, live
+  log file: /mnt/ssd/vulcan4-build/run/boot_desk004011.log
+Two windows, one process: the harness opens its own game window and prints here.
+Stream it to your phone with Moonlight -> Cortex if you are not at the desk.

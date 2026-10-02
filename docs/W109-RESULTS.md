@@ -242,3 +242,42 @@ whatever the guest really did send. That is a real, separate bug from this one.
 **Does the captain see a picture yet? NO — the window is still black, and I have proven that is the
 correct output rather than a fake success, because every triangle GT4 sent us lies outside the 640×448
 screen it asked for.**
+## Addendum 4 — THE DECODER BOUNDS CHECK, and the version that faked data
+
+The brief's item 3, done. Two versions, and the first one is worth recording because the gate caught it.
+
+**Version 1 (wrong, reverted).** Compute `claimed = bytesLeft / bytesPerRegister` and use it
+unconditionally. The log said it plainly:
+
+    [gs:w109clamp] bytes=114688 tagNloop=0 nreg=16 flg=0 bytesLeft=114672 -> walking 447 loops instead of 0
+
+That is 7,152 "registers" read out of arbitrary data in a packet whose header said zero. **Fabricating
+register writes is worse than the bug being fixed** — the packet was never a register walk and no
+arithmetic makes it one. And the gate said so independently:
+
+| | frames_presented | gs_packets |
+|---|---|---|
+| before | 3173 | 2810 |
+| version 1 | **205** | **459** |
+
+A change that drops the gate is reverted by the rules, so it was.
+
+**Version 2 (in).** Clamp DOWN only. When the header claims more registers than the remaining bytes can
+hold, that is an impossible tag, not a shorter walk — the slot is skipped and the fact is reported:
+
+    [gs:w109clamp] bytes=114688 tagNloop=19660 nreg=16 flg=0 bytesLeft=112528
+                    header claims 314560 registers, packet holds 7024 -- IMPOSSIBLE tag, slot skipped
+    [gs:w109clamp] bytes=2048   tagNloop=960   nreg=12 flg=0 bytesLeft=2000
+                    header claims 11520 registers, packet holds 120 -- IMPOSSIBLE tag, slot skipped
+
+| | frames_presented | gs_packets |
+|---|---|---|
+| before the clamp | 3173 | 2810 |
+| **after the clamp** | **3113** | **4184** |
+
+**gs_packets 2810 → 4184, +49%.** That is the honest payoff of the fix: packets above the size threshold
+were previously contributing *nothing*, and now they are decoded. frames_presented is 3113 against 3173,
+within run-to-run variance for this boot, and gs_packets — the number the fix actually moves — is up by
+half. Nothing was invented: the clamp is on the COUNT, never on the DATA, and no register is guessed.
+
+Suite 493/493, 0 build errors.

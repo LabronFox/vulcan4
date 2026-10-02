@@ -8615,3 +8615,107 @@ delivered by dispatch, at scale, and the guest is not short of interrupts.
 
 Next: fix the report so it stops printing inapplicable counters as failures, then go back to the sleep
 loop with `EVDUE` and `WILDPC` already in the tree.
+## W106 - THE REVERT. 71 FUNCTIONS BECAME 22,518.
+
+### The fix, and it was one block
+
+Caine's research was right and my W105 was wrong, and the measurement said so with no argument needed.
+W105 added `m_runtime.raiseInterrupt()` to `dispatchIrq`. Raising `Cause.IP` makes the R5900 take the
+interrupt exception, the PC becomes `EXCEPTION_VECTOR_GENERAL` = `0x80000080`, and there is no code there:
+`grep -c 80000080` over the generated unit is 0, over the guest ELF is 0, and the guest never touches
+COP0 at all. It is a KSEG1 kernel address, this project is BIOS-free by design, and entering it can only
+halt the guest.
+
+Upstream PS2Recomp dispatches instead of vectors, and its own generator test asserts the shape --
+`continuation < dispatch`, i.e. publish the next guest PC and call a C handler. The vector is for real
+hardware faults: TLB refill, address error, reserved instruction, overflow. Never interrupts, never
+syscalls.
+
+So the `if (!dmac) { ... raiseInterrupt ... }` block and the `kIrqCauseToIpBit` helper are gone. **Read
+the commit before reverting wholesale, as the dish asked, and that mattered:** `5e2aca4` also contained
+the `serviceInvocations()` counter, which is the thing that proved interrupts were already being
+delivered. That came from `9ed660f` and stays. Only the raise went.
+
+The mask gate in `dispatchIrq` is untouched. `processDueDeadlines()` is untouched. No handler was written
+at `0x80000080`. No BIOS files. `docs/` and the window title untouched.
+
+### The numbers, before and after
+
+    W105 (with the raise), 15 s:
+        functions_entered=113    true_guest_entries=23,103    halt=pc_outside_generated_table
+        WILDPC dead=0x80000080 last_good=0x0100f800
+
+    W106 (reverted), 15 s:
+        functions_entered=6,550  true_guest_entries=241,307   halt=wallclock_deadline
+        56 guest frames, no WILDPC
+
+    W106 (reverted), 60 s:
+        functions_entered=22,518 true_guest_entries=1,002,686 halt=wallclock_deadline
+        vblanks_processed=3546  irq_q=4702  step_intr_run=10,385
+        inv_by_kind=[intr=10385,dmac=0,override=0,other=0]
+        59 guest frames, no WILDPC
+
+**71 -> 22,518 functions.** The guest now survives a full 60-second budget instead of dying at 3.77 s with
+a kernel address in its PC, and the interrupt path is doing real work: 3,546 vblanks, 4,702 interrupt
+invocations queued, 10,385 interrupt invocations run.
+
+### interrupts_raised is 0 again, and THIS TIME THAT IS CORRECT
+
+The dish's success line asks for `interrupts_raised > 0` and `delivered == raised`. **Neither can happen in
+a design that dispatches rather than vectors, and they should not.** `raiseInterrupt()` is the only writer
+of the first and `servicePendingInterrupt()` the only writer of the second, and a dispatch-based interrupt
+delivery never calls either -- there is no COP0 interrupt to raise or take.
+
+So the counters are not vacuous now; they are *inapplicable*. W105's error was to read 0 as "dead path"
+and then go and make it true. The honest fix is to stop printing them as though they measure interrupt
+delivery, and to point at what does measure it. `inv_by_kind=[intr=...]` counts interrupt invocations
+actually RUN, and `irq_q` counts those queued. Those are the numbers, and they are large.
+
+**Leaving `interrupts_raised=0` next to `inv_by_kind=[intr=10385]` in the same report is the next thing
+that will mislead somebody**, and it misled me for most of a session. The boot report should print the
+counters that belong to the delivery path this project actually uses, and label the COP0 ones as
+unexercised rather than as failures. That is the next single change, and it is a reporting change, not a
+behaviour change.
+
+### The test, inverted rather than deleted
+
+"W105: a dispatched INTC interrupt must move interrupts_raised" asserted the thing that turned out to be
+wrong, so it is now:
+
+    W106: a dispatched INTC interrupt queues a handler and does NOT vector
+
+which asserts `interruptsRaised() == 0`, that `cop0_epc` and `cop0_cause` are untouched, that
+`interruptsDelivered() == 0`, and that the guest handler is QUEUED rather than run. Those are the
+CONTROLs that keep somebody -- including me -- from re-adding the raise, and the comment carries the
+measured reason (71 functions, `dead=0x80000080`).
+
+**493/493.**
+
+### Where the arc stands
+
+The window stays alive past 71 functions, by a factor of 320. No new dead address and no WILDPC line at
+60 s, so the guest is not dying anywhere new -- it is still in the sleep/poll loop the W105 dish found
+(`sce_SleepThread` at `0x0101F348`, `pc=0x0100F2C0` and `0x0100F080` nearby), drawing 59 frames and
+processing 3,546 vblanks while it waits. The vblank question is closed and correctly so: interrupts are
+delivered by dispatch, at scale, and the guest is not short of interrupts.
+
+Next: fix the report so it stops printing inapplicable counters as failures, then go back to the sleep
+loop with `EVDUE` and `WILDPC` already in the tree.
+
+## W106 addendum — the report can no longer be misread
+
+The single most expensive thing in this session was a printed zero. `interrupts_raised=0` sat in the boot
+report for a long time and read as "the interrupt path is dead", which is how four wrong leads happened,
+including W105's raise that vectored the guest to `0x80000080` and cut a 60-second boot from 22,518
+functions to 71. So the BOOT REPORT now prints the counters that belong to the delivery path this project
+uses, and labels the COP0 ones as inapplicable instead of printing them as bare zeros:
+
+    functions_entered=6302 true_guest_entries=267476 halt=wallclock_deadline
+    intr_queued=1168 intr_run=2233 intr_run_by_kind=2229
+    cop0_raised=INAPPLICABLE(0) cop0_delivered=INAPPLICABLE(0)
+
+`INAPPLICABLE` is the load-bearing word. It says the zero is a property of the design -- a dispatcher never
+calls `raiseInterrupt()` or `servicePendingInterrupt()` -- and not a measurement of a missing feature. A
+zero printed beside a live number is a trap, and it is now labelled rather than silent.
+
+**Suite 493/493.**

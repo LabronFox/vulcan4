@@ -2618,8 +2618,23 @@ int main(int argc, char *argv[])
               << " true_guest_exits=" << ps2_log::exitCounter().load()
               << " halt=" << haltReason
               << " bios_files=" << biosFilesOpened
-              << " interrupts_raised=" << runtime.interruptsRaised()
-              << " interrupts_delivered=" << runtime.interruptsDelivered()
+              // W106. THE INTERRUPT NUMBERS THIS PROJECT ACTUALLY USES, AND THE ONES IT DOES NOT.
+              //
+              // intr_queued / intr_run are interrupt invocations created and RUN, dispatched straight to
+              // the guest's registered handler. That is how interrupts are delivered here, and those are
+              // the numbers to read.
+              //
+              // cop0_raised / cop0_delivered are printed as INAPPLICABLE, not as zeros, because this
+              // design never calls raiseInterrupt() or servicePendingInterrupt(): there is no COP0
+              // interrupt to raise or take. W105 read those zeros as "the interrupt path is dead", went
+              // and made them non-zero by raising Cause.IP, and the guest then vectored to
+              // 0x80000080 and entered 71 functions instead of 22,518. A zero printed beside a live number
+              // is a trap, and this one cost a session.
+              << " intr_queued=" << kernelSnapshot.invocationsQueued
+              << " intr_run=" << kernelSnapshot.invocationsRun
+              << " intr_run_by_kind=" << kernelSnapshot.invocationsRunByKind[0]
+              << " cop0_raised=INAPPLICABLE(" << runtime.interruptsRaised() << ")"
+              << " cop0_delivered=INAPPLICABLE(" << runtime.interruptsDelivered() << ")"
               << " pending_ip=0x" << std::hex << runtime.pendingInterrupts() << std::dec << "\n";
 
     // W91. WHO IS STILL ALIVE AT THE END. Every "the guest is waiting for something" question in this

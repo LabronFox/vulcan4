@@ -7435,3 +7435,81 @@ established. Those are two cheap questions and they are where the next dish star
 functions_entered 274, distinct_pcs 129, the disc file open at fd = 4 and fd = 5, clean shutdown, no
 VULCAN4 FRAME source=guest. GS geometry is not the wall any more and neither is the path. The wall is a
 sleeping thread at guest pc 0x01005870.
+## W88 - sce_SleepThread IS TIMED AND WE WERE THROWING THE DURATION AWAY
+
+### The bug, from the ledger and the code
+
+    0x32 sce_SleepThread calls=24  a0=0x00000008 x23, a0=0x00000001 x1
+    VULCAN4 HARNESS detail=blocked inside SCE syscall 0x32 (SleepThread), guest pc 0x01005870
+
+Twenty-three of twenty-four calls pass a0 = 8. On a PS2 that argument is a duration in microseconds:
+the thread sleeps for 8us and the EE timer puts it back.
+
+EeScheduler::sleepCurrent() took NO ARGUMENT. It read nothing from the context and blocked with
+`std::monostate`, so the duration was discarded, no deadline was registered, and the only thing that
+could ever end the wait was an explicit sce_WakeupThread from another thread. A guest that says "yield
+for 8 microseconds" got "stop forever", and it was the last thing the boot did.
+
+### The fix, using machinery that already worked
+
+The scheduler already knows how to do a timed wait: waitVSync(afterTick, ...) plus completeVSync(tick)
+makes a thread Ready without transferring out of the cycle path. This is the same shape.
+
+  * EeTimedSleepWait { uint64_t wakeCycle; } added to the EeWaitPayload variant.
+  * sleepCurrent(uint32_t microseconds) blocks with EeTimedSleepWait{ m_eeCycle + us * 295 }, because
+    kEeClockHz is 294912000, i.e. 294.912 cycles per microsecond, rounded up to 295.
+  * completeTimedSleeps(cycle) makes every expired sleeper Ready with makeReady(), and is called from
+    accountCycles() the moment m_eeCycle moves. makeReady rather than a dispatcher transfer, so it
+    stays callable from a noexcept function on the hot path.
+  * n == 0 keeps the old untimed behaviour DELIBERATELY. A sleep with no duration is a genuine wait
+    for a wakeup, and turning it into a zero-length timed sleep would spin.
+  * sce_SleepThread now passes a0 through.
+
+### Red, honestly
+
+The first attempt at the test was a COMPILE ERROR, because sleepCurrent took no argument. A build break
+is a weak red and I did not want to report it as a failing number, so I added the parameter and left
+the body ignoring it -- the shape of the bug made into a signature. Then the test compiled and failed
+on a number:
+
+    [Run]: W88: a timed sce_SleepThread expires on its own, with no sce_WakeupThread  [Failed]
+      - a TIMED sleep must expire by itself once the cycles pass
+    Total Tests: 490  Passed: 489  Failed: 1
+
+The other three assertions in that test passed: the sleep does block, the thread does land in a typed
+wait, and it is still waiting one cycle short of the duration. Only the expiry was missing, which is
+precisely the bug. GREEN after the fix, 490/490.
+
+Two false starts on the way there, both mine, both worth writing down because they cost real time. The
+test segfaulted twice before it ran. Once because BlockEnv gives the scheduler its own std::vector for
+RDRAM and never initializes the runtime's, so accountCycles() -> advanceEeTimers() walked a null
+m_rdram. And once because, without ee.bindMainContextForSyscall(), blockCurrent() had no running main
+context to move -- the test that already calls sleepCurrent() successfully in
+ps2_runtime_kernel_tests.cpp does that binding, and copying its setup was the fix. The suite's output
+is line-buffered under stdbuf and block-buffered otherwise, so a segfault eats the tail and the failing
+test looks absent; that cost a cycle of "where did my test go".
+
+### THE PRODUCT
+
+    before (W86/W87):  functions_entered=274  halt=blocked inside SCE syscall 0x32 (SleepThread)
+    after  (W88):      functions_entered=567  halt=livelocked_in_syscall
+
+567 against 274. The guest got twice as far and the sleep is no longer a dead end. The disc file still
+opens at fd = 4 and fd = 5, still no frame, and the new stop is:
+
+    VULCAN4 HARNESS detail=livelocked in SCE syscall 0x32 (SleepThread): 1736 of 2180 guest syscalls
+    were this one, at guest pc 0x0101f348 -- it is being retried, not satisfied, so the wall is the
+    return value
+
+### Next, and the harness has already said it
+
+sce_SleepThread on a PS2 returns the number of microseconds actually slept. Our path never reaches
+`setReturnS32(ctx, KE_OK)` in Thread.cpp, because sleepCurrent() throws the dispatcher transfer out
+before it -- so the value the guest resumes with is whatever makeReady(..., KE_OK, ...) left in v0,
+which is 0. A guest that loops "while (elapsed < N)" against a return of 0 spins forever, and 1736
+sleeps at one pc is exactly that shape.
+
+So the next single step is the return value: make the timed sleep resume with the elapsed
+microseconds rather than 0, and see whether the livelock at 0x0101F348 turns into progress. That is a
+guess about the guest's loop, not a measurement, and it is labelled as one -- the measurement to make
+first is what the guest actually does with v0 at 0x0101F348.

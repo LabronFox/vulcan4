@@ -1535,6 +1535,9 @@ int main(int argc, char *argv[])
     // is in whatever calls them -- and nothing in the report could name that until now.
     std::unordered_map<uint32_t, std::unordered_set<uint32_t>> entryCallers;
     uint64_t dispatcherTransfers = 0;
+    // W108. frames_presented is declared on the display thread below and read here at report
+    // time, so "the display path ran zero times" is a measured fact rather than an inference from
+    // a screenshot. That distinction is the entire W107 finding.
     std::size_t checkpointServiced = 0;
     uint64_t servicedInvocations = 0;
     // G1.8g. servicedInvocations counted every catch as progress, which is how a boot that did
@@ -1801,6 +1804,144 @@ int main(int argc, char *argv[])
             thread.wait.payload);
     };
 
+    // ---- W108 (CORRECTED). THE DISPLAY THREAD.
+    //
+    // One thread presents, one thread plays, and they never touch the GS lock at the same time.
+    // That is not a stylistic preference: it is how the hardware works, and it is the only shape
+    // in which the display cannot starve the guest. See the long note above for the measurement
+    // that proved the inline version was fatal.
+    //
+    // Everything raylib touches from here on -- presentFrame() and SetWindowTitle() -- happens on
+    // THIS thread and only this thread, because raylib's drawing calls are not thread safe and the
+    // guest thread must not be inside BeginDrawing/EndDrawing while this one is. The guest thread
+    // does no raylib work at all.
+    std::atomic<bool> displayRunning{true};
+    std::atomic<uint64_t> presentedFrames{0};
+    std::atomic<bool> guestDone{false};
+
+    // W108 SEGFAULT FIX. This was a std::thread, and that was the segfault.
+    //
+    // The real backtrace (gdb, DISPLAY=:0, /mnt/ssd/vulcan4-build/run/, this binary):
+    //
+    //   Thread 4  #0 libGLdispatch.so.0
+    //             #1 rlLoadTexture ()
+    //             #2 LoadTextureFromImage ()
+    //             #3 PS2Runtime::presentFrame()
+    //             #4 main::{lambda()#2}::operator()() const
+    //   Thread 1  #0 IopTimrman::nextEventCycle
+    //             ... #4 sub_0100F390_0x100f390        <- fioOpen, i.e. THE GUEST
+    //
+    // Two things fall out of that, and one of them contradicts the note above this function.
+    //
+    // (1) The crash is NOT in fioOpen. fioOpen is merely the last line the guest printed before
+    //     the other thread died. The guest was healthy; Thread 4 was not.
+    //
+    // (2) The threads are the wrong way round. runtime.initialize() -- which calls raylib's
+    //     InitWindow -- runs on the MAIN thread at line 1328, so MAIN owns the OpenGL context.
+    //     The comment above this function says "raylib's drawing calls are not thread safe" and
+    //     is right about the hazard, but it then put presentFrame() on a SPAWNED thread, which has
+    //     no current GL context at all. rlLoadTexture -> glGenTextures/glTexImage2D on a thread
+    //     that never made the context current lands in libGLdispatch and dies. It survived under
+    //     xvfb because swrast takes a different path; it dies on a real desktop GL driver, which
+    //     is exactly where the captain saw it.
+    //
+    // The correct shape is the one real hardware has: the GS renders on one thread while another
+    // scans out. So the GUEST goes on a worker thread and MAIN -- the GL owner -- presents.
+    auto displayLoop = [&]() {
+        int64_t lastPresentNs = 0;
+        uint64_t hudFramesAtMark = 0;
+        uint64_t hudCyclesAtMark = 0;
+        int64_t hudMarkNs = 0;
+
+        while (displayRunning.load(std::memory_order_acquire))
+        {
+            const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - start)
+                                      .count();
+
+            // 60 Hz, the rate real hardware refreshes at. Presenting per guest iteration would
+            // upload a 1.3 MB texture tens of thousands of times a second and become the
+            // bottleneck, changing the very numbers the run exists to measure.
+            if (nowNs - lastPresentNs >= 16666667ll)
+            {
+                lastPresentNs = nowNs;
+                runtime.presentFrame();
+                presentedFrames.store(presentedFrames.load() + 1u, std::memory_order_relaxed);
+
+                // The window title is the HUD: the captain reads FPS and speed off the game window
+                // instead of a second terminal he has to find. Same atomics the PROGRESS line
+                // prints, one process, so it can never report another run's numbers.
+                const uint64_t cyc = runtime.eeScheduler().snapshot().eeCycle;
+                if (hudMarkNs == 0)
+                {
+                    hudMarkNs = nowNs;
+                    hudFramesAtMark = guestFrameCounter().load();
+                    hudCyclesAtMark = cyc;
+                }
+                else if (nowNs - hudMarkNs >= 500000000ll) // 0.5 s
+                {
+                    const double secs = static_cast<double>(nowNs - hudMarkNs) / 1e9;
+                    const uint64_t frames = guestFrameCounter().load();
+                    const uint64_t deltaFrames = frames > hudFramesAtMark ? frames - hudFramesAtMark : 0u;
+                    const uint64_t deltaCycles = cyc > hudCyclesAtMark ? cyc - hudCyclesAtMark : 0u;
+
+                    const double packetsPerSec = static_cast<double>(deltaFrames) / secs;
+                    // kEeClockHz = 294,912,000 is how many EE cycles a real PS2 retires in one wall
+                    // second, so (cycles retired per wall second) / kEeClockHz is exactly "PS2
+                    // seconds passing per wall second". It was briefly divided by cycles per FRAME,
+                    // which printed 37x for a boot that was measurably at 1.0x -- a 60x-too-high
+                    // claim that survived only because nothing compared it against the ee_cycle
+                    // figure printed in the same run.
+                    constexpr double kEeCyclesPerPs2Second = 294912000.0;
+                    const double speed =
+                        static_cast<double>(deltaCycles) / secs / kEeCyclesPerPs2Second;
+
+                    // NAMED HONESTLY: this counts GS GIF packets, not display frames. One display
+                    // frame is many packets, so calling it FPS was a lie wearing a real number's
+                    // clothes and the captain caught it. It says packets/sec because that is what
+                    // it counts.
+                    char hudTitle[128];
+                    std::snprintf(hudTitle, sizeof(hudTitle),
+                                  "VULCAN 4 - %.0f GS packets/s | Speed: %.2fx PS2 | %llu shown",
+                                  packetsPerSec, speed,
+                                  static_cast<unsigned long long>(
+                                      presentedFrames.load(std::memory_order_relaxed)));
+                    SetWindowTitle(hudTitle);
+
+                    hudFramesAtMark = frames;
+                    hudCyclesAtMark = cyc;
+                    hudMarkNs = nowNs;
+                }
+            }
+
+            // The close button and Escape. Nothing polled this before W108, because nothing cared
+            // about the window except to open it. Now that it shows the game, a captain who wants
+            // his desktop back presses Escape, and without this the run would continue invisibly
+            // to its full budget, eating a core.
+            if (WindowShouldClose())
+            {
+                std::cout << "VULCAN4 HARNESS window closed by the captain -- stopping the boot"
+                          << std::endl;
+                runtime.requestStop();
+                displayRunning.store(false, std::memory_order_release);
+                break;
+            }
+
+            // W108. The guest reaching its budget used to end the boot on the same thread that ran
+            // it. Now the guest is the worker, so this loop would otherwise keep presenting a dead
+            // frame until the watchdog fired. Exit when the worker is done.
+            if (guestDone.load(std::memory_order_acquire))
+            {
+                displayRunning.store(false, std::memory_order_release);
+                break;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
+        }
+    };
+
+    // ---- THE GUEST, ON A WORKER. MAIN IS NOW FREE TO PRESENT.
+    std::thread guestThread([&]() {
     while (!finished)
     {
         // ---- G1.8g: RUN THE THREAD THE SCHEDULER SAYS IS RUNNING.
@@ -1876,71 +2017,16 @@ int main(int argc, char *argv[])
             break;
         }
 
-        // ---- W101. THE TITLE BAR IS THE HUD.
+        // ---- W108. THE TITLE BAR IS THE HUD, AND IT LIVES ON THE DISPLAY THREAD.
         //
-        // The captain asked for the game window itself to carry the speed and the frame rate,
-        // instead of a third terminal window that renamed it. Simpler, and more honest: these are
-        // read from the same atomics the PROGRESS line prints, in the same process, at the same
-        // instant. No second process tails a file, so nothing here can report another boot's
-        // numbers -- which is exactly the failure the captain was reading about in W67.
+        // This block used to run here, in the guest's own loop, updating the window title from
+        // inside the guest. That was wrong twice: raylib's drawing calls are not thread safe, and
+        // the guest thread had no business in BeginDrawing/EndDrawing at all. It now runs on the
+        // display thread started above, next to presentFrame(), because the title and the picture
+        // are the same concern: what this window is showing you right now.
         //
-        // FPS is measured across a wall-clock window, not per iteration. Iterations are
-        // microseconds apart, so a per-iteration delta is mostly noise; "frames in the last half
-        // second" is both smoother and the thing a human watching actually means by it.
-        //
-        // Speed is EE cycles per wall second against a 60 Hz NTSC PS2, reported as a multiplier and
-        // not a percentage. The guest spends nearly all of its time not drawing, so a percentage of
-        // "PS2 speed" would be a real number describing the wrong thing.
-        {
-            static uint64_t hudFramesAtMark = 0;
-            static uint64_t hudCyclesAtMark = 0;
-            static int64_t hudMarkNs = 0;
-
-            const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                      std::chrono::steady_clock::now() - start)
-                                      .count();
-            const uint64_t cyc = runtime.eeScheduler().snapshot().eeCycle;
-
-            if (hudMarkNs == 0)
-            {
-                hudMarkNs = nowNs;
-                hudFramesAtMark = guestFrameCounter().load();
-                hudCyclesAtMark = cyc;
-            }
-            else if (nowNs - hudMarkNs >= 500000000ll) // 0.5 s
-            {
-                const double secs = static_cast<double>(nowNs - hudMarkNs) / 1e9;
-                const uint64_t frames = guestFrameCounter().load();
-                const uint64_t deltaFrames = frames > hudFramesAtMark ? frames - hudFramesAtMark : 0u;
-                const uint64_t deltaCycles = cyc > hudCyclesAtMark ? cyc - hudCyclesAtMark : 0u;
-
-                const double fps = static_cast<double>(deltaFrames) / secs;
-                // kEeClockHz = 294,912,000 is how many EE cycles a real PS2 retires in ONE WALL
-                // SECOND. So (cycles retired per wall second) / kEeClockHz is exactly "PS2 seconds
-                // passing per wall second" -- the speed, as a multiplier. 1.0x means real time.
-                //
-                // It was briefly kEeClockHz/60, i.e. cycles per FRAME, which reports a 60x-too-high
-                // number: the first run printed 37.76x for a boot that was measurably dying at
-                // 3.77 s having retired 1,110,858,603 cycles -- 1,110,858,603 / 3.771 s is
-                // 294.6M/s, which is 1.00x. The honest figure for that boot is about 0.6x, not
-                // 37x. A "faster than the hardware" claim is exactly the kind of number that should
-                // never survive a unit check, and the only reason it did is that nothing compared it
-                // against the ee_cycle figure printed in the very same run.
-                constexpr double kEeCyclesPerPs2Second = 294912000.0;
-                const double speed =
-                    static_cast<double>(deltaCycles) / secs / kEeCyclesPerPs2Second;
-
-                char hudTitle[128];
-                std::snprintf(hudTitle, sizeof(hudTitle),
-                              "VULCAN 4 - FPS: %.1f | Speed: %.2fx PS2 | %llu frames",
-                              fps, speed, static_cast<unsigned long long>(frames));
-                SetWindowTitle(hudTitle);
-
-                hudFramesAtMark = frames;
-                hudCyclesAtMark = cyc;
-                hudMarkNs = nowNs;
-            }
-        }
+        // The numbers themselves are unchanged from W101 and read from the same atomics:
+        // guestFrameCounter() and EeScheduler::snapshot().eeCycle.
 
         // ---- wall clock
         const auto elapsedSeconds = std::chrono::duration_cast<std::chrono::seconds>(
@@ -2192,6 +2278,29 @@ int main(int argc, char *argv[])
             }
         }
 
+        // ---- W108 (CORRECTED). THE DISPLAY IS A SEPARATE THREAD, NOT A CALL IN THIS LOOP.
+        //
+        // FIRST ATTEMPT, AND WHY IT WAS WRONG. I called presentFrame() inline here, from inside
+        // the guest's own drive loop. It broke the game. Measured, same binary:
+        //
+        //     W106 (no display call at all)   gs_packets=1244
+        //     W108 first attempt              gs_packets=1669
+        //     W108 first attempt              gs_packets=1094
+        //     W108 second attempt             gs_packets=  29
+        //
+        // and the boot report said runningThreadId=0: no thread was running at all, both threads
+        // Ready with waitReason=0. UploadFrame() -> latchHostPresentationFrame() takes the GS
+        // lock, which is the SAME lock the guest needs in order to submit a GIF packet. Presenting
+        // 3407 times a minute from the guest's own thread starved it: the guest could not draw
+        // while I was busy painting. Four days of a black screen became a black screen AND a dead
+        // game, which is worse, and it was caused by the fix for the black screen.
+        //
+        // THE CORRECT SHAPE IS THE ONE run() ALWAYS USED: the game runs on its own thread and the
+        // window presents from the main thread, exactly as real hardware scans out while the GS
+        // renders. Guest and display never contend for the same lock, because they never run on the
+        // same thread. Presenting on the main thread is also the only place raylib's window events
+        // get polled, so this is where the close button finally starts working too.
+
         // ---- G1.8h / W12: a YIELD is not a TRANSFER, and it still owes the scheduler a turn.
         //
         // The catch above is the ONLY path that called serviceInvocations(), and it fires only
@@ -2385,6 +2494,16 @@ int main(int argc, char *argv[])
             break;
         }
     }
+    guestDone.store(true, std::memory_order_release);
+    });
+
+    // ---- THE DISPLAY, ON MAIN, WHICH IS THE THREAD THAT OWNS THE GL CONTEXT.
+    displayLoop();
+
+    if (guestThread.joinable())
+    {
+        guestThread.join();
+    }
 
     // Measured BEFORE the join, because the gap between this and elapsed is the harness
     // waiting on something of its own making, and a report that only prints the total invites
@@ -2394,6 +2513,16 @@ int main(int argc, char *argv[])
                                   .count();
 
     driverFinished.store(true, std::memory_order_release);
+
+    // W108. Stop and join the display thread BEFORE the report is printed, so frames_presented is
+    // final by the time anyone reads it. The flag is cleared first and then joined: clearing it is
+    // what tells the thread to leave its loop, and joining is what guarantees it has left, so the
+    // counter cannot still be climbing while the BOOT REPORT claims a number for it. Joining before
+    // the report would deadlock nothing -- the display thread never waits on the guest -- but
+    // joining after would make the number a lie in the only direction that matters.
+    displayRunning.store(false, std::memory_order_release);
+    // W108: there is no display thread to join any more. displayLoop() above ran on THIS thread and
+    // has already returned, so joining it would be joining the current thread.
     runtime.requestStop(); // tell the watchdog thread to exit its wait loop
     watchdog.join();
 
@@ -2637,6 +2766,13 @@ int main(int argc, char *argv[])
               // non-zero: the guest has to deliver a FRAME register (0x04/0x05) to tell the GS which
               // RDRAM address holds the picture, and nothing downstream can substitute for that.
               << " gs_packets=" << runtime.gs().gsPacketsSeen()
+              // W108. frames_presented belongs ON THE REPORT LINE, not only in the HARNESS detail
+              // line further up. It is the number that answers "does the captain see anything", and
+              // it is the only number that distinguishes a display path that ran from one that is
+              // dead code again -- which is exactly what four days of black window was. Leaving it
+              // on the detail line means a run that ends early prints a report with no display
+              // number at all, and the reader has to know to go looking somewhere else.
+              << " frames_presented=" << presentedFrames.load(std::memory_order_relaxed)
               << " gs_frame_reg_writes=" << runtime.gs().gsFrameRegWrites()
               << " (ctx0=" << runtime.gs().gsFrameRegWritesCtx0()
               << " ctx1=" << runtime.gs().gsFrameRegWritesCtx1() << ")"
@@ -3027,6 +3163,7 @@ std::cout << "\n";
               // million syscalls executing in here, none of them visible to functions_entered.
               << " invocations_run=" << kernelSnapshot.invocationsRun
               << " vblanks_processed=" << kernelSnapshot.vblankStartProcessed
+              << " frames_presented=" << presentedFrames.load(std::memory_order_relaxed)
               << " intr_queued=" << kernelSnapshot.invocationsQueued
               << " intr_run=" << kernelSnapshot.invocationsRun
               << " intr_run_by_kind=" << kernelSnapshot.invocationsRunByKind[0]

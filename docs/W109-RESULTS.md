@@ -128,6 +128,57 @@ while the geometry is being offset by 1728, then the offset is being applied twi
 and once by us — and that is a single arithmetic bug with a single arithmetic fix. If DISPFB's origin is
 zero, then the guest genuinely asked to draw off-screen and the question moves to guest state.
 
+
+## Addendum 2 — the register chain, end to end, and the last number
+
+The next single measurement named in the previous addendum, run:
+
+    [w109:dispfb] dispfb1=0x206502c007002090 -> fbp=144 fbw=16 | dispfb2=0x9400 -> fbp=0   fbw=10
+                 ctx0.fbp=0  ctx1.fbp=0  -> displayFbp=0   originX=0 originY=0
+    [w109:dispfb] dispfb1=0x206502c007002090 -> fbp=144 fbw=16 | dispfb2=0x94a0 -> fbp=160 fbw=10
+                 ctx0.fbp=0  ctx1.fbp=0  -> displayFbp=160 originX=0 originY=0
+
+**The display origin is 0,0. So the offset is NOT being applied twice** — that theory is dead, and the
+`xy=6c08,7208` in the rasteriser log is an XYOFFSET the guest genuinely wrote, not a double-applied one.
+
+**And the register chain explains itself in one line:** the guest writes a `DISPFB1` of
+`fbp=144 fbw=16` — a **1024-pixel-wide** framebuffer that **no drawing context ever matches** (the
+contexts only ever hold `fbp=0` and `fbp=160`, both `fbw=10`, i.e. 640 wide) — while `DISPFB2` carries
+the real one, `fbp=160 fbw=10`. DISPFB1 fails the code's own validity check, DISPFB2 passes, and that is
+why the display path falls through to the single-frame branch and shows buffer 160. It is self-consistent
+and it is doing the right thing with the guest's own data.
+
+**So the two remaining unknowns are now separated, and only one is ours-shaped:**
+
+| | what | whose problem |
+|---|---|---|
+| display origin | `originX=0 originY=0` | nothing wrong — rules out double-offset |
+| DISPFB1 | `fbp=144 fbw=16`, matches nothing | the guest's own inconsistent register |
+| DISPFB2 | `fbp=160 fbw=10` | correct, and it is what is displayed |
+| DISPLAY1 | decodes to **640x448**, unclamped | correct, and it is what clips |
+| geometry | X multiple of 0x40, Y 0x720/0x8E0, origin vertex (0,0) | off-screen against 640x448 |
+
+The rasteriser receives `x=1728..2240, y=1824/2272` against a display the guest itself declared as
+**640x448**. X exceeds the width from the very first vertex and Y exceeds the height by 4x, and one
+vertex of every batch is the origin — which is why the whole strip lands outside and GS memory stays
+exactly zero.
+
+**Result (b) stands, and it is now precise: the framebuffer is genuinely empty because every triangle
+GT4 sent is outside the display region GT4 itself requested. The exact geometry is batch 1,
+`(0x6C0,0x720) (0x700,0x8E0) (0,0)` with FBP=0, FBW=10, PSM=CT32. The reason it did not draw is that the
+GS clipped it exactly as hardware would, against a 640x448 window.**
+
+That leaves one thing that is genuinely ours to check, and it is not a guess: **whether a real GT4 at this
+point in boot has begun drawing its startup image at all, or whether it is still in an early 3D-setup pass
+where an off-screen strip is correct.** The boot is dying at `halt=wallclock_deadline` inside a
+`sce_SleepThread` poll loop (W89), and the guest has never left startup. An engine that has not finished
+initialising would legitimately draw a placeholder off to one side.
+
+**Next single measurement:** find which guest function writes the XYOFFSET register that produced
+`6c08,7208`, and read what it computed those coordinates from. If it derives them from a display size the
+guest believes is larger than 640x448, that is guest state still settling. One address-to-instruction
+lookup, and it decides whether the remaining work is ours or the game's.
+
 ---
 
 **Does the captain see a picture yet? NO — the window is still black, and I have proven that is the

@@ -7361,3 +7361,77 @@ comes after the open is the next wall and it has not been looked at yet. Also un
 buffer address 0x01051A10 is still being written with "core.gt4" and then zeroed by a thread that is not
 the one that goes on to open the file, which may be the guest using one scratch buffer from two threads
 or may be us handing the same scratch to two of them.
+## W87 - THE NEW WALL IS A SLEEP, AND interrupts_raised=0 IS NOT WHY
+
+### The halt, verbatim
+
+    VULCAN4 HARNESS detail=blocked inside SCE syscall 0x32 (SleepThread), guest pc 0x01005870
+    -- this syscall is the wall pc=0x01005870 distinct_pcs=129 checkpoint_serviced=55
+    dispatcher_transfers=21 serviced_invocations=76 service_frames=3692
+
+The halt reason has moved off guest_cycle_no_progress, which is what the arc asked for. The boot now
+gets past the disc open, services 3692 frames and 76 invocations, makes 21 dispatcher transfers, and
+stops in a sleep.
+
+The syscall ledger for the same boot:
+
+    0x32 sce_SleepThread        calls=24  a0=0x00000008 x23, a0=0x00000001 x1
+                                          a1=0x0100afa8 x22, a1=0x01051ad0 x1
+    0x44 sce_WaitSema           calls=10
+    0x29 sce_ChangeThreadPriority calls=109
+    0x35 sce_CancelWakeupThread  calls=2
+    0x20 sce_CreateThread        calls=1
+    0x3c sce_SetupThread         calls=2
+
+One thread sleeps 24 times, 23 of them with a0 = 8 and a wakeup struct at a1 = 0x0100AFA8, and the
+24th is the one that never comes back. There is more than one thread in the game and 10 WaitSema calls,
+so there is a plausible mechanism for waking it. Whether one ever fires is NOT established.
+
+### THE INFERENCE I ALMOST SHIPPED, AND WHY IT IS WRONG
+
+interrupts_raised=0 and interrupts_delivered=0 in the same log, 24 sleeps, no wakeup: that reads like a
+hard deadlock with no interrupt source, and I was one command away from writing "the EE interrupt path
+has no source, so every sleep is a permanent deadlock" into this file.
+
+Then I read the code instead of the number:
+
+  * raiseInterrupt() -- which owns m_interruptsRaised and sets COP0 Cause.IP -- has ZERO callers
+    anywhere in the runtime. The mechanism exists and is completely unwired.
+  * BUT EeScheduler::dispatchIrq() delivers an interrupt by building a GuestInvocation with
+    invocation.kind = Interrupt, context.pc = handler.handler, a0 = cause, and calling the guest
+    handler DIRECTLY. m_enabledIntcMask is initialised to 0xFFFFFFFF at EeScheduler.cpp:107, so
+    nothing is masked off and the early return at :1553 is not the break either.
+  * advanceEeTimers() does detect a compare match, sets EQUF, and returns a mask; the scheduler
+    accumulates it and calls dispatchIrq(false, 9 + timer). The chain is complete. It just does not go
+    through COP0.
+
+So interrupts_raised = 0 is consistent with a design that delivers interrupts by direct invocation and
+never touches the architectural path. It is a fact about the counters, NOT proof of a deadlock, and a
+counter reading zero is exactly the "vacuous zero" shape this project keeps getting hurt by -- a number
+that is zero because a path was never taken, not because the thing it measures is absent. Recorded
+because the claim was reasonable, would have read well, and was wrong.
+
+### What IS suspicious, and is the next lead
+
+EeScheduler.cpp:1185, in the driver's step service, with a comment that is worth reading in full:
+
+    // G1.8g. NEVER WAIT. processPendingEvents() paces itself to the next VBlank host deadline, which
+    // is right in run() -- the dispatcher is what models time -- and wrong here, where this function
+    // is called from inside a driver's own step.
+    processPendingEvents(/*mayWait=*/false);
+
+So host time is deliberately never used as a reason to sleep outside run(): queued events are drained,
+the clock is not waited on. The stated reason is measured and sound -- a 120 s boot reached 44579 guest
+entries in 0.85 s of CPU because every step was stalling on the host clock.
+
+That leaves an opening, and it is a hypothesis, not a finding: if the only thing that would bring a
+sleep's wakeup deadline due is host time, and the path the boot is on never waits on host time, then a
+sleep can outlive its own wakeup. Whether sce_SleepThread's a0 = 8 registers a host-time deadline at
+all, and whether the harness reaches that sleep through run() or through the step service, is not
+established. Those are two cheap questions and they are where the next dish starts.
+
+### Where the arc stands
+
+functions_entered 274, distinct_pcs 129, the disc file open at fd = 4 and fd = 5, clean shutdown, no
+VULCAN4 FRAME source=guest. GS geometry is not the wall any more and neither is the path. The wall is a
+sleeping thread at guest pc 0x01005870.

@@ -1,0 +1,246 @@
+W109 measurement instrumentation: see WHY the window is black.
+
+Purely additive logging. No behaviour changes, no register decode changes, no
+framebuffer address changes, nothing painted. Every number in docs/W109-RESULTS.md
+comes from these lines.
+
+The headline finding, which refuted the brief's lead: the 114688-byte packet is a
+VU1 XGKICK, not a display register walk. It reaches the GS via
+PS2Memory::submitGifPacket(Path1,...) in ps2_vu1_core.cpp, which BYPASSES both
+PS2Memory::processGIFPacket overloads -- so the first two dumps here printed nothing,
+which is itself the proof it is not the EE DMA path.
+
+The decisive result: [frame:census] and [frame:channels] show the framebuffer is
+NOT empty. 286720 of 286720 pixels are present, every one of them (0,0,0,255):
+full alpha, zero colour. Coverage works; the colour path does not.
+
+---
+
+=== ps2xRuntime/src/lib/gs/gs_frontend.cpp ===
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -9,6 +9,7 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <iostream>
++#include <sstream>
+ 
+ // W107. A LOG THAT IS NOT COMPILED AWAY BY DEFAULT.
+ //
+@@ -884,6 +885,68 @@
+                                         << " ctx0fbp=" << m_ctx[0].frame.fbp
+                                         << " ctx1fbp=" << m_ctx[1].frame.fbp
+                                         << std::endl);
++            // W109 MEASUREMENT. Dump the raw GIFTAG words for the big packets. A PACKED tag with
++            // nloop==0 executes the inner loops ZERO times, so the outer loop then re-reads the
++            // whole payload as a fresh stream of GIFTAGs -- i.e. register payload is decoded as
++            // tags. Whether that is what hardware means, or our tag decode is wrong, is decided by
++            // looking at the raw words rather than at the fields we derived from them.
++            if (sizeBytes >= 65536u)
++            {
++                const uint64_t tHi = loadLE64(data + 8);
++                std::ostringstream oss;
++                oss << "[gs:giftag] idx=" << packetIndex << " size=" << sizeBytes << " words:";
++                for (uint32_t w = 0; w < 6u && (w * 8u + 8u) <= sizeBytes; ++w)
++                    oss << " " << std::hex << loadLE64(data + w * 8u) << std::dec;
++                oss << " | nloop_lo15=" << (tagLo & 0x7FFFu)
++                    << " bit16=" << ((tagLo >> 16) & 1u)
++                    << " bit17_altmode=" << ((tagLo >> 17) & 1u)
++                    << " bit46_PRE=" << ((tagLo >> 46) & 1u)
++                    << " flg_58_59=" << ((tagLo >> 58) & 3u)
++                    << " nreg_60_63=" << ((tagLo >> 60) & 0xFu)
++                    << " tagHi=" << std::hex << tHi << std::dec;
++                // W109: is the WHOLE packet empty, or just its head? A packet whose head is zero
++                // could be a bad tag decode; a packet with zero non-zero words is an EMPTY SOURCE,
++                // which is a completely different wall and points at whoever was supposed to fill
++                // the buffer. Report both numbers so the two cannot be confused again.
++                uint64_t nonZero = 0u;
++                uint32_t firstNonZero = 0u;
++                bool haveFirst = false;
++                for (uint32_t off = 0; off + 4u <= sizeBytes; off += 4u)
++                {
++                    uint32_t w = 0u;
++                    std::memcpy(&w, data + off, sizeof(w));
++                    if (w != 0u)
++                    {
++                        ++nonZero;
++                        if (!haveFirst)
++                        {
++                            firstNonZero = off;
++                            haveFirst = true;
++                        }
++                    }
++                }
++                oss << " | nonZeroWords=" << nonZero << "/" << (sizeBytes / 4u)
++                    << " head0x60:";
++                // W109: decode the region around the first non-zero word as GIFTAGs, so we can see
++                // whether a valid tag starts there. If it does, the packet we were handed begins
++                // 108 bytes early and the head is something else (a DMA header), which is a
++                // completely different bug from "the guest sent zeros".
++                for (uint32_t off = 0x60u; off <= 0x90u && off + 8u <= sizeBytes; off += 16u)
++                {
++                    const uint64_t w0 = loadLE64(data + off);
++                    const uint64_t w1 = loadLE64(data + off + 8u);
++                    oss << " @" << std::hex << off << std::dec
++                        << "{nloop=" << (w0 & 0x7FFFu)
++                        << ",flg=" << ((w0 >> 58) & 3u)
++                        << ",nreg=" << (((w0 >> 60) & 0xFu) ? (((w0 >> 60) & 0xFu)) : 16u)
++                        << ",w1=" << std::hex << w1 << std::dec << "}";
++                }
++                if (haveFirst)
++                    oss << " firstNonZero@0x" << std::hex << firstNonZero << std::dec;
++                else
++                    oss << " ALL-ZERO BUFFER";
++                RUNTIME_LOG(oss.str() << std::endl);
++            }
+         }
+     });
+ 
+
+=== ps2xRuntime/src/lib/ps2_memory.cpp ===
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -2070,6 +2070,32 @@
+ 
+         m_seenGifCopy = true;
+         m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
++        // W109 MEASUREMENT. Print where a GIF DMA packet actually comes from. The PS2 GIF path is a
++        // 2048-byte RING (256 quadwords); a request far larger than that means we are handing the
++        // GS a guest-supplied count and a guest-supplied address rather than ring contents, which
++        // would explain a packet whose first 108 bytes are zero and whose tail is not.
++        PS2_IF_AGRESSIVE_LOGS({
++            static uint32_t s_w109GifDump = 0u;
++            if (s_w109GifDump < 8u && chunk >= 65536u)
++            {
++                ++s_w109GifDump;
++                const uint32_t nonzero = [&]() {
++                    uint32_t n = 0u;
++                    for (uint32_t off = 0; off + 4u <= chunk && off < 512u; off += 4u)
++                    {
++                        uint32_t w = 0u;
++                        std::memcpy(&w, m_rdram + srcPhysAddr + off, sizeof(w));
++                        if (w != 0u)
++                            ++n;
++                    }
++                    return n;
++                }();
++                std::cout << "[gif:dma] qwCount=" << qwCount << " bytes=" << sizeBytes
++                          << " src=0x" << std::hex << srcPhysAddr << std::dec
++                          << " first512B nonzeroWords=" << nonzero
++                          << " ringQW=" << (2048u / 16u) << std::endl;
++            }
++        });
+         submitGifPacket(GifPathId::Path3, m_rdram + srcPhysAddr, chunk);
+ 
+         bytesLeft -= chunk;
+@@ -2079,6 +2105,26 @@
+ 
+ void PS2Memory::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ {
++    // W109 MEASUREMENT: the big packets arrive HERE, not through the (srcPhysAddr, qwCount) DMA
++    // overload -- which printed nothing at all this run. So whatever calls this overload is
++    // synthesising a size, and we need its name. Print the first words so a caller can be matched
++    // by content, and whether the buffer is RDRAM or something else.
++    PS2_IF_AGRESSIVE_LOGS({
++        static uint32_t s_w109PtrDump = 0u;
++        if (s_w109PtrDump < 4u && sizeBytes >= 65536u)
++        {
++            ++s_w109PtrDump;
++            std::cout << "[gif:ptr] size=" << sizeBytes << " ptr=" << static_cast<const void *>(data)
++                      << " head:";
++            for (uint32_t i = 0; i < 8u && i * 4u + 4u <= sizeBytes; ++i)
++            {
++                uint32_t w = 0u;
++                std::memcpy(&w, data + i * 4u, sizeof(w));
++                std::cout << " " << std::hex << w << std::dec;
++            }
++            std::cout << std::endl;
++        }
++    });
+     if (m_gifArbiter)
+         submitGifPacket(GifPathId::Path3, data, sizeBytes);
+     else if (m_gifPacketCallback && data && sizeBytes >= 16)
+
+=== ps2xRuntime/src/lib/ps2_runtime.cpp ===
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -452,6 +452,78 @@
+         return;
+     }
+ 
++    PS2_IF_AGRESSIVE_LOGS(({
++        // W109: THE DECISIVE CENSUS.  Wrapped in an extra pair of parentheses because this macro
++        // takes ONE argument and the census lines contain top-level commas that the preprocessor
++        // would otherwise count as extra arguments.
++        // s_scratch holds exactly the bytes about to become the window
++        // texture. If they are all zero the window is black because there is nothing there, and the
++        // question moves upstream to whoever should have drawn. Print a real histogram, not a
++        // "non-zero" boolean, so a nearly-black frame is distinguishable from an empty one.
++        {
++            static uint32_t s_census = 0u;
++            static uint32_t s_censusLastFbp = 0xFFFFFFFFu;
++            if (s_census < 6u || displayFbp != s_censusLastFbp)
++            {
++                ++s_census;
++                s_censusLastFbp = displayFbp;
++                uint64_t nonZeroBytes = 0u;
++                uint32_t firstNz = 0u;
++                bool haveFirst = false;
++                for (uint32_t i = 0; i < s_scratch.size(); ++i)
++                {
++                    if (s_scratch[i] != 0u)
++                    {
++                        ++nonZeroBytes;
++                        if (!haveFirst)
++                        {
++                            firstNz = i;
++                            haveFirst = true;
++                        }
++                    }
++                }
++                std::cout << "[frame:census] idx=" << s_census << " fbp=" << displayFbp
++                          << " size=" << width << "x" << height
++                          << " bytes=" << s_scratch.size() << " nonzero=" << nonZeroBytes;
++                if (haveFirst)
++                    std::cout << " first@0x" << std::hex << firstNz << std::dec;
++                else
++                    std::cout << " ALL-ZERO -- nothing has been drawn into this framebuffer";
++                std::cout << std::endl;
++                // W109: WHICH channels carry the data. A frame whose alpha is non-zero while RGB is
++                // zero is a frame the guest genuinely covered but never coloured -- a completely
++                // different wall from an empty framebuffer, and impossible to tell apart without
++                // printing the words. PS2 PSMCT32 is RGBA8 with R in the LOW byte.
++                {
++                    uint64_t rNz = 0u, gNz = 0u, bNz = 0u, aNz = 0u, pixels = 0u;
++                    uint32_t sample[4] = {};  // no brace-init commas: this is inside a 1-arg macro
++                    bool gotSample = false;
++                    for (size_t i = 0; i + 3u < s_scratch.size(); i += 4u)
++                    {
++                        const uint32_t r = s_scratch[i];
++                        const uint32_t g = s_scratch[i + 1u];
++                        const uint32_t b = s_scratch[i + 2u];
++                        const uint32_t a = s_scratch[i + 3u];
++                        if (r) ++rNz;
++                        if (g) ++gNz;
++                        if (b) ++bNz;
++                        if (a) ++aNz;
++                        ++pixels;
++                        if (!gotSample && pixels == 40001u)
++                        {
++                            sample[0] = r; sample[1] = g; sample[2] = b; sample[3] = a;
++                            gotSample = true;
++                        }
++                    }
++                    std::cout << "[frame:channels] pixels=" << pixels
++                              << " R=" << rNz << " G=" << gNz << " B=" << bNz << " A=" << aNz
++                              << " sample=(320,224) RGBA=" << sample[0] << "/" << sample[1] << "/"
++                              << sample[2] << "/" << sample[3] << std::endl;
++                }
++            }
++        }
++    }));
++
+     PS2_IF_AGRESSIVE_LOGS({
+         static uint32_t s_uploadDebugCount = 0u;
+         if (s_uploadDebugCount < 128u ||
+

@@ -6788,3 +6788,82 @@ and read the result as **"the open still did not happen"** or **"the open happen
 never as evidence about mounts. The 27 IRX files do not move.
 
 Suite **482/483**. `VULCAN4 FRAME source=guest` has never printed.
+
+---
+
+## W79 — STEP THREE, THE FILESYSTEM EXPERIMENT: the directory is not the problem, and it never was
+
+The arc put this last for a reason, and the reason held. Done properly, with a control.
+
+### What was done
+
+```sh
+cd /mnt/ssd/gt4/work
+mkdir -p GAMEDATA
+ln -s ../CORE.GT4 GAMEDATA/core.gt4
+```
+
+The 27 IRX files did not move. Then one run through `run_boot_named.sh` as `w79`.
+
+### The answer, verbatim, every `[fioOpen]` line in the run
+
+```
+  11869 [fioOpen] path="cdrom0:\CDROM0:\;1" flags=0x1 -> fd=-1
+      1 [fioOpen] path="rom0:ROMVER" flags=0x1 -> fd=3
+```
+
+**`cdrom0:\GAMEDATA` appears 0 times in 55,673,504 bytes.** Not once. The count moved 11,883 → 11,869,
+which is run-length variance on a retry loop, not a behaviour change.
+
+### The control, because "no line" is only evidence if a line was possible
+
+| check | result |
+|---|---|
+| `GAMEDATA/core.gt4` exists | **True**, 2,020,861 B — same size as `CORE.GT4` |
+| `rom0:ROMVER` still opens | **fd=3** — the open mechanism is live in the same run |
+| log provenance | harness 00:51:42, runtime 00:41:35, generated 00:28:11 — all current |
+
+So the file is reachable, the syscall path works, and the guest still does not ask. **The experiment was
+capable of showing a change and showed none.**
+
+### The 20 `GAMEDATA` occurrences are not disc opens either
+
+Every one is the same line:
+
+```
+W30WRITE seq=29 op=memcpy src=0x103d548 pc=0x1003de0 addr=0x10519cd size=9
+        now='/BASCUS-97328GAMEDATA...'
+```
+
+That is the guest building `/BASCUS-97328GAMEDATA` — the **memory-card** data root, from the constant at
+`0x0103D548` — into the card buffer at `0x010519CD`. It is the card path, not the disc path, and it is
+not an open.
+
+### Conclusion, stated the way the steer required
+
+**H1 is DISPROVEN. Discard the missing-`GAMEDATA`-directory theory entirely.** The wall is **upstream of
+the filesystem**, and it is the same wall W69–W78 named: the guest assembles a device path whose
+**filename component is empty** (`cdrom0:\CDROM0:\;1`), and something not visible to any traced store
+path replaces the contents of `0x010519C0` between the guest correctly building
+`/BASCUS-97328GAMEDATA` there and the 2-byte paste that reads `05 80` out of it.
+
+The symlink stays — it is harmless and it removes one variable from every future run — but **it is not
+the fix and I am not claiming credit for it.**
+
+### On step four, honestly
+
+VU1 is the long pole and microVU is a real route, but **it cannot serve this wall.** The failure is in
+the guest's path assembly, upstream of any floating-point work, and the GS lane is behind the boot
+wall. Compiling microVU would be progress on G3 while G1 is blocked on a two-byte overwrite that four
+dishes have failed to name. **I am not starting a VU1 port on the strength of "three left a named wall"
+— the wall it would serve is a different wall.**
+
+### The wall, in one sentence, and the next single step
+
+Something overwrites `0x010519C0` with card-directory-shaped bytes
+(`0x8005 / 0x0041 / 0x0003 / 0x0042 / 0x1400 / 0x0059`) without passing through any traced store path,
+and the store observer is provably not seeing it. **Next:** the red test W77 named — a test that an
+`sceSifRpc` call which sets a result field is visible to the store observer, which fails today and
+should — then route `RPC.cpp`'s typed-pointer stores through `ps2TraceGuestRangeWrite` and re-run.
+
+Suite **482/483**. `VULCAN4 FRAME source=guest` has never printed.

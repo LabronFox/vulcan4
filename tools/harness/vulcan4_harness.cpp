@@ -138,6 +138,24 @@ constexpr uint32_t kWatchPathStorePc = 0x01003E98u;
 uint32_t g_watchPathHits = 0;
 // W33: the observer needs RDRAM to read the candidate path strings. Set once, before boot.
 uint8_t *g_rdramForWatch = nullptr;
+
+// W90. A SCRATCHPAD WATCH WINDOW, because the RDRAM one cannot see the thing we are looking for.
+//
+// W89 measured the livelock: the guest resumes from sce_SleepThread at 0x0100AFA8 and runs
+//     lbu   $v1, 0x0($s0)
+//     bnel $v1, $zero, ...            (branch back 0x60 bytes -- a poll loop)
+// with $s0 = 0x70002085 / 0x70002050 / 0x70002079, all inside the scratchpad. The flag the guest is
+// polling lives in the scratchpad, and the observer above DELIBERATELY EXCLUDES scratchpad stores:
+// `isScratchStore` forces resolvedAddr to 0 and overlapsWatch to false, so a store to 0x70002085
+// produces no line at all. The shadow is over g_rdramForWatch, and the scratchpad is a separate 16 KB
+// allocation (ps2_memory.cpp:344). So the one byte the boot is stuck on was invisible by construction,
+// and no amount of waiting would have shown it.
+//
+// Off unless VULCAN4_SCRATCH_LO is set, so nothing changes for a normal run.
+const uint32_t kScratchLo = watchEnv("VULCAN4_SCRATCH_LO", 0u);
+const uint32_t kScratchHi = watchEnv("VULCAN4_SCRATCH_HI", 0u);
+const bool kScratchWatch = (kScratchHi > kScratchLo);
+
 // W77. The live runtime, so the shadow can ask whether the buffer it is watching is still the buffer
 // the code reads. RDRAMPROBE printed this ONCE at startup, where the two pointers necessarily agree.
 PS2Runtime *g_runtimeForShadowProbe = nullptr;
@@ -449,10 +467,67 @@ void watchGuestStoreForPath(uint32_t guestAddr,
         uint32_t size;
         const char *op;
         bool hasCtx;
+        int tid;
     };
     static W84Event g_w84Ring[8] = {};
 
     static uint32_t shadowChanges = 0;
+    // W90. Same shadow discipline as the RDRAM window -- prime once, diff per announcement, print the
+    // bracket so the writer is named rather than inferred -- pointed at the scratchpad instead.
+    if (kScratchWatch)
+    {
+        uint8_t *scratch = ps2GetScratchpadHostPtr();
+        if (scratch != nullptr)
+        {
+            static uint8_t scratchShadow[256];
+            static bool scratchInit = false;
+            const uint32_t span = std::min(kScratchHi - kScratchLo, static_cast<uint32_t>(sizeof(scratchShadow)));
+            if (!scratchInit)
+            {
+                for (uint32_t k = 0; k < span; ++k)
+                {
+                    scratchShadow[k] = scratch[kScratchLo + k];
+                }
+                scratchInit = true;
+            }
+            for (uint32_t k = 0; k < span; ++k)
+            {
+                if (scratchShadow[k] != scratch[kScratchLo + k])
+                {
+                    static uint32_t sCount = 0;
+                    if (sCount < 400u)
+                    {
+                        ++sCount;
+                        std::cout << "VULCAN4 SCRATCHCHANGE #" << (sCount - 1u)
+                                  << " seq=" << ps2TraceSequenceCounter().load(std::memory_order_relaxed)
+                                  << " guest=0x" << std::hex << (kScratchLo + k)
+                                  << " off=0x" << (kScratchLo + k)
+                                  << " now=0x" << static_cast<uint32_t>(scratch[kScratchLo + k])
+                                  << " was=0x" << static_cast<uint32_t>(scratchShadow[k])
+                                  << " by_op=" << (op != nullptr ? op : "?")
+                                  << " by_addr=0x" << guestAddr
+                                  << " tid=" << g_guestThreadId << std::dec
+                                  << " | W84BRACKET";
+                        for (int r = 0; r < 8; ++r)
+                        {
+                            const W84Event &e = g_w84Ring[r];
+                            if (e.op == nullptr)
+                            {
+                                continue;
+                            }
+                            std::cout << " [seq=" << e.seq << " pc=0x" << std::hex << e.pc
+                                      << (e.hasCtx ? "" : "*NOCONTEXT*") << " op=" << e.op
+                                      << " addr=0x" << e.addr << " size=" << std::dec << e.size
+                                      << " tid=" << e.tid << "]";
+                        }
+                        std::cout << "\n";
+                    }
+                    scratchShadow[k] = scratch[kScratchLo + k];
+                }
+            }
+        }
+    }
+
     if (kShadow && g_rdramForWatch != nullptr)
     {
         const uint32_t span = std::min(kWatchHi - kWatchLo, static_cast<uint32_t>(sizeof(shadow)));
@@ -541,6 +616,7 @@ void watchGuestStoreForPath(uint32_t guestAddr,
         g_w84Ring[w84Cursor].size = size;
         g_w84Ring[w84Cursor].op = op;
         g_w84Ring[w84Cursor].hasCtx = (ctx != nullptr);
+        g_w84Ring[w84Cursor].tid = g_guestThreadId;
         w84Cursor = (w84Cursor + 1u) & 7u;
     }
     // W64. This used to be a VLA sized by the watch window: `uint8_t before[kWatchHi - kWatchLo]`.
@@ -2077,6 +2153,43 @@ int main(int argc, char *argv[])
               << " interrupts_raised=" << runtime.interruptsRaised()
               << " interrupts_delivered=" << runtime.interruptsDelivered()
               << " pending_ip=0x" << std::hex << runtime.pendingInterrupts() << std::dec << "\n";
+
+    // W91. WHO IS STILL ALIVE AT THE END. Every "the guest is waiting for something" question in this
+    // campaign has been answered by inference from counters, and a counter cannot say whether the
+    // thread that is supposed to answer is still running. EeKernelSnapshot is public and carries
+    // every thread's id, status, pc, priority and wait reason, so the question is one dump away and
+    // there is no excuse for another round of guessing.
+    {
+        const EeKernelSnapshot snap = runtime.eeScheduler().snapshot();
+        std::cout << "VULCAN4 THREADS eeCycle=" << snap.eeCycle
+                  << " nextEventCycle=" << snap.nextEventCycle
+                  << " runningThreadId=" << snap.runningThreadId
+                  << " count=" << snap.threads.size() << "\n";
+        for (const EeThreadSnapshot &t : snap.threads)
+        {
+            static const char *kStatus[] = {"Running", "Ready", "Waiting", "WaitingSuspended",
+                                            "Suspended", "Dormant"};
+            const char *status = kStatus[static_cast<size_t>(t.status)];
+            std::cout << "    THREAD id=" << t.id
+                      << " status=" << status
+                      << " prio=" << t.currentPriority
+                      << " pc=0x" << std::hex << t.pc
+                      << " ra=0x" << t.ra
+                      << " sp=0x" << t.sp
+                      << " entry=0x" << t.entry
+                      << " waitReason=" << static_cast<int>(t.waitReason)
+                      << " wakeupCount=" << std::dec << t.wakeupCount << std::endl;
+        }
+        for (const EeSemaphoreSnapshot &sem : snap.semaphores)
+        {
+            std::cout << "    SEM id=" << sem.id << " count=" << sem.count
+                      << " waiters=" << sem.waiters << std::endl;
+        }
+        for (const EeEventFlagSnapshot &flag : snap.eventFlags)
+        {
+            std::cout << "    EVENTFLAG id=" << flag.id << " waiters=" << flag.waiters << std::endl;
+        }
+    }
 
     // W16: where the guest actually spent its life. Top 24 by entry count, with the share of all
     // entries, so a loop that owns 99% of the run cannot hide behind a function that owns 0.1%.

@@ -7576,3 +7576,80 @@ thread is not running, and the next question is which of sce_WaitSema's 32 calls
 sce_SignalSema's 31 is the one that should have.
 
 State: functions_entered 567, the disc file open at fd = 4 and 5, no VULCAN4 FRAME source=guest.
+## W90/W91 - WE WERE NOT STUCK. WE WERE OUT OF BUDGET, AND THE WATCHDOG WAS CALLING IT A LIVELOCK
+
+### The scratchpad flag is written, by two threads, correctly
+
+W89 ended with the livelock at pc 0x0101F348 and a poll on a scratchpad flag byte at 0x70002085, and noted
+that the flag could not be seen: the RDRAM watch DELIBERATELY excludes scratchpad stores
+(`isScratchStore` forces resolvedAddr to 0 and overlapsWatch to false) and the shadow is over
+g_rdramForWatch, while the scratchpad is a separate 16 KB allocation. The one byte the boot was stuck
+on was invisible by construction.
+
+So: VULCAN4_SCRATCH_LO / VULCAN4_SCRATCH_HI, and a second shadow over ps2GetScratchpadHostPtr() with the
+same prime-once / diff-per-announcement discipline and the same W84 bracket ring, so the writer is named
+rather than inferred. It pays for itself immediately. From boot_w90b.log:
+
+    SCRATCHCHANGE #2  guest=0x2085 now=0x1 was=0x0  by_op=WRITE32
+        bracket: [pc=0x100b0b8 op=WRITE8 addr=0x70002085 size=1]
+                 [pc=0x0*NOCONTEXT* op=PS2Memory::write8 addr=0x70002085 size=1]
+    SCRATCHCHANGE #7  guest=0x2085 now=0x0 was=0x1  by_op=WRITE32
+        bracket: [pc=0x100dcf0 op=WRITE8 addr=0x70002085 size=1]
+                 [pc=0x0*NOCONTEXT* op=PS2Memory::write8 addr=0x70002085 size=1]
+
+Two different guest instructions own the same flag: 0x100B0B8 sets it, 0x100DCF0 clears it, and there
+are paired 32-bit stores at 0x100AF18 and 0x100B004 to 0x70002088 covering the bytes beside it. With
+the thread id added to the ring:
+
+    tid=2: 11 sets, 11 clears
+    tid=1:  8 sets,  8 clears
+
+Both threads write it and the counts balance exactly. **The handshake is healthy. Nobody is stuck on
+that flag, and "nobody writes it" -- the hypothesis W89 sent the next dish after -- is wrong.**
+
+### THE THREAD DUMP, and what it says
+
+EeKernelSnapshot is public and carries every thread's id, status, pc, priority and wait reason, so
+"is anybody still alive" is one dump away and there was no excuse for another round of inference. Added
+at the boot report, with the semaphores and event flags:
+
+    VULCAN4 THREADS eeCycle=290174303 nextEventCycle=294917940 runningThreadId=0 count=2
+        THREAD id=1 status=Ready  prio=3 pc=0x10089dc entry=0x1000008
+        THREAD id=2 status=Ready  prio=2 pc=0x101f348 ra=0x100afa8 entry=0x1000ba0
+
+**Nothing is Waiting. Both threads are Ready. runningThreadId = 0, so nothing is running either.**
+There is no deadlock to find, because there is no blocked thread. The scheduler had stopped with
+runnable work pending.
+
+### AND THE HALT REASON WAS A WATCHDOG, WEARING A LIVELOCK'S NAME
+
+harness line 1780:
+
+    if (runtime.isStopRequested())
+    {
+        // The watchdog sets this when the deadline passes.
+        if (watchdogFired.load())
+
+budget.maxSeconds is argv[4]. **Every run in this campaign has been passing 12.** Twelve seconds of
+wall clock. And the report then labelled the result from whichever syscall the guest happened to be
+inside when the clock ran out, which is how "livelocked_in_syscall ... 1736 of 2180 guest syscalls were
+this one" came to be written down as a wall. It was a timeout with a poll loop nearby, and the poll loop
+was working.
+
+### THE ACTUAL SITUATION, which is a reframe and not a bug
+
+    12 s wall  ->  functions_entered=274    eeCycle=  290,174,303  =  0.98 s of guest time
+    900 s wall ->  functions_entered=13509  eeCycle=6,483,279,460  = 21.98 s of guest time
+
+At kEeClockHz = 294,912,000 the guest is getting about 2.4% of real PS2 speed -- roughly 41x slower than
+the hardware. Both threads are Ready, thread 2 is Running, the halt is honestly labelled
+wallclock_deadline, and the guest keeps entering functions. **The boot is compute-bound, not blocked.**
+GT4's boot to a menu plausibly needs tens of seconds of guest time, which at this rate is tens of
+minutes of wall time per attempt.
+
+So the constraint on this project is no longer a missing feature. It is that nobody has ever let the
+boot run long enough to find out what is actually at the end of it. Every wall named in the last
+several dishes was a twelve-second timeout wearing a costume.
+
+Still no VULCAN4 FRAME source=guest. Next: run it for the length it actually needs, and watch
+functions_entered keep climbing.

@@ -41,6 +41,7 @@
 #include "ps2_runtime.h"
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
+#include "Stubs/LibC.h"
 #include "runtime/ee_scheduler.h"
 #include "Stubs/Audio.h"
 #include "Stubs/MPEG.h"
@@ -54,6 +55,9 @@
 #include <cstdio>
 #include <cstring>
 #include <execinfo.h>
+#include <signal.h>
+#include <sys/time.h>
+#include <ucontext.h>
 #include <cxxabi.h>
 #include <algorithm>
 #include <chrono>
@@ -116,6 +120,255 @@ uint32_t watchEnv(const char *name, uint32_t fallback)
     const unsigned long value = std::strtoul(raw, &end, 0);
     return (end != nullptr && *end == '\0') ? static_cast<uint32_t>(value) : fallback;
 }
+// W93. A SAMPLING PROFILER WE OWN, because perf will not.
+//
+// `perf record` is installed and refused: perf_event_paranoid is 4, so hardware events and call graphs
+// are both out, and changing a system sysctl is not a thing to do to somebody's box unasked. That
+// leaves the only question left on the table unanswerable with what is on it: the guest runs at 3.6%
+// of real PS2 speed, 28x slower than the hardware, and nothing knows where those 28x go.
+//
+// So: SIGPROF on a timer, take the interrupted PC out of the ucontext, and histogram it. One signal
+// handler, one atomic index, one fixed array. No allocation in the handler, because a profiler that
+// allocates in its own signal handler is a profiler that lies to itself. The raw addresses are printed
+// at the end and symbolised with addr2line against this binary, which is the same trick W84 used to
+// turn a memcpy into a named function.
+namespace W93Sampler
+{
+constexpr size_t kBuckets = 1u << 16;
+std::atomic<size_t> g_next{0};
+uintptr_t g_pcs[kBuckets];
+// W94. The caller as well as the leaf. 75% of every sample lands on one address inside libc, and
+// glibc's memcpy/memset variants are LOCAL symbols -- not in .dynsym, so nm -D names the nearest
+// EXPORTED neighbour instead, which for that address is getgroups, a syscall wrapper that cannot
+// possibly be three quarters of a recompiler. The address is therefore not the interesting part; the
+// interesting part is who called it.
+//
+// Those variants are leaf functions: no frame is pushed, so the return address is still at the top of
+// the stack when the sample lands. REG_RSP + one dereference gives the caller, which IS in our binary
+// and does symbolise. One extra load in the handler.
+uintptr_t g_callers[kBuckets];
+std::atomic<uint64_t> g_samples{0};
+
+void handler(int, siginfo_t *, void *ctx)
+{
+    auto *uc = static_cast<ucontext_t *>(ctx);
+    if (uc == nullptr)
+    {
+        return;
+    }
+    const uintptr_t pc = static_cast<uintptr_t>(uc->uc_mcontext.gregs[REG_RIP]);
+    uintptr_t caller = 0;
+    const uintptr_t sp = static_cast<uintptr_t>(uc->uc_mcontext.gregs[REG_RSP]);
+    if (sp != 0)
+    {
+        // Read-only copy, no reinterpret_cast through a volatile pointer into unknown memory.
+        uintptr_t probed = 0;
+        // No condition on the result: __builtin_memcpy returns the destination, which is never null,
+        // so testing it for == 0 made every caller read back as zero. That is the whole bug, and it
+        // is the same shape as the "callerPc was a lie" note in W74 -- an instrument field that is
+        // confidently wrong is worse than one that is obviously missing.
+        __builtin_memcpy(&probed, reinterpret_cast<const void *>(sp), sizeof(probed));
+        caller = probed;
+    }
+    const size_t i = g_next.fetch_add(1u, std::memory_order_relaxed);
+    if (i < kBuckets)
+    {
+        g_pcs[i] = pc;
+        g_callers[i] = caller;
+    }
+    g_samples.fetch_add(1u, std::memory_order_relaxed);
+}
+
+void start(uint32_t hz)
+{
+    struct sigaction sa{};
+    sa.sa_sigaction = &handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGPROF, &sa, nullptr) != 0)
+    {
+        std::cerr << "VULCAN4 PROF sigaction(SIGPROF) failed; no profile will be produced" << std::endl;
+        return;
+    }
+    struct itimerval tv{};
+    const long period = 1000000L / static_cast<long>(hz == 0u ? 1u : hz);
+    tv.it_interval.tv_usec = period;
+    tv.it_value.tv_usec = period;
+    if (setitimer(ITIMER_PROF, &tv, nullptr) != 0)
+    {
+        std::cerr << "VULCAN4 PROF setitimer(ITIMER_PROF) failed; no profile will be produced" << std::endl;
+    }
+}
+
+void stop()
+{
+    struct itimerval tv{};
+    setitimer(ITIMER_PROF, &tv, nullptr);
+
+    const size_t n = std::min(g_next.load(std::memory_order_relaxed), kBuckets);
+    std::vector<uintptr_t> all;
+    all.reserve(n);
+    for (size_t i = 0; i < n; ++i)
+    {
+        if (g_pcs[i] != 0)
+        {
+            all.push_back(g_pcs[i]);
+        }
+    }
+    std::sort(all.begin(), all.end());
+
+    // The binary is PIE, so a raw RIP means nothing without the slide. Take the lowest mapping of our
+    // own executable out of /proc/self/maps and print offsets from there, which is what addr2line
+    // wants. Reading a map file at profile time is not something to do in the signal handler, and this
+    // is not the signal handler.
+    uintptr_t base = 0;
+    {
+        char selfPath[4096] = {};
+        const ssize_t len = ::readlink("/proc/self/exe", selfPath, sizeof(selfPath) - 1);
+        std::ifstream maps("/proc/self/maps");
+        std::string line;
+        while (std::getline(maps, line))
+        {
+            if (len > 0 && line.find(selfPath) == std::string::npos)
+            {
+                continue;
+            }
+            const size_t dash = line.find('-');
+            if (dash == std::string::npos)
+            {
+                continue;
+            }
+            const uintptr_t candidate = std::strtoull(line.substr(0, dash).c_str(), nullptr, 16);
+            if (base == 0 || candidate < base)
+            {
+                base = candidate;
+            }
+        }
+    }
+
+    std::cout << "VULCAN4 PROF samples=" << g_samples.load() << " collected=" << all.size()
+              << " exe_base=0x" << std::hex << base << std::dec << "\n";
+
+    // Rank by COUNT, not by address. The first cut of this printed the first 40 distinct addresses it
+    // found and they were all single-digit counts, which told us nothing: with 59,180 samples over a
+    // large address range, address order and count order are not remotely the same list.
+    // 74% of the samples were landing on one address that is NOT in this binary, so name the mapping
+    // rather than printing an offset that resolves to nothing. Read the maps once and keep the lines.
+    std::vector<std::pair<uintptr_t, std::pair<uintptr_t, std::string>>> regions;
+    {
+        std::ifstream maps("/proc/self/maps");
+        std::string line;
+        while (std::getline(maps, line))
+        {
+            const size_t dash = line.find('-');
+            if (dash == std::string::npos)
+            {
+                continue;
+            }
+            const uintptr_t lo = std::strtoull(line.substr(0, dash).c_str(), nullptr, 16);
+            const size_t sp = line.find(' ');
+            if (sp == std::string::npos)
+            {
+                continue;
+            }
+            const uintptr_t hi = std::strtoull(line.substr(dash + 1, sp - dash - 1).c_str(), nullptr, 16);
+            std::string rest = line.substr(sp);
+            const size_t p = rest.find('/');
+            regions.emplace_back(lo, std::make_pair(hi, p == std::string::npos ? rest : rest.substr(p)));
+        }
+        std::sort(regions.begin(), regions.end());
+    }
+    // Name the mapping AND the offset inside it: 75% of the samples were one address in libc, and an
+    // address alone cannot be looked up in a library that is mapped somewhere different every run.
+    std::string g_topRegion;
+    uintptr_t g_topOffset = 0;
+    auto regionOf = [&regions, &g_topRegion, &g_topOffset](uintptr_t pc) -> std::string
+    {
+        for (const auto &[lo, hi_name] : regions)
+        {
+            if (pc >= lo && pc < hi_name.first)
+            {
+                std::string nm = hi_name.second;
+                const size_t sp = nm.find(' ');
+                if (sp != std::string::npos)
+                {
+                    nm = nm.substr(0, sp);
+                }
+                g_topRegion = nm;
+                g_topOffset = pc - lo;
+                return nm;
+            }
+        }
+        return "?";
+    };
+
+    // Re-walk the sample array so each leaf address carries the caller that was recorded with it.
+    // A std::map would be tidier; this runs once, at exit, on a few hundred thousand entries.
+    std::vector<std::tuple<size_t, uintptr_t, uintptr_t>> ranked;
+    {
+        std::vector<std::pair<uintptr_t, size_t>> counts;
+        std::unordered_map<uintptr_t, size_t> byLeaf;
+        for (size_t i = 0; i < n; ++i)
+        {
+            if (g_pcs[i] != 0)
+            {
+                byLeaf[g_pcs[i]] += 1u;
+            }
+        }
+        counts.reserve(byLeaf.size());
+        for (const auto &[leaf, c] : byLeaf)
+        {
+            uintptr_t bestCaller = 0;
+            size_t bestCount = 0;
+            std::unordered_map<uintptr_t, size_t> callerTally;
+            for (size_t i = 0; i < n; ++i)
+            {
+                if (g_pcs[i] == leaf && g_callers[i] != 0)
+                {
+                    callerTally[g_callers[i]] += 1u;
+                }
+            }
+            for (const auto &[cal, cc] : callerTally)
+            {
+                if (cc > bestCount)
+                {
+                    bestCount = cc;
+                    bestCaller = cal;
+                }
+            }
+            counts.emplace_back(leaf, c);
+            ranked.emplace_back(c, leaf, bestCaller);
+        }
+    }
+    std::sort(ranked.begin(), ranked.end(),
+              [](const std::tuple<size_t, uintptr_t, uintptr_t> &a,
+                 const std::tuple<size_t, uintptr_t, uintptr_t> &b)
+              { return std::get<0>(a) > std::get<0>(b); });
+
+    const size_t total = all.size();
+    int rank = 0;
+    for (const auto &entry : ranked)
+    {
+        const size_t count = std::get<0>(entry);
+        const uintptr_t pc = std::get<1>(entry);
+        const uintptr_t caller = std::get<2>(entry);
+        if (rank >= 30)
+        {
+            break;
+        }
+        std::cout << "    PROFPC " << rank << " count=" << count << " pct="
+                  << ((total != 0) ? (count * 100 / total) : 0) << "%"
+                  << " off=0x" << std::hex << (pc >= base ? pc - base : pc)
+                  << " in=" << regionOf(pc) << "+0x" << std::hex << g_topOffset << std::dec
+                  << " fileoff=0x" << pc
+                  << " caller=" << (caller != 0 ? regionOf(caller) : std::string("?"))
+                  << "+0x" << std::hex << (caller != 0 && caller >= base ? caller - base : caller)
+                  << std::dec << "\n";
+        ++rank;
+    }
+}
+} // namespace W93Sampler
+
 const uint32_t kWatchLo = watchEnv("VULCAN4_WATCH_LO", kWatchLoDefault);
 const uint32_t kWatchHi = watchEnv("VULCAN4_WATCH_HI", kWatchHiDefault);
 uint32_t g_watchStoreHits = 0;
@@ -1344,7 +1597,9 @@ int main(int argc, char *argv[])
     const auto start = std::chrono::steady_clock::now();
     bool finished = false;
 
-    // ---- watchdog
+    
+
+// ---- watchdog
     //
     // A guest that spins INSIDE one generated function never returns to this loop, so neither
     // the entry budget nor the deadline check can fire. The generated code emits
@@ -1363,6 +1618,24 @@ int main(int argc, char *argv[])
     // this project that the instrument, not the thing measured, produced the number.
     // The watchdog now watches a flag the driver sets when it is done, so joining is prompt.
     std::atomic<bool> driverFinished{false};
+    // W95. Turn on the guest copy-size histogram. Gated, and off by default, because it is a
+    // diagnostic and law 12 is that diagnostics are opt-in.
+    // W95 gate. Guarded so the harness still builds against a runtime that predates the histogram,
+    // which is what makes the pre-W92 A/B possible at all.
+    // W95's gate lives in the runtime (W95::g_enabled reads its own env var), deliberately: a
+    // harness that calls a runtime setter will not build against a runtime that predates it, and a
+    // failed harness build leaves a STALE binary that reports numbers for code that is no longer
+    // there. That happened twice today and both times the number looked plausible.
+    (void)0;
+
+    // W93. ITIMER_PROF counts CPU time, not wall time, which is the right clock here: the guest is
+    // compute-bound and the box is shared with a Minecraft server, so wall-clock sampling would spend
+    // its samples on other people's processes.
+    if (watchEnv("VULCAN4_PROF_HZ", 0u) != 0u)
+    {
+        W93Sampler::start(static_cast<uint32_t>(watchEnv("VULCAN4_PROF_HZ", 997u)));
+    }
+
     std::thread watchdog([&runtime, &budget, &watchdogFired, &driverFinished, start]() {
         const auto deadline = start + std::chrono::seconds(budget.maxSeconds);
         while (std::chrono::steady_clock::now() < deadline)
@@ -1983,6 +2256,14 @@ int main(int argc, char *argv[])
     driverFinished.store(true, std::memory_order_release);
     runtime.requestStop(); // tell the watchdog thread to exit its wait loop
     watchdog.join();
+
+    // W93. Stop sampling and print the histogram. After the watchdog join, so the samples cover the
+    // boot and nothing else, and before the thread dump so a profile failure cannot cost us the
+    // thread state.
+    if (watchEnv("VULCAN4_PROF_HZ", 0u) != 0u)
+    {
+        W93Sampler::stop();
+    }
 
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                              std::chrono::steady_clock::now() - start)

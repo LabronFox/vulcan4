@@ -7754,3 +7754,91 @@ with addr2line against the harness binary. ~40 lines, no system change, and it a
 left that matters -- where do the 28x go.
 
 Suite 492/492.
+## W93/W94/W95 - A PROFILER WE OWN, WHAT THE 28x ACTUALLY IS, AND A BENCHMARK WITH NO LOG BEHIND IT
+
+### The profiler, because perf will not
+
+`perf record` is installed and refuses: `perf_event_paranoid` is 4, so hardware events and call graphs
+are both out, and changing a system sysctl on somebody's box is not a thing to do unasked. So the
+sampler is ours: SIGPROF on ITIMER_PROF, take the interrupted RIP out of the ucontext, histogram it,
+print offsets from the executable base read out of /proc/self/maps, and name the mapping for anything
+outside it. Symbolise with addr2line, the same trick W84 used on a memcpy.
+
+Four things were wrong in the first three versions, all recorded because all four would have produced
+a confident wrong answer:
+
+  * The histogram printed the first 40 distinct ADDRESSES rather than the top 40 by COUNT. With 59,180
+    samples over a large range those are not remotely the same list, and the output was all single
+    digits.
+  * The binary is PIE, so a raw RIP is meaningless without the slide. Now printed as exe_base-relative.
+  * One address held 75% of every sample and was outside the executable, so the mapping had to be named
+    too: libc.so.6+0xf487d.
+  * Capturing the caller with one dereference of RSP gave garbage, because glibc's memcpy/memset
+    variants are NOT leaf functions and RSP is not the return address. I had also written the condition
+    backwards -- `if (__builtin_memcpy(...) == 0)` never fires, because it returns the destination --
+    so every caller read back as zero. Same shape as W74's "callerPc was a lie": an instrument field
+    that is confidently wrong is worse than one that is obviously missing.
+
+### What the profile says, and what it does not
+
+    75%  libc.so.6+0xf487d                 one function, three quarters of all CPU
+     1%  vulcan4_harness                   sub_01013F08
+     0%  libstdc++                         operator new / delete territory
+
+The libc address cannot be named from .dynsym, because the memcpy/memset variants are local symbols; the
+nearest EXPORTED neighbour is `getgroups`, a syscall wrapper, which is obviously not three quarters of a
+recompiler. So the function is not in doubt and its arguments are.
+
+### W95: the arguments, measured
+
+Histogram of the guest's own copy sizes, gated on VULCAN4_COPY_SIZES, reported at teardown so a boot
+that dies still reports. 60 s boot:
+
+    [W95] guest copy sizes: memcpy calls=0 bytes=0 | memset calls=46 bytes=24567088
+           largest=16410192 dst=0x10519b0 src=0x0 ra=0x1010eec
+           <=2^23  calls=3  totalBytes=24550169
+
+**So the guest's memsets are NOT the hot function.** 46 calls, 24.5 MB total, largest 16,410,192 bytes
+at pc 0x1010EEC -- the same wrong-argument 16 MB clear W57e flagged, still happening, still wrong, and
+worth its own fix. But 24.5 MB of memset is a millisecond of CPU. It cannot be 75% of anything.
+
+And `memcpy calls=0`. **The guest never calls our memcpy syscall at all.** So the hot libc function is
+our own C++ copying, not the game's.
+
+### The number that matters, and a benchmark with no log behind it
+
+    60 s wall -> functions_entered=1287, total_syscall_calls=7818
+
+That is 21 dispatcher entries per second. W20's note in the runtime says GT4's boot services ~221,000
+invocations for 31 VBlanks, and 3,033,254 syscalls inside them. Today's 7,818 is about 400 times less
+work, not a different phase.
+
+Now the uncomfortable part. tools/harness/build_harness.sh carries this in a comment, as the reason the
+script uses $FRAMEPTR -O2:
+
+    -O0            : functions_entered=1501874  distinct_pcs=149  vsync_tick=27
+    $FRAMEPTR -O2  : functions_entered=1747058  distinct_pcs=152  vsync_tick=31     (+16.3 %)
+
+**1.7 million entries in 45 seconds, 33K/s.** Today: 21/s. That is a factor of about 1500, and
+
+    grep -rloE "functions_entered=1[0-9]{6}" over every log in the run directory: NOTHING.
+
+**No surviving log contains a six-digit functions_entered.** I am not calling the number false -- logs
+get pruned here and pruning after recording evidence is the documented practice -- but it is
+UNCONFIRMED, and it is the number an entire build decision rests on, and every number actually
+measurable today is ~1500 times lower than it. Stated that way because the alternative is building the
+next forty dishes on a figure nothing here supports.
+
+### Where the guest actually is, for the record
+
+    total_syscall_calls=7818, of which sce_SleepThread 6973 (90%)
+    sce_SignalSema 99 / sce_WaitSema 100        -- balanced, the handshake works
+    sce_ChangeThreadPriority 121
+    0x0100AFA8 x5504, 0x0100B680 x1469         -- two sleep call sites
+
+The guest is in the 8-microsecond sleep-and-poll loop W89 found, and the semaphore handshake around it
+is healthy. Nothing about that is a wall we have not already named; the problem is that at 21 entries a
+second, reaching the end of the boot is a matter of hours.
+
+So the main job is the one the goal asks for and the one nobody has ever done here: turn everything
+off, which is now the default, and let it run.

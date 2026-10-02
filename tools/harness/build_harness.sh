@@ -16,6 +16,17 @@ G=$B/recomp
 INC="-I$G -I$R/ps2xRuntime/include -I$R/ps2xRecomp/include -I$R/ps2xRuntime/src/lib/Kernel -I$R/ps2xIOP/include"
 DEFS="-DPS2_RUNTIME_LOGS=1 -DAGRESSIVE_LOGS=1 -DPS2_FUNCTION_LOG_TRACKER=1 -DPS2X_ENABLE_IOP_RPC_TRACE=1 -DPS2X_HAS_FFMPEG=1"
 
+# W96. FRAME POINTERS, ON REQUEST ONLY. The sampling profiler needs to walk the stack to say WHO
+# called the libc function that takes 75% of the CPU, and glibc's memcpy/memset variants are not leaf
+# functions, so [RSP] is not the return address and guessing it produced garbage callers. -fno-omit-
+# frame-pointer changes codegen for the whole program, so it is a diagnostic build, not the default:
+# VULCAN4_FRAMEPTR=1 for a profile run, nothing for a normal one.
+FRAMEPTR=""
+if [ "${VULCAN4_FRAMEPTR:-0}" = "1" ]; then
+  FRAMEPTR="-fno-omit-frame-pointer"
+  echo "build_harness: frame pointers ON (diagnostic build)"
+fi
+
 mkdir -p "$B/run"
 cd "$B/run"
 
@@ -41,11 +52,11 @@ done
 # functions, i.e. ~33K/s. Measured head to head at the same 45 s wall clock, same binary otherwise:
 #
 #   -O0 : functions_entered=1501874  distinct_pcs=149  vsync_tick=27
-#   -O2 : functions_entered=1747058  distinct_pcs=152  vsync_tick=31     (+16.3 %)
+#   $FRAMEPTR -O2 : functions_entered=1747058  distinct_pcs=152  vsync_tick=31     (+16.3 %)
 #
-# So -O2 is a strict improvement -- more work done and slightly further into the guest -- and it is
+# So $FRAMEPTR -O2 is a strict improvement -- more work done and slightly further into the guest -- and it is
 # what this script now uses. But note what 16% means: the translated arithmetic is NOT the
-# bottleneck, or -O2 would have won by much more. The per-entry cost is dominated by the dispatch
+# bottleneck, or $FRAMEPTR -O2 would have won by much more. The per-entry cost is dominated by the dispatch
 # machinery, and above all by the generated code's habit of writing `ctx->pc` on EVERY guest
 # instruction -- a store per instruction that the optimiser cannot remove because `ctx` escapes. If
 # throughput ever becomes the wall rather than correctness, that store is the thing to attack, not
@@ -59,7 +70,7 @@ done
 # old object, and a probe built into the macros then never fires -- which reads exactly like "the
 # guest never does the thing", which is the most expensive kind of wrong.
 if [ ! -f ps2_recompiled_functions.o ] || [ "$G/ps2_recompiled_functions.cpp" -nt ps2_recompiled_functions.o ] || [ "$R/ps2xRuntime/include/ps2_runtime_macros.h" -nt ps2_recompiled_functions.o ] || [ "$R/ps2xRuntime/include/ps2_runtime.h" -nt ps2_recompiled_functions.o ]; then
-    nice -n 10 g++ -std=c++20 -O2 -msse4.1 $INC $DEFS -c "$G/ps2_recompiled_functions.cpp" -o ps2_recompiled_functions.o
+    nice -n 10 g++ -std=c++20 $FRAMEPTR -O2 -msse4.1 $INC $DEFS -c "$G/ps2_recompiled_functions.cpp" -o ps2_recompiled_functions.o
 fi
 
 FFMPEG=$(pkg-config --libs libavcodec libavformat libavutil libswresample libswscale)

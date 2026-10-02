@@ -7653,3 +7653,104 @@ several dishes was a twelve-second timeout wearing a costume.
 
 Still no VULCAN4 FRAME source=guest. Next: run it for the length it actually needs, and watch
 functions_entered keep climbing.
+
+
+---
+
+## W92-CAPTAIN (2026-10-02) — written by CAINE, not the chef. Where the captain thinks we are, verbatim.
+
+The captain asked for the black screen himself, and for the truth about how far the menu is. This
+entry exists because a chef's HANDOFF records what the code did; it did not record that for
+sixty dishes the captain was judging a text log, and that the runner below is the answer.
+
+**What the captain said, and it is the brief now:**
+- "I WANNA RUN THE RECOMP. And I wanna see the black screen myself. I feel like we're chasing a
+  blind dog."
+- "When are we close to the menu? Recomps are thriving rn and I feel like I'm so behind."
+
+**The answer to "am I behind", from this repo's own numbers: no, the tools do not work yet.**
+W90/W91 is the load-bearing finding: every wall named in W82-W89 was a 12-second timeout wearing
+a costume, and the guest runs at 2.4% of real PS2 speed with no thread blocked. There is no
+missing feature between us and the menu; there is a boot nobody has let finish.
+
+**The runner, for the captain:** `tools/harness/run_gt4_desktop.sh`. TWO windows, ONE process --
+the harness's own raylib window is the game, and an xfce4-terminal beside it carries the live log.
+Run it with `DISPLAY=:0 bash tools/harness/run_gt4_desktop.sh [entries] [seconds]`. It refuses to
+start while another boot is running, because two boots fight over the same files and every number
+then belongs to neither. A black window is the honest current state; when it is not black, we win.
+
+**Ladder position, no sugar:** G1 (first boot) is the wall. The menu is G4.1, three goals past it.
+Still zero `VULCAN4 FRAME source=guest`.
+## W92 - THE CONTRADICTION RESOLVED, AND TWO OF MY OWN NUMBERS RETRACTED
+
+### The contradiction: 382,881 versus 13,509. Both real, the comparison invalid.
+
+The goal asked which is real, and the answer is that they are not comparable, and the log sizes say so
+before any code does:
+
+    boot_w85b.log     functions_entered=382,881   55,494,325 bytes
+    boot_w91_long.log functions_entered= 13,509      407,260 bytes
+
+134:1 in bytes against 28:1 in the counter, and `[Dispatch]` is capped at 400 in both. The counter is
+incremented at the top of the guest dispatch loop (harness:1687, `++functionsEntered`), so it counts
+dispatcher ITERATIONS, not distinct functions -- and W71 already established that the dispatcher
+inlines callees, so one iteration can be a lot of guest code or none at all.
+
+The first 400 dispatches settle it:
+
+    boot_w85b    top target_pc 0x100d308, 190 times
+    ab_fixed     top target_pc 0x1005870, 377 times
+
+The old runs were SPINNING at 0x100d308 and writing 55 MB about it. functions_entered=382,881 is an
+honest count of 382,881 iterations, nearly all of them the same instruction. It is not progress and was
+never progress. **Neither number measures progress, and the ratio between them means nothing.** The
+usable number is distinct_pcs, and the honest summary is that both figures are loop counts.
+
+### RETRACTION 1: the "697x regression" was noise
+
+Seeing 549 against 382,881 in matched 12 s runs, I concluded W84 had cost 697x and went looking for it.
+W84's getMemPtr announcement hook was the suspect, and I made raw-pointer announcements opt-in
+(ps2SetRawPtrObserverEnabled) on the strength of that.
+
+**It bought nothing: 549 before, 567 after.** The hypothesis was wrong and the fix was unnecessary for
+the reason I gave. It is kept anyway, and for a real reason recorded in the code: getMemPtr is the
+runtime's hottest path and unbounded traffic off it should never be on by default, which is the same
+law as everything else we add. But it is not a speed fix and must not be counted as one.
+
+### RETRACTION 2: "the observer costs 9x" was noise, and it nearly became a headline
+
+With an explicit knob I measured 549 with the store observer installed and 4,884 without, at 12 s each.
+**That is 8.9x and it is not true.** Measured properly, 60 s each, comparing EE cycles rather than a
+12-second entry count:
+
+    observer installed     eeCycle=588,596,953   functions_entered=1185
+    observer NOT installed eeCycle=634,011,765   functions_entered=1269
+
+**7.7%, by cycles. By entries it is 6.6%.** A 12-second window on a boot this slow samples a handful of
+guest functions and swings by an order of magnitude between runs; 4,884 was an outlier, not the
+observer being free. I nearly wrote "the instrument cost 9x" into this file and it would have been
+wrong, and the rule that caught it is the one the goal states: measure, do not argue.
+
+The observer is still now opt-in, because 8% is worth having and a diagnostic nobody asked for should
+not be in the default path -- but the honest number next to it is 8%, not 9x.
+
+### What the speed actually is, and it is the real remaining problem
+
+    60 s wall -> eeCycle=634,011,765 -> 10.6 M EE cycles/s
+
+kEeClockHz is 294,912,000, so the guest runs at **3.6% of real PS2 speed, 28x slower than the hardware**,
+and 634M cycles across 1269 dispatcher entries is ~500,000 EE cycles per entry, which is 1.7 ms of PS2
+time and entirely plausible for one of GT4's large functions. So the guest is not spinning and not
+blocked: it is executing, slowly.
+
+**28x slower than hardware is the number that should worry us.** A static recompilation that emits C++
+should land within a small factor of native, not 28x. Something specific is expensive per instruction or
+per function, and the honest way to find it is a profile.
+
+perf is installed but `perf_event_paranoid` is 4, so hardware events and call graphs are refused, and
+changing a system sysctl is not something to do unasked. So the profiler has to be ours: a SIGPROF
+sampler in the harness that records the interrupted PC from the ucontext into a histogram, symbolised
+with addr2line against the harness binary. ~40 lines, no system change, and it answers the only question
+left that matters -- where do the 28x go.
+
+Suite 492/492.

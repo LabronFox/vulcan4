@@ -1079,7 +1079,46 @@ int main(int argc, char *argv[])
 
     // W30: watch the guest buffer holding the memory-card path. Installed before the first guest
     // instruction so the one-time formatting write is caught, not just the reads that follow.
-    ps2SetGuestStoreObserver(&watchGuestStoreForPath);
+    // W92. THE OBSERVER IS THE MOST EXPENSIVE THING IN THIS PROGRAM, AND IT WAS ON BY DEFAULT.
+    //
+    // Measured, 12 s wall, same guest, same binary, one boolean:
+    //     observer installed    functions_entered=549    (knob_0.log)
+    //     observer not installed functions_entered=4884  (knob_1.log)
+    // 8.9x. Every traced guest write calls into it, and the ring record alone runs on every call.
+    //
+    // So the default run -- the one whose number decides whether the game is alive -- pays 8.9x for an
+    // instrument nobody asked for. Install it when a diagnostic is actually requested and not before.
+    // This is the same law as everything else we add being off by default, and the default had it
+    // exactly backwards: the instrumentation was the default and the speed was the opt-in.
+    {
+        const bool diagnosticsRequested =
+            (watchEnv("VULCAN4_BRANCH_WATCH", 0u) != 0u) ||
+            (watchEnv("VULCAN4_SHADOW", 0u) != 0u) ||
+            (watchEnv("VULCAN4_TRACE_WRITES", 0u) != 0u) ||
+            (watchEnv("VULCAN4_BIGCOPY_MAX", 2u) != 2u) ||
+            (watchEnv("VULCAN4_PATHSTORE_MAX", 4u) != 4u) ||
+            (watchEnv("VULCAN4_WATCH_MAX", 120u) != 120u) ||
+            (kScratchHi > kScratchLo) || (kWatchLo != kWatchLoDefault) || (kWatchHi != kWatchHiDefault);
+        if (diagnosticsRequested)
+        {
+            ps2SetGuestStoreObserver(&watchGuestStoreForPath);
+        }
+        else
+        {
+            std::cerr << "VULCAN4 TRACE store observer NOT installed (no diagnostic knob set). "
+                      << "Set VULCAN4_WATCH_LO, VULCAN4_SHADOW, VULCAN4_TRACE_WRITES or "
+                      << "VULCAN4_BRANCH_WATCH to turn it on; it costs about 9x." << std::endl;
+        }
+    }
+    // W92. Opt in to raw-pointer announcements ONLY when a diagnostic window is configured. The
+    // getMemPtr hook is on the runtime's hottest path; turning it on unconditionally cost 697x of
+    // guest throughput with no knob to undo it. watchEnv() is read at namespace scope above, so the
+    // decision is made once, here, and the default path pays nothing.
+    {
+        const bool wantRaw = (kScratchHi > kScratchLo) || (kWatchLo != kWatchLoDefault) ||
+                             (kWatchHi != kWatchHiDefault);
+        ps2SetRawPtrObserverEnabled(wantRaw);
+    }
     ps2SetGuestBranchObserver(&watchGuestCallForPath);
     g_rdramForWatch = rdram;
     g_runtimeForShadowProbe = &runtime;

@@ -6867,3 +6867,84 @@ and the store observer is provably not seeing it. **Next:** the red test W77 nam
 should — then route `RPC.cpp`'s typed-pointer stores through `ps2TraceGuestRangeWrite` and re-run.
 
 Suite **482/483**. `VULCAN4 FRAME source=guest` has never printed.
+
+---
+
+## W80 — RPC.cpp is instrumented and tested, and then ELIMINATED: the SIF-RPC layer never runs
+
+Step one of the W77 next-step. Red test first, as named.
+
+### Red, then green
+
+`ps2_sif_rpc_tests.cpp`, **"W80: an RPC result-field write is visible to the store observer"** —
+`SifStopModule(99, &result)` and assert the store observer saw the 4-byte write, with a `CONTROL:`
+assertion that the write *happened*, so the test cannot pass by observing nothing:
+
+```
+[Run]: W80: an RPC result-field write is visible to the store observer  [Failed]
+      - the RPC's result-field write must be reported to the store observer; today it is
+        written through `reinterpret_cast<int32_t*>(getMemPtr(...))` and NOBODY SEES IT,
+        which is why a guest-memory change has been found with no writer
+```
+
+Only the visibility assertion failed; the `CONTROL:` line passed, so the write itself was correct and
+the test was measuring exactly one thing. Green after routing the store through
+`ps2TraceGuestRangeWrite`, and then the same for the **other eighteen typed-pointer stores** in the same
+file — `sifClientInit`, `sifClientCall`, `sifClientUnbind`, `sifClientAttach`, `sifServerRecord`,
+`sifServerDummy`, `SifStopModuleResult`. **One traced store is not a fix when eighteen more of the same
+shape sit beside it**, and the whole SIF-RPC bookkeeping layer — register, bind, and the client/server
+descriptors the guest reads back — was invisible.
+
+Suite **484/484**.
+
+### And then the file is eliminated anyway, which is the more useful result
+
+One run after the fix, `boot_w80.log`:
+
+| trace | count |
+|---|---|
+| `load-emulated` | **5** |
+| `loaded IRX id=1..5` | 5 |
+| `SifInitRpc` | 1 |
+| `SifRegisterRpc` | **0** |
+| `SifExecRpc` | **0** |
+| `[IOP/RPC trace` | **0** |
+| `SifStopModule` | **0** |
+| any `op=sif*` (my six new tags) | **0** |
+
+The new trace strings are in the binary (`strings vulcan4_harness` finds `sifClientInit` and
+`sifServerRecord`), so this is not a build that missed them. **The SIF-RPC client/server layer never
+executes in our boot**, because the HLE module manager substitutes all five IRX modules
+(`load-emulated` × 5) — so no module ever registers an RPC server, and the guest never calls
+`SifRegisterRpc` or `SifExecRpc`.
+
+**RPC.cpp is therefore eliminated as the writer of `0x010519C0`.** The 19 untraced sites were a real
+hole and are now closed and tested, so the work stands on its own — but they are dead code in this boot
+and cannot have written the buffer.
+
+### What that costs and what it buys
+
+It bought a clean negative on the largest candidate and it moved the target. The remaining
+`getMemPtr(rdram, …)` write sites by file, all still untraced:
+
+| sites | file | note |
+|---|---|---|
+| 7 | `Kernel/Stubs/CD.cpp` | **now the top candidate** — and `sceCdSearchFile` has a *hard rate cap* (`CD.cpp:551-556`) that would hide a late call even with tracing fully on |
+| 5 | `Kernel/Syscalls/System.cpp` | |
+| 5 | `Kernel/Stubs/MPEG.cpp` | |
+| 4 | `Kernel/Stubs/Pad.cpp` | |
+
+### The next single step
+
+**`CD.cpp`**, and specifically the rate cap, which is a second independent way this wall could be a
+vacuous zero. The bytes that appear at `0x010519C0` — `0x8005 / 0x0041 / 0x0003 / 0x0042 / 0x1400 /
+0x0059` — are the shape of a **card directory entry table**, `0x8005` being the PS2 free-clusters marker
+in entry 0. `sceCdSearchFile` is exactly the call that hands the guest such a table, and its trace is
+capped at 128 plus every 512th.
+
+So: remove or raise the cap, route `CD.cpp`'s seven `getMemPtr` writes through
+`ps2TraceGuestRangeWrite` with a red test first, and re-run. If `sceCdSearchFile` fires and one of those
+writes lands on `0x010519C0`, the wall is named — for the first time in five dishes, by an instrument
+that is known to work.
+
+Suite **484/484**. `VULCAN4 FRAME source=guest` has never printed.

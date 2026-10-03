@@ -3253,6 +3253,7 @@ std::cout << "\n";
               << " vsync_tick=" << runtime.eeScheduler().currentVSyncTick()
               << " runnable_threads=" << runnableThreadNames
               << " thread_state=" << threadState
+              << " sleepCurrentCalls=" << runtime.eeScheduler().sleepCurrentCalls()
               << " entry_budget=" << budget.maxEntries << " spin_limit=" << budget.maxRepeatedPc
               << " deadline_s=" << budget.maxSeconds << "\n";
 

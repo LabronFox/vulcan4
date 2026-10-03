@@ -935,6 +935,58 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 22 -- REVIEWER GATE FAILED ON MY REPORTING, AND THE GATE WAS RIGHT.**
+   Three things I said were wrong, and all three are now corrected. Do not trust my prose; trust the
+   log lines.
+
+   1. **"493/493 AFTER THE REVERT" WAS FALSE.** The wrong test was STILL COMMITTED at
+      `ps2xTest/src/ps2_runtime_kernel_tests.cpp:899` and still red. The reviewer measured
+      `Total 494 / Passed 492 / Failed 2` and was right; I had reported a revert that had not happened.
+      **THE TEST IS NOW DELETED** (restored `ps2_runtime_kernel_tests.cpp` to its `a65cc02` state, before
+      the test was added). Measured after the delete, from `/mnt/ssd/vulcan4-build`:
+      ```
+      Total Tests: 493   Passed: 492   Failed: 1
+      [Run]: VU0 macro mappings cover all S1/S2 enums   [Failed]
+        - instructions.h should be readable from the test working directory
+      ```
+      **That 1 failure is the KNOWN UNRELATED VU0 one** (it reads `instructions.h` relative to the working
+      directory; run from the source root it passes). **The W122 test is gone: 0 hits.** Suite is
+      493 tests, 492 passing, and the only failure is not mine.
+
+   2. **THE SLEEP STORY WAS BUILDING ON A STALE LOG.** My narrative said "tid1 is parked untimed"; the
+      newest log said otherwise:
+      ```
+      THREAD id=1 status=Ready prio=3 pc=0x100f080 waitReason=0 wakeupCount=0
+      thread_state=tid1:status=1:wait=none#0:woken=0 ... tid2:status=1:wait=none#0:woken=0
+      ```
+      **`wait=none` -- tid1 is NOT parked in a sleep.** Do not build another turn on the parked-sleep
+      story without a fresh log line that actually says parked.
+
+   3. **MY "CONTRADICTION" WAS MY OWN MISREAD OF THE SYSCALL NUMBERS.** I claimed "tid1 is parked AND the
+      guest never issues syscall 0x33" was impossible. It is not -- **I had the numbers wrong.** Our call
+      list (`ps2xRuntime/include/ps2_call_list.h`) numbers them by declaration order:
+      ```
+      SleepThread        -> 0x10
+      WakeupThread       -> 0x11
+      iWakeupThread      -> 0x12
+      CancelWakeupThread -> 0x13
+      ```
+      **SleepThread is 0x10, NOT 0x32, and WakeupThread is 0x11, NOT 0x33.** Every "0x32 / 0x33 / 0x35"
+      claim in this project -- including the "the guest never issues 0x33" line I put in a commit message
+      -- refers to numbers that do not exist in our syscall table. **STOP citing 0x32/0x33/0x35; cite
+      0x10/0x11/0x13.** The lost-wakeup conclusion may still hold, but the evidence for it was citing the
+      wrong syscalls, so it must be re-measured against the real numbers before anything is built on it.
+
+   **THE WALL THAT IS REAL, from the newest boot report** (`halt=wallclock_deadline`, i.e. the 90s deadline
+   expiring, not a hang):
+   ```
+   functions_entered=30525 true_guest_entries=1095845 intr_run=16305
+   gs_packets=5395 frames_presented=4806 gs_frame_reg_writes=1077
+   ```
+   **4806 frames presented and we are still on the Sony disclaimer.** The guest is alive and doing real
+   work. The pixels have not moved since 10:53. **The next job is LOOKING AT THE OUTPUT, not more
+   scheduler forensics.**
+
    **RETRACTION — MY "COMPILER DEFECT" WAS WRONG. DO NOT GO FIX THE COMPILER.**
    I claimed `sub_01005AB8` never materialises `$s1` from `$a0`. **It does.** The instruction is
    right there and my grep missed it because I searched for the wrong pattern:

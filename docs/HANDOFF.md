@@ -95,30 +95,63 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
 
 ## THE THREE OPEN WIRES
 
-1. **The spin — SOLVED DOWN TO ONE 32-BIT COMPARISON (W120). Start here.**
-   `sub_010088E8` is ONE generated function, so its `0x10089dc: bltz $v0` back-edge is an internal
-   `goto` and can **never** appear as a dispatch `targetPc` — which is why a probe keyed on
-   `targetPc == 0x10089dc` never fired. That was structural blindness, not evidence.
-   The loop is `jal func_1007738` (queue walk) then `jal func_1005870` then `bltz $v0` back.
-   `func_10057F0` is **not a fetch — it is a three-way compare returning -1/0/+1**:
-   ```
-   0x10057f0: lw    $a2, 0x8($a0)      ; leftCount  = *(a0+0x08)
-   0x10057f4: lw    $a3, 0x8($a1)      ; rightCount = *(a1+0x08)
-   0x10057f8: sltu  $v1, $a2, $a3
-   0x10057fc: bnez  $v1, -> 0x1005868  ; if left < right, EXIT
-   0x1005800: addiu $v0, $zero, -1     ; DELAY SLOT, runs unconditionally
-   0x100583c: lw    $v1, 0x0($v0)      ; only now are elements compared
-   ```
-   **It returns -1 the instant `*(a0+8) < *(a1+8)`, out of the delay slot, without comparing anything.**
-   Measured solid: `v0=0xffffffff` at `resumePc=0x1005898` (`w120i.log`, `w120q2.log`). The caller's
-   `movn $v0,$v1,$a0` only overwrites `$v0` when `*(s0+0x10)` is non-zero; that word measures 0, so
-   `$v0` stays -1 and `bltz` loops.
-   **So the livelock reduces to one 32-bit comparison of two counts.** Run until the corrected
-   `[w120:cmp]` probe fires in a livelock run (it samples BEFORE the call) and read `leftCount` /
-   `rightCount`. **UNVERIFIED:** that probe has not yet fired — three runs came back non-spin
-   (XFER 153,682 / 128,817 / 37,370). Do not assume `left < right` until it prints.
-   Note guest `0x1fffbc0` (`$sp`+0x10) is **never written** (store-observer silence, verified against a
-   positive control on `0x1895304`) — but that may be the SAME fact as the spin, not a second one.
+1. **THE REAL SPIN, AND IT IS NOT THE ONE WE WERE WATCHING (W122). `0x100d908`.**
+
+   **The old probe was watching the wrong three addresses, and six boots proved it.**
+   `[w122:reach]` counts entries to `func_10057F0`/`func_1005870`/`func_1007738` unconditionally.
+   It fires (so the instrument works), and on a `halt=livelocked_in_syscall` boot it prints:
+
+       [w122:reach] entries=1 func_10057F0=0 func_1005870=0 func_1007738=0
+
+   **All three counters are ZERO.** So `sub_010088E8`, `func_10057F0` and `func_1007738` are never
+   entered on these runs. **Everything W119/W120 concluded about that spin was measuring a loop this
+   halt does not visit.** Treat the "counts are equal" claim as unsupported and the delay-slot claim as
+   unproven.
+
+   **RETRACTION, and it rules out a whole branch.** W120 claimed `func_10057F0` returns -1 out of the
+   delay slot at `0x1005800`. With counts EQUAL (1,1) that cannot happen: `0x1005804 sltu $v0,$a3,$a2`
+   **overwrites** `$v0` with 0 before anything returns it. The delay slot only survives when
+   `0x10057fc bnez` is taken, i.e. when `left < right` is genuinely true — which was never measured,
+   because every reading of those counts was the `0xDEADBEEF` sentinel. The `-1` at `0x100584c`
+   (element comparison) is still possible and still unmeasured.
+
+   **THE ACTUAL SPIN — one address, 99.99% of all control transfers:**
+
+       VULCAN4 XFER SITES distinct=407 total=483865665
+         top: 0x0100d908=483826869(99.99%)
+
+   `boot_desk120054.log`, `halt=livelocked_in_syscall`, `true_guest_entries=226639`. The guest
+   executes **483.8 million** control transfers at a single PC in 90 seconds.
+
+       0x100d8f8: lw    $s0, 0x0($s1)     ; walk a thread list
+       0x100d8fc: beql  $s0, $zero, ...   ; skip empty slot
+       0x100d904: nop
+       0x100d908: jal   func_10202E8      ; <-- 99.99% of all transfers
+       0x100d90c: lw    $a0, 0x4($s0)     ; (delay slot) target thread id
+
+   And the callee:
+
+       0x102040c: addiu $v1, $zero, -0x2F  ; 0x2F = sce_GetThreadId
+       0x1020410: syscall 0
+       0x1020414: daddu $s0, $v0, $zero    ; s0 = GetThreadId()
+       0x1020418: beq   $s0, $a0, ...      ; EXIT when running thread == target
+       0x1020420: jal   func_101F3A0       ; else SuspendThread (-0x38)
+
+   **So the guest is spinning on a THREAD-ID BARRIER: it loops until `sce_GetThreadId()` returns the
+   thread id it is waiting for, suspending itself in between.** It is not waiting on data, a counter,
+   a clock or a producer. It is waiting for **another thread to become the running thread.**
+
+   **And that is exactly what does not happen.** At halt:
+
+       runnable_threads=tid1@prio3:pc=0x0100f800(ready), tid2@prio2:pc=0x0100d910(running)
+
+   **tid1 is READY and never runs. tid2 spins on the barrier for the whole 90 seconds.** Both syscalls
+   involved are implemented (`0x2F`→`GetThreadId`, `0x37/0x38`→`SuspendThread`), so this is a
+   **scheduling** failure, not a missing syscall.
+
+   **R1 ANSWER, stated plainly: the guest is waiting on guest thread tid1 to be scheduled — the word is
+   tid1's readiness/state in the scheduler, not a word in RDRAM.** Fixing this means making the
+   scheduler actually run the ready peer (preempt/yield at the barrier), NOT inventing a value.
 
 2. **Memory card / `mcRoot` / `sceMcUdCheckNewCard`.** Stubbed at `/mnt/ssd/gt4/work/gt4.toml` **line 180**:
    `"sceMcUdCheckNewCard@0x01017868"`. Runs during boot (earlier logs show `[MC] Open ... core.gt4 ...

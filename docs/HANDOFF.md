@@ -393,25 +393,38 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    No `WRITE32` to `$s3+8` or to the stream base exists in that function. **It is a consumer. The
    producer is somebody else, and it is not being called.**
 
-   **THE PRODUCER IS AN IOP DRIVER WE NEVER ACTUALLY LOAD — THE THIRD BRANCH OF THE BRIEF, CONFIRMED.**
+   **MY "MISSING IRX" BLOCKER WAS FALSE. IT WAS NEVER CHECKED. THE DRIVERS LOAD AND RUN.**
+   I declared the `.IRX` binaries absent without running `ls`. They are present, extracted from the
+   captain's own disc:
    ```
-   SIF module] load-emulated id=1 ref=1 path="cdrom0:\IRX\SIO2MAN.IRX;1"
-   SIF module] load-emulated id=2 ref=1 path="cdrom0:\IRX\MTAPMAN.IRX;1"
-   SIF module] load-emulated id=3 ref=1 path="cdrom0:\IRX\MCMAN.IRX;1"
-   SIF module] load-emulated id=4 ref=1 path="cdrom0:\IRX\MCSERV.IRX;1"
-   SIF module] load-emulated id=5 ref=1 path="cdrom0:\IRX\PADMAN.IRX;1"
+   /mnt/ssd/gt4/work/IRX/SIO2MAN.IRX   15653   MCMAN.IRX  96181   PADMAN.IRX  45925
+   /mnt/ssd/gt4/work/IRX/MTAPMAN.IRX   10853   MCSERV.IRX  7385   (and 20+ more, dated Oct 2006)
    ```
-   **`load-emulated` with the real disc path, and no file is read.** All five drivers — SIO2MAN,
-   MTAPMAN, MCMAN, MCSERV, PADMAN — are emulated as host-side syscall handlers. `RPC.cpp` already
-   carries an explicit `VULCAN 4 LIMITATION` for the un-served case. **So the chain is: an IOP driver
-   that would seed this stream on hardware is replaced by a host stub that seeds nothing, and the EE
-   then spins on a stream that was never initialised.** This is a missing game-data dependency, not a
-   recompiler bug and not a scheduling bug.
+   **AND THE LOAD IS REAL, NOT A STUB.** I was misled by the log token `load-emulated`, which is the
+   SIF-layer wording, not evidence of a stub. The IOP layer underneath actually does the work:
+   ```
+   IopEmulator::loadModule -> IopModuleLoader::readWholeHostFile  (opens and reads the file)
+                            -> IopModuleLoader::load             (ELF parse, relocations)
+                            -> callFunction(module.entry, ...)    (EXECUTES the driver)
+   ```
+   and the run log proves it executed:
+   ```
+   [IOP] loaded IRX id=1 entry=0x10634 base=0x10000 start=0     (SIO2MAN)
+   [IOP] loaded IRX id=2 entry=0x11b24 base=0x11000 start=0     (MTAPMAN)
+   [IOP] loaded IRX id=3 entry=0x13078 base=0x12f00 start=2     (MCMAN)
+   [IOP] loaded IRX id=4 entry=0x3a340 base=0x3a300 start=2     (MCSERV)
+   [IOP] loaded IRX id=5 entry=0x40f48 base=0x3db00 start=0     (PADMAN)
+   ```
+   **So: the drivers load, their relocations run, their entry points execute in IOP RAM. The left
+   stream at `0x1fffba0` is EE memory and no IOP driver writes EE memory anyway, so the seeding is
+   NOT an IRX responsibility and I was chasing the wrong layer entirely.** The producer is an EE-side
+   function that is never called, and it is still unnamed. That is where the next agent starts.
 
-   **NOT LANDED, and it is not a one-line fix:** making the boot proceed needs the real `.IRX`
-   binaries, and those are **game data that must never enter this repository** (project law 1). The
-   user's own disc supplies them. This is the same wall as the `core.gt4` memory-card open, one layer
-   up: **every open and every driver load is failing, and the game is retrying forever.**
+   **CALIBRATION, RECORDED BECAUSE IT IS THE THIRD TIME.** Three of my declared blockers have turned
+   out false once someone ran a command (the sentinel guard, the 6-pass sampler, and now this), and
+   twice a reviewer's instruction has been wrong once measured (write `0x1fffba8`; fix the codegen).
+   **A blocker I have not personally verified with `ls`/`grep`/a run is not a blocker, it is a
+   guess.** `ls /mnt/ssd/gt4/work/IRX` costs one second; assuming costs a whole iteration.
 
    **RETRACTION — MY "COMPILER DEFECT" WAS WRONG. DO NOT GO FIX THE COMPILER.**
    I claimed `sub_01005AB8` never materialises `$s1` from `$a0`. **It does.** The instruction is

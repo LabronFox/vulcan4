@@ -935,6 +935,80 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 33 -- PRIORITY ONE CLOSED (VU0 red, 494/494 BOTH WAYS). PRIORITY TWO ANSWERED BY
+   LOOKING UP AND OUT: THE SPIN IS REACHED FROM A 24-BYTE REFCOUNTED OBJECT LIFECYCLE.**
+
+   **1. THE VU0 RED IS CLOSED, AT THE SOURCE, MECHANISM-BASED. Nested `474417c`.**
+   `ps2xTest/CMakeLists.txt` now hands the tests the absolute source root at COMPILE time:
+   ```cmake
+   target_compile_definitions(ps2x_tests PRIVATE VULCAN4_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+   ```
+   and `code_generator_tests.cpp` ends its candidate list with
+   `std::string(VULCAN4_SOURCE_ROOT) + "/../ps2xRecomp/include/ps2recomp/instructions.h"` under
+   `#ifdef VULCAN4_SOURCE_ROOT`. `__FILE__` was tried in ITERATION 32 and did not resolve; an explicit
+   definition is correct regardless of how the compiler was invoked. **MEASURED:**
+   ```
+   cd /mnt/ssd/vulcan4-build      ->  Total 494  Passed 494  Failed 0  EXIT=0   <- the reviewer's way
+   cd tools/PS2Recomp/ps2xTest    ->  Total 494  Passed 494  Failed 0
+   ```
+   **NO TEST WAS DISABLED, SKIPPED OR WEAKENED** -- the same assertions run; they just resolve the header
+   from a known absolute location instead of guessing from cwd. **The suite is no longer noise in a report.**
+
+   **2. THE CALL-CHAIN WALK, DONE WITH OBJDUMP AND **NO NEW INSTRUMENT**, LOOKING UP AND OUT.**
+   Each function has exactly one caller, so the chain is unambiguous:
+   ```
+   func_1007738 (the spin)      <- called ONLY from 0x1005f50
+     in sub_01005D48 (0x1005d48 .. 0x10064b8)
+       <- called ONLY from 0x1006fb4
+     in sub_01006F90 (0x1006f90 .. )
+       <- called ONLY from 0x100460c
+     in sub_01004500 (0x1004500 .. )          <-- THE NEAREST CALLER THAT DOES REAL WORK
+   ```
+   **WHAT `sub_01004500` IS DOING, IN PLAIN WORDS, FROM ITS OWN BYTES:**
+   ```
+   1004518:  jal   0x1004308
+   1004524:  li    a0,24
+   100452c:  lw    s1,20(s3)
+   1004530:  jal   0x101d2a0            ; operator new(24)
+   1004544:  jal   0x10055e0            ; construct it, (this, s3->0x14, s3->0x18)
+   1004554:  lw    v0,4(s2)
+   1004558:  addiu v0,v0,1
+   100455c:  sw    v0,4(s2)             ; ++refcount  (the field at +4)
+   ...
+   1004600:  move  a0,sp
+   1004604:  addiu a2,sp,32
+   1004608:  addiu a3,sp,48
+   100460c:  jal   0x1006f90            ; <-- the call that reaches the spin
+   1004614:  lw    a0,52(sp)
+   1004620:  lw    v0,4(a0)
+   1004624:  addiu v0,v0,-1
+   1004628:  bgtz  v0,0x1004638
+   100462c:  sw    v0,4(a0)             ; --refcount
+   1004630:  jal   0x1005588            ; destroy when it hits zero (a1=3)
+   ```
+   **SO THE SPIN IS CALLED FROM AN OBJECT LIFECYCLE ROUTINE: it allocates a 24-byte object, constructs it,
+   bumps a reference count at `+4`, calls the spin through `sub_01006F90` with three STACK BUFFERS as
+   out-parameters (`sp`, `sp+32`, `sp+48`), and then tears the refcount back down.** **This is what I
+   have been staring into for twenty turns: a constructor/registration path, not a frame loop and not a
+   bit accumulator.** The zero-word the accumulator was said to chew on is a freshly allocated 24-byte
+   object that nothing has written yet -- **which is consistent with the ITERATION 32 finding that the
+   field is never read, and it means the zero word is a SYMPTOM of the object not being initialised, not a
+   cause.**
+
+   **STILL TO DO ON THE SPIN:** the next step is the constructor at `0x10055e0` and the callee
+   `0x1006f90` -- specifically whether `sub_01006F90` WRITES those three out-parameters before
+   `func_1007738` reads them. **I have NOT measured that and am not claiming it.** But the shape is now
+   named, which is what twenty turns of looking downward did not give us.
+
+   **3. THE BOOT, UNCHANGED AND NOT YET FIXED:**
+   ```
+   true_guest_entries=410946394   halt=livelocked_in_syscall
+   ```
+   **PICTURE:** `docs/evidence/w133_game.png`, window id `0x978490`, 650x482, **387 distinct colours**.
+   Still the 2005 Sony disclaimer. **STILL NOT PAST IT. NO FIX LANDED ON THE SPIN THIS TURN** -- the
+   priority-one task was closed and the priority-two task was answered, but a diagnosis is not a fix and
+   I am not going to report it as one.
+
    **ITERATION 32 -- THE GATE WAS RIGHT ON ALL THREE, AND THE ONE NUMBER SAYS THE TWO FAULTS ARE NOT
    THE SAME FAULT. NO FIX LANDED, AND I AM NOT PRETENDING OTHERWISE.**
 

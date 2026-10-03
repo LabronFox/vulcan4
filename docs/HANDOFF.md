@@ -227,6 +227,39 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    claimed.** What it buys: the barrier is proven a real gate, and the **next** wall is now named and
    reproducible — `sub_010088E8` at `0x1005890`/`0x10089c8`/`0x10089d4`, 33.32% each.
 
+   **THE RAW OPERAND DUMP — THE ANSWER. `/tmp/opencode/dump8.log`. 145,234,000 passes.**
+   The live wall is `sub_010088E8`; its compare is `func_10057F0`, entered via `jal func_10057F0` at
+   `0x1005890`, and its operands are `$a0`/`$a1`, consumed as `*(a0+8)` and `*(a1+8)`.
+   Replaces the old 8-line probe (a line budget is not a measurement — same failure as the first
+   sampler). First 200 passes, then every 1000th, raw:
+
+       pass=1 a0=0x1895100 a1=0x18951e0 LEFT[1895108]=0 RIGHT[18951e8]=1 leftBase=0x0     rightBase=0x1895210
+       pass=2 a0=0x1fffba0 a1=0x1895280 LEFT[1fffba8]=1 RIGHT[1895288]=1 leftBase=0x18953f0 rightBase=0x18953a0
+       pass=3 a0=0x1fffba0 a1=0x1895280 LEFT[1fffba8]=1 RIGHT[1895288]=1 leftBase=0x18953f0 rightBase=0x18953a0
+       ...
+       pass=145234000 a0=0x1fffba0 a1=0x1895280 LEFT[1fffba8]=1 RIGHT[1895288]=1 leftBase=0x18953f0 rightBase=0x18953a0
+
+   **`LEFT CHANGED` / `RIGHT CHANGED` events in the entire run: 0.**
+
+       final totals: distinctL=2 distinctR=1 distinctA0=1 distinctA1=1
+                     leftStores=0 rightStores=0
+
+   **SO: NEITHER OPERAND EVER CHANGES.** After pass 2 the loop is a **true infinite spin on a stale
+   value** — the exact first case the brief named. `LEFT[0x1fffba8]` is `1` and `RIGHT[0x1895288]`
+   is `1`: **equal**, so `left < right` is false and the delay-slot `-1` at `0x1005800` is NOT the
+   exit. With equal counts the compare walks its elements instead (loop `0x1005830`), reading
+   `leftBase=0x18953f0` and `rightBase=0x18953a0`.
+
+   **`leftStores=0 rightStores=0`** — the store observer, which is the same hook that proved
+   `0x01047b50` is written 110 times, saw **zero** writes to either operand in 145 million passes.
+   So this is not "written and overwritten"; these two words are **never written at all**.
+
+   **AND IT SETTLES THE W120 QUESTION DEFINITIVELY.** W120 claimed the `-1` came out of the delay
+   slot because `left < right`. **Measured: the counts are equal (1 and 1), `left < right` is false,
+   and `0x1005804` overwrites `$v0` before any return.** That claim is **retracted for good**. The
+   spinning `-1` comes from the element comparison at `0x100584c`, which the earlier sentinel probe
+   could never see.
+
    **RETRACTION — MY OWN SAMPLER, second time.** The first `w122:poll` put change-detection and the
    pass counter *inside* the "print the first 6 lines" budget, so `distinctValues=1` covered **six
    passes, not the run** — the same failure class as the W115 stride-16 sampler: an instrument that

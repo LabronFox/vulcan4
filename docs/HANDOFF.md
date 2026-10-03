@@ -935,6 +935,53 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 35 -- THE SPLIT ANSWERED, AND IT OVERTURNS MY OWN CALL CHAIN. NINTH RETRACTION. THE REAL
+   SPIN IS A `bltz` LOOP AT 0x10089DC IN `sub_010088E8`, CALLING `func_1005870`.**
+
+   **THE INSTRUMENT, emitted by the translator behind `VULCAN4_W135_ARGS`, free when off.** Two halves:
+   `control_flow_emitter.cpp` prints `a0`-`a3` at the **call site 0x1005f50**, and `function_emitter.cpp`
+   prints them at the **entry of `func_1007738` (0x1007738)**.
+
+   **THE MEASUREMENT, GATED (`VULCAN4_W135_ARGS=1`):**
+   ```
+   [w135:args] n=1 at=callee-0x1007738 a0=0x01fffba0 a1=0x00000000 a2=0xffffffff a3=0x01895310 a3&3=0x0 pc=0x01007738 ra=0x010089d0
+   [w135:args] callsite-0x1005f50 hits: 0
+   ```
+   **TWO THINGS, AND BOTH OVERTURN ME.**
+
+   **1. `a3` IS NOT STALE AND NOT GARBAGE. IT IS `0x01895310` -- A VALID, 4-BYTE-ALIGNED GUEST RAM
+   POINTER** (`a3&3 = 0`, and `0x01895310` is below the 32MB ceiling). So `func_1007738`'s
+   `lw v0,20(a3)` / `lw v1,8(a3)` are dereferencing a real object. **The ITERATION 34 conclusion -- that
+   `a3` is stale and the defect is a register-mapping failure across the call -- IS WRONG.**
+
+   **2. THE CALL SITE I ANALYSED IN ITERATIONS 33 AND 34 IS **NEVER EXECUTED**.**
+   `ra=0x010089d0`, **NOT** `0x01005f58`. And the call-site probe fired **ZERO** times.
+   **So the whole chain I walked -- `sub_01004500 -> sub_01006F90 -> sub_01005D48 -> func_1007738` -- is a
+   REAL BUT UNTAKEN PATH IN THE BINARY. The guest never goes there.** That is the ninth retraction, and the
+   most expensive one: I built a three-level story on a call site that does not execute.
+
+   **THE REAL CALLER, AND THE REAL SPIN -- `sub_010088E8`, DISASSEMBLED:**
+   ```
+   10089c0: move  a0,sp
+   10089c8: jal   0x1007738
+   10089cc: addiu s1,s1,1
+   10089d0: move  a0,sp          <-- ra, and it MATCHES the measured ra
+   10089d4: jal   0x1005870
+   10089d8: move  a1,s2
+   10089dc: bltz  v0,0x10089c8  <-- *** THE SPIN ***  loops back while v0 < 0
+   ```
+   **THE SPIN IS THE `bltz v0,0x10089c8` BACK-EDGE, AND THE FUNCTION THAT KEEPS IT NEGATIVE IS
+   `func_1005870` (0x1005870).** **THIS IS THE `0x01005890` FAMILY THE REVIEWER NAMED ALL ALONG, AND IT
+   CONNECTS TO W120's FINDING THAT `func_10057F0` RETURNS -1 FROM ITS DELAY SLOT AND "the caller loops
+   while $v0 < 0" -- EXACTLY THIS BACK-EDGE SHAPE.** So W120 was right about the mechanism and I spent
+   W121-W122 looking somewhere else entirely.
+
+   **THE BOOT, UNCHANGED:** `halt=livelocked_in_syscall`.
+   **PICTURE:** `docs/evidence/w135_game.png`, window id `0x9812d2`, 650x482, **394 distinct colours**.
+   Still the 2005 Sony disclaimer.
+   **NO FIX LANDED THIS TURN.** But the spin is now located to a single back-edge and a single callee,
+   which is the first time in this project that "the spin" has meant one address and one function.
+
    **ITERATION 34 -- THE BRANCH IS DECIDED: THE SECOND ONE. `func_1007738` DEREFERENCES `a3` AND THE CALL
    SITE AT 0x1005F50 NEVER SETS IT. THAT IS A CALL-ORDER / REGISTER-MAPPING DEFECT.**
 

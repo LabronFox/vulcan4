@@ -638,6 +638,44 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    the generated `sub_010088E8` actually execute `ctx->pc = 0x1008924u` and the five `WRITE32`s when
    entered at `0x10088e8`?** Everything else is now measured and trustworthy.
 
+   **ITERATION 14: THE CONTRADICTION WAS A TYPO IN MY OWN WINDOW. NOTHING WAS BROKEN.**
+   Read the generated body (`ps2_recompiled_functions.cpp:43400`). The three questions:
+
+   **(1) IS THE PROLOGUE REACHABLE FROM `case 0x10088e8`?** The switch has **no `case 0x10088e8`** — it
+   falls through `default: break` straight into the body. **So the prologue is the fall-through path,
+   not a skipped one.** The table's three entries are `0x10088e8` (prologue), `0x100894c` and
+   `0x1008960` (resume past it), and `0x10089c8` is a spin label reached only from `0x100894c`.
+   Measured first arrival: `pc=0x10088e8 (PROLOGUE RUNS) sp=0x1fffc20 s3=0x1fffcb0 s0=0x18951f0`.
+
+   **(2) ARE THE FIVE STORES REAL TRACING `WRITE32`s?** Yes, all five:
+   ```
+   0x1008924: sw $zero,0x4($sp)   -> WRITE32(ADD32(GPR_U32(ctx,29), 4),  GPR_U32(ctx,0))
+   0x1008928: sw $v0,0x10($sp)    -> WRITE32(ADD32(GPR_U32(ctx,29), 16), GPR_U32(ctx,2))
+   0x100892c: sw $v1,0x8($sp)     -> WRITE32(ADD32(GPR_U32(ctx,29), 8),  GPR_U32(ctx,3))
+   0x1008930: sw $zero,0xC($sp)   -> WRITE32(ADD32(GPR_U32(ctx,29), 12), GPR_U32(ctx,0))
+   0x1008938: sw $zero,0x14($sp)   -> WRITE32(ADD32(GPR_U32(ctx,29), 20), GPR_U32(ctx,0))
+   ```
+   **The translator did not elide anything.** No codegen bug.
+
+   **(3) THE REAL ANSWER, AND IT IS MY OWN TYPO.** The generated body runs `addiu $sp,$sp,-0x80`
+   **before** the stores, so the measured `sp=0x1fffc20` is **already decremented** and the five stores
+   land at `0x01FFFC24 / 28 / 2C / 30 / 34`. **My window was `0x01FFC00-0x01FFC40` — I typed `0x1ffc`
+   where the frame is `0x1fffc`, dropping THREE hex digits.** The window sat **0x1DFFFE0 bytes below**
+   the frame and could never see one of them. **Nothing was wrong with the game, the codegen, the
+   observer slot, or the dispatcher** — the observer delivered 1.6M stores correctly and I was
+   watching empty memory.
+
+   **WITH THE WINDOW CORRECTED, THE CENSUS IS HONEST AT LAST** (`t1.log`, spin live at
+   `0x01005890=120,669,828`): **244 writes into the frame where the broken window reported zero**, and
+   `sub_010088E8`'s own stores are visible for the first time:
+   ```
+   [w122:sp] #239 addr=0x1fffc10 size=8 value=0x1fffcd0 writerPc=0x1008904 op=WRITE64   ; sd $s0,0x10($sp)
+   [w122:sp] #241 addr=0x1fffc08 size=8 value=0x1fffca0 writerPc=0x1008914 op=WRITE64   ; sd $s1,0x8($sp)
+   [w122:sp] #243 addr=0x1fffc18 size=8 value=0x1009004 writerPc=0x1008918 op=WRITE64   ; sd $ra,0x18($sp)
+   ```
+   **Every claim from iterations 9-13 about "nothing writes the frame" is RETRACTED.** The function does
+   write it, on every entry, exactly as the disassembly says.
+
    **RETRACTION — MY "COMPILER DEFECT" WAS WRONG. DO NOT GO FIX THE COMPILER.**
    I claimed `sub_01005AB8` never materialises `$s1` from `$a0`. **It does.** The instruction is
    right there and my grep missed it because I searched for the wrong pattern:

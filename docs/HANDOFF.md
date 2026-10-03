@@ -814,6 +814,42 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    per pass, with the entry count and the compare count — so the next agent needs only a gated run and
    one `grep w122:depth`. **Do not rewrite `EeScheduler`; there is no defect in it that I have shown.**
 
+   **ITERATION 19: THE 0x80 QUESTION CLOSES, AND IT CLOSES BY SHOWING I WAS CHASING THE WRONG SPIN.**
+   First, a correction to the brief's premise, verified rather than assumed: **`boot_desk122351.log`
+   CANNOT answer the question.** It has `halt=wallclock_deadline` with `0x01005890=157,626,387`, which is
+   a live spin — but it is dated **12:25:21**, and `[w122:depth]` was not compiled into the binary until
+   **16:38:01**. `grep -c w122:depth` on it returns **0**. **The data on disk does not contain the
+   instrument.** Every one of my 20 "no gate pass" runs also returns `depth=0`, and the reason is now
+   obvious and was never the gate: `sub_010088E8` **was never entered** in any of them.
+
+   **AND THAT IS THE FINDING.** There are **TWO DIFFERENT LIVELOCKS**, and they are not the same shape:
+   ```
+   z14.log  halt=livelocked_in_syscall  spin5890=0    top: 0x0100d908=473,114,102 (99.99%)
+                                                    also 0x010202e8=473,112,604
+   y2.log   halt=livelocked_in_syscall  spin5890=125,740,680
+                                                    top: 0x01007738=125,740,248 (99.99%)
+                                                    also 0x01089c8 =125,740,681
+   ```
+   - **`0x0100D908`** is the **thread-id barrier** found in W122 iteration 1 — the *dominant* livelock,
+     present in most runs. `sub_010088E8` is never reached in those.
+   - **`0x01007738`** is `func_1007738`, the **accumulator**, and it burns 125.7M transfers in the
+     minority of runs that get past the barrier and into `sub_010088E8`.
+
+   **SO THE 0x80 GAP WAS AN ARTIFACT OF COMPARING ACROSS INVOCATIONS, exactly as suspected.**
+   `sub_010088E8` is entered repeatedly and `$sp` is not constant across entries, so "entry `$sp`" from
+   one invocation and "compare `$a0`" from another differ by `0x80` without anything being wrong.
+   **There is no mid-function `$sp` reallocation, and `EeScheduler` is not involved.** Thread closed.
+
+   **AND THE REAL WALL, NAMED AT LAST:** the accumulator `func_1007738` is the thing spinning, and on
+   the gated run it is entered exactly once through its refill:
+   ```
+   [w122:refill] ENTER #1 a0=0x1895180 a1(count)=0 a2(bit)=1
+   ```
+   **Its loop bound `*(a3+8)` is `0`, so `sltu` is false on the first pass and the refill never
+   supplies a bit — while the accumulator itself is called 125,740,248 times.** The guest is asking for
+   bits from an empty stream, forever. That is the livelock in one sentence, and it is upstream of the
+   compare, the element word, and every stack frame measured today.
+
    **RETRACTION — MY "COMPILER DEFECT" WAS WRONG. DO NOT GO FIX THE COMPILER.**
    I claimed `sub_01005AB8` never materialises `$s1` from `$a0`. **It does.** The instruction is
    right there and my grep missed it because I searched for the wrong pattern:

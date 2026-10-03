@@ -935,6 +935,67 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 24 -- THE 15-MINUTE BOOT IS ANSWERED, AND IT KILLS THE SPEED THEORY OUTRIGHT.**
+
+   **ITEM 3, THE LONG BOOT, RUN PROPERLY (all VULCAN4_ knobs unset, 900s budget):**
+   ```
+   started 18:23:52   log last written 18:23:58   <-- SIX SECONDS
+   WILDPC dead=0x00012403 last_good=0x0100f800
+   SYSTABLE n=0x83 slot=0x1218c handler=0xa3000400
+   SYSTABLE n=0x5a slot=0x120e8 handler=0xa0000c12
+   true_guest_exits=0   halt=pc_outside_generated_table   frames_presented=277
+   ```
+   **THE GUEST DIED IN SIX SECONDS.** ITERATION 23 said `v0=0xffffffff` was the -1 from func_10057F0's
+   delay slot, and blamed instrumentation overhead for the guest dying earlier than the reviewer's run.
+   **BOTH WRONG.** With every knob off and 15 minutes of budget, the guest still dies in six seconds at
+   `pc_outside_generated_table`. **So the halt is NOT a race against the budget, and it is NOT caused by
+   instrumentation. The reviewer is right that nobody had done this: the screen does NOT change with more
+   wall clock, because the guest is dead long before a disclaimer timer could expire.** There is no
+   "just wait longer" answer, and I should not have let 0.26x stand as an explanation.
+
+   **ITEM 1, SYSCALL TABLE BASE AND STRIDE -- BOTH SIDES, AS ASKED.**
+   OURS: `ps2_runtime.cpp:4012 kTableGuestBase = 0x80011F80`, masked `& 0x1FFFFFFFu` -> physical
+   **0x11F80, stride 4**. `setEeSyscallOverride` (:3968) uses the same base and `syscallNumber * 4`.
+   Arithmetic checks: `0x11F80 + 0x5A*4 = 0x120E8` and `0x11F80 + 0x83*4 = 0x1218C`, difference
+   **0xA4 = 164** -- which is exactly the constant `System.cpp:1071` says GT4 hunts.
+   THE GUEST IS THE TRUTH, AND IT DOES NOT AGREE:
+   - `mips-linux-gnu-objdump -d SCUS_973.28 | grep -E '0x5a|0x83'` returns **NOTHING**. The guest has
+     **zero immediates for syscall 0x5A or 0x83** and **zero references to 0x80011F80/0x11F80**. The two
+     hits for "11f80" are coincidental CODE addresses (0x1011f80, 0x10120e8), not the table.
+   - `[FindAddress:hit]` = **0** and `[FindAddress:miss]` = **0** in the long boot. **GT4 never called
+     FindAddress at all**, so the `s1 = s3 - 0x20C / s0 = s2 - 0x168 / loop until s1 == s0` convergence
+     routine described in System.cpp is **not on this path**.
+   **SO THE 0x11F80 BASE IS A ps2SDK CONVENTION WE ASSUMED, NOT SOMETHING THIS GUEST USES.** The comment
+   at `vulcan4_harness.cpp:2727` claims "GT4 registers two of its own syscall handlers (0x83 and 0x5A)" --
+   **that claim is false as far as this binary is concerned**, and the SYSTABLE probe has been reporting
+   our assumption back to us as if it were a measurement. This is the same class of error as the 0x32/0x33
+   syscall numbers: **an assumption quoted as ground truth.**
+
+   **WHAT THOSE TWO SLOTS ACTUALLY CONTAIN, AND WHY IT MATTERS.** The same two slots read completely
+   differently in two runs of the same binary:
+   ```
+   knobs on :  n=0x83 -> 0x?     n=0x5a -> 0x240302d
+   knobs off:  n=0x83 -> 0xa3000400   n=0x5a -> 0xa0000c12
+   ```
+   and the arithmetic does not close: `0xa3000400 - 0xa0000c12 = 0x02fff7ee`, where 0xA4 is required.
+   Both values are KSEG1-shaped (0xa...), i.e. **host-style aliased addresses**, and RDRAM is zeroed at
+   init, so **the guest wrote them**. **And the wild pc `0x00012403` lies INSIDE the assumed table
+   region** (0x11F80-0x129E8 is 0x11F80 + 666*4). So the guest is jumping into a low-RDRAM region that
+   holds DATA, not handlers.
+
+   **THE HYPOTHESIS THAT FITS, STATED AS A HYPOTHESIS AND NOT AS A FINDING.** On real hardware the
+   **console kernel** fills the syscall table at 0x80011F80 with handler pointers. **This project has no
+   BIOS in the path by law**, so nothing fills that table with real handlers; whatever is there is guest
+   data, and a guest that jumps through it lands in data and dies at `pc_outside_generated_table`. The fix
+   would be to populate the table with trampolines into our own dispatcher. **I have NOT verified this and
+   I am NOT claiming it** -- it is the next thing to measure, because it is the only explanation that fits
+   the wild pc being inside the table region.
+
+   **ITEM 4, THE PICTURE.** `docs/evidence/w124_long_game.png`, window id `0x94fc30`, 650x482,
+   **390 distinct colours**, title `VULCAN 4 - 117 GS packets/s | Speed: 0.82x PS2 | 452 shown`. Still
+   the 2005 Sony disclaimer. Note 0.82x here versus 0.26x/0.27x earlier: **the "speed" figure is not
+   stable either**, which is more evidence it was never the wall.
+
    **ITERATION 23 -- ITER PROFILED THE 90s. PER-ENTRY HOST OVERHEAD IS *NOT* THE PROBLEM, AND THE GUEST
    DIES ON A WILD PC, WHICH IS A BIGGER FINDING THAN SPEED.**
 

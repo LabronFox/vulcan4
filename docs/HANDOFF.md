@@ -1,3 +1,41 @@
+   **ITERATION 54 -- THE FULL LIST OF WRITES TO A RUNNING THREAD'S CONTEXT. THREE REAL ASSIGNMENTS, AND
+   NONE OF THEM CAN INSTALL `0xdfb0`. THE REVIEWER'S HYPOTHESIS 2 IS ELIMINATED.**
+
+   **EVERY assignment to a thread's context object in the runtime (`grep -rnE "\bcontext\s*=|->context\s*="`):**
+   ```
+   EeScheduler.cpp:138   main.context  = mainContext;              // bind at reset
+   EeScheduler.cpp:556   target->context = R5900Context{};         // startThread
+   EeScheduler.cpp:1258  main->context = m_runtime.m_cpuContext;   // the G1.8 refresh
+   EeScheduler.cpp:250   R5900Context &context = running->activeContext();   // a BINDING, not a write
+   EeScheduler.cpp:1356  R5900Context &context = running->activeContext();   // a BINDING, not a write
+   EeScheduler.cpp:2118  const R5900Context &context = item.activeContext(); // a READ
+   ```
+   **THREE REAL WRITES, AND ALL THREE ARE RULED OUT:**
+   - **`:138`** binds the base frame at reset only.
+   - **`:556`** is inside `startThread()` and is guarded by `if (target->status != EeThreadStatus::Dormant)
+     { return KE_NOT_DORMANT; }` -- **it can only ever fire on a DORMANT thread**, which is correct behaviour
+     for a thread that has not started. It cannot be installing a value into a thread that is already
+     running.
+   - **`:1258`** is the G1.8 refresh, and ITERATION 53 MEASURED IT INNOCENT: `pcDiffer=0 raDiffer=0` in two
+     derailed runs.
+
+   **SO NONE OF THEM IS THE WRITER, AND THE FRAME-OVERWRITE THEORY IS DEAD AGAIN.**
+
+   **AND THE MEASUREMENT FROM ITERATION 53 RE-READS DIFFERENTLY NOW, CORRECTLY THIS TIME.** I printed
+   `thread(1)->context` -- **thread 1** -- while `runningThreadId=2`. **So "both other copies hold
+   0x1010a70" was never two independent confirmations: `m_cpuContext` and `thread(1)->context` are the SAME
+   logical base frame, seen through two pointers.** The picture is therefore:
+   ```
+   runningThreadId            = 2
+   pendingInvocationsNow      = 1
+   m_cpuContext      (base)   pc=0x100f800 ra=0x1010a70     <- the BASE frame, correct
+   thread(1)->context (base)  pc=0x100f800 ra=0x1010a70     <- the SAME base frame, not a second witness
+   ctx actually dispatched    pc=0x100f800 ra=0xdfb0        <- THREAD 2's context, corrupted
+   ```
+   **THE CORRUPTION IS IN THREAD 2'S OWN CONTEXT, AND IT IS NOT ANY OF THE THREE WHOLESALE ASSIGNMENTS --
+   so it is written per-instruction through `running->activeContext()` while thread 2 executes.** That is a
+   different question from "who assigns a context" and it is the one now open.
+
 # VULCAN 4 — HANDOFF
 
 **Rewritten 2026-10-03 09:40.** The previous 546 KB handoff was last written Oct 2 21:36 and did not

@@ -1420,6 +1420,13 @@ int main(int argc, char *argv[])
             (watchEnv("VULCAN4_PATHSTORE_MAX", 4u) != 4u) ||
             (watchEnv("VULCAN4_WATCH_MAX", 120u) != 120u) ||
             (kScratchHi > kScratchLo) || (kWatchLo != kWatchLoDefault) || (kWatchHi != kWatchHiDefault);
+        // W122 ITERATION 9. ARM THE STACK-STREAM WATCH BEFORE ANY GUEST INSTRUCTION RUNS.
+        // The watch on 0x1fffba0..0x1fffbb4 was previously armed from the first func_10057F0 compare,
+        // which is inside the loop it is meant to observe -- $sp is set up long before that, so it
+        // could only ever report zero. Arm it here, at the harness's own guest start, and it chains
+        // to whatever observer is installed below so nothing is silenced.
+        ps2ArmSpStreamWatch();
+
         if (diagnosticsRequested)
         {
             ps2SetGuestStoreObserver(&watchGuestStoreForPath);

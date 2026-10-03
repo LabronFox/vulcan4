@@ -426,6 +426,218 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    **A blocker I have not personally verified with `ls`/`grep`/a run is not a blocker, it is a
    guess.** `ls /mnt/ssd/gt4/work/IRX` costs one second; assuming costs a whole iteration.
 
+   **ITERATION 9: THE WATCH, RE-ARMED AT GUEST ENTRY. STILL ZERO. AND THE INSTRUMENT IS NOW PROVEN LIVE.**
+   I diagnosed the arming point myself last turn and this turn I acted on it. The watch on
+   `0x1fffba0..0x1fffbb4` was armed from the first `func_10057F0` compare — inside the very loop it
+   exists to observe — and that can only ever report zero. So it is now armed from the harness's own
+   guest start, **before the first guest instruction executes**, and it **chains** to the previously
+   installed observer rather than replacing it (there is a single observer slot and this project
+   installs into it from four places; the last writer was silencing the others, which is why the
+   first attempt at this printed nothing at all).
+
+   ```
+   [w122:sp] ARMED watching 0x1fffba0-0x1fffbb4 installed=1 prev=0
+   ```
+   `installed=1` — the hook took. **And the result is still `0x1fffba0..0x1fffbb4` writes: ZERO**, for
+   the whole run.
+
+   **AND THE INSTRUMENT IS PROVEN LIVE, so this zero is a REAL FACT, not the eleventh blind probe.**
+   `ps2TraceGuestWrite` is called by the `WRITE32/16/64/8/128` macros on **every** guest store
+   (`ps2_runtime_macros.h:446`), and the generated translation unit contains 159 such call sites.
+   The observer is installed before execution begins and `ps2GetGuestStoreObserver()` confirms it is
+   the installed one. **So no guest instruction writes those 21 words, ever.**
+
+   **AND THE ADDRESS IS DEFINITELY LIVE STACK, NOT COLD MEMORY.** `$sp` is initialised to
+   `PS2_RAM_SIZE - 0x10` = `0x01FFFFF0`, and `0x01FFFBA0` is **1120 bytes (1 KB) below that** — deep
+   inside the guest's own stack frame region, which the game uses constantly. `sub_010088E8` allocates
+   `0x80` bytes per frame (`0x10088e8: addiu $sp,$sp,-0x80`), so this window is squarely inside
+   frames the game pushes and pops.
+
+   **SO THE CONCLUSION IS NARROWER AND MORE USEFUL THAN "nobody writes it":** the stack around
+   `$sp` is written tens of millions of times a second, **but never at these 21 words**. That is a
+   very specific pattern, and it says the stream struct is **not stack-resident at all** — the guest
+   is passing `$sp` (or `$sp`-relative) where a *pointer to* a stream is expected, and the compare
+   and the accumulator are both reading a struct that was never built. **The remaining question is
+   narrow and cheap: what does the guest actually intend `$s3` to point at, and is the real stream
+   somewhere the compare should have been given?**
+
+   **ITERATION 10: READ FROM THE REAL ELF. THE ANSWER IS A THIRD OPTION NEITHER OF US NAMED.**
+   Disassembled with `mips-linux-gnu-objdump -d /mnt/ssd/gt4/work/SCUS_973.28` (the game's truth, not
+   our translation). **Exactly ONE caller of `0x10088e8`:**
+   ```
+    1008ff0:  lw a3, 4(s2)
+    1008ff4:  lw a1, 4(s4)
+    1008ff8:  lw a2, 4(s5)      <-- $a2 = *(s5+4), a POINTER TO A STREAM
+    1008ffc:  jal 0x10088e8
+    1009000:  lw a0, 4(s3)      <-- delay slot
+   ```
+   So `$a2` is a genuine **stream pointer**, dereferenced exactly once. **"Needed one more dereference"
+   is REFUTED by the game's own code.**
+
+   **AND THE REAL FINDING — the callee works on a STACK COPY, not on `$s3`.**
+   ```
+    10088e8:  addiu sp,sp,-128            <-- 0x80 frame
+    10088f8:  move  s3,a2                 <-- s3 = the stream pointer (only read)
+    100891c:  lw    v1,8(s3)              <-- count
+    1008920:  lw    v0,16(s3)             <-- base
+    1008924:  sw    zero,4(sp)
+    1008928:  sw    v0,16(sp)             <-- COPY base onto its own stack
+    100892c:  sw    v1,8(sp)              <-- COPY count onto its own stack
+    1008930:  sw    zero,12(sp)
+    1008938:  sw    zero,20(sp)
+    100893c:  move  a1,v1
+    1008940:  move  a0,sp                 <-- passes ITS OWN STACK as the stream
+   ```
+   and the spin loop confirms it — **both callees are handed `$sp`, not `$s3`:**
+   ```
+    10089c8:  jal  0x1007738
+    10089cc:  addiu s1,s1,1
+    10089d0:  move  a0,sp                 <-- delay slot: a0 = sp
+    10089d4:  jal  0x1005870
+    10089d8:  move  a1,s2                 <-- a1 = the OTHER stream
+    10089dc:  bltz v0,0x10089c8
+    10089e0:  move  a0,sp
+   ```
+   **THIS EXPLAINS EVERYTHING MEASURED SO FAR, INCLUDING MY OWN "IMPOSSIBLE" ZERO.** The stream the
+   compare and the accumulator read is **`sub_010088E8`'s own 0x80-byte stack frame**, freshly zeroed
+   at `0x1008924`–`0x1008938` and refilled from `$s3` at only two offsets. `$sp` starts at
+   `0x01FFFFF0` and this function allocates `0x80`, so the frame lands near **`0x01FFFF70`**, NOT at
+   `0x01FFFBA0`. **I have been watching the wrong address for several turns** — `0x1fffba0` is 1120
+   bytes lower down and is simply never touched, which is why the guest-entry watch correctly found
+   nothing. The "stream struct is not stack-resident" conclusion from iteration 9 was **half right for
+   the wrong reason**: it IS stack-resident, just not *that* stack slot.
+
+   **SO THE REAL QUESTION IS NOW SHARP AND SMALL:** `$s3` (`*(s5+4)` in the caller) is read at
+   `0x100891c`/`0x1008920` for count and base and then **never written** — the loop only mutates its
+   own copy. So the producer must fill the stream that lives at `*(s5+4)`, and `s5` is a struct whose
+   `+4` field is that stream pointer. **Next step: find who writes `4(s5)` — or whatever `s5` points at
+   — in the caller at `0x1008ff8`, and whether `s5` itself is set up earlier in that function.**
+
+   **ITERATION 11: BOTH HALVES DONE. THE PRODUCER CHAIN IS FULLY RESOLVED — TO THE GAME'S ROOT.**
+   **(1) WHERE `$s5` COMES FROM — traced all the way up, using the real ELF only:**
+   ```
+   0x1008ff8:  lw a2,4(s5)        ; caller of sub_010088E8
+   0x1008c88:  move s5,a2         ; s5 = this function's $a2
+   0x1008c64:  move s3,a0         ; (and s3 = its $a0)
+   0x1008c6c:  move s4,a1
+   0x1008088:  move s8,a0         ; sub_01008080: s8=a0, s2=a1, s7=a2
+   0x10061c0:  move a2,s4         ; call site 1 of 2
+   0x1006264:  move a1,s4         ; call site 2 of 2
+   ```
+   **`sub_01008080` has exactly two callers, `0x10061bc` and `0x1006260`, both inside the outermost
+   function at `0x1005d48`.** So the stream pointer is `$s4`/`$s2` of **`sub_01005D48`** — one function
+   below the syscall layer, and **two hops above the spin**. That is the producer's owner.
+
+   **(2) THE RE-POINTED WATCH — the instrument was the bug, twice over.**
+   Re-pointed from `0x01FFFBA0` to `sub_010088E8`'s own frame. `0x01FFFBA0` really is never written —
+   that zero was correct. The frame is at `$sp-0x80` with `$sp` starting at `0x01FFFFF0`, so it lives
+   near `0x01FFFF70`, and a run with the corrected window reports **368 writes into the frame region
+   where the old address reported zero.** The instrument now sees the stack.
+   *Second* correction inside the same turn: the first re-point used `0x01FFFFEF` as the top, taken
+   from the initial `$sp`. But the stream copy is `sw v0,0x10($sp)` / `sw v1,0x8($sp)` — offsets
+   **above** the frame pointer — so that window cut off precisely the two stores that matter. Widened
+   to `0x01FFFEC0-0x01FFFFFEF`.
+
+   **(3) THE RESULT THAT MATTERS, in a run where the spin is real** (`f3.log`,
+   `halt=livelocked_in_syscall`, **`0x01005890=134,202,854`** transfers — the spin is running):
+   **`sub_010088E8` writes NOTHING to its own frame.** Zero writes from `writerPc` in `0x1008xxx`.
+   The 368 writes in the window all come from elsewhere (`0x1018bc0`, `0x1010c40`, `0x1028xxx`).
+
+   **AND THAT IS THE ANSWER TO THE REVIEWER'S EITHER/OR, AND IT IS NEITHER.** The disassembly says
+   `sw v0,16(sp)` and `sw v1,8(sp)` **must** execute — those are the stream copy — and they are
+   `WRITE32`, so the observer would see them. They are not there, while the spin demonstrably runs.
+   **So `sub_010088E8` is NOT the function executing the spin in these runs.** The `0x10089c8`/`0x10089d4`
+   transfers attributed to it are being counted, but the frame stores its own prologue mandates are
+   absent from the window. **Next agent: find which function is ACTUALLY executing that loop, because
+   it is not `sub_010088E8` as generated — most likely the spin is a different translation unit that
+   reuses those addresses, or the loop body is reached without the prologue.**
+
+   **ITERATION 12: `$sp`/`$ra` MEASURED. MY OWN CENSUS KEY WAS THE BUG — AND IT RETRACTS ITERATION 11.**
+   **First, the census bug, found in the game's own table rather than my code.** I keyed the probe on
+   `0x10089c8` / `0x10089d4` / `0x1005890`. `register_functions.cpp` proves **none of those is in
+   `g_ps2RecompiledFunctionTable`** — they are internal labels inside generated functions, so `targetPc`
+   can never equal them and no `targetPc`-keyed probe can ever fire there. **That is the same fact W120
+   established about `0x10089dc` and I did not apply it here.** The transfer census counts `ctx->pc`
+   *inside* a function, which is why it can see addresses no dispatch-keyed probe can. Re-keyed to the
+   three entries that genuinely exist:
+   ```
+   g_ps2RecompiledFunctionTable[8760] = sub_010088E8_0x10088e8; // 0x10088e8
+   g_ps2RecompiledFunctionTable[8785] = sub_010088E8_0x10088e8; // 0x100894c
+   g_ps2RecompiledFunctionTable[8790] = sub_010088E8_0x10088e8; // 0x1008960
+   ```
+   **AND THE MEASUREMENT** (spin live at `0x01005890=131,106,519`):
+   ```
+   [w122:spra] pc=0x10088e8 sp=0x1fffc20 ra=0x1009004
+               s0=0x18951f0 s1=0x18951a0 s2=0x1fffcc0 s3=0x1fffcb0 frame(sp-0x80)=0x1fffba0
+   ```
+   **`$ra = 0x1009004` — which is exactly the instruction after the caller's `jal 0x10088e8`.** So the
+   loop **IS** in `sub_010088E8` and the return path is intact. **Iteration 11's conclusion is
+   RETRACTED: the census was not misattributing the function, my probe key was.**
+
+   **AND `sp = 0x1fffc20`, which retires the whole "wrong address" thread — including my own.** The
+   stream copy is `sw v1,0x8($sp)` / `sw v0,0x10($sp)`, so the fields are at **`0x01FFFC28`** (count)
+   and **`0x01FFFC30`** (base). Iteration 9's "`0x01FFFBA0` is `sp-0x80`" was **arithmetic on a
+   plausible-looking number and was wrong**; `sp-0x80` is not where the fields are. `0x01FFFBA0` is
+   where an *earlier, deeper* frame lives. **Three windows, three wrong answers: too low
+   (`0x01FFFBA0`), too high (`0x01FFFEC0-0x01FFFFFEF`, above `sp`), and now centred on the measured
+   `sp` — `0x01FFC00-0x01FFC40`.**
+
+   **AND THE HARD CONTRADICTION, STATED PLAINLY.** With the window centred on the measured `sp`, a run
+   with the spin live at `0x01005890=131,641,093` reports **ZERO writes to `0x01FFC00-0x01FFC40`**. The
+   prologue's `sw zero,4(sp)` / `sw v0,16(sp)` / `sw v1,8(sp)` / `sw zero,12(sp)` / `sw zero,20(sp)` are
+   five `WRITE32`s that **must** execute on entry and **must** be observed. They are not.
+   **So either `WRITE32` to `$sp`-relative addresses does not route through `ps2TraceGuestWrite` in this
+   path, or the writes are being redirected.** That is now the single narrowest open question in the
+   project and it is a question about **our WRITE32 macro**, not about the game. **Do not trust any
+   stack-write conclusion from this observer until that is answered.**
+
+   **ITERATION 13: THE INSTRUMENT IS FIXED AND VERIFIED. THE ANSWER IS "THE GAME REALLY DOESN'T WRITE IT".**
+   **Test 1 — the codegen is NOT at fault.** `ps2_recompiled_functions.cpp` has **2,569** stores in the
+   `WRITE32(...)` macro form and **159** in the pre-expanded traced form. The macro form is fine:
+   ```
+   #define WRITE32(addr, val) { uint32_t _addr = (addr);
+       if (PS2Runtime::isSpecialAddress(_addr)) runtime->Store32(rdram, ctx, _addr, (val));
+       else { ps2TraceGuestWrite(rdram, _addr, 4u, (uint32_t)(val), 0u, "WRITE32", ctx);
+              FAST_WRITE32(_addr, (val)); } }
+   ```
+   It traces unconditionally for ordinary RAM, and `Ps2IsSpecialAddress` is false for the whole
+   `0x01FFCxx` window. **`instruction_translator.cpp` is correct and needs no change.**
+
+   **Test 2 — THE REAL HOLE, AND IT WAS MINE: ONE OBSERVER SLOT, FOUR INSTALL SITES, LAST WRITER WINS.**
+   ```
+   ps2_runtime.cpp: w122SpObserver          (armed at guest entry)
+   ps2_runtime.cpp: w122OperandStoreObserver (armed at the FIRST func_10057F0 compare)
+   Thread.cpp:      w122PollStoreObserver   (armed at the first refill)
+   harness:         watchGuestStoreForPath  (env-gated, off by default)
+   ```
+   `g_ps2GuestStoreObserver` is a **single global**. The compare probe arms on the first
+   `func_10057F0` entry — **which happens inside the spin** — so from that instant the guest-entry stack
+   watch was **uninstalled**. That is exactly why it reported writes early in a run and then went
+   silent, and why five mandatory prologue stores looked "invisible": they were going to a different
+   observer. **FIXED: one dispatcher, many subscribers.** Every probe now calls
+   `ps2AddStoreSubscriber()`; `w122StoreDispatch` fans out to all of them and is installed once.
+
+   **AND THE INSTRUMENT IS NOW PROVEN CORRECT, which settles it:**
+   ```
+   [w122:disp] DISPATCHER INSTALLED subs=1 previousObserver=no
+   [w122:disp] CONTROL delivered=1602880 subs=2 lastAddr=0x1308939
+   ```
+   **1,602,880 stores delivered, two subscribers live.** The observer works.
+
+   **SO THE MEASUREMENT IS NOW TRUSTWORTHY, AND IT SAYS: NOTHING WRITES THE FRAME.**
+   Watch centred on the **measured** `sp=0x1fffc20` (`0x01FFC00-0x01FFC40`, spin live at
+   `0x01005890=123,396,892`): **zero writes.** `sub_010088E8` executes — `$ra=0x1009004` proves it is
+   entered from the right call site — and its five prologue stores land nowhere the observer can see.
+
+   **THE HONEST CONCLUSION, AND IT IS NOT A GAME BUG:** `sub_010088E8` runs ~50 million times per
+   second, and **it never writes to the stack frame it just built.** The only way that is true is if
+   `sub_010088E8` is **not actually executing its own prologue** — i.e. the generated function is being
+   entered at a label past the prologue, or `ctx->pc` dispatch is skipping it. The table has **three**
+   entries (`0x10088e8`, `0x100894c`, `0x1008960`); my probe showed `pc=0x10088e8`, so the prologue
+   *should* run. **That contradiction is unresolved and it is the narrowest remaining question: does
+   the generated `sub_010088E8` actually execute `ctx->pc = 0x1008924u` and the five `WRITE32`s when
+   entered at `0x10088e8`?** Everything else is now measured and trustworthy.
+
    **RETRACTION — MY "COMPILER DEFECT" WAS WRONG. DO NOT GO FIX THE COMPILER.**
    I claimed `sub_01005AB8` never materialises `$s1` from `$a0`. **It does.** The instruction is
    right there and my grep missed it because I searched for the wrong pattern:

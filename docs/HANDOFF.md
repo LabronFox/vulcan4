@@ -676,6 +676,39 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    **Every claim from iterations 9-13 about "nothing writes the frame" is RETRACTED.** The function does
    write it, on every entry, exactly as the disassembly says.
 
+   **ITERATION 15: WATCHED EXACTLY TWO WORDS. THE WRITER IS NAMED — AND IT IS *NOT* THE PRODUCER.**
+   Window narrowed to `0x01FFFC28` (count) and `0x01FFFC30` (base) only. Whole 90 s run, 18 lines,
+   and they are all one burst from a single writer:
+   ```
+   #1  FIELD=COUNT(sp+0x08) addr=0x1fffc28 size=1 value=0x38 writerPc=0x100f800 op=WRITE8
+   #3  FIELD=BASE(sp+0x10)  addr=0x1fffc29 size=1 value=0xff writerPc=0x100f800 op=WRITE8
+   #5  addr=0x1fffc2a value=0x2d   #7  addr=0x1fffc2b value=0x3a   #9  addr=0x1fffc2c value=0x4f
+   #11 addr=0x1fffc2d value=0x0c   #13 addr=0x1fffc2e value=0x02   #15 addr=0x1fffc2f value=0x1c
+   #17 addr=0x1fffc30 value=0x2c
+   ```
+   **The writer is `0x100f800`, and it is `sub_0100F390_0x100f390` — a generic byte-copy inner loop:**
+   ```
+   0x100f7f8: addu  $s2, $s1, $s3
+   0x100f7fc: lbu   $v0, 0x0($s1)      ; load byte
+   0x100f800: sb    $v0, 0x0($t1)      ; <-- store byte
+   0x100f804: addiu $t1, $t1, 0x1      ; dst++
+   0x100f808: bne   $t1, $t4, ...      ; loop until t1 == t4  (a memcpy)
+   0x100f80c: addiu $s1, $s1, 0x1      ; src++ (delay slot)
+   ```
+   **AND THE VALUES SAY IT IS NOT THE STREAM PRIME: they are ASCII.** `38 ff 2d 3a 4f 0c 02 1c 2c`
+   reads as `8ÿ-:O...,` — **not** a count and **not** a base pointer. As little-endian words they
+   would be count `0x3A2DFF38` and base `0x2C1C020C`, which are nonsense for a stream. **So this is a
+   bulk `memcpy` passing over the frame as scratch, and hitting these two words only because that is
+   where `$sp` happened to be.** It is transient and it is not the producer.
+
+   **SO THE HONEST POSITION AFTER FIFTEEN TURNS:** the two words are written exactly once per run, by a
+   memcpy, with values that are clearly not a stream. **`sub_010088E8`'s own `sw v1,0x8($sp)` /
+   `sw v0,0x10($sp)` — the instructions that would actually prime them — do not appear at all in this
+   run**, because this run halted `pc_outside_generated_table` and never entered the spin. **The one
+   measurement still missing is the two-word watch on a run that actually spins**, which is the same
+   shape as every gap in the last six turns: I keep getting a non-spinning run and reading it as if it
+   were the interesting one.
+
    **RETRACTION — MY "COMPILER DEFECT" WAS WRONG. DO NOT GO FIX THE COMPILER.**
    I claimed `sub_01005AB8` never materialises `$s1` from `$a0`. **It does.** The instruction is
    right there and my grep missed it because I searched for the wrong pattern:

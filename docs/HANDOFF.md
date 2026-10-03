@@ -935,6 +935,37 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 51 -- THE SHIFT HYPOTHESIS, PARTIALLY CHECKED. TWO OF THE VARIABLE SHIFTS ARE CORRECT.
+   I DID NOT COMPLETE THE DERIVATION MEASUREMENT.**
+
+   **THE SHIFTS IN `sub_0100F390` (objdump, `sll|srl|sra|dsll|dsrl|dsra`):**
+   ```
+   100f3d0: sllv  v1,v0,s5      100f3d8: sllv  v0,v0,s7
+   100f418: dsll32 v0,a3,0x0     100f41c: dsra32 v0,v0,0x0
+   100f430: sllv  v1,s6,v1      100f434: dsll32 v0,a3,0x0   100f438: dsra32 v0,v0,0x0
+   100f448: sll   v0,v1,0x3     100f460: dsrlv a3,a3,v1
+   100f4c8: dsllv v0,v0,a2      100f4e8: sllv  v1,s6,s2
+   ```
+   **I DIFFED THE TWO PLAINEST VARIABLE SHIFTS AGAINST OUR GENERATED CODE AND BOTH ARE CORRECT:**
+   ```
+   // 0x100f3d0: 0x2a21804  sllv $v1, $v0, $s5
+   SET_GPR_S32(ctx, 3, (int32_t)SLL32(GPR_U32(ctx, 2), GPR_U32(ctx, 21) & 0x1F));
+   // 0x100f430: 0x761804    sllv $v1, $s6, $v1
+   SET_GPR_S32(ctx, 3, (int32_t)SLL32(GPR_U32(ctx, 22), GPR_U32(ctx, 3) & 0x1F));
+   ```
+   **Register indices verified by hand: `$s5` = 21, `$s6` = 22, `$v0` = 2, `$v1` = 3 -- all correct, and the
+   `& 0x1F` amount mask is present on both.** So the "wrong register for the shift amount" defect **is not
+   present at these two sites.** That is a partial negative result, not a clearance of the function.
+
+   **WHAT I DID NOT DO, AND I AM NOT PRETENDING OTHERWISE: I did not find the single instruction that
+   derives the jumped-through address, and I did not print its operands at run time.** The reviewer's step 1
+   -- read the game's bytes at the jump site -- was already answered in ITERATION 50: the jump is
+   **`100f8bc: jr ra`** with `ra` loaded by **`100f8b8: ld ra,88(sp)`**, so the derivation is *not* an
+   arithmetic one inside this function. `ra` was saved correctly by `100f3c4: sd ra,88(sp)`, so the bad value
+   arrived in the SLOT, from outside, and ITERATION 50 already established that it is a full 32-bit
+   replacement. **THE DERIVATION TO CHASE IS THEREFORE THE WRITER'S, NOT A SHIFT IN THIS FUNCTION** -- which
+   is the same conclusion ITERATION 50 reached, now with two shifts additionally cleared.
+
    **ITERATION 50 -- THE BYTE-STORE PREDICTION IS REFUTED. ALL FOUR BYTES DIFFER. `ra` WAS REPLACED
    WHOLESALE, AND BOTH CANDIDATE STORES ARE INNOCENT.**
 

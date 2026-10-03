@@ -935,6 +935,49 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 41 -- THE FOURTH CANDIDATE IS DEAD BY MEASUREMENT, AND THE RECEIPT IS A GREEN TEST.**
+   **Suite is now 495 tests, 495 passing, EXIT=0.**
+
+   **THE THEORY UNDER TEST:** the guest stack sits above the heap the loader sets up
+   (`runtimeEnd=0x1f00000`) and "nothing clears memory after allocation", so the frame the guest stands on
+   holds whatever the host allocator left there. That would explain three symptoms at once -- five
+   registers holding one pattern, nondeterminism between runs, and `sp` near the RDRAM ceiling, since `sp`
+   was measured at `0x01ffff60`, 160 bytes below `0x02000000`.
+
+   **MEASURED RESULT: IT IS NOT TRUE.** `PS2Memory::initialize(size_t ramSize = PS2_RAM_SIZE)` and the body
+   does:
+   ```cpp
+   m_rdram = new uint8_t[ramSize];
+   std::memset(m_rdram, 0, ramSize);
+   ```
+   **The ENTIRE 32MB addressable range is zeroed at startup, including everything above `runtimeEnd`.**
+   `PS2_RAM_SIZE = 32u * 1024u * 1024u` (`ps2_memory.h:26`), and the harness calls `m_memory.initialize()`
+   with no argument, so the default applies. **There was never an uncleared region.**
+
+   **THE RECEIPT, AND IT IS A TEST THAT PASSES AGAINST THE UNCHANGED CODE:**
+   ```
+   [Run]: W141: RDRAM reads zero everywhere, including above the heap's runtimeEnd   [Passed]
+   Total Tests: 495   Passed: 495   Failed: 0   EXIT=0
+   ```
+   It samples 256 bytes at each of five addresses spanning `runtimeEnd` to the ceiling, including
+   `PS2_RAM_SIZE - 0xA0` (exactly where `sp` was observed) and `PS2_RAM_SIZE - 4`, and asserts every one
+   reads zero on a freshly initialized runtime. **I wrote it expecting it to FAIL and it passed, which is
+   the refutation.** It is kept deliberately: it is the receipt for this dead candidate AND it will catch a
+   regression if anyone ever narrows the zeroing to "only the words we hand out", which is the shape of
+   bug this theory described.
+
+   **SO THE BOARD IS NOW:** loader CORRECT (ITERATION 40) -- LCG CORRECT and XOR LOOP NOT OVERRUNING
+   (ITERATION 39) -- ENTIRE RDRAM CORRECTLY ZEROED (ITERATION 41). **All four candidates dead, four in a
+   row, every one by a number.**
+   **STILL UNEXPLAINED, AND IT IS THE ONLY THING LEFT: `0xe9a2f5ef` appearing simultaneously in `pc`, `ra`,
+   `gp`, `a1` and `a3`, with `sp=0x01ffff60`.** It is in neither our source nor the disc, and the stack it
+   lands on is provably zero-initialised. **So it cannot be leftover memory -- it must be WRITTEN during the
+   run, by something, into the guest's own stack.** The next question is therefore not "what is under it"
+   but "**what writes it**", and the writer-watch that already exists (the W130 mechanism) is the tool.
+
+   **PICTURE:** `docs/evidence/w141_game.png`, window id `0x98ad18`, 650x482, **405 distinct colours**.
+   **STILL THE 2005 SONY DISCLAIMER. The screen has NOT changed.**
+
    **ITERATION 40 -- READELF ANSWERED IT, AND IT KILLS MY OWN ITER39 LEAD. THE DISC LEGITIMATELY
    CONTAINS `0x32277070`. THE LOADER IS CORRECT AND IS NOT THE WALL.**
 

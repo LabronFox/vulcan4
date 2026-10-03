@@ -935,6 +935,44 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 32 -- THE GATE WAS RIGHT ON ALL THREE, AND THE ONE NUMBER SAYS THE TWO FAULTS ARE NOT
+   THE SAME FAULT. NO FIX LANDED, AND I AM NOT PRETENDING OTHERWISE.**
+
+   **1. THE SUITE NUMBER WAS WRONG AND IT IS MY FAULT.** I read the summary from a **source-root** run
+   and quoted `494/494` without ever running the reviewer's invocation. **BOTH numbers, as read just now:**
+   ```
+   cd /mnt/ssd/vulcan4-build        ->  Total 494  Passed 493  Failed 1   (EXIT=1)   <- the reviewer's way
+   cd tools/PS2Recomp/ps2xTest      ->  Total 494  Passed 494  Failed 0   (EXIT=0)
+   ```
+   The one failure is **`VU0 macro mappings cover all S1/S2 enums`**, and it is **CWD-dependent, not a real
+   defect**: `code_generator_tests.cpp:1289` built a candidate list of **relative paths only**, so the test
+   passes from the source root and fails from the build directory. **I ATTEMPTED THE FIX AND IT DID NOT
+   WORK** -- I added `__FILE__`-relative candidates and the build-dir run is still `493/1`, so I do not
+   yet know why. **THE HONEST STATUS IS: KNOWN-RED FROM THE BUILD DIRECTORY, NOT YET FIXED. Do not let
+   anyone report this suite green again without naming which directory they ran it from.**
+
+   **2. `halt=livelocked_in_syscall`, AND THE ADEL DID NOT EVEN HAPPEN.** This is the important finding.
+   With the W132 AdEL probe **on** and `VULCAN4_W132_ADEL=1`:
+   ```
+   [w132:adel] hits: 0        <-- NOT ONE, in a whole boot
+   true_guest_entries=406327585   halt=livelocked_in_syscall
+   ```
+   **SO THE REVIEWER IS EXACTLY RIGHT AND I CONFIRM IT: THE SPIN AND THE AdEL ARE TWO DIFFERENT THINGS,
+   AND IN THIS RUN ONLY THE SPIN HAPPENED.** The AdEL at `0x100d90c` is real but **it does not reproduce
+   every boot**, which is the same nondeterminism recorded in ITERATION 22. **Any future work that treats
+   "the AdEL" and "the livelock" as one story is wrong, and this entry exists to stop that.**
+
+   **3. NO FIX LANDED THIS TURN, AND THE INSTRUCTION WAS RIGHT THAT NAMING A DEFECT IS NOT FIXING ONE.**
+   The W132 probe is in place and costs nothing when off, and it will print `faultAddr`, `vaddr&3`, `s0`,
+   `s0&3`, `addrInRam` and `ramSize` on the first eight AdELs plus every 50000th. **It has not fired, so
+   I have not split the hypothesis and I have no new cause to name.** The probe is deliberately NOT masking,
+   NOT suppressing and NOT widening the check: real hardware raises AdEL for these and raising it here is
+   correct.
+
+   **PICTURE:** attempted this turn; the capture was interrupted, so **the newest png is still
+   `docs/evidence/w131_game.png`, window `0x96e5ec`, 650x482, 386 colours -- still the 2005 Sony
+   disclaimer.** No new picture this turn and I am not going to claim one.
+
    **ITERATION 31 -- THE FAULT CLASS IS NAMED: ExcCode 0x4, ADDRESS ERROR ON LOAD. NOT 0xC, NOT A
    SYSCALL. AND THE FAULTING CODE IS A LINKED-LIST WALK.**
 

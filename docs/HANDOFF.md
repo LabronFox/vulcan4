@@ -935,6 +935,59 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 49 -- THE STATIC STORE LIST. NO PROBE NEEDED. EXACTLY FIVE INSTRUCTIONS IN
+   `sub_0100F390` CAN WRITE TO AN ARBITRARY ADDRESS, AND THEY ARE ALL BYTE STORES.**
+
+   `mips-linux-gnu-objdump -d --start-address=0x0100f390 --stop-address=0x0100f8c8 SCUS_973.28`, every
+   `sw`/`sb`/`sh`/`sd`, sorted by destination class.
+
+   **CLASS 1 -- `sp`-RELATIVE (the frame saves). ELEVEN OF THEM, ALL CORRECT:**
+   ```
+   100f398 sd s0,16(sp)   100f3a0 sd s6,64(sp)   100f3a8 sd s1,24(sp)   100f3ac sd s2,32(sp)
+   100f3b0 sd s3,40(sp)   100f3b4 sd s4,48(sp)   100f3b8 sd s5,56(sp)   100f3bc sd s7,72(sp)
+   100f3c0 sd s8,80(sp)   100f3c4 sd ra,88(sp)   100f410 sw v0,0(sp)
+   ```
+   **`sd ra,88(sp)` AT `0x100f3c4` IS THE ONLY STORE TO `sp+88`, AND IT IS THE PROLOGUE'S OWN SAVE, WHICH IS
+   CORRECT.** The frame is 96 bytes, so `sp+88` is its top slot and nothing in this function addresses above
+   it by a constant.
+
+   **CLASS 2 -- `s0`-RELATIVE (the callee-saved spill area `s0 = a0`). FORTY-ODD, ALL `0(s0)`-`60(s0)`:**
+   `sw s5,56(s0)`, `sw s7,60(s0)`, `sd a3,0(s0)`, `sw a2,8(s0)`, `sw t2,12(s0)`, `sw t2,16(s0)`,
+   `sw t3,24(s0)`, `sw t1,32(s0)`, `sw t4,36(s0)`, `sw t0,12(s0)`, `sw t4,32(s0)`, repeated in each of the
+   five blocks at `0x100f4xx`, `0x100f5xx`, `0x100f6xx`, `0x100f7xx`, `0x100f8xx`.
+
+   **CLASS 3 -- REGISTER-INDIRECT. THIS IS THE ENTIRE CANDIDATE SET. FIVE INSTRUCTIONS, ALL BYTE STORES:**
+   ```
+   100f4ec: sb s3,0(t1)
+   100f500: sb s3,0(v0)
+   100f780: sb v1,0(t1)
+   100f78c: sb v1,0(a1)
+   100f800: sb v0,0(t1)
+   ```
+   **THOSE FIVE ARE THE ONLY INSTRUCTIONS IN `sub_0100F390` THAT CAN WRITE TO AN ARBITRARY ADDRESS.** Every
+   other store is `sp`-relative with a constant no greater than 88, or `s0`-relative with a constant no
+   greater than 60.
+
+   **`t1` IS ALREADY EXCLUDED BY MEASUREMENT** (ITERATION 48: `t1 = 0x01051a46`, in the guest's data region,
+   `0x0FAE232` away from the saved-`ra` slot at `0x01ffc878`, `t1_ge_savedRa=0` on every pass). That kills
+   `0x100f4ec`, `0x100f780` and `0x100f800` -- **three of the five.**
+
+   **SO THE CANDIDATE SET IS TWO INSTRUCTIONS, AND NEITHER IS `t1`:**
+   ```
+   100f500: sb s3,0(v0)
+   100f78c: sb v1,0(a1)
+   ```
+   **`a1` IS THE FUNCTION'S SECOND ARGUMENT** and **`v0` AT `0x100f500` HAS NOT YET BEEN MEASURED.** That is
+   a much smaller question than the one I deferred for three turns: print the base register at `0x100f500`
+   and at `0x100f78c` and compare each against `sp + 88`. **I am not nominating one of the two -- the list
+   says there are two, and picking between them without the number is the mistake I have already made
+   fifteen times.**
+
+   **WHAT THIS DOES AND DOES NOT ESTABLISH.** It establishes that the frame layout is sound, that the
+   prologue's `ra` save is the only constant-offset write to `sp+88`, and that the corruption must arrive
+   through a register-indirect **byte** store -- which also explains why ITERATION 42's 32-bit `SW` poison
+   watch saw **zero** hits: a byte store never presents the pattern as one word.
+
    **ITERATION 48 -- ONE MEASUREMENT, AND IT EXONERATES THE COPY LOOP. THE REVIEWER'S THEORY IS WRONG
    AND I AM SAYING SO PLAINLY, AS ASKED.**
 

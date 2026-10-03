@@ -341,6 +341,71 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    is never called" (wire it) or "the refill is called and exits without advancing" (fix its exit).
    **I have NOT landed a fix and no speedup is claimed.**
 
+   **THE FINAL MEASUREMENT — AND IT IS A REAL RECOMPILATION DEFECT. `/tmp/opencode/rf3.log`.**
+   `func_1005AB8` **IS entered** — exactly once:
+   ```
+   [w122:refill] ENTER #1 a0=0x1895150 a1(count)=0 a2(bit)=1
+   ```
+   `w122:bound` lines: **0** — the count advance **never fires**. So it is not "the refill is never
+   called". It is called and its advance is skipped.
+
+   **THE MECHANISM, AND IT IS A COMPILER BUG, NOT A GUEST BUG.** The refill's only count advance is
+   ```
+   0x1005b50: beqz  $s3, -> 0x1005b7c      ; $s3 = $a2 = 1, so NOT taken
+   0x1005b54: addiu $s0, $s2, 0x1          ; $s0 = count+1
+   0x1005b60: jal   func_10059E8
+   0x1005b78: sw    $s0, 0x8($s1)          ; *(stream+8) = count+1
+   ```
+   and **`$s1` is the stream pointer — but `0x1005b78` never assigns `$s1` either.** Every `$s1`
+   reference in the whole function is a save (`sd $s1, 0x8($sp)`) or a restore (`ld $s1, 0x8($sp)`);
+   it is never set from `$a0`. The recompiled body is therefore operating on **whatever `$s1` held
+   on entry**, and `0x1005ae0` exits immediately anyway because `sltu $s2, *(s1+8)` is `0 < 0` =
+   false with `a1(count)=0`.
+
+   **THIS IS THE PROJECT'S FIRST NON-HARNESS DEFECT:** a register that the original EE code sets is
+   not materialised in the recompiled translation unit. That is why the accumulator's loop bound never
+   moves. It is a **toolchain gap in the recompiler's register assignment**, not something to paper
+   over in the runtime — patching `ps2_runtime.cpp` to write `0x1fffba8` would be exactly the fake the
+   project forbids.
+
+   **RETRACTION — MY "COMPILER DEFECT" WAS WRONG. DO NOT GO FIX THE COMPILER.**
+   I claimed `sub_01005AB8` never materialises `$s1` from `$a0`. **It does.** The instruction is
+   right there and my grep missed it because I searched for the wrong pattern:
+   ```
+   // 0x1005ac0: 0x80882d  daddu       $s1, $a0, $zero
+   SET_GPR_U64(ctx, 17, (uint64_t)GPR_U64(ctx, 4) + (uint64_t)GPR_U64(ctx, 0));
+   ```
+   Register 17 **is** `$s1` and register 4 **is** `$a0`. Counting the writes to reg 17 in that
+   translation unit gives exactly two, both legitimate: the `daddu $s1,$a0,$zero` and the stack
+   restore. **The recompiler is correct. There is no codegen bug. Do not touch it.**
+
+   **THAT IS THE SEVENTH TIME AN INSTRUMENT MISREAD AROUND IN THIS PROJECT**, and the family is
+   now unmistakable: the sentinel guard, the stride-16 sampler, the block-as-word-index, the window
+   too small, the pre-transfer sample, the wrong CLUT address, the 6-pass sampler, the element latch
+   frozen at pass 1, and now a grep that reported "never assigned" for a line that says it twice.
+   **The standing rule is unchanged and I broke it again: verify the instrument can see what it
+   claims before believing what it says — including my own shell commands.**
+
+   **WHAT THE REFIL MEASUREMENT ACTUALLY SHOWS** (`/tmp/opencode/rf3.log`), now that the premise is
+   corrected. The refill is entered **once**, on pass 1, with `a0=0x1895150 a1(count)=0 a2(bit)=1`.
+   Note `a0` is **`0x01895150`, the RIGHT-hand stream, not `0x1fffba0`.** So there is no
+   contradiction in the numbers: `*(0x1895150+8)` is `0`, `sltu $s2,*(s1+8)` is `0 < 0` = false,
+   and `0x1005ae0` returns before the advance. That is **correct guest behaviour for an empty
+   stream** — there is nothing to advance. It is not a bug in the refill at all.
+
+   **SO THE REAL QUESTION IS ONE LEVEL UP, AND IT IS STILL OPEN:** the left stream at `0x1fffba0`
+   has bound `1` and element `0`, and `func_1007738` walks it once per outer-loop pass, ORing in the
+   word's own top bit — so a word of `0` stays `0` forever. **Something must first put a non-zero
+   bit into that stream, and the refill is only consulted when the incoming bit `$a2` is zero**
+   (`0x1007788: beqz $a2 -> 0x100779c`), which it always is. The producer of that first bit is still
+   unnamed, and it is upstream of everything measured so far.
+
+   **ALSO RECORDED, BECAUSE IT MATTERED:** the W122 brief instructed me to "make guest `0x1fffba8`
+   write". **I measured first and refused, and the measurement was right** — `LEFT[0x1fffba8]=1` and
+   `RIGHT[0x18951f8]=1` are already equal; writing 0 would give `0 < 1`, return `-1`, and make the
+   spin *worse*. The reviewer confirmed in writing that this was the correct call. **Measure the
+   instruction before obeying it.**
+
    **RETRACTION — MY OWN SAMPLER, second time.** The first `w122:poll` put change-detection and the
    pass counter *inside* the "print the first 6 lines" budget, so `distinctValues=1` covered **six
    passes, not the run** — the same failure class as the W115 stride-16 sampler: an instrument that

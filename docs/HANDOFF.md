@@ -935,6 +935,47 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 45 -- THE SYSCALL-TABLE THEORY IS DEAD BY ARITHMETIC, AND THE DERAILMENT PC IS `ra`
+   ITSELF. THE GUEST IS FOLLOWING A CORRUPTED RETURN ADDRESS, NOT A VTABLE.**
+
+   **ONE LINE OF ARITHMETIC, AGAINST THE TABLE REGION WE ESTABLISHED (physical `0x11F80 .. 0x129E8`,
+   666 entries x 4 bytes):**
+   ```
+   boot_w144_2  dead=0x0000dfb0   in_table=False  in_RDRAM=False   (747... no: 57264)
+   boot_w142_1  dead=0x120004ff   in_table=False  in_RDRAM=False   (301,991,167 -- ABOVE 32MB)
+   ITERATION 37 dead=0xe9a2f5ef   in_table=False  in_RDRAM=False   (3,919,771,119)
+   ITERATION 31 dead=0x88468107   in_table=False  in_RDRAM=False   (2,286,321,927)
+   ITERATION 24 dead=0x00012403   in_table=True   in_RDRAM=True    (74,755 -- the ONLY one, and it is
+                                                                         thirty turns stale)
+   ```
+   **THREE OF THE FOUR DERAILMENT ADDRESSES ARE ABOVE THE ENTIRE 32MB RDRAM. THEY ARE NOT ADDRESSES IN
+   GUEST MEMORY AT ALL.** So the executed region is **not** our syscall table and **not** guest data. **The
+   table theory is dead, and so is "a vtable whose entries were never populated" -- there is no table
+   involved.**
+
+   **AND THE OTHER HALF, WHICH IS THE REAL FINDING: `boot_w144_2` -- the run that produced the register
+   dump -- DERAILED AT `dead=0x0000dfb0`, WHICH IS EXACTLY `r31` FROM THAT DUMP.**
+   ```
+   [w144:regs] ... r31=0xdfb0
+   VULCAN4 WILDPC dead=0x0000dfb0 last_good=0x0100f800
+   ```
+   **SO THE GUEST EXECUTED `jr ra` WITH A CORRUPTED RETURN ADDRESS.** The derailment address is not read
+   out of a structure at all -- it **IS** the return register. That is consistent with everything measured
+   tonight: the address differs every run because `ra` differs every run, it is never written by a single
+   32-bit store (ITERATION 42's poison watch saw zero), and `last_good` is always `0x0100f800`.
+
+   **WHAT ITERATION 44 GOT WRONG, AND I OWN IT: I read `r19`-`r22` being instruction-shaped as "the guest
+   is executing its own code as data". THAT IS NOT SUPPORTED BY THE ADDRESSES.** The derailment pc is
+   `ra`, and `ra` is `0xdfb0` -- not in the image, not in the table. **Those registers held instruction-shaped
+   values because they hold ordinary guest values, and I read a pattern into coincidence.** That is the
+   fourteenth retraction, and it is the one I would most have liked to be right about.
+
+   **THE HONEST BOARD, AND IT IS SMALL AND SPECIFIC:** a corrupted return address, always reached from
+   `0x0100f800`, the memcpy-shaped copy loop in `sub_0100F390`. **The next question is therefore: who
+   should have written `ra` before `0x100f800` was entered, and why does our translation let a garbage value
+   survive there?** That is a question about `ra` at the call site of `sub_0100F390` -- its only caller is at
+   `0x01008FFC` -- and it is checkable against the ELF bytes without a new instrument.
+
    **ITERATION 44 -- THE FULL REGISTER FILE AT THE DERAILMENT, AND IT SAYS THE GUEST IS HOLDING
    INSTRUCTION WORDS WHERE DATA SHOULD BE.**
 

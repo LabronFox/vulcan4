@@ -185,6 +185,48 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    registered into that slot — not because a producer failed to advance a counter.** The wall is
    upstream: the node never gets a thread.
 
+   **THE WRITER HUNT (R1 c-follow-up): NOTHING EVER WRITES IT NON-ZERO. ZERO TIMES.**
+   `boot_desk123132.log`, 90 s. Watch widened to the whole node `0x01047b40..0x01047b60` (wider on
+   purpose — a thread id could be published by a bulk store a 4-byte filter would miss, which is
+   the W115 stride-16 mistake). **Writes to `0x01047b50` with a non-zero value: 0.** All 25 non-zero
+   stores in the node went to the **adjacent** word `0x01047b48`, values `0x10519e0 / 0x1051a00 /
+   0x10d1a40 / 0x10d1a60 / 0x10d1a70`, by `writerPc=0x10122f8`. Those are **memory-card buffer
+   pointers**, written in lockstep with `[MC] Open '/BASCUS-97328GAMEDATA/core.gt4' ... result=-4`.
+   So `0x01047b48` is this node's MC buffer pointer and `0x01047b50` is the thread-id slot beside it.
+   **Answer to "is the writer a syscall or a hardware write": neither — it is guest code at
+   `0x1011588`, and it writes ZERO.** No other writer exists. Every MC open returns `result=-4`
+   because mc0/mc1 hold no `core.gt4`; populating that honestly is **R5, forbidden.**
+
+   **THE COUNTERFACTUAL — RUN IT, IT ANSWERED, AND IT PARTLY REFUTES ME.**
+   Temporary probe `VULCAN4_W122_BARRIER=1` (explicitly marked for deletion, OFF by default) writes
+   the running thread id into `0x01047b50` at the moment the barrier reads it. Note
+   `run_gt4_desktop.sh` builds a **fixed** command with **no env passthrough** — that is why the
+   first attempt logged `forced=0`. Run the harness directly on `:0` to set it.
+   `/tmp/opencode/cf2_on1.txt` vs `boot_desk123814.log`, same binary:
+
+       transfers at 0x0100d908   force OFF: 483,826,869 (99.99% of all transfers)
+                                 force ON:            907 (0.00%)
+
+   **The barrier is real and it is gated on that word.** But the boot did **not** advance — it moved
+   one step downstream onto the loop I had retired:
+
+       force ON new hot set:  0x01005890=156,756,909 (33.32%)
+                              0x010089c8=156,756,909 (33.32%)
+                              0x010089d4=156,756,908 (33.32%)
+
+   **TWO CORRECTIONS I OWE, both mine:**
+   1. **"`func_10057F0`/`func_1005870`/`func_1007738` are never entered" was true of the runs I
+      sampled and FALSE of the boot.** Those functions are reached only *after* the `0x100d908`
+      barrier is passed. The zeros were real; I wrongly generalised them into "not the livelock"
+      when the correct statement is "**this is the livelock you see BEFORE the barrier**".
+   2. **"the wall is that this word is never set" is too simple.** It is the **first** wall. There
+      is a second behind it. `tid1` sitting `ready` while `tid2` spins was a *symptom* of the
+      barrier, not the whole disease.
+
+   `halt` is still `livelocked_in_syscall` either way, so **no rung was reached and no speedup is
+   claimed.** What it buys: the barrier is proven a real gate, and the **next** wall is now named and
+   reproducible — `sub_010088E8` at `0x1005890`/`0x10089c8`/`0x10089d4`, 33.32% each.
+
    **RETRACTION — MY OWN SAMPLER, second time.** The first `w122:poll` put change-detection and the
    pass counter *inside* the "print the first 6 lines" budget, so `distinctValues=1` covered **six
    passes, not the run** — the same failure class as the W115 stride-16 sampler: an instrument that

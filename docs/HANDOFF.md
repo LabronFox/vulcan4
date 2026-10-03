@@ -935,6 +935,67 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 28 -- OWNER IDENTIFIED, AND THE `bnel` HYPOTHESIS IS REFUTED BY MEASUREMENT.**
+
+   **ITEM 1, THE OWNER (this unblocks every measurement blocked for three turns).** The generated
+   translation unit is `/mnt/ssd/vulcan4-build/recomp/ps2_recompiled_functions.cpp` (8.9MB, 707
+   functions), each generated as `void sub_<ADDR>_<hexaddr>(uint8_t* rdram, R5900Context* ctx,
+   PS2Runtime *runtime)`, so the owner is simply the function with the largest start address <= the
+   target:
+   ```
+   target  0x100f800
+   OWNER   sub_0100F390_0x100f390   starts 0x100f390
+   next    sub_0100F8C8 starts 0x100f8c8  ->  the function is 0x538 = 1336 bytes
+   ```
+   **So the copy loop lives in `sub_0100F390`, and that is a real memcpy-shaped routine -- which is
+   consistent with it running entirely inside one generated body, exactly as the zero-hit dispatcher
+   probe (ITERATION 27) showed.** Labels inside it: `label_100f7f8`, `label_100f800` (line 77320),
+   `label_100f804`, `label_100f808`, `label_100f864` (line 77461), `label_100f86c`.
+
+   **ITEM 3, AND IT IS CLEAN -- THE `bnel` GENERATION IS CORRECT.** The reviewer's hypothesis was that
+   our translator ran the likely-branch delay slot unconditionally or elided it, so the exit could never
+   be satisfied. **The generated code says otherwise.** For `bnel $s1,$s2` at 0x100f864:
+   ```c
+   label_100f864:
+   label_100f868:
+       if (ctx->pc == 0x100F868u) { ...delay slot...; goto label_100f86c; }   // re-entry from the slot
+       ctx->pc = 0x100F864u;
+       {
+           const bool branch_taken_0x100f864 = (GPR_U64(ctx, 17) != GPR_U64(ctx, 18));
+           if (branch_taken_0x100F864) {
+               ctx->pc = 0x100F868u;
+               ctx->in_delay_slot = true;  ctx->branch_pc = 0x100F864u;
+               SET_GPR_ZE32(ctx, 2, (uint8_t)READ8(ADD32(GPR_U32(ctx, 17), 0)));   // lbu v0,0(s1)
+               ctx->in_delay_slot = false;
+               ctx->pc = 0x100F800u;
+               if (runtime->eeCheckpointDue()) { return; }
+               goto label_100f800;                        // TAKEN -> loop head
+           }
+       }
+       ctx->pc = 0x100F86Cu;                              // NOT TAKEN -> delay slot SKIPPED
+   label_100f86c:
+   ```
+   **TAKEN executes the delay slot then loops. NOT TAKEN skips the delay slot entirely and exits. That
+   is exactly `bnel` semantics, so the exit condition CAN be satisfied and the translator did not elide or
+   hoist the slot.** The same shape is present for the ordinary `bne` at 0x100f808. **Hypothesis 3 is
+   REFUTED. Do not go looking for a delay-slot bug here.**
+
+   **ONE STRUCTURAL THING WORTH A SECOND PAIR OF EYES, FLAGGED NOT CLAIMED:** `label_100f864` **falls
+   through** into `label_100f868`, whose first act is `if (ctx->pc == 0x100F868u)` -- and that arm runs the
+   delay slot and exits to `label_100f86c`. In this function nothing branches to `label_100f864` *with*
+   `ctx->pc == 0x100F868`, so the arm looks dead here. **But that is exactly the shape that miscompiles
+   when some other path DOES arrive carrying that pc**, and I have not searched the other 706 functions
+   for it. Not a claim.
+
+   **SO THE CAUSE IS `s3`, UNMEASURED.** With `bnel` exonerated, the remaining candidate from ITERATION 27
+   stands alone: `s2 = s1 + s3` makes **the iteration count `s3`**, and the loop is bounded by
+   `s1 != s2`. **A wrong or runaway `s3` overruns the destination and clobbers the structure whose
+   `+0x1C` field holds the function pointer.** That is still a theory: reading `s3` needs an instrument
+   inside `sub_0100F390`'s generated body, which has not been added.
+
+   **PICTURE:** `docs/evidence/w128_game.png`, window id `0x95ed60`, 650x482, **391 distinct colours**.
+   Still the 2005 Sony disclaimer.
+
    **ITERATION 27 -- THE COPY LOOP IS BOUNDED BY `s3`, NOT BY `t1`/`t4`. THE REVIEWER'S QUESTION IS
    ANSWERED: IT IS "BOUNDED BY SOMETHING ELSE ENTIRELY".**
 

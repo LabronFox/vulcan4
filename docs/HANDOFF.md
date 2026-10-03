@@ -935,6 +935,75 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 25 -- A REAL BUG, LANDED. `GetEntryAddress` WAS INVERTED.**
+
+   **THE libosd.c CITATION (recorded so the base is never re-derived).** From Sony's ps2dev/ps2sdk,
+   `ee/kernel/src/libosd.c`: **0xFFFFC402 is documented as a patch entry**, with the comment
+   **`0x80011F80 + (-15358*4) = 0x80002F88`, where `0x80011F80` is the start of the syscall table.**
+   Slots are **4 bytes each**. The table is populated by **SetSyscall** and read by **GetEntryAddress**,
+   and **libosd.c calls GetEntryAddress for each patch entry** -- which is exactly the arithmetic our own
+   FindAddress already performs. Our numbering (`runtime/syscall_names.h`) is
+   **`0x5A=Copy, 0x5B=GetEntryAddress, 0x74=SetSyscall, 0x83=FindAddress`**
+   (note: **SetSyscall is 0x74, not 0x83** -- 0x83 is FindAddress).
+
+   **ITEM 1: BOTH PRIMITIVES ALREADY EXISTED.** `SetSyscall` at `System.cpp:485` (writes
+   `0x11F80 + n*4` via `setEeSyscallOverride`, and there was already a passing test covering the signed
+   `-15358 -> slot 0x2F88` case from the citation) and `GetEntryAddress` at `System.cpp:1144`. So the
+   missing primitive was not missing -- **it was WRONG.**
+
+   **THE BUG, AND IT IS EXACTLY THE WALL.** `GetEntryAddress` computed the correct slot address and then
+   **threw it away, returning the slot's CONTENTS (the handler pointer) instead**:
+   ```cpp
+   const uint32_t entryAddr = kGuestSyscallTableGuestBase + (syscallNum * 4u);
+   uint32_t handler = 0;
+   if (const uint8_t *ptr = getConstMemPtr(rdram, entryAddr)) { std::memcpy(&handler, ptr, sizeof(handler)); }
+   setReturnU32(ctx, handler);          // <-- returns CONTENTS, should return entryAddr
+   ```
+   On real hardware it returns **the ADDRESS of the slot**, because that is the whole point: libosd.c
+   writes *through* the returned address. So a caller doing the libosd.c thing --
+   `*(uint32_t *)GetEntryAddress(n) = my_handler;` -- **wrote its handler to whatever the slot's previous
+   contents happened to be.** **That is how a value like `0x240302d` ends up in slot `0x120E8`, and how
+   the guest comes to jump into data and halt at `pc_outside_generated_table`.** The guest was not
+   misbehaving; we were handing it a pointer to the wrong thing. **This also explains why slot contents
+   changed between runs** (ITERATION 24: `0x240302d` vs `0xa0000c12`) -- they were whatever the guest was
+   writing through a bad pointer, not a table.
+
+   **THE FIX, AT THE SOURCE** (`System.cpp:1144`): return `kGuestSyscallTableGuestBase + syscallNum * 4u`.
+   No read, no mutation -- it only reports where the slot is.
+
+   **ITEM 3, RED FIRST, AND IT WAS GENUINELY RED.** New test in `ps2_find_address_tests.cpp`,
+   **"W125: GetEntryAddress returns the SLOT ADDRESS, so a caller can write the slot"**, written in the
+   plain-context fixture (`R5900Context` + `mem.getRDRAM()`, no scheduler, no executor -- so it did not
+   repeat the segfault mistake). Before the fix:
+   ```
+   Total Tests: 494   Passed: 493   Failed: 1
+   [Run]: W125: GetEntryAddress returns the SLOT ADDRESS... [Failed]
+     - GetEntryAddress(n) must return the ADDRESS of slot n (0x80011F80 + n*4), because libosd.c writes through it
+     - a handler written through GetEntryAddress(0x5A) must appear in slot 0x5A...
+     - slots 0x5A and 0x83 must be exactly 0xA4=164 bytes apart...
+   ```
+   **After the fix the W125 test passed but an OLD test failed**: `"GetEntryAddress syscall (0x5B) returns
+   handler from guest table"` -- **an existing test was pinning the inverted contract.** Corrected in place
+   to assert the address, keeping the end-to-end `callSyscall(0x5B, ...)` path.
+   **ONE MORE OF MY OWN TEST BUGS, RECORDED:** my first draft asserted the planted handler with
+   `env.rdram[kEntryPhysAddr / 4u]`, but `rdram` is a **byte** vector, so that indexed a single byte. Fixed
+   to `readGuestU32(...)`. **That was my bug, not the source's.**
+   **FINAL: `Total Tests: 494  Passed: 494  Failed: 0  EXIT=0`.**
+
+   **ITEM 4, THE BOOT AFTER THE FIX -- REAL PROGRESS, NOT SOLVED.**
+   ```
+   true_guest_entries=115180   (was 79267 -- 45% further)
+   halt=pc_outside_generated_table   true_guest_exits=0   frames_presented=275
+   WILDPC dead=0x88468107 last_good=0x0100f800   a0=0x440800a3
+   SYSTABLE n=0x83 slot=0x1218c handler=0x46002328
+   SYSTABLE n=0x5a slot=0x120e8 handler=0x000028a0
+   ```
+   **45% more guest entries, and the slot values changed again** -- so the fix did move the guest. **But it
+   still halts at `pc_outside_generated_table`, and `last_good=0x0100f800` is UNCHANGED across four boots
+   now.** That address is the derailment point and it is stubbornly reproducible. The new wild pc
+   `0x88468107` is still nonsense (`0x88` is not a PS2 segment alias). **So the wall MOVED BACK a LITTLE
+   BUT DID NOT FALL.**
+
    **ITERATION 24 -- THE 15-MINUTE BOOT IS ANSWERED, AND IT KILLS THE SPEED THEORY OUTRIGHT.**
 
    **ITEM 3, THE LONG BOOT, RUN PROPERLY (all VULCAN4_ knobs unset, 900s budget):**

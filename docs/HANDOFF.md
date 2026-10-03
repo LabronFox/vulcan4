@@ -935,6 +935,51 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 22 -- THE WALL MOVES, AND THE SCREEN TITLE SAYS WHY. THIS IS THE REAL STATE.**
+
+   **(d) APPLIED: THE PARKED-SLEEP STORY IS DROPPED AS A STANDALONE CLAIM.** Two boots minutes apart
+   disagree, with the same binary:
+   ```
+   boot_desk123819.log   tid1:status=1:wait=none#0:woken=0      <- reviewer, NOT parked
+   boot_w122c.log        tid1:status=1:wait=sleep#0:woken=0     <- mine, parked
+   ```
+   `sleepCurrentCalls` -- the instrument that was built and never used, now MEASURED -- is **140,273** in
+   `boot_w122c.log`, so the guest sleeps constantly and often. **The wall is NOT a lost wakeup and NOT a
+   parked sleep; it is NONDETERMINISM.** Do not chase tid1's state again: it has been observed both
+   Ready-and-runnable and Sleeping on the same build, and no measurement yet distinguishes the two. If
+   someone wants the sleep, they must FIRST show a log line proving it in the run they are discussing.
+
+   **THE SCREEN, WHICH IS THE ACTUAL WALL. I OPENED THE PNG AND LOOKED AT IT.**
+   `docs/evidence/w122_iter22_game.png`, window id `0x9425da`, 650x482, **405 distinct colours**. It is
+   still the 2005 Sony Computer Entertainment Inc. disclaimer, flat white text on black. Same screen as
+   `caine_1053`. The pixels have not moved.
+   **The window title is the new information, and it is not a hang:**
+   ```
+   VULCAN 4 - 39 GS packets/s | Speed: 0.26x PS2 | 2836 shown
+   ```
+   **0.26x PS2 speed.** The GS is alive (39 packets/s, 2836 shown), but the guest is running at roughly
+   a quarter of real hardware. **The disclaimer is a TIMED screen the guest dismisses itself when its own
+   timer expires -- so at 0.26x the timer has not had the wall-clock time to run out.** That is a
+   concrete, checkable explanation for seven hours of unmoving pixels, and it is consistent with
+   `halt=wallclock_deadline` being the 90s budget expiring rather than a livelock.
+
+   **THEREFORE THE LADDER MOVES: THE WALL IS SPEED, NOT CORRECTNESS.** The guest is correct enough to
+   present thousands of frames of real GS output; it is simply too slow to reach the menu inside our
+   budget. The next job is **throughput**, not more scheduler forensics:
+   `true_guest_entries=484,303,659` per 90s and still only 0.26x means the recomp is spending its time
+   somewhere that is not the guest's own work. Measure where the wall-clock actually goes before
+   optimising anything.
+
+   **HOW TO GET A PICTURE, because three attempts failed first and the reason matters:**
+   - `import -window <game>` returns `Resource temporarily unavailable` while the harness is mid-present.
+     Start a background boot, then capture.
+   - `xdotool search` HANGS. Do not use it.
+   - **Find the game window BY SIZE (650x482), not by name** -- the log terminal is 1068x671 and capturing
+     the root gives you the TERMINAL, which is how the old screenshots kept showing a log full of MMIO
+     lines instead of the game.
+   - If the log says `INFO: Window closed successfully` / `=== boot ended ===`, the run is OVER and there
+     is nothing live to photograph.
+
    **ITERATION 22 -- REVIEWER GATE FAILED ON MY REPORTING, AND THE GATE WAS RIGHT.**
    Three things I said were wrong, and all three are now corrected. Do not trust my prose; trust the
    log lines.

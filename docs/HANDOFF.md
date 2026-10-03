@@ -935,6 +935,50 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 44 -- THE FULL REGISTER FILE AT THE DERAILMENT, AND IT SAYS THE GUEST IS HOLDING
+   INSTRUCTION WORDS WHERE DATA SHOULD BE.**
+
+   Gated on `VULCAN4_W144_REGS`, printed once per derailed boot from the missing-target reporter.
+   `boot_w144_2.log` (`halt=pc_outside_generated_table`); runs 1 and 3 were the healthy class and printed
+   nothing, which is the knob behaving.
+   ```
+   [w144:regs] pc=... full GPR file:
+   r0=0x0        r1=0x437f0000 r2=0xffffffff r3=0xd4         r4=0x34dfb0   r5=0x0
+   r6=0x70000000 r7=0x10000105 r8=0x11000000 r9=0x80808080   r10=0x0      r11=0x24b0
+   r12=0x24b0    r13=0x6c00    r14=0x7200    r15=0x70002000  r16=0x10210003
+   r17=0x80211a60 r18=0x240    r19=0x302d2652 r20=0x202d0c07  r21=0x282d0200
+   r22=0x30c07   r23=0xfff60253 r24=0x1051a70 r25=0x0 r26=0x0  r27=0x0
+   r28=0x1049770 r29=0x10459e0 r30=0x1c0240  r31=0xdfb0
+   ```
+   **THE STANDING OBSERVATION: `r19`, `r20`, `r21` AND `r22` ARE NOT DATA -- THEY ARE MIPS INSTRUCTION
+   ENCODINGS.**
+   ```
+   r19 = 0x302d2652  ->  opcode 0x30 = ANDI   (rs=s5, rt=t1, imm=0x2652)
+   r20 = 0x202d0c07  ->  opcode 0x20 = ADDUI  (rs=t1, rt=t4, imm=0x0c07)
+   r21 = 0x282d0200  ->  opcode 0x28 = SLTI
+   r22 = 0x00030c07  ->  opcode 0x00 = SPECIAL, function 0x0c = SYSCALL
+   ```
+   **`r22` IS A SYSCALL INSTRUCTION.** And this is the family I kept seeing and mis-filed: `0x200202d`,
+   `0x240302d`, `0x200302d`, `0x260202d`, `0x70002000` (in `r15` and `r6`) -- **every one of those is a
+   MIPS opcode** (`0x20` addiu, `0x24` lbu, `0x26` xori, `0x28` slti). **ITERATION 38 I called them "a
+   family of similar values" and could not place them. THEY WERE CODE THE WHOLE TIME.**
+
+   **AND `r31` (ra) = 0x0000dfb0, WHICH IS NOT A CODE ADDRESS AT ALL** -- the guest image starts at
+   `0x01000000`, and `0xdfb0` is 57264, far below it. `r9 = 0x80808080` is a memset fill byte.
+   `r2 = 0xffffffff` is the `-1` from the compare in `func_1005870`.
+
+   **SO THE DERAILMENT IS NOW READABLE: control has reached data that is actually a stream of the guest's
+   OWN INSTRUCTIONS, a syscall word included, and the jump target came from that stream.** That is
+   consistent with every derailment being different (the stream differs per run), consistent with the value
+   never being written as a plain 32-bit store by any single instruction (ITERATION 42's poison watch saw
+   zero, because the words arrive by a path that was never a `SW`), and consistent with `last_good`
+   always being `0x0100f800`.
+
+   **I HAVE NOT PROVEN WHICH STRUCTURE IS BEING READ AS CODE, AND I AM NOT NAMING IT.** The next
+   measurement is to find what pointer in this register file is aimed at a code region when the derailment
+   happens -- `r17=0x80211a60` and `r24=0x1051a70` are the two candidates that point into the guest image,
+   and `r15=0x70002000` / `r6=0x70000000` are the two that point outside it.
+
    **ITERATION 43 -- THE W120 PRIOR ART HOLDS AS AN OBSERVATION AND IS REFUTED AS AN INFERENCE. THE LOOP
    IS NOT UNABLE TO EXIT; IT EXITS ON `s1 != s2` AND `t4` IS NOT THE BOUND.**
 

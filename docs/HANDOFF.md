@@ -776,6 +776,44 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    struct the compare never reads, and the compare reads a struct nobody primes.** That is the livelock,
    and it is a **thread-context restore defect in our scheduler**, not a data problem at all.
 
+   **ITERATION 18: ITERATION 17 IS RETRACTED. `0x100894c` IS A CALL RETURN, NOT A THREAD RESUME.**
+   I was told to go fix `EeScheduler`'s context restore. **I read the code first, and the premise was
+   wrong, so I did not write the fix.** Two checks:
+
+   **(1) `0x100894c` IS NOT A RESUME.** From the real ELF:
+   ```
+   1008940: move  a0,sp
+   1008944: jal   0x10059e8
+   1008948: move  a2,zero          (delay slot)
+   100894c: lw    a1,20(s3)        <-- the instruction right after the jal
+   ```
+   It is the **return address of a `jal`**, and it is in the table only because the recompiler lists
+   every branch target. **A call does not change `$sp`**, so nothing about `$sp` can be wrong there. My
+   "our EE thread does not restore `$sp` for mid-body resumes" was **inference from an address, and the
+   address did not mean what I assumed.** Fourteenth instrument defect: I read a number and built a
+   theory on it instead of measuring it.
+
+   **(2) THE SCHEDULER HAS NO REGISTER RESTORE — AND THAT IS NORMAL, NOT THE BUG.** `grep` for
+   `SET_GPR_VEC|restoreRegs|memcpy.*context` in `EeScheduler.cpp` returns **nothing**, and `activeContext()`
+   is `invocations.empty() ? context : invocations.back().context`. That is the correct design for a
+   **continuation-style** guest: the generated function keeps running on the real CPU context and yields
+   rather than being context-switched mid-function. **So there is nothing to fix there either.**
+
+   **THE REAL QUESTION I COULD NOT CLOSE, STATED HONESTLY.** The spin's entry `$sp` measures
+   `0x1fffc20` and the compare's `$a0` measures `0x1fffba0`, and `a0` is set by `move a0,sp` — so those
+   genuinely disagree by `0x80` **within one run**. `sub_01005D48` (the outermost caller) allocates
+   `0xB0`, not `0x80`, so it does not account for the gap, and a dozen other functions allocate `0x80`.
+   I added a direct measurement of exactly this — `[w122:depth]` printing `$sp` at `sub_010088E8` entry
+   and at the compare, so the two are sampled in the same pass rather than compared across runs — and
+   **20 consecutive boots produced no gate pass, so I have no gated number and I claim nothing from
+   them.** `0x100894c` is reached by an ordinary `jal` return, so the 0x80 gap cannot be a skipped
+   prologue; it is most likely the two measurements coming from *different invocations* of
+   `sub_010088E8`, since it is entered repeatedly and `$sp` is not constant across entries.
+
+   **THE ONE MEASUREMENT THAT WOULD SETTLE IT:** `[w122:depth]` already prints both, on the same line
+   per pass, with the entry count and the compare count — so the next agent needs only a gated run and
+   one `grep w122:depth`. **Do not rewrite `EeScheduler`; there is no defect in it that I have shown.**
+
    **RETRACTION — MY "COMPILER DEFECT" WAS WRONG. DO NOT GO FIX THE COMPILER.**
    I claimed `sub_01005AB8` never materialises `$s1` from `$a0`. **It does.** The instruction is
    right there and my grep missed it because I searched for the wrong pattern:

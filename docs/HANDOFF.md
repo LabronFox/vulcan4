@@ -935,6 +935,56 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 39 -- BOTH CANDIDATES MEASURED, AND BOTH ARE DEAD. THE LCG IS CORRECT AND THE XOR LOOP
+   DOES NOT OVERRUN. THE DERAILMENT IS NEITHER.**
+
+   **NUMBER 1 -- THE LCG RETURN VALUE OVER EIGHT CALLS, GATED (`VULCAN4_W139_LCG=1`):**
+   ```
+   [w139:lcg] n=1 ret_v0=0x00000001 state@0x01033060=0x32277070
+   [w139:lcg] n=2 ret_v0=0x8a1c2c31 state@0x01033060=0x8a1c2c31
+   [w139:lcg] n=3 ret_v0=0xc6f40a56 state@0x01033060=0xc6f40a56
+   [w139:lcg] n=4 ret_v0=0xcb74c5ef state@0x01033060=0xcb74c5ef
+   [w139:lcg] n=5 ret_v0=0x89b2dc4c state@0x01033060=0x89b2dc4c
+   [w139:lcg] n=6 ret_v0=0xc74e2dfd state@0x01033060=0xc74e2dfd
+   [w139:lcg] n=7 ret_v0=0xccc883d2 state@0x01033060=0xccc883d2
+   [w139:lcg] n=8 ret_v0=0x44df07db state@0x01033060=0x44df07db
+   ```
+   **THE VALUE CHANGES EVERY CALL, AND THE STATE WRITE-BACK MATCHES THE RETURN VALUE EXACTLY ON EVERY
+   CALL. `multu`, `mflo`, `mfhi`, the `dsll32`/`dsrl32` pairing and the `daddiu` are ALL CORRECT.**
+   **CANDIDATE 1 IS DEAD: the multiply is not mistranslated and the LCG is not stuck.**
+
+   **NUMBER 2 -- THE XOR LOOP'S BASE, COUNT AND RANGE:**
+   ```
+   [w139:xor] n=1 base=0x0102de00 count=16368 sp=0x01fffec0 pastRDRAM=0
+   [w139:xor] n=2 base=0x70002000 count=0     sp=0x01fffec0 pastRDRAM=0
+   ```
+   **IT IS A BYTE LOOP** (`sb v1,0(s0)` with `s0++`), so call 1 touches
+   **`0x0102de00 .. 0x0102de00 + 16367 = 0x01031dff`.** That range is **entirely inside the guest's own
+   image**, far below `sp = 0x01fffec0`, and `pastRDRAM=0` confirms it never leaves RDRAM.
+   **CANDIDATE 2 IS DEAD: the guest does NOT overrun its own buffer on these calls.** Call 2 has
+   `count=0`, so that call does nothing at all.
+
+   **SO THE DERAILMENT'S `0xe9a2f5ef` IS NOT PRODUCED BY THE PRNG AND NOT BY THE XOR LOOP. BOTH
+   MECHANISMS I COULD SEE FROM THE OBJDUMP ARE EXONERATED BY MEASUREMENT.**
+
+   **AND ONE NEW FACT THAT POINTS SOMEWHERE REAL: THE VERY FIRST ENTRY SHOWS
+   `state@0x01033060 = 0x32277070`.** RDRAM is `memset` to zero by `PS2Memory::initialize()`, and the ELF
+   load should have seeded anything inside its file-backed range -- yet the LCG's state word holds
+   `0x32277070`, which is neither zero nor a plausible game constant. **This is the same class of finding as
+   ITERATION 38's grep (the pattern is in neither our source nor the game binary): UNINITIALISED HOST
+   MEMORY IS REACHING THE GUEST.** Two independent witnesses now (`0xe9a2f5ef` in five registers, and
+   `0x32277070` in the PRNG state at first entry) point at the same defect, and it is OURS: **we are not
+   initialising a region we hand to the guest.** That is now the strongest lead on the board and it is a
+   memory-discipline bug, not a translator bug.
+
+   **A CAVEAT I OWN: my `lastByteAddr` field printed as the literal text `0x%08llx`** -- a format-string
+   escaping slip in the probe -- so I computed the range by hand from base and count above rather than
+   reading it. The `overlapsStack` figure in the same line is likewise untrustworthy. **The conclusion
+   above rests on base, count and the byte-loop reading, all of which printed correctly.**
+
+   **PICTURE:** unchanged this turn from `docs/evidence/w138_game.png`, window `0x987ac4`, 650x482,
+   **394 distinct colours** -- still the 2005 Sony disclaimer. **NO FIX LANDED THIS TURN.**
+
    **ITERATION 38 -- THE PATTERN IS NEITHER OURS NOR THE GAME'S, AND THE PRNG AT 0x100D308 IS A PLAIN
    LCG WHOSE XOR LOOP CAN WRITE ONE CONSTANT ACROSS A RANGE.**
 

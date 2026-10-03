@@ -153,6 +153,44 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    tid1's readiness/state in the scheduler, not a word in RDRAM.** Fixing this means making the
    scheduler actually run the ready peer (preempt/yield at the barrier), NOT inventing a value.
 
+   **R1 (a)(b)(c) — MEASURED, `boot_desk122351.log`, nested `d44451f`. All three answered.**
+
+   **(a) THE ADDRESS.** `0x01047b50`:
+       [w122:poll] ARMED addr=0x1047b50 (guest[$s0+4], s0=0x1047b4c)
+                  inStaticData=YES (PT_LOAD seg2 0x102dc80..0x10519ac)
+   Inside the game's own second `PT_LOAD` segment — **game static data**, not scratch.
+
+   **(b) DOES IT EVER CHANGE? NO.** `distinctValues=1` for the whole run, exactly **one**
+   `pollchange` event (the initial sample). `lastVal=0` throughout — **while the word is stored
+   110 times.** The sampler counts every pass now (`passes` climbs 1 → 82 → 83 → 84); the earlier
+   version that reported `distinct=1` after only six passes is retracted, see below.
+
+   **(c) WHO WRITES IT — AND why it stays zero.**
+       [w122:writer] FIRST STORE to 0x1047b50 size=4 value=0x0 writerPc=0x1011588 op=WRITE32
+   and that instruction is:
+       // 0x1011584: lw    $s1, 0x0($s0)
+       // 0x1011588: sw    $zero, 0x4($s0)     <-- the polled word, written with ZERO
+       // 0x101158c: sw    $zero, 0x0($s0)
+   inside `sub_01011508_0x1011508`, which clears a whole struct: `sw $zero` to offsets `0x10`,
+   `0x14`, `0x04`, `0x00` — a **node free/reset path**. `writerNonZero=0`: every one of the 110
+   stores wrote zero.
+
+   **SO THE WORD IS NOT "NEVER WRITTEN". It is written 110 times, always zero, by the game
+   clearing the queue node it is walking.** `guest[$s0+4]` is the **thread-id field of a queue
+   node**, `sub_01011508` resets it to 0 ("no thread"), and the barrier at `0x100d908` then spins
+   comparing that never-populated field against `sce_GetThreadId()`, which returns 1.
+
+   **CORRECTS THE EARLIER STORY.** `want=17070924` was `$a0 = *(s0+4)` read as a *pointer*, while
+   the id field is the word at that same node. **The field is empty because no thread was ever
+   registered into that slot — not because a producer failed to advance a counter.** The wall is
+   upstream: the node never gets a thread.
+
+   **RETRACTION — MY OWN SAMPLER, second time.** The first `w122:poll` put change-detection and the
+   pass counter *inside* the "print the first 6 lines" budget, so `distinctValues=1` covered **six
+   passes, not the run** — the same failure class as the W115 stride-16 sampler: an instrument that
+   looks like it measures everything and measures almost nothing. Fixed and re-measured.
+
+
 2. **Memory card / `mcRoot` / `sceMcUdCheckNewCard`.** Stubbed at `/mnt/ssd/gt4/work/gt4.toml` **line 180**:
    `"sceMcUdCheckNewCard@0x01017868"`. Runs during boot (earlier logs show `[MC] Open ... core.gt4 ...
    result=-4`). Standing instruction from the W119 brief: **do not touch the memory card rewrite, mcRoot

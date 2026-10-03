@@ -368,6 +368,51 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    over in the runtime — patching `ps2_runtime.cpp` to write `0x1fffba8` would be exactly the fake the
    project forbids.
 
+   **THE WHOLE-STRUCT WATCH, AND THE ANSWER IT GIVES. `/tmp/opencode/sw7.log`.**
+   Window armed correctly on the left stream and left there:
+   ```
+   [w122:ops]   TRACK a0=0x1fffba0 LEFT now 0x1fffba8 RIGHT now 0x18951f8
+   [w122:struct] ARM 0x1fffba0-0x1fffbd4 from left operand 0x1fffba8
+   ```
+   **EVERY WRITE to `0x1fffba0..0x1fffbd4` over the whole 90 s run: `structWrites=0`,
+   `structNonZero=0`.** Not one. So **no guest code writes this stream at all** — it is not "written
+   and overwritten", it is never written. `leftElem` at `0x01895360` still receives 549,831,752 writes
+   of `0x0` from `0x1007774`, and `leftStores=0`, and the run ends `halt=livelocked_in_syscall`,
+   `true_guest_entries=412,941,911`.
+
+   **AND THE CALLER CONFIRMS IT IS NOT MEANT TO PRIME IT.** `sub_010088E8` receives the stream as
+   `$a2` -> `$s3` and only ever **reads** it:
+   ```
+   0x10088f8: daddu $s3, $a2, $zero
+   0x100891c: lw    $v1, 0x8($s3)      ; count  -- READ
+   0x1008920: lw    $v0, 0x10($s3)     ; READ
+   0x10089c8: jal   func_1007738       ; the accumulator walk
+   0x10089d4: jal   func_1005870       ; the compare
+   0x10089dc: bltz  $v0, -> 0x10089c8  ; the spin
+   ```
+   No `WRITE32` to `$s3+8` or to the stream base exists in that function. **It is a consumer. The
+   producer is somebody else, and it is not being called.**
+
+   **THE PRODUCER IS AN IOP DRIVER WE NEVER ACTUALLY LOAD — THE THIRD BRANCH OF THE BRIEF, CONFIRMED.**
+   ```
+   SIF module] load-emulated id=1 ref=1 path="cdrom0:\IRX\SIO2MAN.IRX;1"
+   SIF module] load-emulated id=2 ref=1 path="cdrom0:\IRX\MTAPMAN.IRX;1"
+   SIF module] load-emulated id=3 ref=1 path="cdrom0:\IRX\MCMAN.IRX;1"
+   SIF module] load-emulated id=4 ref=1 path="cdrom0:\IRX\MCSERV.IRX;1"
+   SIF module] load-emulated id=5 ref=1 path="cdrom0:\IRX\PADMAN.IRX;1"
+   ```
+   **`load-emulated` with the real disc path, and no file is read.** All five drivers — SIO2MAN,
+   MTAPMAN, MCMAN, MCSERV, PADMAN — are emulated as host-side syscall handlers. `RPC.cpp` already
+   carries an explicit `VULCAN 4 LIMITATION` for the un-served case. **So the chain is: an IOP driver
+   that would seed this stream on hardware is replaced by a host stub that seeds nothing, and the EE
+   then spins on a stream that was never initialised.** This is a missing game-data dependency, not a
+   recompiler bug and not a scheduling bug.
+
+   **NOT LANDED, and it is not a one-line fix:** making the boot proceed needs the real `.IRX`
+   binaries, and those are **game data that must never enter this repository** (project law 1). The
+   user's own disc supplies them. This is the same wall as the `core.gt4` memory-card open, one layer
+   up: **every open and every driver load is failing, and the game is retrying forever.**
+
    **RETRACTION — MY "COMPILER DEFECT" WAS WRONG. DO NOT GO FIX THE COMPILER.**
    I claimed `sub_01005AB8` never materialises `$s1` from `$a0`. **It does.** The instruction is
    right there and my grep missed it because I searched for the wrong pattern:

@@ -481,6 +481,62 @@ void watchGuestCallForPath(const R5900Context *ctx,
                            PS2Runtime::GuestBranchKind /*kind*/,
                            bool /*isReturning*/)
 {
+    // W119 R1. $v0 AS SEEN BY THE bltz AT 0x10089dc. func_10057F0 has several paths that compute
+    // $v0 = $a0 - 1, which is -1 (and therefore "keep spinning") whenever $a0 is 0 there. Probe the
+    // return edge so the value the branch actually tests is logged, not inferred.
+    if (ctx != nullptr && targetPc == 0x010089DCu)
+    {
+        static uint32_t w119Ret = 0;
+        if (w119Ret < 6u)
+        {
+            ++w119Ret;
+            const uint32_t v0 = getRegU32(ctx, 2);
+            std::cerr << "[w119:ret] back at 0x10089dc v0=0x" << std::hex << v0
+                      << " signed=" << static_cast<int32_t>(v0)
+                      << " bltz_taken=" << (static_cast<int32_t>(v0) < 0 ? "YES -> LOOPS" : "no -> exits")
+                      << " a0=0x" << getRegU32(ctx, 4)
+                      << " s2=0x" << getRegU32(ctx, 18) << std::dec << std::endl;
+        }
+    }
+
+    // W119 R1. THE SPIN, WITH ITS ACTUAL OPERANDS. sub_010088E8 loops while $v0 < 0 at 0x10089dc, where
+    // $v0 is what func_1005870 returned. func_1005870 calls func_10057F0 only when
+    // *(a0+0x10) == *(a1+0x10) (0x1005880-0x1005888), and func_10057F0 compares *(a0+8) against *(a1+8)
+    // and returns $a0-1. Those three addresses are 99.96% of all control transfers in the pathological
+    // boot shape. Print the operands instead of reasoning about them.
+    if (ctx != nullptr && sourcePc == 0x010089D4u)
+    {
+        static uint32_t w119Spin = 0;
+        if (w119Spin < 6u)
+        {
+            ++w119Spin;
+            const uint32_t a0 = getRegU32(ctx, 4);
+            const uint32_t a1 = getRegU32(ctx, 5);
+            const uint32_t v0 = getRegU32(ctx, 2);
+            auto peek = [&](uint32_t base, uint32_t off) -> uint32_t
+            {
+                if (g_rdramForWatch == nullptr || base == 0u || base >= 0x02000000u)
+                {
+                    return 0xDEADBEEFu;
+                }
+                const uint32_t o = (base + off) & 0x01FFFFFFu;
+                return static_cast<uint32_t>(g_rdramForWatch[o])
+                     | (static_cast<uint32_t>(g_rdramForWatch[o + 1u]) << 8)
+                     | (static_cast<uint32_t>(g_rdramForWatch[o + 2u]) << 16)
+                     | (static_cast<uint32_t>(g_rdramForWatch[o + 3u]) << 24);
+            };
+            std::cerr << "[w119:spin] jal func_1005870: a0=0x" << std::hex << a0
+                      << " a1=0x" << a1
+                      << " | *(a0+0x10)=0x" << peek(a0, 0x10u)
+                      << " *(a1+0x10)=0x" << peek(a1, 0x10u)
+                      << " EQUAL=" << (peek(a0, 0x10u) == peek(a1, 0x10u) ? "YES -> will call func_10057F0" : "no")
+                      << " | *(a0+8)=0x" << peek(a0, 8u)
+                      << " *(a1+8)=0x" << peek(a1, 8u)
+                      << " | v0OnEntry=0x" << v0
+                      << " sp=0x" << getRegU32(ctx, 29) << std::dec << std::endl;
+        }
+    }
+
     // W65. Off unless asked for: this is one indirect call per branch dispatch, and a 2M-entry run
     // makes three million of them.
     static const bool kWatch = watchEnv("VULCAN4_BRANCH_WATCH", 0u) != 0u;

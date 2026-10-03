@@ -935,6 +935,64 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 26 -- `0x0100f800` DISASSEMBLED. IT IS A BYTE-COPY LOOP, AND THE DERAILMENT IS AN
+   INDIRECT CALL THROUGH A POINTER IT READS RIGHT AFTER.**
+
+   **HOUSEKEEPING FIRST: the 5 W125 files are committed. NESTED SHA `3b30563`** (outer `f81fb49`).
+   The nested origin is upstream ran-j/PS2Recomp and is NOT pushed.
+
+   **ITEM 1, THE GUEST CODE, FROM `mips-linux-gnu-objdump -d SCUS_973.28`.**
+   ```
+   0100f7f8:  addu  s2,s1,s3
+   0100f7fc:  lbu   v0,0(s1)        ; v0 = byte at s1
+   0100f800:  sb    v0,0(t1)        ; store it to t1        <-- last_good
+   0100f804:  addiu t1,t1,1
+   0100f808:  bne   t1,t4,0x100f864 ; loop while t1 != t4
+   0100f80c:  addiu s1,s1,1         ; delay slot
+   ...
+   0100f810:  lw    v0,68(s0)       ; v0 = *(u32*)(s0+0x44)  -- a POINTER to a structure
+   0100f81c:  addiu v0,v0,24        ; v0 = that + 0x18       -- third slot
+   0100f834:  lh    a0,0(v0)        ; a0 = *(i16*)(v0)       -- 16-bit offset
+   0100f838:  lw    v1,4(v0)        ; v1 = *(u32*)(v0+4)     -- THE FUNCTION POINTER
+   0100f83c:  jalr  v1                                       ; <-- THE DERAILMENT
+   0100f840:  addu  a0,s0,a0        ; delay slot: a0 = s0 + offset
+   ```
+   **IN PLAIN WORDS: `0x100f800` is a byte store inside a memcpy-shaped copy loop, and the value it is
+   about to jump to is `v1 = *(u32*)( *(u32*)(s0+0x44) + 0x18 + 4 )` -- a function pointer read out of a
+   structure the guest owns.** The `lh`/`lw` pair (a 16-bit offset, then a 32-bit pointer, then
+   `a0 = s0 + offset` in the delay slot) is a table-driven indirect call, not a direct one. **So the guest
+   is not jumping to a constant; it is jumping to whatever word lives at that structure+0x1C, and we have
+   never established who is supposed to write it.**
+
+   **WHAT THE RUNTIME SAW AT THE DERAILMENT, SAME BOOT:**
+   ```
+   missing-target] pc=0x88468107 ra=0x88468107 sp=0x010459e0 gp=0x01049770
+       a0=0x440800a3 a1=0x0 a2=0x70000000 a3=0x10000105 s0=0x8c00c900 s1=0x8c00c900
+       v0=0xffffffff v1=0xd4
+       s0Readable=no  recordReadable=no  vtableReadable=no  vtbl[0..c]=0x0  codeRegion=no  policy=1
+       trace=0x100f800 -> 0x100f800 -> 0x100f800 -> 0x100f800 -> ... (repeating)
+   ```
+   **TWO THINGS THIS SAYS PLAINLY.**
+   1. **THE GUEST SPINS IN THE COPY LOOP.** `trace` is `0x100f800` over and over -- the `bne t1,t4` at
+      0x100f808 is not terminating, so the loop at 0x100f7f8 is running for a very long time before the
+      guest ever falls through to the `jalr`. **The copy loop not terminating is the thing to explain
+      first**, and it is upstream of the bad pointer.
+   2. **`s0Readable=no` AND `vtableReadable=no`.** `s0=0x8c00c900` masks to `0x0c00c900`, which is far
+      above the 32MB RDRAM ceiling (`0x2000000`) -- so `s0` itself is already a bad pointer by the time we
+      log it. **The chain that produced 0x88468107 started upstream of the structure read.**
+
+   **SO THE CLASS IS NOW NAMED: WE HAND THE GUEST A POINTER TO A STRUCTURE WHOSE CONTENTS WE NEVER
+   POPULATE.** `GetEntryAddress` was one instance (fixed, W125). This is another, and possibly the same
+   family: a structure field at `+0x44` that should hold a pointer to a valid dispatch table.
+
+   **ITEM 2 IS THE NEXT JOB AND IS NOT DONE: instrument the writers of `*(u32*)(s0+0x44)` and of the
+   word at `+0x1C` of whatever it points to, printing address, value and writer pc on a gated run, and
+   check whether our runtime is supposed to initialise that field and does not.** I have NOT done that
+   yet and I am not going to guess at the owner of that word.
+
+   **PICTURE:** `docs/evidence/w126_game.png`, window id `0x955d2a`, 650x482, **396 distinct colours**.
+   Still the 2005 Sony disclaimer.
+
    **ITERATION 25 -- A REAL BUG, LANDED. `GetEntryAddress` WAS INVERTED.**
 
    **THE libosd.c CITATION (recorded so the base is never re-derived).** From Sony's ps2dev/ps2sdk,

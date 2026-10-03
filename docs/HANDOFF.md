@@ -935,6 +935,60 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 34 -- THE BRANCH IS DECIDED: THE SECOND ONE. `func_1007738` DEREFERENCES `a3` AND THE CALL
+   SITE AT 0x1005F50 NEVER SETS IT. THAT IS A CALL-ORDER / REGISTER-MAPPING DEFECT.**
+
+   All three facts below are from `objdump -d SCUS_973.28`. No new instrument was used to find them.
+
+   **FACT 1 -- `sub_01006F90` HAS ITS OWN FRAME AND WRITES ONLY *ONE* OUT-PARAM.**
+   ```
+   1006ff8: addiu sp,sp,-112          ; ITS OWN 112-byte frame
+   100700c: move  s6,a0
+   1007010: sw    a1,0(sp)            ; saves the three args at ITS sp+0/4/8
+   1007018: sw    a2,4(sp)
+   1007048: sw    a3,8(sp)
+   1007160: sw    v0,0(a0)            ; <-- the ONLY out-parameter store in the function
+   10071ac: sw    v0,0(a0)            ; ... and it is the same store again
+   ```
+   **The caller's `sp+32` and `sp+48` ARE NEVER WRITTEN by `sub_01006F90`.**
+
+   **FACT 2 -- `func_1007738` READS `a3` AND DEREFERENCES IT.**
+   ```
+   1007758: lw    v0,20(a3)           ; a3->0x14 -- a3 IS TREATED AS A POINTER
+   1007778: lw    v1,8(a3)            ; a3->0x08
+   1007798: sw    a3,0(sp)
+   100779c: jal   0x1005ab8           ; and passes a3 on
+   ```
+
+   **FACT 3 -- AND AT THE CALL SITE, `a3` IS NEVER ASSIGNED.**
+   ```
+   1005f4c: lw    a0,4(s2)
+   1005f50: jal   0x1007738
+   1005f54: nop                        ; delay slot -- NOTHING is set here
+   ```
+   **Only `a0` is loaded. `a1`, `a2` AND `a3` ARE STALE -- whatever the previous code left in them.**
+
+   **PUTTING 2 AND 3 TOGETHER: `func_1007738` dereferences `a3`, and at its only call site `a3` holds a
+   STALE REGISTER VALUE. On real hardware this cannot be what the game intends, so the game must be
+   reaching `func_1007738` with `a3` already meaningful -- which means either `0x1005f50` is not the entry
+   the game really uses, or `a3` is set on a path into this block that we are not taking.**
+
+   **SO THE REVIEWER'S SECOND BRANCH IS THE CORRECT ONE: this is a CALL-ORDER / REGISTER-MAPPING
+   question, which is exactly the class of bug that has been landing all night.** NOT a missing write:
+   `sub_01006F90` writing only one out-param is not itself wrong, because `a3` does not come from it --
+   `func_1007738` is reached through `sub_01005D48`, a different frame.
+
+   **THE NEXT STEP IS NOW MECHANICAL AND I AM NAMING IT RATHER THAN GUESSING AT IT: print `a0`-`a3` at
+   0x1005f50 and at the entry of `func_1007738`, on a gated run.** If `a3` differs between the two, our
+   translation is losing the register across the call. If it matches and is still stale, then the guest
+   should not be reaching this call at all and the defect is one level up in `sub_01005D48`'s control
+   flow. **I did not land that instrument this turn and I am not claiming the fix.**
+
+   **THE BOOT, UNCHANGED:** `true_guest_entries=407930288`, `halt=livelocked_in_syscall`.
+   **PICTURE:** `docs/evidence/w134_game.png`, window id `0x97b39a`, 650x482, **393 distinct colours**.
+   **Still the 2005 Sony disclaimer. NO FIX LANDED THIS TURN** -- I took the branch the objdump selected
+   and it points at a register, not at a write.
+
    **ITERATION 33 -- PRIORITY ONE CLOSED (VU0 red, 494/494 BOTH WAYS). PRIORITY TWO ANSWERED BY
    LOOKING UP AND OUT: THE SPIN IS REACHED FROM A 24-BYTE REFCOUNTED OBJECT LIFECYCLE.**
 

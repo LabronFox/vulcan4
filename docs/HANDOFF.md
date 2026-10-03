@@ -709,6 +709,42 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    shape as every gap in the last six turns: I keep getting a non-spinning run and reading it as if it
    were the interesting one.
 
+   **ITERATION 16: GATED ON A REAL SPIN RUN. AND IT EXPOSES THE MISTAKE I HAVE MADE SINCE ITERATION 10.**
+   Gate first, as instructed: `halt=livelocked_in_syscall` AND `0x01005890 > 0`. Runs 1-2 failed the
+   gate (`pc_outside_generated_table`, spin 0) and their numbers are discarded. **Run 3 passed:**
+   `v3.log`, `halt=livelocked_in_syscall`, `0x01005890=126,799,715`.
+
+   **ON THAT VERIFIED RUN, the two words at `0x1fffc28`/`0x1fffc30` are written 34 times, and EVERY write
+   is a callee-saved register save from a different function:**
+   ```
+   0x1011000 -> 0x1005a4c   0x1012530 -> 0x1fffe28   0x101254c -> 0x1005a4c
+   0x1012890 -> 0x18951f0   0x1012894 -> 0x1fffcb0   0x1012884 -> 0x1fffd80
+   0x101288c -> 0x1fffca0   0x1007258 -> 0x1fffc70   0x101289c -> 0x1010fe8
+   ```
+   and the generated code says what they are:
+   ```
+   0x1012884: sd $s2, 0x10($sp)   -> WRITE64(ADD32(sp,16), GPR(18))
+   0x101288c: sd $s0, 0x0($sp)    -> WRITE64(ADD32(sp,0),  GPR(16))
+   0x1012890: sd $s1, 0x8($sp)    -> WRITE64(ADD32(sp,8),  GPR(17))
+   0x1012894: sd $s3, 0x18($sp)   -> WRITE64(ADD32(sp,24), GPR(19))
+   ```
+   **THE MISTAKE, STATED PLAINLY: `$sp` IS NOT A FIXED ADDRESS, AND I TREATED IT AS ONE.** Each caller
+   has its own frame, so `0x1fffc28` is shared scratch that many different functions save registers
+   into. It is **not a stream**, and no amount of watching it could ever have found the producer.
+
+   **THE ACTUAL SPIN READS A DIFFERENT WORD — AND IT IS NOT EVEN IN THE SPIN'S FRAME:**
+   ```
+   sub_010088E8 enters with sp = 0x1fffc20   -> its count/base are 0x1fffc28 / 0x1fffc30
+   func_10057F0 is handed a0 = 0x1fffba0      -> 0x70 LOWER, a different frame
+   so the word the compare reads is 0x1fffba8  (= *(a0+8), which measures 1)
+   and the element it reads is *(a0+0x14) = 0x1895360, which measures 0
+   ```
+   **The spin is therefore gated on `0x1fffba8` (count = 1, equal) and on the ELEMENT at `0x1895360`
+   (= 0, vs the right stream's `0x1895310` = 1).** Everything I have been watching — `0x1fffba0..b4`,
+   `0x1fffc28/30`, and every "frame" derived from a single `$sp` sample — was the wrong address or
+   shared scratch. **The word to watch is `0x1fffba8` for the count and `0x1895360` for the element, and
+   `0x1895360` is in the game's static data, not on any stack.**
+
    **RETRACTION — MY "COMPILER DEFECT" WAS WRONG. DO NOT GO FIX THE COMPILER.**
    I claimed `sub_01005AB8` never materialises `$s1` from `$a0`. **It does.** The instruction is
    right there and my grep missed it because I searched for the wrong pattern:

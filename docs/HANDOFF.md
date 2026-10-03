@@ -935,6 +935,52 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 40 -- READELF ANSWERED IT, AND IT KILLS MY OWN ITER39 LEAD. THE DISC LEGITIMATELY
+   CONTAINS `0x32277070`. THE LOADER IS CORRECT AND IS NOT THE WALL.**
+
+   **`mips-linux-gnu-readelf -l SCUS_973.28`:**
+   ```
+   Type      Offset   VirtAddr   PhysAddr   FileSiz  MemSiz  Flg
+   REGINFO   0x02ec3c 0x0102dc3c 0x0102dc3c 0x00018  0x00018  R
+   LOAD      0x001000 0x01000000 0x01000000 0x2dc54  0x2dc54  RWE
+   LOAD      0x02ec80 0x0102dc80 0x0102dc80 0x13aa4  0x23d2c  RW
+   ```
+   **SEGMENT 2 IS FILE-BACKED `0x0102dc80 .. 0x01041724`, AND `0x01033060` IS INSIDE THAT RANGE** (it is
+   also inside the memsz range `.. 0x010519AC`, so it is ordinary `.data`, not `.bss`).
+
+   **SO THE BYTES ARE ON THE DISC, AND I READ THEM:**
+   ```
+   file offset = 0x02ec80 + (0x01033060 - 0x0102dc80) = 0x034060
+   bytes  : 70 70 27 32
+   as LE  : 0x32277070
+   MATCHES THE POISON 0x32277070: True
+   ```
+   **THE DISC ITSELF CONTAINS `0x32277070` AT THAT ADDRESS.**
+
+   **THEREFORE, AND I AM RETRACTING MY OWN ITER39 LEAD FLATLY: THE GUEST IS READING ITS OWN DATA AND OUR
+   LOADER IS CORRECT.** I claimed last turn that `state@0x01033060 = 0x32277070` was a second independent
+   witness of uninitialised host memory reaching the guest. **It is not. It is the game's legitimate
+   initial PRNG seed, loaded correctly from the file.** **So the "uninitialised memory" theory now has ONE
+   witness, not two** -- `0xe9a2f5ef`, which is genuinely in neither our source nor the disc -- and the
+   reviewer's first branch ("if the segment file itself contains the poison value then OUR LOADER is the
+   wall") is **REFUTED BY MEASUREMENT**. The load path is sound.
+
+   **WHAT THAT LEAVES, AND IT IS A SMALLER AND MORE HONEST LIST:**
+   - `0x32277070` -- **explained**: the game's own seed. Not a bug. (retracted)
+   - `0xe9a2f5ef` -- **still unexplained**, and not from the disc and not from our source text.
+   - The derailment itself -- `pc=ra=gp=a1=a3=0xe9a2f5ef`, `sp=0x01ffff60`.
+
+   **THE ALIAS CHECK (the reviewer's step 2) IS NOW THE ONLY CHEAP THING LEFT, AND IT IS NOT EXOTIC HERE.**
+   Our PS2 address space aliases one physical word many ways -- the `0x11F80` / `0x1218C` / `0x80011F80`
+   business in `Kernel/Syscalls/System.cpp` is the precedent. **`sp=0x01ffff60` is 160 bytes below the 32MB
+   RDRAM ceiling, and the guest heap the loader sets up runs to `runtimeEnd=0x1f00000` -- so the stack sits
+   ABOVE the heap, in a region nothing memsets after allocation.** Whether a KSEG0/KSEG1 alias can reach
+   outside the zeroed region is the next free check, and the allocator question is still the expensive one
+   behind it. **I HAVE DONE NEITHER THIS TURN.**
+
+   **PICTURE:** unchanged, `docs/evidence/w138_game.png`, window `0x987ac4`, 650x482, **394 distinct
+   colours** -- still the 2005 Sony disclaimer. **NO FIX LANDED THIS TURN.**
+
    **ITERATION 39 -- BOTH CANDIDATES MEASURED, AND BOTH ARE DEAD. THE LCG IS CORRECT AND THE XOR LOOP
    DOES NOT OVERRUN. THE DERAILMENT IS NEITHER.**
 

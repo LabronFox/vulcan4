@@ -935,6 +935,75 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 38 -- THE PATTERN IS NEITHER OURS NOR THE GAME'S, AND THE PRNG AT 0x100D308 IS A PLAIN
+   LCG WHOSE XOR LOOP CAN WRITE ONE CONSTANT ACROSS A RANGE.**
+
+   **1. THE GREP. `0xe9a2f5ef` IS NOT OURS AND NOT THE GAME'S.**
+   ```
+   grep -rniE "e9a2f5ef|ef5fa2e9" over tools/ (cpp,h,hpp,py,sh)   ->  0 hits
+   SCUS_973.28, bytes ef f5 a2 e9                                     ->  0 hits
+   SCUS_973.28, bytes e9 a2 f5 ef                                     ->  0 hits
+   ```
+   **So it is branch 3 of the reviewer's list: IT IS WHATEVER WAS IN THE HOST HEAP BEFORE WE CLAIMED
+   IT. We are NOT INITIALISING A REGION WE HAND TO THE GUEST.** That is the first hard fact of the night
+   about our own memory discipline, and it is a one-line-class bug once the region is identified.
+
+   **2. THE PRNG AT 0x100D308 IS A PLAIN LCG, AND IT WRITES ITS OWN STATE BACK.**
+   ```
+   100d308: lui   a0,0x103
+   100d30c: lui   v1,0x5d58
+   100d310: addiu a0,a0,12384        ; a0 = 0x01033060   <-- THE STATE WORD
+   100d314: ori   v1,v1,0x8b65       ; v1 = 0x5d588b65   <-- THE MULTIPLIER
+   100d318: lw    v0,0(a0)           ; load the state
+   100d31c: multu v0,v1              ; 64-bit multiply
+   100d320: mflo  a1
+   100d324: mfhi  v0
+   100d328: dsll32 a1,a1,0
+   100d32c: dsll32 v0,v0,0
+   100d330: dsrl32 a1,a1,0
+   100d334: or    v0,v0,a1
+   100d338: daddiu v0,v0,1
+   100d33c: dsll32 v0,v0,0
+   100d340: dsra32 v0,v0,0
+   100d344: jr    ra
+   100d348: sw    v0,0(a0)           ; store the new state back, IN THE DELAY SLOT
+   ```
+   **STATE = STATE * 0x5d588b65 + 1, HELD AT GUEST ADDRESS `0x01033060`.** That address is **inside the
+   second loaded segment (0x102dc80-0x10519ac)**, i.e. the guest's own `.data`, so it is the game's to
+   seed. **This is W120's `multu`/`mfhi`/`mflo` routine, confirmed.**
+
+   **3. AND THE XOR LOOP IS `buffer[i] ^= random()`, W120's finding, WITH THE COUNT AND THE BUFFER BOTH
+   IN REGISTERS AND BOTH BOOKKEEPING STEPS IN DELAY SLOTS:**
+   ```
+   100d350: addiu sp,sp,-32
+   100d374: blez  a1,0x100d3a0        ; count <= 0 -> skip
+   100d37c: move  s1,a1               ; s1 = COUNT
+   100d380: jal   0x100d308           ; random()
+   100d384: addiu s1,s1,-1            ; delay slot
+   100d388: lbu   v1,0(s0)            ; buffer[i]
+   100d38c: xor   v1,v1,v0            ; ^= random
+   100d390: sb    v1,0(s0)            ; buffer[i] = ...
+   100d394: bnez  s1,0x100d380
+   100d398: addiu  s0,s0,1            ; delay slot: buffer++
+   ```
+   **THIS IS THE ONLY MECHANISM I HAVE FOUND THAT EXPLAINS "THE SAME VALUE IN FIVE REGISTERS".** If the
+   XOR source is CONSTANT and the range is wide enough to cover saved registers, then every saved
+   register is XOR'd with the same constant -- and since a cleared byte XOR constant IS the constant, five
+   registers ending up all holding `0xe9a2f5ef` is exactly what you would see. **The derailment's
+   `gp=a1=a3=pc=0xe9a2f5ef` with `sp` at the top of RDRAM fits a buffer whose range runs off into the
+   stack.**
+
+   **WHAT I HAVE **NOT** ESTABLISHED, AND WILL NOT ASSERT: whether the XOR source is actually constant
+   (which would mean `multu`/`mflo`/`mfhi` is mistranslated and the LCG is stuck), or whether the RANGE is
+   simply too large (a guest overrun).** Those are two different bugs with two different fixes, and the
+   difference is one measurement: **print the value returned by 0x100d308 for the first fifty calls, and
+   print the buffer base `s0` and count `s1` on entry to 0x100d350.** If the value is constant, the
+   multiply is wrong and the fix is in our `multu`/`mflo`. If the value varies and the range runs past
+   the top of RDRAM, it is a guest overrun and the fix is upstream of the call.
+
+   **PICTURE:** `docs/evidence/w138_game.png`, window id `0x987ac4`, 650x482, **394 distinct colours**.
+   Still the 2005 Sony disclaimer. **NO FIX LANDED THIS TURN.**
+
    **ITERATION 37 -- THE SPIN IS DROPPED (IT IS NOT REPRODUCING). THE BOOT IS NONDETERMINISTIC, AND THE
    DERAILMENT HAS A VISIBLE UNINITIALISED-MEMORY SIGNATURE.**
 

@@ -889,6 +889,52 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    peer that is permanently parked. **The livelock is a lost wakeup, not a data value** — which is why
    every element word, stack frame and accumulator bound measured today was a dead end.
 
+   **ITERATION 21: THE SDK SAYS MY RED TEST WAS WRONG. RECORDED SO IT IS NEVER RE-DERIVED.**
+   **Primary sources, supplied by the reviewer from Sony's ps2dev/ps2sdk:**
+   ```
+   ee/kernel/include/kernel.h:405      extern s32 SleepThread(void);
+   ```
+   **It takes NO ARGUMENTS.** Not a microsecond count, not a duration — an **untimed, event-driven
+   block**. There is no timeout argument, so there are no timed semantics to look for.
+
+   **Upstream `menaman123/Ps2Recomp`, `host_app/ps2_scheduler.cpp:2748`, `PS2Scheduler::SleepThread`:**
+   ```cpp
+   if (current_thread_id_ <= 0) return;
+   PS2Thread& t = threads_[current_thread_id_];
+   if (t.wakeup_count > 0) { t.wakeup_count--; return; }
+   RemoveFromReadyQueue(current_thread_id_);
+   t.status = THS_WAIT;
+   t.wait_type = WAIT_SLEEP;
+   Reschedule(ctx);
+   ```
+   **Only `WakeupThread` clears `WAIT_SLEEP`.** Their header also flags `SuspendThread` with
+   `NOTE: Has documented BUG - no reschedule`.
+
+   **OUR `sleepCurrent()` ALREADY MATCHES THIS LINE FOR LINE** — the `wakeupCount` shortcut, then
+   `blockCurrent()` which is `RemoveFromReadyQueue` + `THS_WAIT` + `Reschedule`. **And we did NOT
+   inherit the SuspendThread bug: our `suspendThread()` sets `m_rescheduleRequested = true` on both the
+   Running and interrupt-safe paths.** So neither the sleep nor the suspend needs a fix.
+
+   **MY RED TEST WAS WRONG AND IS RETRACTED.** I asserted "an untimed sce_SleepThread must be
+   RELEASABLE by the scheduler". **A sleep is NOT self-releasing on real hardware — only
+   `WakeupThread` clears it.** That assertion was a fake failure chasing a contract the console does
+   not have, and it would have sent the next agent to "fix" correct code. **A lost wakeup is not a PS2
+   semantic.**
+
+   **WHERE THE WALL ACTUALLY IS, RESTATED CORRECTLY:** if GT4 parks and is never woken, then
+   **something upstream of the sleep failed to deliver what the guest was waiting on**, and the sleep is
+   only where it becomes visible. Our evidence for that is unchanged and still the whole story:
+   `wakeupCount=0`, `woken=0` in every run, `tid1:status=1:wait=sleep#0:woken=0`, and the guest
+   **never issues syscall `0x33`**. So the next question is the reviewer's: **who is supposed to signal
+   tid1** — a semaphore, an event flag, an interrupt handler, or another thread's completion — and that
+   must be answered from the guest side with a measurement.
+
+   **MY OWN ERROR THIS TURN, TWICE:** I rewrote the test to the upstream contract and it **segfaulted
+   again**, because `sleepCurrent()` on the *main* thread of that fixture is not a supported call path.
+   That is the second time in this project I shipped a crashing test, and the second time I reverted
+   it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
+   the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
+
    **RETRACTION — MY "COMPILER DEFECT" WAS WRONG. DO NOT GO FIX THE COMPILER.**
    I claimed `sub_01005AB8` never materialises `$s1` from `$a0`. **It does.** The instruction is
    right there and my grep missed it because I searched for the wrong pattern:

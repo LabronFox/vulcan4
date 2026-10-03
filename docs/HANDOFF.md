@@ -935,6 +935,48 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 43 -- THE W120 PRIOR ART HOLDS AS AN OBSERVATION AND IS REFUTED AS AN INFERENCE. THE LOOP
+   IS NOT UNABLE TO EXIT; IT EXITS ON `s1 != s2` AND `t4` IS NOT THE BOUND.**
+
+   **RE-MEASURED ON THE CURRENT BUILD, GATED (`VULCAN4_W129_COPY=1`, `boot_w143.log`):**
+   ```
+   n=1 taken=1 s1=0x01051a45 s2=0x01051a4b s3=0x7 t1=0x01051a46 t4=0x01051a3f len=0x06 dstlen=t4-t1=0xfffffff9
+   n=2 taken=1 s1=0x01051a46 ...                     t1=0x01051a47 t4=0x01051a3f len=0x05 dstlen=0xfffffff8
+   n=3 taken=1 s1=0x01051a47 ...                     t1=0x01051a48 t4=0x01051a3f len=0x04 dstlen=0xfffffff7
+   n=4 taken=1 s1=0x01051a48 ...                     t1=0x01051a49 t4=0x01051a3f len=0x03 dstlen=0xfffffff6
+   n=5 taken=1 s1=0x01051a49 ...                     t1=0x01051a4a t4=0x01051a3f len=0x02 dstlen=0xfffffff5
+   n=6 taken=1 s1=0x01051a4a ...                     t1=0x01051a4b t4=0x01051a3f len=0x01 dstlen=0xfffffff4
+   n=7 taken=0 s1=0x01051a4b s2=0x01051a4b          t1=0x01051a4c t4=0x01051a3f len=0x00 dstlen=0xfffffff3
+   n=8 taken=1 s1=0x01051a4a s2=0x01051a4c s3=0x3   t1=0x01051a50 t4=0x01051a3f len=0x02
+   ```
+   **THE OBSERVATION HOLDS EXACTLY AS RECORDED IN W120:** `$t1` climbs by one each pass
+   (`0x01051a46 -> 0x01051a4c`), `$t4` NEVER CHANGES (`0x01051a3f` throughout), and the start is past the
+   end -- `0x01051a46 - 0x01051a3f = 7`, so **seven** bytes past, not six.
+
+   **BUT THE INFERENCE DRAWN FROM IT IS REFUTED BY THE SAME NUMBERS: THE LOOP DOES EXIT.**
+   - **`len` counts down `6,5,4,3,2,1,0`** -- exactly one pass per byte, and `s3=7`.
+   - **On pass 7 the exit fires: `n=7 taken=0`, with `s1 == s2 == 0x01051a4b` and `len=0`.**
+
+   **SO: THE LOOP IS *NOT* MATHEMATICALLY UNABLE TO EXIT, AND IT IS NOT WRAPPING THE 32-BIT SPACE.** The
+   bound is **`s1 != s2`**, where `s2 = s1 + s3` is computed ONCE before the loop -- the iteration count is
+   the byte count `s3`, and `s3` is sane (`7`, then `3`). `t4` is **not the loop bound at all**: the
+   `bne t1,t4` at `0x100f808` only selects whether to run the tail block, exactly as ITERATION 28 read
+   from the game's own bytes. **`t4 - t1` being negative (`0xfffffff9`) is therefore harmless**, because
+   nothing loops on that difference.
+
+   **THIS IS THE THIRD TIME THIS PROJECT HAS RE-READ A PRIOR FINDING AND FOUND THE OBSERVATION TRUE BUT
+   THE CONCLUSION WRONG** (the others being W120's delay-slot claim and W121's equal-count claim). **The
+   lesson worth keeping: a recorded measurement is prior art; a conclusion drawn from it is a hypothesis,
+   and it has to be re-measured like one.**
+
+   **WHAT I DID NOT DO, AND WILL NOT CLAIM: I did not land a fix.** There is no wrong instruction here to
+   correct -- the exit condition is correct, the byte count is correct, and the `bnel` codegen was already
+   proven correct in ITERATION 28. **The register-initialisation question ITERATION 42 raised stands
+   untouched.**
+
+   **PICTURE:** unchanged this turn from `docs/evidence/w142_game.png`, window `0x996c58`, 650x482,
+   **393 distinct colours** -- still the 2005 Sony disclaimer.
+
    **ITERATION 42 -- THE POISON IS NEVER WRITTEN, AND MY "FIVE POISONED REGISTERS" READING WAS A
    SINGLE-RUN ARTIFACT. TWELFTH RETRACTION.**
 

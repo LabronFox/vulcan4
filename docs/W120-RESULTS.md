@@ -104,3 +104,52 @@ the first thing the next agent should do — not a new wall, the same one, one l
    `0xffffffff`, so its `$a0` was 0 on the taken path. Find what it is polling.
 3. Only then re-measure mode A vs mode B, with **at least 5 runs per configuration**, because the 2,846x
    spread means a single before/after pair proves nothing.
+
+## ADDENDUM — func_10057F0 IS A COMPARE, AND THE SPIN IS ONE 32-BIT TEST
+
+Read in full from the generated code, `func_10057F0` is **not** a fetch. It is a three-way comparison
+returning -1 / 0 / +1:
+
+    0x10057f0: lw    $a2, 0x8($a0)      ; left  count = *(a0+0x08)
+    0x10057f4: lw    $a3, 0x8($a1)      ; right count = *(a1+0x08)
+    0x10057f8: sltu  $v1, $a2, $a3      ; v1 = (left < right)
+    0x10057fc: bnez  $v1, -> 0x1005868  ; if left < right, EXIT
+    0x1005800: addiu $v0, $zero, -1     ; DELAY SLOT -- executes unconditionally
+    0x100583c: lw    $v1, 0x0($v0)      ; only NOW are elements compared
+
+**It returns -1 the instant `*(a0+8) < *(a1+8)`, straight out of the delay slot, without comparing a
+single element.** The caller `sub_010088E8` loops while `$v0 < 0` at `0x10089dc`. So the livelock reduces
+to **one 32-bit comparison of two counts** — a far smaller target than "find the producer".
+
+Measured, solid (`w120i.log`, `w120q2.log`, both at `resumePc=0x1005898`, the label right after the jal):
+
+    [w120:ret] func_10057F0 returned: resumePc=0x1005898 v0=0xffffffff signed=-1
+
+and the caller's `0x100589c: negu $v1,$v0` / `0x10058a4: movn $v0,$v1,$a0` overwrites `$v0` only when
+`*(s0+0x10)` is non-zero, and that word measures **0**, so `$v0` stays -1 and `bltz` loops.
+
+### RETRACTION — my probe was not positioned to see what it claimed
+
+The first `[w120:cmp]` probe ran **after** `targetFn()` and therefore read `func_10057F0`'s
+**return-state** registers, not its arguments. It printed `a0=0x1 a1=0x0` and counts of `3735928559`,
+which is `0xDEADBEEF` — the probe's own "unreadable address" sentinel. **Those numbers were meaningless
+and are withdrawn.** This is the sixth time in this project a probe reported a confident result it was
+not positioned to see, and it is the same failure as the stride-16 sampler and the block-as-word-index
+scan: the instrument looked authoritative and was blind.
+
+**NOT YET MEASURED:** the corrected probe samples *before* the call, but three consecutive runs came back
+in the non-spin shape (XFER totals 153,682 / 128,817 / 37,370) so it has not yet fired in a livelock run.
+**Do not treat the `left < right` verdict as established** until the corrected probe prints it. The spin
+is intermittent — roughly half of all runs — so catching it takes several attempts.
+
+## WHERE THE NEXT AGENT STARTS (much smaller than "find the producer")
+
+1. Run until the corrected `[w120:cmp]` fires in a livelock run, then read `leftCount` and `rightCount`.
+   If `left < right`, the spin is confirmed and the next question is **which side is short and who is
+   supposed to extend it**. That is a data-flow question about two structures the guest owns, not a
+   search of the runtime.
+2. Separately, `0x1fffbc0` is still never written — but note the spin may not need it written at all:
+   `*(s0+0x10)` only gates whether `$v0` is overwritten, and with it at 0 the -1 propagates. So "the word
+   is never written" and "the spin loops" may be the same fact rather than two.
+3. Re-measure with **at least 5 runs per configuration**. The 2,846x spread means one before/after pair
+   proves nothing, which is how I nearly reverted a correct fix in W112.

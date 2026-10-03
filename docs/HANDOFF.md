@@ -850,6 +850,45 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    bits from an empty stream, forever. That is the livelock in one sentence, and it is upstream of the
    compare, the element word, and every stack frame measured today.
 
+   **ITERATION 20: THE WALL, CONFIRMED FROM THE SOURCE. NOBODY EVER WAKES tid1.**
+   Verified independently before acting, from the logs and then the code.
+
+   **FACT 1 — `sce_SleepThread` is 93-95% of every syscall, and it is retried, not satisfied.**
+   ```
+   z14: 12282 of 13196    z9: 266010 of 281425    z10: 269387 of 284723    y2: 109005 of 115765
+   ```
+   The harness already names it: *"it is being retried, not satisfied, so the wall is the return value
+   it is not getting, not the call itself."*
+
+   **FACT 2 — `wakeupCount=0` and `woken=0` in EVERY run, without exception** (z3, z9, z10, z14, z15,
+   z16, y2), and `tid1:status=1:wait=sleep#0:woken=0:pc=0x0100f800`. **There is no run today where
+   `wakeupCount` has ever been non-zero.**
+
+   **FACT 3 — the code, quoted.** `sleepCurrent()` has exactly two ways out:
+   ```c++
+   void EeScheduler::sleepCurrent(uint32_t microseconds) {
+       if (self->wakeupCount != 0u) { --self->wakeupCount; setReturnS32(..., KE_OK); return; }  // ONLY exit
+       ...
+       blockCurrent(EeWaitState{ EeWaitReason::Sleep,
+           (microseconds != 0u) ? EeWaitPayload{EeTimedSleepWait{deadline}} : EeWaitPayload{std::monostate{}}, ...});
+   }
+   ```
+   For tid1 the sleep is **untimed** (`std::monostate`), so it cannot expire. **And `wakeupCount` is
+   raised in exactly ONE place — `EeScheduler::wakeupThread()` — which has exactly ONE caller in the
+   whole runtime:**
+   ```
+   tools/PS2Recomp/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp:259:
+       const int result = ee.wakeupThread(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
+   ```
+   That is the `sce_WakeupThread` (syscall `0x33`) handler. **The guest never reaches it: the string
+   `0x33` appears ZERO times in every run log, while `0x35` (`sce_CancelWakeupThread`) does appear.** So
+   the guest is **cancelling wakeups it never issues**, and tid1 is parked forever.
+
+   **THE MECHANISM, IN ONE SENTENCE:** tid1 sleeps untimed, only `syscall 0x33` can release it, the
+   guest never issues `0x33`, and meanwhile tid2 retries `sce_SleepThread` 269,387 times waiting for a
+   peer that is permanently parked. **The livelock is a lost wakeup, not a data value** — which is why
+   every element word, stack frame and accumulator bound measured today was a dead end.
+
    **RETRACTION — MY "COMPILER DEFECT" WAS WRONG. DO NOT GO FIX THE COMPILER.**
    I claimed `sub_01005AB8` never materialises `$s1` from `$a0`. **It does.** The instruction is
    right there and my grep missed it because I searched for the wrong pattern:

@@ -935,6 +935,57 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 46 -- THE BRANCH RESOLVES: `ra` IS SET CORRECTLY AT BOTH CALL SITES, THEREFORE
+   `sub_0100F390` CLOBBERS IT. FIFTEENTH SELF-CORRECTION: I NAMED THE WRONG CALLER LAST TURN.**
+
+   **FIRST, MY OWN ERROR FROM ITERATION 45: I SAID `sub_0100F390`'S ONLY CALLER WAS AT `0x01008FFC`.
+   IT IS NOT.** The bytes there are:
+   ```
+   1008ff0: lw    a3,4(s2)
+   1008ff4: lw    a1,4(s4)
+   1008ff8: lw    a2,4(s5)
+   1008ffc: jal   0x10088e8        <-- calls sub_010088E8, NOT sub_0100F390
+   1009000: lw    a0,4(s3)         (delay slot)
+   ```
+   **`0x1008ffc` calls `sub_010088E8`** -- which is the function containing the spin back-edge at
+   `0x10089dc` (ITERATION 35). **The real caller of `sub_0100F390` is at `0x1010a68`, inside
+   `sub_0100F8C8`:**
+   ```
+   1010a64: sw    t4,24(s0)
+   1010a68: jal   0x100f390
+   1010a6c: sw    s8,36(s0)        (delay slot)
+   1010a70: ld    s3,0(s0)         <-- ra on entry to sub_0100F390
+   ```
+   **AND `0x1010a70` IS EXACTLY THE `ra` ITERATION 26 MEASURED ON THE FIRST DERAILMENT OF THE NIGHT
+   (`ra=0x01010a70`).** So the chain is closed:
+   `sub_0100F8C8` -> `jal 0x100f390` -> `sub_0100F390` (the copy loop, `last_good=0x0100f800`) -> returns
+   to `0x1010a70`. **The derailment happens on that return path.**
+
+   **NOW THE BRANCH, AND IT RESOLVES AGAINST OUR CALL LOWERING. I CHECKED THE GENERATED CODE AT BOTH
+   CALL SITES:**
+   ```
+   // at 0x1008ffc, in the generated unit:
+   SET_GPR_U32(ctx, 31, 0x1009004u);          <-- ra = fallthrough. CORRECT.
+   // at 0x1010a68, in the generated unit:
+   ctx->pc = 0x1010A68u;
+   SET_GPR_U32(ctx, 31, 0x1010A70u);          <-- ra = fallthrough. CORRECT.
+   ctx->pc = 0x1010A6Cu;
+   ctx->in_delay_slot = true;
+   ```
+   **OUR `jal` LOWERING SETS `ra` CORRECTLY AT BOTH SITES. The guest's instruction is a plain `jal`
+   (`0x0c40223a`, `0x0c403ce4`) with a delay slot, not a `jalr`, so the return address comes from the
+   instruction stream and we materialise it correctly.**
+
+   **SO: `ra` IS CORRECT ON ENTRY TO `sub_0100F390` (and ITERATION 26 measured exactly `0x01010a70`
+   there), AND THE DERAILMENT CARRIES `ra=0xdfb0`. `sub_0100F390` CLOBBERS THE RETURN ADDRESS.** That is
+   the guest's own memcpy-shaped routine, `0x100f390..0x100f8c8`, and the clobber is a DATA bug inside it
+   -- a store past its own frame, or a frame that our translation sized wrongly.
+
+   **THE NEXT MEASUREMENT IS NOW TINY AND LOCAL: inside `sub_0100F390`, print every `sw` whose destination
+   lands at or above the frame's own saved-`ra` slot, with address, value and pc.** Its prologue is two
+   instructions (`addiu sp,sp,-N` and the `sd`/`sw` pair), so the frame is trivially known and the clobber
+   should fall out immediately. **I did not take that measurement this turn and I am not claiming the fix.**
+
    **ITERATION 45 -- THE SYSCALL-TABLE THEORY IS DEAD BY ARITHMETIC, AND THE DERAILMENT PC IS `ra`
    ITSELF. THE GUEST IS FOLLOWING A CORRUPTED RETURN ADDRESS, NOT A VTABLE.**
 

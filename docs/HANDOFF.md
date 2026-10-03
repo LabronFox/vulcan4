@@ -935,6 +935,57 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 31 -- THE FAULT CLASS IS NAMED: ExcCode 0x4, ADDRESS ERROR ON LOAD. NOT 0xC, NOT A
+   SYSCALL. AND THE FAULTING CODE IS A LINKED-LIST WALK.**
+
+   **THE THREE NUMBERS (gated, `VULCAN4_W131_EXC=1`, 295 exceptions in one boot), all from
+   `raiseCop0Exception` -- the single funnel every EE exception passes through, so no guessing:**
+   ```
+   [w131:exc] excCode=0x4 epc=0x100d908 guestPc=0x100d90c inDelaySlot=1 v1=0x100d910 v3=0xba
+   [w131:exc] excCode=0x4 epc=0x100d910 guestPc=0x100d910 inDelaySlot=0 v1=0x100d910 v3=0xbb
+   ```
+   - **ExcCode = 0x4.** Per our own `ps2_runtime.h:53` that is **`EXCEPTION_ADDRESS_ERROR_LOAD`**.
+     **NOT `EXCEPTION_SYSCALL` (0x8), and NOT 0xC (which our enum says is INTEGER_OVERFLOW).** The
+     reviewer's expectation of 0xC is not what the hardware is doing.
+   - **cop0 EPC = 0x100d908**, guest pc = **0x100d90c**, and `inDelaySlot=1` -- the fault is inside a
+     branch delay slot, so EPC is correctly attributed to the branch, not the instruction.
+   - The second line of each pair is the retry at 0x100d910, not in a delay slot.
+
+   **MY OWN LABEL WAS WRONG AND I AM FIXING IT BEFORE ANYONE ELSE FINDS IT: I printed
+   "v1" = `r[31]` and "v3" = `r[3]`. In this ABI `r[31]` is `$ra` and `r[3]` is `$v1`.** So the constant
+   0x100d910 I reported as a "syscall number" is the RETURN ADDRESS, and the actually-changing value in
+   `$v1` is **0xba, 0xbb, 0xbc, 0xbd, 0xbe, ...** Our call list maps `0xba=strchr, 0xbb=strcmp, 0xbc=strcpy,
+   0xbd=strlen`, **but these are NOT syscalls** -- they are small integers being carried in a list.
+
+   **THE FAULTING CODE, DISASSEMBLED (0x100d8f0-0x100d920) -- IT IS A LINKED-LIST WALK:**
+   ```
+   100d8f8:  lw    s0,0(s1)      ; s0 = list head
+   100d8fc:  beqzl s0,0x100d920  ; list empty -> exit
+   100d908:  jal   0x10202e8     ; call one function per node
+   100d90c:  lw    a0,4(s0)      ; DELAY SLOT: a0 = node->arg   <-- ADEL FAULTS HERE
+   100d910:  lw    s0,0(s0)      ; s0 = node->next  (advance the cursor)
+   100d914:  bnez  s0,0x100d908  ; loop while s0 != 0
+   ```
+   **THE FAULT IS `lw a0,4(s0)` WITH A BAD `s0`.** The list cursor has become a pointer we cannot load
+   from, and the payload at `node+4` is a small incrementing integer (0xba, 0xbb, ...). So the guest is
+   walking a list of small integers and calling `0x10202e8` once per element.
+
+   **WHAT THIS MEANS PLAINLY: OUR RUNTIME IS BEHAVING CORRECTLY HERE.** A load from an unaligned or
+   invalid address on a PS2 raises AdEL, and we raise it, with the right EPC and the right BD bit. **The
+   bug is upstream of the fault: the list's `next` pointers are wrong, so the cursor walks off into
+   nowhere.** The wall is a DATA-STRUCTURE walk in the guest, not a syscall we failed to implement, and
+   not a branch bug.
+
+   **AND NOTE WHAT THIS RETIRES: `0x100d908` IS THE ADDRESS I CALLED THE "THREAD-ID BARRIER" IN W120 AND
+   W122 AND LATER DECLARED A DECOY.** It is neither. It is this list walk, and it is where the guest is
+   spending its time and where it eventually faults. **Seventh retraction, and it kills a name I had
+   carried for three dishes.**
+
+   **THE NEXT QUESTION IS NARROW AND IT IS A DATA QUESTION: what builds the list whose `next` field
+   (`lw s0,0(s0)`) becomes unaligned?** Nodes look like `{u32 next; u32 arg;}` at 8-byte stride, and an
+   AdEL on a 32-bit load means the cursor is not 4-byte aligned. **That points at whoever allocated or
+   filled that list -- not at the scheduler, not at syscalls, and not at the copier.**
+
    **ITERATION 30 -- THE WRITER-WATCH LANDS AND RECORDS **ZERO READS AND ZERO WRITES**, WHICH KILLS
    THE TAIL-BLOCK THEORY *AND RETRACTS MY OWN ITERATION 26 ANSWER*.**
 

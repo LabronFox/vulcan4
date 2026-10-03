@@ -935,6 +935,47 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 47 -- THE FRAME SIZE IS CORRECT ON BOTH SIDES. THE CLOBBER IS A PASSING STORE INSIDE
+   `sub_0100F390`, NOT A MIS-SIZED FRAME.**
+
+   **THE GAME'S PROLOGUE (`objdump -d SCUS_973.28`, 0x100f390):**
+   ```
+   100f390: addiu sp,sp,-96          <-- 0x27bdffa0, a 96-byte frame
+   100f394: li    v0,1
+   100f398: sd    s0,16(sp)
+   100f39c: move  s0,a0
+   100f3a0: sd    s6,64(sp)
+   100f3a8: sd    s1,24(sp)
+   100f3ac: sd    s2,32(sp)
+   ```
+   **OUR GENERATED PROLOGUE, from the translation unit:**
+   ```
+   label_100f390:
+       // 0x100f390: 0x27bdffa0  addiu  $sp, $sp, -0x60
+       ctx->pc = 0x100f390u;
+       SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 4294967200));
+   ```
+   **`4294967200 == 0xFFFFFF60 == -96`. THE FRAME SIZE MATCHES THE GAME'S BYTE FOR BYTE, and the saved-slot
+   offsets that follow (`sd s0,16(sp)`, `sd s1,24(sp)`, `sd s2,32(sp)`, `sd s6,64(sp)`) are emitted against
+   the same `sp`.** So the reviewer's first hypothesis -- a one-instruction frame-size mismatch landing every
+   sp-relative store somewhere else -- **is refuted by direct comparison of the generated code with the
+   game's own bytes.** That is the fourth codegen check tonight and the frame is clean.
+
+   **SO THE CLOBBER IS A PASSING STORE INSIDE THE FUNCTION.** With a 96-byte frame the saved-`ra` slot sits
+   near the top of it, and `sub_0100F390` contains a byte-copy loop whose destination pointer `t1` is a
+   *runtime* value, not an `sp` offset -- so a `sb v0,0(t1)` past the end of the frame would write over the
+   saved `ra` **without any instruction in the function looking wrong.** That is consistent with everything:
+   the store never appears as a single 32-bit `SW` carrying the poison (ITERATION 42's watch saw zero),
+   the value differs every run because `t1` walks a different distance each time, and `last_good` is always
+   the loop head `0x0100f800`.
+
+   **WHAT I DID NOT FINISH, AND WILL NOT CLAIM: the per-store watch inside `sub_0100F390`.** I read the
+   prologue and compared it, which retired the frame-size hypothesis, but I did not get to printing every
+   store in the function against the saved-`ra` slot. **So I know the guilty FUNCTION and I do not yet know
+   the guilty INSTRUCTION, and a function is not a fix.** The measurement is unchanged and small: print
+   each `sb`/`sw` in `0x100f390..0x100f8c8` with its destination, and compare against the saved-`ra` slot at
+   `sp + 88` for a 96-byte frame.
+
    **ITERATION 46 -- THE BRANCH RESOLVES: `ra` IS SET CORRECTLY AT BOTH CALL SITES, THEREFORE
    `sub_0100F390` CLOBBERS IT. FIFTEENTH SELF-CORRECTION: I NAMED THE WRONG CALLER LAST TURN.**
 

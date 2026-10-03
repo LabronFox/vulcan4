@@ -935,6 +935,37 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 48 -- ONE MEASUREMENT, AND IT EXONERATES THE COPY LOOP. THE REVIEWER'S THEORY IS WRONG
+   AND I AM SAYING SO PLAINLY, AS ASKED.**
+
+   **THE JOIN OF TURN 26/27 + TURN 28 + TURN 47 IS MEASURED AND IT DOES NOT HOLD.** The W129 probe now also
+   prints `sp` and the saved-`ra` slot for this function's 96-byte frame, gated on the same
+   `VULCAN4_W129_COPY`, `boot_w148.log`:
+   ```
+   [w129:copy] n=1 taken=1 t1=0x01051a46 t4=0x01051a3f len=0x06 sp=0x01ffc820 savedRa=0x01ffc878 t1_ge_savedRa=0 t1_over_savedRa=0x00000000
+   [w129:copy] n=2 taken=1 t1=0x01051a47 ... sp=0x01ffc820 savedRa=0x01ffc878 t1_ge_savedRa=0
+   [w129:copy] n=3 taken=1 t1=0x01051a48 ... t1_ge_savedRa=0
+   [w129:copy] n=4 taken=1 t1=0x01051a49 ... t1_ge_savedRa=0
+   [w129:copy] n=5 taken=1 t1=0x01051a4a ... t1_ge_savedRa=0
+   [w129:copy] n=6 taken=1 t1=0x01051a4b ... t1_ge_savedRa=0
+   [w129:copy] n=7 taken=0 t1=0x01051a4c ... t1_ge_savedRa=0   <-- the exit fires, len=0
+   [w129:copy] n=8 taken=1 t1=0x01051a50 ... t1_ge_savedRa=0
+   ```
+   **THE DESTINATION POINTER `t1` LIVES IN `0x01051xxx` -- THE GUEST'S OWN DATA REGION. THE SAVED-`ra`
+   SLOT IS AT `0x01ffc878`, IN THE STACK. THEY ARE `0x0FAE232` APART -- ROUGHLY 255MB -- AND `t1` NEVER
+   GETS WITHIN `0x0FAE232` OF IT ON ANY PASS.** `t1_ge_savedRa=0` on every single pass.
+
+   **SO THE COPY LOOP CANNOT BE WRITING OVER THE SAVED RETURN ADDRESS, AND IT IS INNOCENT.** A
+   non-terminating loop in this function would have had to walk the destination up through the stack, and
+   the destination is not near the stack at all. **The premise that the copy loop and the corrupted `ra`
+   are the same defect is refuted by measurement.** **And the loop is not even non-terminating:** `len`
+   counts down to `0` and the exit fires on pass 7, re-measured here for a fourth time.
+
+   **WHICH LEAVES EXACTLY WHAT ITERATION 47 LEFT OPEN: the clobber is some OTHER store in
+   `0x100f390..0x100f8c8`.** I know the function and I do not know the instruction. **The next measurement
+   is the one I have specified twice and not yet taken: print every `sb`/`sw`/`sd` in the function with its
+   destination and flag any that reach `sp + 88`.** I am not going to nominate a candidate store.
+
    **ITERATION 47 -- THE FRAME SIZE IS CORRECT ON BOTH SIDES. THE CLOBBER IS A PASSING STORE INSIDE
    `sub_0100F390`, NOT A MIS-SIZED FRAME.**
 

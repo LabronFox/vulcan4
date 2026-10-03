@@ -935,6 +935,51 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 30 -- THE WRITER-WATCH LANDS AND RECORDS **ZERO READS AND ZERO WRITES**, WHICH KILLS
+   THE TAIL-BLOCK THEORY *AND RETRACTS MY OWN ITERATION 26 ANSWER*.**
+
+   **THE WATCH, emitted by the translator exactly as W129 was, behind `VULCAN4_W130_STORE`.**
+   - **Writer-watch:** `instruction_translator.cpp` now prefixes **every `SW`** with
+     `if (::vulcan4W130StoreWatch(dst, value, 0x<pc>u)) {}` -- 2522 sites emitted.
+   - **Read probe:** the same file prefixes every `LW` with a runtime address test that fires only at
+     **`0x0100F810`**, the guest's `lw v0,0x44(s0)` -- 3270 sites emitted, one of which can ever fire.
+     That instruction is the read of the field whose `+0x1C` I claimed was indirect-called.
+   - Helpers `inline` in `ps2_runtime_macros.h` (the header the generated unit includes), with a
+     four-slot watched-address set that the read probe fills in when it first sees the structure.
+   Both are free when off: one load-and-test on an inline-visible static.
+
+   **THE MEASUREMENT (gated, `VULCAN4_W130_STORE=1`):**
+   ```
+   reads: 0        writes: 0
+   ```
+   **NOTHING IN THE FUNCTION EVER READS `*(s0+0x44)`, AND NOTHING EVER WRITES EITHER WORD.**
+
+   **SO, THE THREE QUESTIONS, PLAINLY. This is a FOURTH situation, not one of the three offered, and I
+   am not going to pretend otherwise: it is "the code that would touch those fields NEVER RUNS".**
+   1. **Does anything write `*(u32*)(s0+0x44)`? NO -- measured zero writes.**
+   2. **Does anything write the `+0x1C` word? NO -- measured zero writes.**
+   3. **But it is NOT situation three (an uninitialised field nobody filled). It is that
+      `0x0100F810` IS NEVER EXECUTED AT ALL.** The read probe is at that exact address and it fired zero
+      times, so the guest never reaches the `lw v0,0x44(s0)`, never reaches the vtable read, and never
+      reaches `jalr v1`.
+
+   **AND THIS RETRACTS MY OWN ITERATION 26 PLAIN-WORDS ANSWER.** I said then: "the value it is about to
+   jump to is `*(u32*)(*(u32*)(s0+0x44) + 0x1C)`" and called `jalr v1` at `0x100f83c` "THE DERAILMENT".
+   **That was read off the disassembly and presented as the mechanism. It is not the mechanism, because
+   that code never executes.** ITERATION 29 had already shown `t4` sits BEHIND `t1`, so
+   `bne t1,t4` cannot match and the whole tail block is dead -- I noticed that and still let the ITER26
+   claim stand. **Sixth retraction in this project, and this one is mine from two turns ago.**
+
+   **SO WHAT `last_good=0x0100F800` ACTUALLY MEANS, REVISED: IT IS NOT THE DERAILMENT POINT.** It is the
+   last *dispatch* pc, and the copy loop is simply where the guest spends its time -- a busy memcpy,
+   called over and over, which exits correctly to `0x100f418` each time. **The wild pc does not come
+   from this function.** `[guest-branch:missing-target]` reports `op=EE invocation service`, i.e. an
+   **EE EXCEPTION** with pc `0x88468107`, not a `jalr` we followed. **The next wall is an exception whose
+   reported pc is already garbage, and nothing has yet established what raises it or what that pc means.**
+
+   **PICTURE:** `docs/evidence/w130_game.png`, window id `0x96ad68`, 650x482, **389 distinct colours**.
+   Still the 2005 Sony disclaimer. Suite 494/494 EXIT=0.
+
    **ITERATION 29 -- THE PROBE IS IN, AND THE OVERRUN THEORY IS DEAD. THE POINTER IS THE WHOLE WALL.**
 
    **THE PROBE IS EMITTED BY THE TRANSLATOR, as required, behind an env knob.** It lives in

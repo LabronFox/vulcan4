@@ -935,6 +935,51 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 42 -- THE POISON IS NEVER WRITTEN, AND MY "FIVE POISONED REGISTERS" READING WAS A
+   SINGLE-RUN ARTIFACT. TWELFTH RETRACTION.**
+
+   **THE WATCH.** Every 32-bit guest store already calls `vulcan4W130StoreWatch(addr, value, writerPc)`,
+   so matching on the VALUE costs one compare and **needed no regeneration of the translation unit.** New
+   knob **`VULCAN4_W142_POISON`**, first twelve hits printed.
+
+   **THE RESULT, ACROSS FOUR GATED RUNS -- INCLUDING ONE THAT ACTUALLY DERAILED:**
+   ```
+   boot_w142.log     halt=wallclock_deadline        poison_hits=0
+   boot_w142_1.log   halt=pc_outside_generated_table  poison_hits=0   <-- DERAILED, still zero
+   boot_w142_2.log   (no halt line)                  poison_hits=0
+   boot_w142_3.log   (no halt line)                  poison_hits=0
+   ```
+   **`0xe9a2f5ef` IS NEVER WRITTEN AS A 32-BIT STORE, NOT EVEN IN THE BOOT THAT DERAILED.**
+
+   **AND THE DERAILMENT IN THAT RUN LOOKS NOTHING LIKE ITERATION 37's:**
+   ```
+   missing-target] source=0x120004ff target=0x120004ff pc=0x120004ff ra=0x120004ff
+       sp=0x10459e0 gp=0x01049770 a0=0xe0000838 a1=0x0 a2=0x70000000 a3=0x10000105
+       s0=0xa2004600 s1=0x42000103 v0=0xffffffff v1=0xd4
+   VULCAN4 WILDPC dead=0x120004ff last_good=0x0100f800
+   ```
+   **`sp = 0x010459e0`, NOT `0x01ffff60`. `gp`, `a1` and `a3` are all perfectly SANE.** Only
+   `source == target == pc == ra`, which is simply what a jump-to-register looks like when `ra` is the
+   target. **So ITERATION 37's "five registers holding the same value, the signature of uninitialised
+   memory" WAS ONE RUN, AND IT DOES NOT REPRODUCE.** The wild address is different in every derailed boot
+   (`0xe9a2f5ef`, `0x120004ff`, `0x88468107`, `0x00012403`), which is consistent with the guest jumping
+   through a register that holds arbitrary junk -- not with a stable poison pattern.
+
+   **WHAT IS ACTUALLY REPRODUCIBLE ACROSS EVERY DERAILED BOOT: `last_good=0x0100f800`.** That is the one
+   stable fact on the board, and it is the copy loop in `sub_0100F390` (ITERATION 27/28) -- which the
+   reviewer said had stopped reproducing. **So the derailment point reproduces even though the spin's
+   transfer counter does not.** Those are compatible: the guest passes through 0x100f800 constantly, and
+   the derailment happens there, without the spin's loop necessarily running.
+
+   **THE HONEST BOARD:** four candidates dead (loader, LCG, XOR range, whole-RDRAM zeroing) -- all by
+   measurement -- and now the fifth, the poison pattern itself, dead because it is never written. **What
+   remains is not a pattern at all: it is a guest that jumps through a register holding arbitrary junk,
+   always from the same place.** That reframes the goal from "find what wrote this" to "**why is a
+   register holding junk at 0x100f800**", which is a register-initialisation question, not a memory one.
+
+   **PICTURE:** `docs/evidence/w142_game.png`, window id `0x996c58`, 650x482, **393 distinct colours**.
+   **Still the 2005 Sony disclaimer.**
+
    **ITERATION 41 -- THE FOURTH CANDIDATE IS DEAD BY MEASUREMENT, AND THE RECEIPT IS A GREEN TEST.**
    **Suite is now 495 tests, 495 passing, EXIT=0.**
 

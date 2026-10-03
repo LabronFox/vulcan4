@@ -260,6 +260,87 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    spinning `-1` comes from the element comparison at `0x100584c`, which the earlier sentinel probe
    could never see.
 
+   **THE REAL DECIDING OPERANDS ARE THE ELEMENTS, NOT THE COUNTS — AND THE WRITER IS NAMED.**
+   The brief asked me to fix a write to `0x1fffba8`. **My own dump shows that premise is wrong**:
+   `LEFT[0x1fffba8]=1` and `RIGHT[0x18951f8]=1` are **already equal**, so the count compare at
+   `0x10057f8` passes and the function falls into its element loop. Writing `0x1fffba8` would make
+   it **0**, and `0 < 1` would return `-1` and make the spin *worse*. So the fix is not there.
+
+   With equal counts, what returns `-1` is `0x100584c`:
+   ```
+   0x1005820: lw    $t0, 0x14($a0)     ; leftBase
+   0x100583c: lw    $v1, 0x0($v0)     ; leftElem
+   0x1005840: lw    $a0, 0x0($a1)     ; rightElem
+   0x100584c: bnez  $v1, -> exit      ; if leftElem < rightElem -> $v0 = -1
+   ```
+   Measured, `/tmp/opencode/ew2.log`:
+   ```
+   [w122:elem] LATCH pass=2 leftBase=0x1895360 leftElem=0 rightBase=0x1895310 rightElem=1
+               -> leftElem<rightElem RETURNS -1, SPINS
+   ```
+   `leftElem=0 < rightElem=1`, unchanged for the whole run (`dLelem=1 dRelem=1`, zero ELEM CHANGED
+   events). **`leftElem` at guest `0x01895360` is 0 and stays 0 — that is the wall.**
+
+   **AND IT IS BEING WRITTEN — 286 MILLION TIMES, ALWAYS ZERO:**
+   ```
+   lElemStores=285959976
+   [w122:elemw] LEFT ELEM STORE #2 addr=0x1895360 size=4 value=0x0 writerPc=0x1007774 op=WRITE32
+   [w122:elemw] LEFT ELEM STORE #4 addr=0x1895360 size=4 value=0x0 writerPc=0x0     op=Ps2FastWrite32
+   ```
+   **The writer is guest code at `0x01007774`, inside `func_1007738`** — the very "queue walk" W120
+   guessed at. Read in full it is not a queue walk, it is a **BIT-EXPANSION DECODER**:
+   ```
+   0x1007758: lw    $v0, 0x14($a3)     ; base
+   0x100775c: sll   $v1, $a1, 2
+   0x1007764: addu  $v1, $v1, $v0     ; addr = base + i*4
+   0x1007768: lw    $a0, 0x0($v1)     ; current word
+   0x100776c: sll   $v0, $a0, 1       ; shift left one bit
+   0x1007770: or    $v0, $v0, $a2     ; OR in the incoming bit ($a2)
+   0x1007774: sw    $v0, 0x0($v1)     ; STORE IT BACK
+   ```
+   So it is compacting a bitstream in place: shift each word left by one and OR in the next bit.
+   `$a2` is that bit, set at `0x1007784: srl $a2, $a0, 31` (the bit shifted out of the previous word)
+   and `0x1007794: addiu $a2, $zero, 0x1` on the first pass. **The next bit must come from the
+   SOURCE buffer at `*(a3+8)`, which the decoder treats as its element count — and that count is the
+   `1` that never changes.** The decoder therefore keeps ORing in zero forever, leaving `0x1895360`
+   at 0 while `0x1895310` already holds 1. **Mechanism named and proved: the source stream runs dry
+   because its length is never advanced, so the decoder is fed zeros forever.**
+
+   **THE MECHANISM, TRACED TO THE INSTRUCTION. NO FIX LANDED YET.**
+   `func_1007738` is a **BIT ACCUMULATOR**, and each pass does:
+   ```
+   0x1007768: lw   $a0, 0x0($v1)    ; current word
+   0x100776c: sll  $v0, $a0, 1      ; shift left one
+   0x1007770: or   $v0, $v0, $a2    ; OR in the incoming bit
+   0x1007774: sw   $v0, 0x0($v1)    ; store back
+   0x1007778: lw   $v1, 0x8($a3)    ; loop bound = *(a3+8)
+   0x100777c: sltu $v0, $a1, $v1
+   0x1007780: bnez $v0, loop
+   0x1007784: srl  $a2, $a0, 31     ; next incoming bit = TOP BIT of the word just read
+   0x1007788: beqz $a2, -> 0x100779c ; bit exhausted -> jal func_1005AB8 (REFILL)
+   ```
+   **`$a2` is the word's own top bit.** So the step is `w = (w << 1) | (w >> 31)`. **If `w` is 0
+   that is `0` forever** — the accumulator can never bootstrap itself. Measured: `lElemStores=285,959,976`
+   writes of value `0x0` to `0x01895360`, `dLelem=1`, zero change events. The right-hand stream
+   `0x01895310` already holds `1`, so `leftElem(0) < rightElem(1)` returns `-1` and spins.
+
+   **THE LOOP BOUND IS THE STALLED PART.** `*(a3+8)` = `LEFT[0x1fffba8]` = **1**, and
+   **`leftStores=0`** — that word is never written at all. `func_1005AB8` (the refill, entered from
+   `0x100779c`) contains a **trailing-zero trimmer** that is supposed to advance it:
+   ```
+   0x1005b1c: addiu $v0, $a0, -0x1
+   0x1005b30: sw    $v0, 0x8($s1)   ; <-- THE COUNT ADVANCE
+   0x1005b34: lw    $v0, -0x4($v1)
+   0x1005b44: b     0x1005b20        ; loop back, and 0x1005b14/0x1005b38 can exit WITHOUT storing
+   ```
+   Two of its three exits (`0x1005b14`, `0x1005b38` -> `label_1005b80`) and the `beqz` at
+   `0x1005b2c` (-> `label_1005b7c`) all **skip the store at `0x1005b30`**. So the count stays at 1.
+
+   **NEXT STEP, NOT YET DONE:** instrument `func_1005AB8` to prove whether it is entered at all and,
+   if it is, which of its three exits it takes. That single number says whether the fix is "the refill
+   is never called" (wire it) or "the refill is called and exits without advancing" (fix its exit).
+   **I have NOT landed a fix and no speedup is claimed.**
+
    **RETRACTION — MY OWN SAMPLER, second time.** The first `w122:poll` put change-detection and the
    pass counter *inside* the "print the first 6 lines" budget, so `distinctValues=1` covered **six
    passes, not the run** — the same failure class as the W115 stride-16 sampler: an instrument that

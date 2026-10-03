@@ -745,6 +745,37 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    shared scratch. **The word to watch is `0x1fffba8` for the count and `0x1895360` for the element, and
    `0x1895360` is in the game's static data, not on any stack.**
 
+   **ITERATION 17: WATCH RESOLVED FROM LIVE `$sp`. THE FRAME IS **NOT** CLOBBERED — AND THE REAL
+   FINDING IS THAT THE SPIN'S FRAME AND THE COMPARE'S `a0` ARE TWO DIFFERENT FRAMES.**
+   The window is now resolved **per run from the register**, not from a constant. Gated run `y2.log`,
+   `halt=livelocked_in_syscall`, `0x01005890=125,740,680`:
+   ```
+   [w122:frame] RESOLVED FROM LIVE $sp sp=0x1fffc20 count(sp+0x08)=0x1fffc28 base(sp+0x10)=0x1fffc30
+   ```
+   **Writes to the resolved `0x1fffc28`/`0x1fffc30`: ZERO.** Dispatcher control
+   (`delivered=f4240 subs=2`) and the compare probe (125,939 lines) are both live on the same run, so
+   this is a real zero, and **the frame is not being clobbered** — it is simply never written, because
+   `sub_010088E8` does not execute its prologue on this path.
+
+   **WHY, AND IT IS A RUNTIME SCHEDULER FACT, NOT A CLOBBER.** The game calls the compare with
+   `move a0,sp` (`0x10089d0` / `0x10089e0`), so `$a0` **is** the spin's stack pointer. But measured:
+   ```
+   spin entry      sp = 0x1fffc20
+   compare receives a0 = 0x1fffba0
+   0x1fffba0 + 0x80 = 0x1fffc20
+   ```
+   **`0x1fffba0` is exactly the value of `$sp` BEFORE `addiu $sp,$sp,-0x80`.** So the compare is running
+   with the *un-decremented* stack pointer. **The only way that happens is that control is arriving at
+   `0x100894c` or `0x1008960` — the two table entries that SKIP the `addiu $sp,$sp,-0x80` prologue
+   instruction — so the frame is never allocated and never primed.** The `j`/`jal` resume paths re-enter
+   the generated function mid-body, and **our EE thread does not restore `$sp` for them.**
+
+   **AND THE CONSEQUENCE IS EXACTLY THE SPIN:** the accumulator `func_1007738` is handed `a0=sp`
+   (`0x1fffc20`) and primes `0x1fffc28`; the compare `func_10057F0` is handed `a0=0x1fffba0` and reads
+   `0x1fffba8` and `*(0x1fffba0+0x14)=0x1895390`. **Two different frames, so the accumulator primes a
+   struct the compare never reads, and the compare reads a struct nobody primes.** That is the livelock,
+   and it is a **thread-context restore defect in our scheduler**, not a data problem at all.
+
    **RETRACTION — MY "COMPILER DEFECT" WAS WRONG. DO NOT GO FIX THE COMPILER.**
    I claimed `sub_01005AB8` never materialises `$s1` from `$a0`. **It does.** The instruction is
    right there and my grep missed it because I searched for the wrong pattern:

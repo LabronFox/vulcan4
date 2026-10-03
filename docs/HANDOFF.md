@@ -935,6 +935,75 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 23 -- ITER PROFILED THE 90s. PER-ENTRY HOST OVERHEAD IS *NOT* THE PROBLEM, AND THE GUEST
+   DIES ON A WILD PC, WHICH IS A BIGGER FINDING THAN SPEED.**
+
+   **METHOD (item 1), so the numbers can be trusted.** `perf` is unusable here:
+   `/proc/sys/kernel/perf_event_paranoid=4` and both `perf record -p` and a 70-second attach produced
+   **0 samples** (perf23.data empty). So I instrumented in-process with `std::chrono::steady_clock`,
+   **unconditional with no env gate** -- because the last instrument I added, `sleepCurrentCalls`, was
+   built and never used for exactly that reason. Two probes at the same call site: one around
+   `targetFn()` (the recompiled guest body) and one from the top of `EeScheduler::run()`'s dispatch
+   function, so guest vs host is a subtraction of the same clock, not an inference.
+
+   **RESULT 1 -- guest vs host, measured:**
+   ```
+   [w123:split] entries=20000 totalS=1 guestPct=99 hostPct=0 avgEntryNs=84745 avgGuestNs=84686
+   ```
+   **99% guest, host rounds to 0%.** Per the reviewer's own rule that means it is NOT per-entry host
+   overhead, so that is not the win. (First attempt printed nonsense -- `entries=4e20 totalS=1` -- because
+   the stream was not in `std::dec`; fixed with an explicit `std::dec`, and the corrected numbers are
+   above.)
+
+   **RESULT 2 -- AND THE ARITHMETIC SAYS THE GUEST SPLIT IS NOT THE WHOLE STORY.** 79267 entries x
+   84745ns is only **~6.7 seconds**, in a process that runs far longer. I instrumented
+   `EeScheduler::run()`'s other blocking path, `waitForEvent()`, and it **never fired** (0 iterations
+   counted). So the missing time is neither guest nor host nor idle-wait.
+
+   **RESULT 3 -- THE ACTUAL WALL. THE GUEST DOES NOT RUN SLOW; IT DIES.**
+   ```
+   VULCAN4 BOOT REPORT functions_entered=2246 true_guest_entries=79267 true_guest_exits=0
+       halt=pc_outside_generated_table bios_files=0 intr_run=1728 gs_packets=395 frames_presented=306
+   [guest-branch:missing-target] kind=DirectJump op=EE invocation service
+       source=0x240302d target=0x240302d pc=0x240302d ra=0x240302d sp=0x010459e0 gp=0x01049770
+       a0=0xccef5ea1 a2=0x70000000 a3=0x10000105 s0=0x0c0bf89e s1=0x260202d v0=0xffffffff
+   VULCAN4 WILDPC dead=0x0240302d last_good=0x0100f800
+   VULCAN4 SYSTABLE n=0x5a slot=0x120e8 handler=0x240302d
+   VULCAN4 THREADS eeCycle=1724987830 runningThreadId=2
+       THREAD id=1 status=Ready prio=3 pc=0x100f800 ra=0x1010a70 waitReason=1 wakeupCount=0
+   ```
+   **Syscall n=0x5a (90) = `fioRemove` in our call list, and its handler is `0x240302d` -- a WILD
+   address, far outside the code region `generated_table=[0x01000008,0x0102dbec)`.** We jumped to it and
+   the boot stopped with `pc_outside_generated_table`.
+
+   **THIS EXPLAINS BOTH OPEN MYSTERIES AT ONCE.**
+   - **`last_good=0x0100f800` IS EXACTLY tid1's pc.** The address I spent W120-W122 calling "tid1's
+     parked pc" is the last good instruction before the wild jump. It was never a sleep -- it is where
+     the guest was when it derailed.
+   - **`v0=0xffffffff` is the `-1` that `func_10057F0` returns from its delay slot** -- the very value
+     W120 identified as the "spin reduces to ONE 32-bit comparison". The guest was still failing that
+     comparison when it computed the bad pointer.
+   - **THE WALL IS NOT 0.26x SPEED.** `true_guest_exits=0`: the guest never returns cleanly, it walks
+     off the end. **A disclaimer that needs more wall clock cannot be the explanation, because the
+     guest is not waiting -- it is dead.** And this is why the halt reason varies between boots
+     (`wallclock_deadline` vs `pc_outside_generated_table`): **whether we notice the wild jump before the
+     budget expires is a race, which is the same nondeterminism recorded in ITERATION 22.**
+
+   **RDRAM IS NOT THE CULPRIT FOR THE GARBAGE.** `PS2Memory::initialize()` does
+   `new uint8_t[ramSize]; std::memset(m_rdram, 0, ramSize);`, so `0x240302d` was **written by the guest
+   itself**, not left over from uninitialised memory. So the guest computed a bad pointer from a bad
+   value. The neighbours in that table are the same shape -- `[1047a70]=0x200202d [1047a74]=0x260202d
+   [1047a78]=0x200302d [1047aa8]=0x240202d` -- and `s1=0x260202d`, so **`0x240302d` is a member of a
+   family of similar values, which smells like we are reading a DATA table as if it held handler
+   pointers, or reading the wrong offset.**
+
+   **THE NEXT JOB IS THEREFORE NARROW AND CONCRETE: work out why syscall n=0x5a resolves to a
+   data-shaped value.** Check the syscall table base and slot arithmetic against the guest's own layout,
+   and check whether the guest is supposed to have written a handler there at all before this call. Do
+   NOT go looking for speed until that is answered -- a guest that executes a wild pointer cannot be
+   made fast, only fixed. Note `MissingFunctionPolicy` already has `ContinueToTarget`, but jumping to
+   `0x240302d` is undefined and must not be enabled as a shortcut.
+
    **ITERATION 22 -- THE WALL MOVES, AND THE SCREEN TITLE SAYS WHY. THIS IS THE REAL STATE.**
 
    **(d) APPLIED: THE PARKED-SLEEP STORY IS DROPPED AS A STANDALONE CLAIM.** Two boots minutes apart

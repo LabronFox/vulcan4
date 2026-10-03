@@ -935,6 +935,63 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 36 -- `func_1005870` IS A COMPARE. THE SPIN IS A WAIT-UNTIL-EQUAL LOOP. THE INSTRUMENT
+   IS IN, BUT IT DID NOT FIRE: THE SPIN WAS NOT REACHED IN EITHER GATED RUN.**
+
+   **THE WHOLE BODY, FROM THE GAME'S BYTES (`objdump -d SCUS_973.28`, 0x1005870-0x10058c0):**
+   ```
+   1005870: addiu sp,sp,-16
+   1005874: sd    s0,0(sp)
+   1005878: move  s0,a0
+   1005880: lw    v0,16(a1)      ; v0 = arg1->0x10
+   1005884: lw    v1,16(s0)      ; v1 = arg0->0x10      (s0 = a0)
+   1005888: bne   v1,v0,0x10058a8
+   100588c: sltu  a2,zero,v0     ; delay slot: a2 = (v0 != 0)
+   1005890: jal   0x10057f0      ; EQUAL -> ask func_10057F0
+   1005898: lw    a0,16(s0)
+   100589c: negu  v1,v0
+   10058a4: movn  v0,v1,a0
+   10058a8: li    v0,-1          ; UNEQUAL -> return -1
+   10058ac: movz  v0,a2,v1
+   10058b0: ld    s0,0(sp)
+   10058b8: jr    ra
+   10058bc: addiu sp,sp,16
+   ```
+   **READ AS AN ALGORITHM, IN PLAIN WORDS: `func_1005870` IS AN EQUALITY TEST BETWEEN TWO OBJECTS.** It
+   reads the word at **offset `+0x10`** of each of its two arguments. **If they are unequal it returns
+   `-1` at 0x10058a8 without doing anything else. If they are equal it calls `func_10057F0` and negates
+   the result.** It is not pure-and-stateless in the sense that matters -- it is a **predicate** with no
+   side effect on the objects, so **the caller's `bltz v0,0x10089c8` is a WAIT-UNTIL-EQUAL LOOP: it spins
+   until the `+0x10` field of the two objects matches.**
+
+   **THIS IS W120's MECHANISM, NOW IN ONE FUNCTION AND ONE FIELD.** W120 recorded that `func_10057F0`
+   returns `-1` from a delay slot when a left count is less than a right count. That is the *equal* branch
+   here. **The unequal branch -- plain `li v0,-1` -- is the one the spin is actually living in**, and it
+   says only one thing: **`arg0->0x10 != arg1->0x10`, and nothing in this function ever changes either.**
+
+   **SO THE REVIEWER'S BRANCH 2 IS THE ONE TO PREPARE FOR: IF THE TWO `+0x10` FIELDS NEVER CHANGE, THE LOOP
+   IS ASKING A QUESTION WHOSE ANSWER NEVER CHANGES, AND THE DEFECT IS UPSTREAM -- in whatever was supposed
+   to mutate `+0x10`.** `func_1005870` is not where the fix goes. **I HAVE NOT MEASURED THAT YET.**
+
+   **THE INSTRUMENT IS EMITTED BY THE TRANSLATOR AND GATED ON `VULCAN4_W136_ARGS`** (one probe at
+   `function.start == 0x01005870`), and it prints, for the first 50 calls and every millionth,
+   **`a0`, `a1`, `a0->0x10`, `a1->0x10`, whether they are EQUAL, and `ra`.** Free when off.
+
+   **AND IT DID NOT FIRE IN EITHER GATED RUN -- BECAUSE THE SPIN WAS NEVER REACHED:**
+   ```
+   boot_w136.log    w136 hits: 0   true_guest_entries=352245   halt=wallclock_deadline
+   boot_w136b.log   w136 hits: 0   true_guest_entries=73397    halt=pc_outside_generated_table
+   ```
+   **Two runs, two DIFFERENT halts, neither of them `livelocked_in_syscall`, and zero visits to the
+   compare.** This is the ITERATION 22 nondeterminism again and it is now the dominant obstacle: **the
+   spin is real but not every boot reaches it.** A gated boot that does reach it is needed before the
+   `+0x10` question can be answered, and I am not going to answer it from the disassembly alone -- I have
+   been wrong nine times by doing exactly that.
+
+   **PICTURE:** `docs/evidence/w136_game.png`, window id `0x987430`, 650x482, **396 distinct colours**.
+   Still the 2005 Sony disclaimer. **NO FIX LANDED THIS TURN** -- the algorithm is now read and the
+   instrument is in, but it has not produced a number yet.
+
    **ITERATION 35 -- THE SPLIT ANSWERED, AND IT OVERTURNS MY OWN CALL CHAIN. NINTH RETRACTION. THE REAL
    SPIN IS A `bltz` LOOP AT 0x10089DC IN `sub_010088E8`, CALLING `func_1005870`.**
 

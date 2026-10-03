@@ -935,6 +935,61 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 29 -- THE PROBE IS IN, AND THE OVERRUN THEORY IS DEAD. THE POINTER IS THE WHOLE WALL.**
+
+   **THE PROBE IS EMITTED BY THE TRANSLATOR, as required, behind an env knob.** It lives in
+   `ps2xRecomp/src/lib/control_flow_emitter.cpp` (emitted at the guest's `bnel`), with the two helpers
+   defined `inline` in **`ps2xRuntime/include/ps2_runtime_macros.h`** -- which is the header the
+   GENERATED unit includes, so the probe survives regeneration. **A probe pasted into
+   `ps2_recompiled_functions.cpp` would not have: that file is rebuilt from the guest every time.** The
+   helpers are in `ps2_runtime_macros.h` rather than the generator's own header precisely because the
+   generated unit does not include the generator's headers. Knob: **`VULCAN4_W129_COPY`**, read once into
+   a function-local static so it costs a load and a test when off. Regenerate with
+   `ps2_recomp /mnt/ssd/gt4/work/gt4_recomp.toml`, then relink with `tools/harness/build_harness.sh`.
+
+   **FOUR BUILD TRAPS HIT ON THE WAY, RECORDED SO NOBODY LOSES AN HOUR TO THEM:**
+   1. **`cmake --build --target ps2xRecomp` does NOT relink `ps2_recomp`.** The exe stayed dated Oct 1 and
+      the regenerated file came out byte-identical. The target name is **`ps2_recomp`**.
+   2. **The probe was emitted BEFORE `const bool branch_taken_...`,** so it referenced an undeclared name.
+      It must come after that declaration line.
+   3. **The C++ `if (m_branchInst.address == ...)` block needs its own closing brace** -- closing only the
+      EMITTED `if` is not enough, and the missing brace surfaced as `m_ss does not name a type` three
+      lines later, which is a misleading error far from the real mistake.
+   4. **Helpers in the generator's header are invisible to the generated unit.** They must live in a
+      header the generated code includes.
+
+   **THE THREE NUMBERS, MEASURED, GATED (`VULCAN4_W129_COPY=1`, 13 probe hits in the boot):**
+   ```
+   [w129:copy] n=1 at=bnel-exit taken=1 s1=0x01051a45 s2=0x01051a4b s3=0x00000007(7) t1=0x01051a46 t4=0x01051a3f len=0x00000006 dstlen=0xfffffff9
+   [w129:copy] n=6 at=bnel-exit taken=1 s1=0x01051a4a s2=0x01051a4b s3=0x00000007(7) t1=0x01051a4b t4=0x01051a3f len=0x00000001 dstlen=0xfffffff4
+   [w129:copy] n=7 at=bnel-exit taken=0 s1=0x01051a4b s2=0x01051a4b s3=0x00000007(7) t1=0x01051a4c t4=0x01051a3f len=0x00000000 dstlen=0xfffffff3
+   [w129:copy] n=8 at=bnel-exit taken=1 s1=0x01051a4a s2=0x01051a4c s3=0x00000003(3) t1=0x01051a50 t4=0x01051a3f len=0x00000002 dstlen=0xffffffef
+   ```
+   **1. `s3` IS A SANE BYTE COUNT AND IT DOES CHANGE: `7`, then `3` on the next call.** Tiny memcpy
+   lengths, entirely normal. **There is no runaway length.**
+   **2. THE EXIT FIRES, AND IT FIRES CORRECTLY: `taken=1` for passes 1-6, then `taken=0` on pass 7 when
+   `s1 == s2` (`len=0`).** `len` counts down 6,5,4,3,2,1,0 -- exactly one pass per byte. **The loop is
+   NOT stuck and it terminates precisely when the source is exhausted.** Combined with ITERATION 28's
+   proof that the `bnel` codegen is correct, **the copy loop is exonerated on both counts.**
+   **3. SOURCE AND DESTINATION ARE BOTH ORDINARY GUEST MEMORY: `s1=0x01051a45`, `s2=0x01051a4b`,
+   `t1=0x01051a46`** -- all in the 0x0105xxxx heap/data region the guest has already allocated. Nothing
+   here is wild.
+
+   **AND ONE GENUINELY NEW FACT THAT FALLS OUT, WORTH THE NEXT AGENT'S TIME:** **`t4` is CONSTANT at
+   `0x01051a3f` while `t1` climbs `0x01051a46 -> 0x01051a4c`, so `t4 - t1` is NEGATIVE (`0xfffffff9`
+   and falling).** `t4` sits BEHIND the destination cursor, so **`bne t1,t4` at 0x100f808 never matches
+   and the tail block at 0x100f810 -- the one containing the vtable read and `jalr v1` -- does not run for
+   these calls.** That is self-consistent for a 6-byte copy, but it means **the tail block only fires when
+   `t4` is set to a real end-of-destination**, and nothing has yet shown a case where it does.
+
+   **SO, PLAINLY, AS ASKED: `s3` IS SANE AND THE EXIT FIRES, THEREFORE THE OVERRUN THEORY IS DEAD, AND
+   THE POINTER IS THE WHOLE WALL.** The guest jumps through `*(u32*)(*(u32*)(s0+0x44) + 0x1C)`, that word
+   is garbage, and nothing else is left standing. **The next job is the OWNER OF THAT WORD: who is
+   supposed to write `*(u32*)(s0+0x44)`, and why is it not a pointer to a valid dispatch table.**
+
+   **PICTURE:** `docs/evidence/w129_game.png`, window id `0x964b74`, 650x482, **393 distinct colours**.
+   Still the 2005 Sony disclaimer.
+
    **ITERATION 28 -- OWNER IDENTIFIED, AND THE `bnel` HYPOTHESIS IS REFUTED BY MEASUREMENT.**
 
    **ITEM 1, THE OWNER (this unblocks every measurement blocked for three turns).** The generated

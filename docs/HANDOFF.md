@@ -935,6 +935,65 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 37 -- THE SPIN IS DROPPED (IT IS NOT REPRODUCING). THE BOOT IS NONDETERMINISTIC, AND THE
+   DERAILMENT HAS A VISIBLE UNINITIALISED-MEMORY SIGNATURE.**
+
+   **THE REVIEWER IS RIGHT AND I AM NOT CHASING THE SPIN ANY MORE.** Over the last thirty boots none
+   reports a `0x01005890` transfer count; the spin lived in `boot_desk122351.log` and is absent since.
+   **ITERATION 36's "wait-until-equal on `+0x10`" analysis is a correct reading of the code and a
+   description of a fault that no longer fires. It stays in the tree as knowledge, not as the wall.**
+
+   **1. THE FIRST DIVERGENCE, BY DIRECT DIFF OF TWO LOGS.** `boot_w136.log` (`wallclock_deadline`) and
+   `boot_w136b.log` (`pc_outside_generated_table`), same binary, same disc, same flags.
+   **THE LAST GUEST DISPATCH IS IDENTICAL IN BOTH:**
+   ```
+   [Dispatch] n=400 target_pc=0x100d308 entry_pc=0x100d308 source_pc=0x100d380 fallthrough_pc=0x100d388 kind=DirectCall
+   ```
+   **So the two runs agree all the way to `0x100d308` called from `0x100d380`, and diverge immediately
+   after it.** The pc_outside run then reports:
+   ```
+   missing-target] op=EE invocation service
+       pc=0xe9a2f5ef ra=0x10294b4 sp=0x1ffff60 gp=0xe9a2f5ef
+       a0=0xeffeffff a1=0xe9a2f5ef a2=0xea492700 a3=0xe9a2f5ef s0=0xa2f5efe
+   VULCAN4 WILDPC dead=0xe9a2f5ef last_good=0x0100f800
+   ```
+   **AND THAT IS THE WHOLE NONDETERMINISM IN ONE LINE: `gp`, `a1`, `a3` and `pc` ALL HOLD THE SAME VALUE
+   `0xe9a2f5ef`, with `s0 = 0xa2f5efe` (the same four bytes rotated) and `sp = 0x1ffff60` -- which is 160
+   bytes below the 32MB RDRAM ceiling.** Five registers poisoned with one repeating byte pattern, and a
+   stack sitting at the very top of RAM. **That is the signature of reading memory that was never
+   written, or of a wild pointer computed from it -- NOT of the compare loop.**
+
+   **2. WHICH HALT CLASS IS CLOSER TO THE MENU? `wallclock_deadline`, AND NOT CLOSELY -- IT IS A DIFFERENT
+   ORDER OF MAGNITUDE CLOSER:**
+   ```
+                          wallclock_deadline    pc_outside_generated_table
+   functions_entered            23007                       2135      (11x deeper)
+   true_guest_entries           352245                      73397     (5x)
+   frames_presented              6551                        328      (20x)
+   gs_packets                    2005                        395      (5x)
+   intr_run                     13235                         496      (27x)
+   missing-target hits               0                           1
+   ```
+   **The `wallclock_deadline` run reaches 11x more functions, presents 20x more frames, runs 27x more
+   interrupts, AND NEVER DERAILS AT ALL -- zero missing-targets.** It is still on the disclaimer at the end
+   of its budget, but the guest is intact and still executing. **The `pc_outside` class has lost the plot
+   2135 functions in, with every register full of `0xe9a2f5ef`.**
+
+   **3. SO THE WALL TO BREAK IS THE DERAILMENT, AND THE PRIORITY ORDER IS NOW ESTABLISHED:**
+   - **The `pc_outside_generated_table` derailment is the bug.** It is the only place a register ever
+     becomes `0xe9a2f5ef`, it happens at a reproducible guest pc (`last_good=0x0100f800`), and it is what
+     truncates a boot 11x early. **Every boot that survives it goes much deeper.**
+   - **The remaining distance to the menu is then a SPEED question on the healthy path**, not a
+     correctness question -- because the healthy path never faults, it simply runs out of budget while
+     still on the disclaimer. **AND NOTE WHAT THIS INVALIDATES: ITERATION 24's 900-second long boot
+     reported `halt=pc_outside_generated_table`, i.e. it hit the BROKEN class, so its "the guest dies in
+     six seconds, more wall clock will not help" conclusion WAS MEASURED ON A DERAILED BOOT AND DOES NOT
+     HOLD FOR THE HEALTHY PATH.** That test should be redone, but only counting a boot that ends in
+     `wallclock_deadline`.
+
+   **PICTURE:** `docs/evidence/w137_game.png`, window id `0x98777a`, 650x482, **394 distinct colours**.
+   **STILL THE 2005 SONY DISCLAIMER. No recent run shows more than the disclaimer.**
+
    **ITERATION 36 -- `func_1005870` IS A COMPARE. THE SPIN IS A WAIT-UNTIL-EQUAL LOOP. THE INSTRUMENT
    IS IN, BUT IT DID NOT FIRE: THE SPIN WAS NOT REACHED IN EITHER GATED RUN.**
 

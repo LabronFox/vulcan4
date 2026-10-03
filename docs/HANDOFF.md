@@ -95,27 +95,30 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
 
 ## THE THREE OPEN WIRES
 
-1. **The spin at `func_1005870` — found, not finished.**
-   `sub_010088E8` (the enclosing function) is:
+1. **The spin — SOLVED DOWN TO ONE 32-BIT COMPARISON (W120). Start here.**
+   `sub_010088E8` is ONE generated function, so its `0x10089dc: bltz $v0` back-edge is an internal
+   `goto` and can **never** appear as a dispatch `targetPc` — which is why a probe keyed on
+   `targetPc == 0x10089dc` never fired. That was structural blindness, not evidence.
+   The loop is `jal func_1007738` (queue walk) then `jal func_1005870` then `bltz $v0` back.
+   `func_10057F0` is **not a fetch — it is a three-way compare returning -1/0/+1**:
    ```
-   0x10089c8: jal func_1007738        ; $s1 += 1
-   0x10089d0: daddu $a0, $sp, $zero
-   0x10089d4: jal func_1005870
-   0x10089dc: bltz $v0, -0x6<<2        ; loop back to 0x10089c8
+   0x10057f0: lw    $a2, 0x8($a0)      ; leftCount  = *(a0+0x08)
+   0x10057f4: lw    $a3, 0x8($a1)      ; rightCount = *(a1+0x08)
+   0x10057f8: sltu  $v1, $a2, $a3
+   0x10057fc: bnez  $v1, -> 0x1005868  ; if left < right, EXIT
+   0x1005800: addiu $v0, $zero, -1     ; DELAY SLOT, runs unconditionally
+   0x100583c: lw    $v1, 0x0($v0)      ; only now are elements compared
    ```
-   and `func_1005870` gates its inner call on two words being EQUAL:
-   ```
-   0x1005880: lw $v0, 0x10($a1)       ; $a1 = $s2 from the caller
-   0x1005884: lw $v1, 0x10($s0)       ; $s0 = $sp
-   0x1005888: bne $v1, $v0, -> 0x10058a8
-   0x1005890: jal func_10057F0       ; the 33.32% site
-   ```
-   Measured: both `*(+0x10)` are **0 and stay 0**, so the equality is permanently true. It is a
-   *wait for a producer to advance a word that never advances.*
-   **The unexplained part:** the guest **never arrives at 0x10089dc** in any probe I installed (dispatcher
-   hook on `targetPc == 0x10089dc`, and a branch-observer hook on the return edge) — zero hits — even
-   though `0x10089d4` is 33.32% of all transfers. `UNVERIFIED` why. Either the return is delivered by a
-   path no observer sees, or the loop body is not the one I think. **Start here, not from scratch.**
+   **It returns -1 the instant `*(a0+8) < *(a1+8)`, out of the delay slot, without comparing anything.**
+   Measured solid: `v0=0xffffffff` at `resumePc=0x1005898` (`w120i.log`, `w120q2.log`). The caller's
+   `movn $v0,$v1,$a0` only overwrites `$v0` when `*(s0+0x10)` is non-zero; that word measures 0, so
+   `$v0` stays -1 and `bltz` loops.
+   **So the livelock reduces to one 32-bit comparison of two counts.** Run until the corrected
+   `[w120:cmp]` probe fires in a livelock run (it samples BEFORE the call) and read `leftCount` /
+   `rightCount`. **UNVERIFIED:** that probe has not yet fired — three runs came back non-spin
+   (XFER 153,682 / 128,817 / 37,370). Do not assume `left < right` until it prints.
+   Note guest `0x1fffbc0` (`$sp`+0x10) is **never written** (store-observer silence, verified against a
+   positive control on `0x1895304`) — but that may be the SAME fact as the spin, not a second one.
 
 2. **Memory card / `mcRoot` / `sceMcUdCheckNewCard`.** Stubbed at `/mnt/ssd/gt4/work/gt4.toml` **line 180**:
    `"sceMcUdCheckNewCard@0x01017868"`. Runs during boot (earlier logs show `[MC] Open ... core.gt4 ...
@@ -193,3 +196,56 @@ binary produces an 1800x spread and I lost whole dishes to that.
 Standing rules, unchanged: numbers from runs only; a commit is not proof; the untouched original is the
 default state and everything we add ships OFF by default; suite stays 493/493; author `Or Golan`; do not
 push.
+
+
+---
+
+## W120 STATE (added at the session halt, 2026-10-03)
+
+**No rung reached.** `halt=livelocked_in_syscall` in the pathological shape, `true_guest_exits=0`,
+window still the 2005 Sony disclaimer. Suite 493/493. Outer `main` and nested `main` both clean.
+Full detail in `docs/W120-RESULTS.md`.
+
+**The number that matters: the boot is nondeterministic.** Same binary, same budget 300000/60, three
+runs: `true_guest_entries` **83,905 / 1,117,046 / 238,826,320** — a **2,846x spread on identical input**.
+Two modes: Mode A livelocks (three addresses at exactly 33.32% each of ~297M transfers); Mode B is the
+captain's shape and walks the disclaimer. Any single-run speed claim is meaningless.
+
+**Where the 90 s goes** (`[w120:split]`, timing `targetFn()` — the guest's own code — separately from
+our runtime): `guestEntries=461,000,000 guestBodyMs=52,547 pctOf90sBudget=58%`. **58% is the guest
+executing instructions, 42% is our runtime.** We are not overheaded enough to explain the crawl alone.
+
+**Three suspects measured and exonerated — do not re-chase:**
+| suspect | measurement | verdict |
+|---|---|---|
+| syscall dispatch | `[w120:dispatch] avgUs=6 maxUs=13`, 100,000 calls / 90 s | **<1%** of budget |
+| branch-edge bookkeeping | `[w120:edge] avgNsPerCall=45` | **0.09%** of budget |
+| disc reads | `[w120:cd]` census **never fired** | `sceCdRead` not called 500x; **not** the gate |
+
+**Landed:** `m_branchEdgeIndex` — the dispatch path did a **linear scan of ~400 edges** plus unbounded
+`push_back` on **every guest function entry**; now one hash probe, same reported data. Correct but
+**MINOR** (0.09%), and no speedup is claimed from it. Hot-path timers are now **OFF by default** behind
+`VULCAN4_W120_TIMING=1`, because two `steady_clock` reads per guest call cost about as much as the 45 ns
+they were measuring.
+
+**Probes added (read-only, bounded):** syscall leaderboard, unrouted-syscall census, `sceCdRead` census,
+`func_1007738` queue probe, `func_10057F0` compare + return-value probes, guest-vs-runtime split, edge
+timing.
+
+**The retraction to carry forward:** the first `[w120:cmp]` probe ran AFTER `targetFn()` and read
+return-state registers, not arguments — it printed `a0=0x1 a1=0x0` and counts of `3735928559`, which is
+`0xDEADBEEF`, its own unreadable-address sentinel. Meaningless, withdrawn, now sampling before the call.
+**That is the sixth time this project a probe reported a confident result it was not positioned to see**
+(stride-16 sampler, block-as-word-index, too-small window, too-early sample, wrong CLUT address, and this).
+The standing lesson, and the reason several of my walls were misdiagnosed for days: **run a positive
+control before believing any "no output" result.** The `0x1fffbc0` zero is trustworthy only because a
+control fired on another address.
+
+**First three things to do next, revised:**
+1. Run until `[w120:cmp]` fires in a livelock run; read `leftCount` vs `rightCount`. If `left < right`,
+   the spin is confirmed and the question becomes "which side is short, and who should extend it" — a
+   data-flow question about two guest-owned structures, not a runtime search.
+2. Then, and only then, re-measure with **at least 5 runs per configuration**. At a 2,846x spread, one
+   before/after pair proves nothing — that is how I nearly reverted a correct fix in W112.
+3. Keep R3's real acceptance in view: `halt` not `livelocked_in_syscall`, `true_guest_exits > 0`, and a
+   window capture showing something past the disclaimer. The PNG is the product.

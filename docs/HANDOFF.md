@@ -935,6 +935,50 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 50 -- THE BYTE-STORE PREDICTION IS REFUTED. ALL FOUR BYTES DIFFER. `ra` WAS REPLACED
+   WHOLESALE, AND BOTH CANDIDATE STORES ARE INNOCENT.**
+
+   **THE MEASUREMENT THE REVIEWER ASKED FOR, DONE FIRST:**
+   ```
+   corrupted ra = 0x0000dfb0    correct ra = 0x01010a70
+     byte0: corrupted=0xb0  correct=0x70  DIFFER
+     byte1: corrupted=0xdf  correct=0x0a  DIFFER
+     byte2: corrupted=0x00  correct=0x01  DIFFER
+     byte3: corrupted=0x00  correct=0x01  DIFFER
+   BYTES DIFFERING: 4  ->  byte-store theory REFUTED
+   ```
+   **A BYTE STORE CAN ONLY CHANGE ONE BYTE. FOUR DIFFER, SO NEITHER `0x100f500 sb s3,0(v0)` NOR
+   `0x100f78c sb v1,0(a1)` CLOBBERED THE RETURN ADDRESS.** The candidate set from ITERATION 49 is empty,
+   and I am not going to go back to enumerating stores inside `sub_0100F390` because its own store list is
+   now provably not the answer.
+
+   **AND THE PROLOGUE AND EPILOGUE ARE BOTH CORRECT AND SYMMETRIC, WHICH LOCALISES THE WRITE OUTSIDE THIS
+   FUNCTION.** The game's epilogue, from the same objdump:
+   ```
+   100f8b8: ld    ra,88(sp)
+   100f8bc: jr    ra
+   100f8c0: addiu sp,sp,96        <-- the 96-byte frame is given back correctly
+   ```
+   So the prologue writes `ra` at `sp+88` (`100f3c4: sd ra,88(sp)`), the epilogue reads it from `sp+88`, and
+   the frame size round-trips. **A wholesale 32-bit replacement of that slot therefore has to come from
+   OUTSIDE `sub_0100F390`'s own instruction list -- from a nested callee writing through a pointer into this
+   frame, or from a different function entirely.**
+
+   **AND THE ITERATION 44 "INSTRUCTION WORDS" OBSERVATION IS NOW EXPLAINED, AND IT EXPLAINS BOTH SIDES OF
+   THE REVIEWER'S ARGUMENT.** The corrupted `ra=0x0000dfb0` is four bytes wrong, so it is NOT a near-miss
+   code pointer and the "one corrupted byte lands near valid code" reasoning does not apply to it. But
+   `0x0000dfb0` is still only 57264, and the guest image starts at `0x01000000` -- **so the wild address is a
+   SMALL NUMBER, not a large garbage one.** Every derailment address measured tonight has the same shape:
+   `0x0000dfb0`, `0x00012403`, `0x120004ff`, `0xe9a2f5ef`, `0x88468107`. **Two of the five are small and
+   inside RDRAM; three are enormous and outside all memory.** A single mechanism producing both is a value
+   that is sometimes truncated to 32 bits and sometimes not -- which is what a bad POINTER DERIVATION looks
+   like, not a bad pointer VALUE.
+
+   **SO THE QUESTION MOVES ONE LEVEL UP, AND IT IS NO LONGER ABOUT STORES AT ALL: who writes a 32-bit word
+   into this frame's `sp+88`, given that this function's own store list cannot?** The next measurement is a
+   writer-watch on the single word at `sp + 88` for the duration of one `sub_0100F390` call, printing the
+   writer pc for every write. **I have not taken it and I am not naming the writer.**
+
    **ITERATION 49 -- THE STATIC STORE LIST. NO PROBE NEEDED. EXACTLY FIVE INSTRUCTIONS IN
    `sub_0100F390` CAN WRITE TO AN ARBITRARY ADDRESS, AND THEY ARE ALL BYTE STORES.**
 

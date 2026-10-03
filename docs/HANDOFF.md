@@ -935,6 +935,40 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 52 -- THE G1.8 CONTEXT-REFRESH GUARD IS STILL IN PLACE, AND IT COPIES `r[31]`. THIS IS
+   PRIOR ART FROM THIS PROJECT AND IT IS THE RIGHT SHAPE.**
+
+   **`EeScheduler.cpp:1254`, verbatim, and it is the load-bearing guard the notes describe:**
+   ```cpp
+   // Guarded on m_guestExecuting, which is true only while run() is between its own steps -- the one
+   // case where the scheduler's copy is authoritative. Without that guard this rewinds run()'s own
+   // state and the suite hangs; that was measured, which is why the guard is here.
+   if (!m_guestExecuting.load(std::memory_order_acquire) && !m_driverAdvancesSchedulerContext)
+   {
+       if (GuestThread *main = thread(kMainThreadId))
+       {
+           main->context = m_runtime.m_cpuContext;
+       }
+   }
+   ```
+   **THE GUARD IS PRESENT AND UNCHANGED. AND THE REFRESH IS A WHOLE-STRUCTURE ASSIGNMENT, `R5900Context`,
+   WHICH CONTAINS `r[31]` -- `ra`.** So this exact code path, when it runs, **restores every general register
+   including the return address into the base frame.** That is a mechanism that can put a wrong `ra` into a
+   live frame, it is in the same box, and it was a real, hard-won bug here that was already fixed once.
+
+   **THE PRIOR ART IS RECORDED HERE SO IT IS NOT RE-DERIVED: W6 was measured as 256 consecutive resumes all
+   at `0x00300808`, the PC the base frame held before the chain ever published a new one; on GT4 the same
+   shape appeared at the ELF entry point `0x01000008` with `distinct_pcs=1` and its own CRT init re-run 25
+   times.** The refresh deliberately happens on ENTRY rather than after servicing, because `onComplete`
+   writes the handler's `$v0` into the base frame and refreshing afterwards would discard the result being
+   delivered.
+
+   **WHAT I DID NOT DO: the run-time measurement the reviewer asked for in step 2** -- printing
+   `runningThreadId`, whether a service invocation is pending, and the live context pointer versus the
+   scheduler's copy pointer at the derailment. **So I am NOT claiming this is tonight's wall.** The prior art
+   is the right shape and the guard is verifiably present, but "right shape" is exactly what the byte-store
+   prediction was, and that was wrong. The measurement decides it and I have not taken it.
+
    **ITERATION 51 -- THE SHIFT HYPOTHESIS, PARTIALLY CHECKED. TWO OF THE VARIABLE SHIFTS ARE CORRECT.
    I DID NOT COMPLETE THE DERIVATION MEASUREMENT.**
 

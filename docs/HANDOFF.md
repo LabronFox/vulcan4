@@ -935,6 +935,50 @@ All at budget **300000/60**, guest `SCUS_973.28`, config `/mnt/ssd/gt4/work/gt4.
    it rather than leave a red tree. **The lesson is in the tree now: drive the scheduler only through
    the pattern the passing tests already use (`ee.run()`), not by calling `sleepCurrent()` from a test.**
 
+   **ITERATION 27 -- THE COPY LOOP IS BOUNDED BY `s3`, NOT BY `t1`/`t4`. THE REVIEWER'S QUESTION IS
+   ANSWERED: IT IS "BOUNDED BY SOMETHING ELSE ENTIRELY".**
+
+   **THE FULL LOOP, FROM THE GAME'S OWN BYTES** (`objdump -d SCUS_973.28`, 0x100f740-0x100f890):
+   ```
+   100f7f8:  addu  s2,s1,s3          ; s2 = SOURCE END -- computed ONCE, before the loop
+   100f7fc:  lbu   v0,0(s1)
+   100f800:  sb    v0,0(t1)          ; LOOP HEAD (this is what the `bnel` below targets)
+   100f804:  addiu t1,t1,1
+   100f808:  bne   t1,t4,0x100f864   ; dst bound: picks the TAIL WORK, does NOT exit the loop
+   100f80c:  addiu s1,s1,1           ; delay slot, unconditional
+   ...  (tail work: the vtable read and jalr v1 at 0x100f83c)
+   100f864:  bnel  s1,s2,0x100f800   ; <-- THE REAL EXIT CONDITION: src != src_end
+   100f868:  lbu   v0,0(s1)          ; delay slot of a LIKELY branch
+   100f86c:  b     0x100f418         ; exit
+   ```
+   **`t1` and `t4` DO NOT EXIT THE LOOP.** `bne t1,t4` only decides whether to run the tail block; the
+   loop itself runs while `s1 != s2`. And `s2 = s1 + s3`, so **the iteration count is `s3`, the byte
+   count.** So the answer to "does t1 climb past t4 and the bne still fire?" is: it does not matter,
+   because that branch is not the loop bound. **The defect, if there is one, is `s3` being huge or
+   garbage -- and an overrunning copy is a direct explanation for the garbage function pointer at
+   `*(u32*)(s0+0x44)+0x1C`, because it would clobber the structure holding it. Cause before symptom, and
+   the cause is `s3`.**
+
+   **MY RUNTIME PROBE NEVER FIRED, AND THAT IS ITSELF A FINDING.** I armed a probe keyed on
+   `targetPc == 0x0100F800` in `dispatchGuestBranch`, printing s1/s2/s3/t1/t4. **Zero hits across a full
+   boot** (`grep -c w127:copyloop` = 0), same binary. **So the copy loop does NOT run through the
+   per-entry dispatcher at all -- it runs INSIDE a single recompiled function body.** The repeated
+   `trace=0x100f800 -> 0x100f800 -> ...` from ITERATION 26 is therefore an edge/trace counter, NOT
+   evidence of re-entry. **Consequence for the next agent: to see the bounds you must instrument the
+   GENERATED function that contains 0x100f800, or find which recompiled function owns that address --
+   probing the dispatcher will silently show you nothing, which is exactly what happened to me.**
+
+   **ONE MORE THING TO CHECK, FLAGGED NOT CLAIMED:** the exit is `bnel`, the MIPS *branch-likely* form.
+   Its delay slot at 0x100f868 (`lbu v0,0(s1)`) must NOT execute when the branch is not taken. **If our
+   generated code executes a not-taken likely-branch's delay slot, that is a real defect** -- and it is
+   the kind of thing that has already bitten this project. **I have NOT verified our generated code for
+   that block and I am not claiming it is wrong.** Item 2 said "check our generated code for that block
+   against the game's own bytes"; the probe result means the block is inside generated code, so that
+   comparison is now the right next move and has not been done.
+
+   **PICTURE:** `docs/evidence/w127_game.png`, window id `0x95bb0c`, 650x482, **398 distinct colours**.
+   Still the 2005 Sony disclaimer.
+
    **ITERATION 26 -- `0x0100f800` DISASSEMBLED. IT IS A BYTE-COPY LOOP, AND THE DERAILMENT IS AN
    INDIRECT CALL THROUGH A POINTER IT READS RIGHT AFTER.**
 

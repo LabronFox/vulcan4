@@ -3019,3 +3019,23 @@ NEXT:    get a full run (shape A/good) with `VULCAN4_W186_SCREEN` and read the f
          dispatcher is indirect, so also watch the function-pointer table it calls. Graphic unchanged;
          goal gate failed.
 
+---
+
+## 2026-10-04 20:3x · CAMPAIGN re-arm (dishes 11/12) · dominant wall = the EARLY BARRIER
+
+WALL:    the early VSync-handler barrier at `0x100D908`. Current dominance: 4/4 boots this session
+         ended `halt=livelocked_in_syscall`, `functions_entered~2000`, top XFER `0x0100d908`. The good
+         shape (`FE=37898`, top `0x0100afa0`) is rare, so the later screen/state wall is often not even
+         reached.
+DID:     Wrote `.auto/queue/11-screen-dispatcher.txt` and `.auto/queue/12-barrier-invocation.txt`.
+         Worked dish 12's first measurement: ran with `VULCAN4_W160_BARRIER` + `VULCAN4_W173_SWITCH`.
+MEASURED:at halt — `tid2@prio2` **RUNNING at pc=`0x010202E8`** (the barrier's callee), `tid1@prio3`
+         READY at `0x0100f800` (never running at the end); `[w160:bar] s0=0x1045970 next=0x0 tid=0x2`
+         (a one-node list that terminates) but the handler is re-entered; switch histogram 154/146 (both
+         threads DO switch during the run). So the barrier is the handler re-entry / tid2 spin, with
+         tid1 ready. Suite 497/497. Gate v3 FAILS (byte-identical disclaimer).
+NEXT:    dish `12-barrier-invocation.txt`: instrument `EeScheduler::dispatchIrq`/`serviceInvocations` in
+         a barrier-shape run -- is the handler invocation re-queued every VSync (re-entered) or
+         resumed, and is tid1 runnable-but-unscheduled? Name which. Then dish `11-screen-dispatcher`
+         once the guest reliably gets past the barrier. Graphic unchanged; goal gate failed.
+

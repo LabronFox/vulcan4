@@ -2809,3 +2809,20 @@ NEXT:    the node-identity mismatch: which of the 0x50-stride pair `sub_01008080
          `arg2` (`0x18953c0`) is the untouched sibling. Dish `05-trace-parse-node.txt`. Graphic
          unchanged; goal gate failed.
 
+---
+
+## 2026-10-04 18:3x · dish 05 (W177/W178) · stuck
+
+WALL:    the decode work buffer. The guest never leaves the 2005 disclaimer.
+DID:     Watched the copy loop's byte stores (`VULCAN4_W178_COPY`, OFF by default) and the clone slots.
+MEASURED:`sub_0100F390`'s `sb` writes the file's bytes to string/data buffers in `0x1050000-0x105BFFF`
+         (first: `0x1051a40` = `"Tex1…"`), and **0 writes into the decode node region `0x1895xxx`**.
+         The clone (`0x1008264`) writes `dst=0x1895370` = the decoder's `arg1` buffer. So the parsed
+         bytes exist at `0x105xxxx` and the decoder's `arg2` node (`0x1895390`, data `0x18953c0`) has
+         **no producer** — the drop is a node-data-pointer selection, not a missing copy loop.
+         Suite 497/497. Gate v3 FAILS (byte-identical disclaimer).
+NEXT:    decide whether `arg2`'s `+0x14` should reference a parsed `0x105xxxx` buffer (find what writes
+         it) or the compare meaning is inverted. Next measurement: dump the `arg2` node's producer
+         chain at `0x1895390`, comparing its `+0x14` with the parsed buffers. Graphic unchanged; goal
+         gate failed.
+

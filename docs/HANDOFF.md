@@ -3074,3 +3074,32 @@ NEXT:    find the ACTUAL disclaimer driver: in a good-shape run, watch which fun
          near frame 0 and which state word the running code branches on (no static pointer table
          exists). Also still open: the early barrier (dish 12) and whether GT4.VOL data is needed.
 
+
+---
+
+## 2026-10-04 20:3x · dish 11 re-run (W188) · P2 MET (mechanism named) · gate failed
+
+WALL:    GT4's screen advance past the 2005 disclaimer. Dish 11 asked for the screen dispatcher.
+DID:     Found that the "dispatcher" is a THREAD CREATION, not a pointer table, and traced the
+         advance flag to a screen-setup function that never completes. Added `VULCAN4_W188_DISP`
+         (runtime + harness, OFF by default). Corrected W187.
+MEASURED:(1) STATIC: `sub_01000940` builds an `ee_thread_t` with `.func = 0x1000BA0` (lui $v1,0x100;
+         addiu $v1,$v1,2976 @0x10009E4; `sw` @0x10009EC) and calls `sce_CreateThread` (syscall 0x20 @
+         0x101F220). `sub_01000940` is called by `sub_01000558` @0x100057C; main calls `0x1000558`
+         @0x1000210. (2) DYNAMIC: `VULCAN4 THREADS` shows `id=2 entry=0x1000ba0 prio=2`, and the syscall
+         census `sce_CreateThread calls=1`. So 0x1000BA0 is a THREAD ENTRY, reached via the function
+         table's resume slots (0x1000BE0/0x1000CFC), never via dispatchGuestBranch -- which is why
+         W187's targetPc probe read 0. **W187 "0x1000BA0 never runs" RETRACTED.** (3) `[w188:setup]`,
+         4 runs incl. good shape (FE=23776): sub_01000558's calls stop at n=8
+         `0x10005D4 -> 0x10047C0`; the chain continues `0x10047C0 -> 0x1004500 -> 0x1004308 ->
+         0x1000FD8` ([MEMSET] 6,119,116 B @0x12BF100) `-> 0x1010B10 -> 0x100ED78 -> 0x100F8C8`
+         (which calls 0x100F390, the CORE.GT4 parse). `[w188:fn]`: `0x1000DC0/0x1000E00/0x1000E30`
+         entered **0 times** in a full 60 s run; `[0x1047A84]=0` at every screen event. Main thread
+         tid1 at halt: `pc=0x100F800 ra=0x1010A70 sp=0x1FFC760` (inside sub_0100F390, called from
+         0x1010A68 in the 0x100F8C8 fn). Suite 497/497. Gate v3 FAILS (stale capture; FE<20000).
+NEXT:    the wall is a NAMED block inside the screen setup: the parse chain 0x1004308 -> 0x100F8C8 ->
+         0x100F390 does not return, so 0x1000E00 never runs and 0x1047A84 is never set. Next dish:
+         instrument 0x100F8C8/0x100F390 on the MAIN thread and name why the 6.1 MB parse does not
+         terminate (spin / blocked file read / bound never reached). This re-opens the parse as the
+         wall, now with a concrete consumer: the disclaimer cannot advance until it returns. The early
+         barrier (dish 12) and GT4.VOL data remain open. Graphic unchanged; goal gate failed.

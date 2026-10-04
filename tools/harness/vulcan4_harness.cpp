@@ -2289,6 +2289,25 @@ int main(int argc, char *argv[])
         ++pcEntryCounts[ctx.pc];
         entryCallers[ctx.pc].insert(getRegU32(&ctx, 31));
 
+        // W188 (Sanji). HOW IS 0x1000BA0 ENTERED? The runtime dispatch probe never sees a
+        // targetPc==0x1000BA0, yet its fade-loop call site 0x1000CEC runs -- so it arrives through
+        // THIS loop, not through dispatchGuestBranch. Log the first entries into the function range
+        // with the predecessor PC, so the mechanism is a measurement, not a theory. OFF unless
+        // VULCAN4_W188_DISP.
+        {
+            static const bool s_w188hOn = (std::getenv("VULCAN4_W188_DISP") != nullptr);
+            static int s_w188hN = 0;
+            if (s_w188hOn && s_w188hN < 40 && ctx.pc >= 0x1000ba0u && ctx.pc < 0x1000db0u)
+            {
+                ++s_w188hN;
+                std::cout << "VULCAN4 W188 ENTER pc=" << toHex(ctx.pc)
+                          << " ra=" << toHex(getRegU32(&ctx, 31))
+                          << " sp=" << toHex(getRegU32(&ctx, 29))
+                          << " prev=" << (lastResolvedPcValid ? toHex(lastResolvedPc) : std::string("NONE"))
+                          << std::endl;
+            }
+        }
+
         // W43. Interrupt counters at the halt. "The delivery path works" and "the guest takes
         // interrupts" are different claims; only the second matters to the boot, so both are printed.
         if (traceAll || (traceFirst && (functionsEntered <= traceFirst || functionsEntered % 100000 == 0)))

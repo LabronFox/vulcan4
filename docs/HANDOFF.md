@@ -2929,3 +2929,22 @@ MEASURED:`0x7000206d` (the poll byte) **toggles**: `val=1 @0x100DEBC` (set by th
 NEXT:    wall is the game's own screen/state step (no runtime defect). Dish
          `10-game-state-from-disclaimer.txt`. Graphic unchanged; goal gate failed.
 
+---
+
+## 2026-10-04 19:4x · dish 07 re-run (W184) · runtime fully exonerated
+
+WALL:    the guest never leaves the 2005 disclaimer; the wall is GT4's own screen/state machine.
+DID:     Traced the frame loop up from `sub_0100AE78` to name the top-level game code.
+MEASURED:the good-shape render layer `sub_0100B108` (callers `0x1009CA8/0x100A534/0x100B6C`) and the
+         per-frame render function at `0x1000A48` (sets the 640x448 display, GS setup, draws, zeroes
+         `0x1047A84`/`0x1047A88`) are all the GAME's own code. Combined with W180 (decode = shape-A
+         artefact), W181b (RTOS poll byte toggles 0->1->0 each frame -- the wait works), W182 (the loop
+         is the game's vsync DMA/GS kick), and W183 (the milestone-2 marker already fires), **no
+         low-level runtime defect is named by any measurement in W171-W184**. Suite 497/497. Gate v3
+         FAILS (byte-identical disclaimer).
+NEXT:    GT4's own screen/state step from the disclaimer. Dish `10-game-state-from-disclaimer.txt`:
+         find the game's "current screen" word and the branch that advances it, watch it, and name what
+         should change it (a timer/resource/input). This is a game-logic effort, not a runtime bug.
+         The campaign's milestone-2 marker is met (W183); the captain's stricter bar (menu) is the
+         remaining distance.
+

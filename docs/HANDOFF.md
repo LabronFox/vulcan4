@@ -3486,3 +3486,21 @@ MEASURED:`w234d` (halt=livelocked_in_syscall, FE~6.5k): c5870=49,973,317 bnePred
          the paths. Also fixed my own backwards element comparison (recorded). Suite 497/497. Gate FAILS.
 NEXT:    find what writes the two +0x14 element arrays (e0lo/e1lo, 0x1895360/0x1895310, moving between
          runs) and why they never become equal; a store watch on the array bases names the producer.
+
+---
+
+## 2026-10-05 0x:xx · dish 18 (W218b) · the spin's compare producer NAMED · gate failed
+
+WALL:    the shape-A decode spin sub_010088E8 never exits (func_10057F0 returns -1).
+DID:     Extended the W218 counters to dump the element words, and read the producer from the W217
+         store watch.
+MEASURED:`w235e` (halt=livelocked_in_syscall): func_10057F0 compares e0[0]=0x0 vs e1[0]=0x1 (c0=c1=1)
+         -> returns -1 (0x0<0x1) for ~50M calls; the `+0x14` fields point into SORTED LINKED LISTS built
+         by the parse's insert sub_010121F8 (0x10121F8): `lw v1,4(a0)` (node sortkey), compare, `sw`
+         links (0x1012204/0x1012210/0x1012218). The W217 watch saw exactly those writers:
+         [0x1895204]=0x1895230 @0x1012218, =0x1FF8000 @0x1012214, [0x1FFFBB4] @0x101150C. So the producer
+         is the parse's sorted-list insert; it builds two different-keyed lists and func_10057F0 compares
+         keys from two lists never meant to be equal. Suite 497/497. Gate v3 FAILS.
+NEXT:    func_10057F0 is used as an equality/ordering test between two different lists; the merge's
+         input (func_1007738's stream at 0x1FFFBA0, bound +8=1) is the next measurement -- what should
+         advance it (the same 0x1fffba0 wire W122 chased).

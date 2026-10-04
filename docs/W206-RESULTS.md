@@ -120,3 +120,44 @@ still a real defect (the pool's first stack sits in the main frame) and a candid
 `sub_01000558` reaches the`0x10005D4 → 0x10047C0` call, whose tree completes, but the statement after
 it (`0x1000608`, which leads to `0x1000E00` and sets the disclaimer flag) is **never reached**; the top
 wait `0x100AFA0` is a **yielding SleepThread (336–680 cycles/visit)**, not a starve source.
+
+---
+
+## W215 — the decode spin measured: 3-site loop, `+0x10` fields equal, `func_10057F0` returning the spin
+
+`VULCAN4_W215_SPIN` logs the three spin sites (`0x1005890 → func_10057F0`, `0x10089C8 → func_1007738`,
+`0x10089D4 → func_1005870`) with their arguments and the eeCycle. Shape `w224b` (`FE=4959`,
+`halt=livelocked_in_syscall`) has the spin (`0x1005890=0x10089d4=0x10089c8 = 33.31% each` of ~117M
+transfers).
+
+```
+[w215:spin] n=1  eeCycle=211632465 from=0x10089d4 target=0x1005870 a0=0x1fffba0 [a0+10]=0x0 a1=0x18952e0 [a1+10]=0x0 equal=1 ra=0x10089dc
+[w215:spin] n=2  eeCycle=211632465 from=0x1005890 target=0x10057f0 a0=0x1fffba0 [a0+10]=0x0 a1=0x18952e0 [a1+10]=0x0 equal=1 ra=0x1005898
+[w215:spin] n=3  eeCycle=211632465 from=0x10089c8 target=0x1007738 a0=0x1fffba0 [a0+10]=0x0 a1=0x0      [a1+10]=0x0 equal=1 ra=0x10089d0
+...
+[w215:spin] n=115000000 eeCycle=2360018086 from=0x10089d4 target=0x1005870 a0=0x1fffba0 [a0+10]=0x0 a1=0x18952e0 [a1+10]=0x0 equal=1
+```
+
+- **The loop is a tight 3-call cycle** — `0x10089D4 → func_1005870`, `0x1005890 → func_10057F0`,
+  `0x10089C8 → func_1007738` — and it runs **~117 million times** in the run.
+- **The compared fields are `0` on both sides** (`[a0+0x10]=0x0`, `[a1+0x10]=0x0`, `equal=1`) in the
+  sampled window. `func_1005870` returns the **equal** branch (`jal func_10057F0`), and `func_10057F0`
+  compares the two `+0x8` counts; the caller loops while `$v0 < 0`. So the exported party is a **count at
+  `+0x8`** (`func_10057F0`) whose left side never reaches the right side.
+- **It yields, but only slowly:** the eeCycle sampled at the logged entries climbs from **211,632,465 to
+  2,366,018,086** across the run (≈11×), i.e. the scheduler does advance time between checkpoints. The
+  `n=1..27` samples share `eeCycle=211632465` (the checkpoint resets between yields), which is why the
+  loop dominates XFER — each yield runs millions of the loop's iterations.
+
+**Positive control:** the census sees a known-hot site (`0x1005890` = 33.31%, matching the XFER
+histogram) and the syscall-free `0x100AFA0` wait (0.02%), so the ranking is trustworthy.
+
+## The wall, in one line
+The shape-A livelock is the 3-call decode cycle at `sub_010088E8` (`0x1005890`/`0x10089C8`/`0x10089D4`),
+117M iterations/run, comparing the `+0x10` fields (both 0) and the `+0x8` counts of two structures; it
+yields only every ~millions of iterations, so it consumes the budget before tid1's `sub_01000558` can
+finish — `0x10005DC` is never reached.
+
+## NEXT
+Find what writes the `+0x8` count `func_10057F0` compares and the `+0x10` fields `func_1005870` compares
+(`a1=0x18952E0`, `a0=0x1FFFA0`), and why they stay equal/zero; that producer is upstream of the spin.

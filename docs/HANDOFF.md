@@ -3391,3 +3391,21 @@ MEASURED:0x10005DC (the statement after `jal 0x10047C0` @0x10005D4) is NEVER rea
 NEXT:    get tid1 past 0x10005DC -- either speed the decode spin sub_010088E8 (shares CPU with the
          parse) or reduce the subtree depth; that is the first statement that leads to 0x1000608 ->
          0x1000E00 and the disclaimer flag.
+
+---
+
+## 2026-10-05 0x:xx · CAMPAIGN re-arm (dish 17) · the decode spin measured · gate failed
+
+WALL:    the shape-A decode spin `sub_010088E8` (0x1005890/0x10089C8/0x10089D4, 33.31% each) starves
+         tid1 so `sub_01000558` never reaches 0x10005DC.
+DID:     Wrote `.auto/queue/17-decode-spin-cpu-share.txt` and worked it: added `VULCAN4_W215_SPIN`
+         (3-site spin probe with args, compared fields and eeCycle).
+MEASURED:`w224b` FE=4959 halt=livelocked_in_syscall: the spin is a tight 3-call cycle
+         (0x10089D4->func_1005870, 0x1005890->func_10057F0, 0x10089C8->func_1007738) running ~117M times.
+         The compared fields `[a0+0x10]`/`[a1+0x10]` are BOTH 0 (equal=1) with a0=0x1FFFA0 a1=0x18952E0;
+         func_1005870 takes the equal branch, func_10057F0 compares the +0x8 counts, caller loops while
+         v0<0. It DOES yield but slowly: eeCycle climbs 211,632,465 -> 2,366,018,086 (~11x) across the
+         run; the early samples share one eeCycle value (checkpoint resets between yields). Positive
+         control: the census matches the XFER histogram (0x1005890=33.31%). Suite 497/497. Gate v3 FAILS.
+NEXT:    find what writes the +0x8 count func_10057F0 compares and the +0x10 fields func_1005870 compares
+         (a1=0x18952E0, a0=0x1FFFA0) and why they stay equal/zero -- that producer is upstream of the spin.

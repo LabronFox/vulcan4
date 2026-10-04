@@ -50,6 +50,13 @@ if [ "${VULCAN4_LOGS:-0}" = "1" ]; then
   DEFS="$DEFS -DPS2_RUNTIME_LOGS=1 -DAGRESSIVE_LOGS=1"
   echo "build_harness: PS2_RUNTIME_LOGS ON (diagnostic build)"
 fi
+# W213. ROUTE GENERATED `jr $ra` RETURNS THROUGH dispatchGuestBranch, so a return becomes a MEASURED
+# edge instead of an inference (the W210 scoreboard's `returns` counter reads 0 otherwise). OFF by
+# default: it is a diagnostic build and it changes codegen for every function in the game.
+if [ "${VULCAN4_RETURNS:-0}" = "1" ]; then
+  DEFS="$DEFS -DPS2X_STRICT_RETURN_DIAGNOSTICS=1"
+  echo "build_harness: PS2X_STRICT_RETURN_DIAGNOSTICS ON (return edges measured)"
+fi
 
 # W96. FRAME POINTERS, ON REQUEST ONLY. The sampling profiler needs to walk the stack to say WHO
 # called the libc function that takes 75% of the CPU, and glibc's memcpy/memset variants are not leaf

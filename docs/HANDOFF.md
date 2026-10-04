@@ -3352,3 +3352,24 @@ MEASURED:(a) BOTH WAITS ARE RELEASED BY LIVE WRITERS. `[0x70002050]` (sub_0100B6
          So the count=1 leaves remain return-UNPROVEN. Suite 497/497. Gate v3 FAILS.
 NEXT:    trace the main frame's PC across the `0x10047C0` -> return boundary; why is `sub_01000558`
          (0x1000558) entered once and `0x1000608` never dispatched even though `0x10047C0` returns?
+
+---
+
+## 2026-10-05 0x:xx · dish 16 (W213b) · returns MEASURED via VULCAN4_RETURNS · gate failed
+
+WALL:    the screen setup `sub_01000558` never returns. Dish 16: writers + W209 retraction + measured
+         returns.
+DID:     `VULCAN4_W212_WAIT` (writer watch) + a `returns` counter in the W210 scoreboard; added
+         `VULCAN4_RETURNS=1` to build_harness.sh to compile with PS2X_STRICT_RETURN_DIAGNOSTICS so
+         generated `jr $ra` route through dispatchGuestBranch (OFF by default, law 12).
+MEASURED:(a) WRITERS RUN: `[0x70002050]` incremented 1->2->3->4->5 by `0x100D8B4` (GS/VSync handler);
+         `0x7000206D` toggled by `0x100DEBC`(1)/`0x100DCF0`,`0x100AC78`(0). Postive controls
+         0x70002064/0x70002079/0x70002085 toggle. So the waits are ordinary frame pacing, NOT the wall.
+         (b) W209 RETRACTED: same shape family; node scoreboard shows 0x1010BD0 (the call AFTER 0x100F8C8)
+         entered 2-8x with advancing last_ms, so the chain is NOT blocked in the decompressor. (c)
+         RETURNS MEASURED (strict build, w217a-d): every watched node has returns>0 EXCEPT `0x1004500`
+         (returns=0) -- the one function whose return is not observed before the budget expires. Suite
+         497/497. Gate v3 FAILS.
+NEXT:    trace main-frame PC across the `0x10047C0` return boundary; why is `0x1000558` entered once and
+         0x1000608 never dispatched even though 0x10047C0 returns 6400+ times? Watch the resume PC of
+         sub_01000558 after its 0x10047C0 call.

@@ -64,15 +64,37 @@ call `sub_010047C0` (`0x10047C0`) is entered **once**, and the statement after i
 to `0x1000E00`) is never dispatched. But this is **not** "blocked inside the decompressor" — the
 decompressor and its caller both return (count 49/8 with advancing `last_ms`).
 
-## (c) "Returns" made measured — the counter is INCONCLUSIVE (honest)
+## (c) "Returns" made measured — via `VULCAN4_RETURNS=1` (`PS2X_STRICT_RETURN_DIAGNOSTICS`)
 
-A `returns` counter was added, keyed on `GuestBranchKind::Return` in `dispatchGuestBranch`. It reads
-**0 for every node** — because the generated code's `jr $ra` returns happen **inline inside the
-generated function** and only call `dispatchGuestBranch` when `PS2X_STRICT_RETURN_DIAGNOSTICS` is
-defined; on this build they return directly, so the runtime never sees the return edge. **So "returns"
-is still inferred, not measured, and this probe does not close the gap.** The count>1 nodes
-(`0x100F390=49`, `0x1010BD0=8`) are re-entered with advancing `last_ms`, which is the honest evidence
-that they progress; the `count=1` leaves (e.g. `0x1000558`, `0x10047C0`) remain **return-UNPROVEN**.
+The first attempt (a counter in `dispatchGuestBranch`) read 0 for every node because generated `jr $ra`
+returns are emitted **inline** unless `PS2X_STRICT_RETURN_DIAGNOSTICS` is defined. `build_harness.sh`
+now takes `VULCAN4_RETURNS=1` (OFF by default, law 12) and compiles the generated unit with that define,
+so the return edge routes through `dispatchGuestBranch` and the scoreboard counts it. Measured
+(`w217a` `wallclock_deadline` FE=8034, `w217b/c/d`):
+
+```
+pc=0x100F8C8 count=1  returns=2
+pc=0x1010B10 count=1  returns=1
+pc=0x1004308 count=1  returns=1
+pc=0x1004500 count=1  returns=0        <-- the one node with no return edge
+pc=0x1010BD0 count=2  returns=602
+pc=0x100F390 count=11 returns=13
+pc=0x100ED78 count=2  returns=34
+pc=0x10047C0 count=1  returns=6417
+pc=0x101D2A0 count=29 returns=1211
+pc=0x1000558 count=1  returns=16547
+```
+
+**Every node returns except `0x1004500` (`returns=0`)** — so `sub_01004500` is the one function whose
+return has **not** been observed by the time the budget expires. (The return attribution is approximate
+— a return from an inner call is credited to the nearest enclosing watched node — so the large counts on
+`0x10047C0`/`0x1000558` include their callees' returns; the reliable signal is **returns=0 vs returns>0**.)
+`0x1004500` is a caller (`jal 0x1004308` at `0x100451C` then more calls at `0x1004544`), so a plausible
+reading is that it is simply still inside a long call chain at halt — the honest statement is that its
+return is the one not measured.
+
+**Positive control:** the strict build is the control itself — the same scoreboard that read `returns=0`
+for every node in the non-strict build now prints non-zero counts, so the counter can fire.
 
 ## Corrected wall, in one line
 The two frame-pump waits are **released every frame** by live guest writers (`0x100D8B4` increments

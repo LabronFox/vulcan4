@@ -97,8 +97,37 @@ carry is 0 on every iteration, so no refill and no progress. The merge `func_100
 waiting for input bits that the (parse) producer never supplies — the same "producer of the first bit"
 W122 left unnamed, now located to the refill `0x1005AB8` and counted.
 
+## W220 — the array is never re-fed: word `0x0`, `changes=0`
+
+A watch on the stream's bit array base (`+0x14 = 0x1895480`, deterministic across runs) counts changes
+to its first word (`[w220:array]`):
+
+```
+[w220:array] base=0x1895480 word=0x0 changes=0     (w238a wallclock_deadline, w238c/e livelocked)
+```
+
+**The word is `0x0` and `changes=0`** — the parse never writes the array after building the stream. So
+`func_1007738` rotates an all-zero buffer, the carry is 0 on every iteration, the refill `0x1005AB8`
+runs once (initial fill) and never again, and the bound stays 1. The producer that should feed more bits
+**never runs**.
+
+## Verdict (dish P2 complete)
+
+- **Struct:** `0x1FFFBA0` — bound `+8=1`, base `+0x14=0x1895480`, code ptr `+0=0x1012658`, fields
+  `+c/+18/+28/+2c=1`.
+- **Writers:** the parse's node-builder (`0x10112E0–0x1011650`, `0x1012xxx`), **once**, then never.
+- **Feeder:** `0x1005AB8` (from `func_1007738`), **runs once** vs 50M iterations.
+- **Array:** word `0x0`, `changes=0`.
+- **Why the merge never progresses:** the stream is a length-1, all-zero bit buffer built by one parse
+  pass; the merge `func_1007738`/`func_10057F0` waits for input bits that are never supplied, so
+  `func_10057F0` returns -1 forever and `sub_010088E8`'s `bltz` spin never exits.
+
+**A named blocker, fully measured.** The wall is not the spin's code — it is the **parse producing a
+degenerate (length-1, zero) stream** for this merge. Either the parse must supply more input (a second
+element / non-zero bits), which is upstream in `sub_0100F390`'s callbacks, or the consumer is mis-fed.
+
 ## NEXT
-Trace what should set `func_1007738`'s carry to 1 after the first fill — the byte/bit source the parse
-feeds the stream from. `0x1005AB8`'s callers are all in `func_1007738` (`0x100779c`/`0x1007a04`/
-`0x1007bf8`); the source is whatever fills the `+0x14` array before the rotate. Watch the array write
-from the parse and whether the parse reaches it after the first fill.
+`func_1007738`'s two lists are length 1 with keys 0 and 1 and its bit array is all-zero. Find the parse
+callback that should supply the merge's second element / the stream's next byte and prove it never runs
+(this is the byte-source in `sub_0100F390`'s `jalr` table at `0x1036AC0`). If it is gated on GT4.VOL data
+absent from the build, that is the input to name.

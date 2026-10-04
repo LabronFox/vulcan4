@@ -3540,3 +3540,19 @@ MEASURED:`w237a` (halt=livelocked_in_syscall): refill1005AB8=1 against c5870=49,
 NEXT:    trace what should set func_1007738's carry to 1 after the first fill -- the byte/bit source the
          parse feeds the +0x14 array from; watch the array write from the parse and whether it is reached
          after the first fill.
+
+---
+
+## 2026-10-05 0x:xx · dish 19 (W220) · the array is never re-fed · gate failed
+
+WALL:    the shape-A decode spin sub_010088E8 never exits (the merge makes no progress).
+DID:     Added a change-counter on the stream's bit array base (0x1895480) under VULCAN4_W215_SPIN.
+MEASURED:`w238a/c/e`: [w220:array] base=0x1895480 word=0x0 changes=0 -- the parse never writes the array
+         after building the stream. Combined with W219b (refill runs once) and W219 (struct static,
+         bound=1, base=0x1895480 deterministic across runs): the stream is a length-1 all-zero bit buffer
+         built by one parse pass; func_1007738 rotates zeros, carry=0, no refill, bound stays 1, and
+         func_10057F0 returns -1 forever. The producer NEVER runs. A fully-named blocker. Suite 497/497.
+         Gate v3 FAILS.
+NEXT:    find the parse callback that should supply the merge's second element / the stream's next byte
+         and prove it never runs -- the byte-source in sub_0100F390's jalr table at 0x1036AC0. If gated
+         on GT4.VOL data absent from the build, name that input.

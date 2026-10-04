@@ -2948,3 +2948,23 @@ NEXT:    GT4's own screen/state step from the disclaimer. Dish `10-game-state-fr
          The campaign's milestone-2 marker is met (W183); the captain's stricter bar (menu) is the
          remaining distance.
 
+---
+
+## 2026-10-04 19:5x · dish 08 (W182/W185) · event NAMED; good shape not capturable
+
+WALL:    the good-shape RTOS loop's event. Dish 08 asks: name it, with a measurement.
+DID:     Named the event from W181b/W182 and its producer, and tried to capture a good-shape run.
+MEASURED:event = **DMA/GS completion**, signalled by the VSync/GS handler clearing the poll byte
+         `0x7000206d`, and by the consumer (`0x100ac78`/`0x100dcf0`); the producer that re-arms it is
+         `0x100DEBC` in the DMA/GS kick `sub_0100DE58`. The poll byte toggles 0->1->0 each frame (W181b),
+         so the loop is RELEASED (not timing out) and the caller proceeds -- there is no unmet event.
+         **Good-shape capture FAILED this session**: 8/8 attempts came back shape A
+         (`top 0x01005890`, `FE~8000-11800`) or derail (`top 0x0100d380`). The good shape is rare right
+         now, which is itself a measurement: **shape A (the decode spin) is the common shape again.**
+         Suite 497/497. Gate v3 FAILS.
+NEXT:    (1) the good-shape RTOS event is named (DMA/GS completion; the loop is released), so the wall
+         is not there; (2) but shape A now dominates, and W180 showed the decode does not change the
+         picture. Re-arm should re-check the shape distribution ($VULCAN4_BUILD/run, several boots) and
+         pick the current dominant wall. Dish `10-game-state-from-disclaimer.txt` stands for the
+         disclaimer; consider re-opening the decode ONLY as a shape-A speed/advance item, not a picture.
+

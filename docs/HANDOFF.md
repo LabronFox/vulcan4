@@ -3127,3 +3127,27 @@ NEXT:    instrument the ra save/restore of sub_0100AE78 (`sd ra,104(sp)` entry, 
          0x100B040) across a derailing run and name who overwrites the slot -- the parse/decrypt chain
          (0x100F390, the 0x100D380 XOR loop) or the scheduler's resume of the RTOS wait. Barrier CLOSED
          as not dominant. Graphic unchanged; goal gate failed.
+
+---
+
+## 2026-10-04 21:xx · dish 12 resume (W193) · barrier not dominant; derail located · gate failed
+
+WALL:    dish 12's early barrier 0x100D908. Measured again: it is not the dominant stall.
+DID:     Ran ~17 boots; measured the shape distribution; located the `pc_outside_generated_table`
+         derail to a single instruction; added W190/W192 probes (OFF by default).
+MEASURED:(1) SHAPES (n=17): ~13 `livelocked_in_syscall` top `0x1005890/0x10089c8/0x10089d4` 33.32%
+         (decode spin, FE 5.2k-6.1k); 2 `wallclock_deadline` good (FE up to 23776); 2
+         `pc_outside_generated_table` derail (FE~2.1k, top `0x100d380`=16368). Barrier `0x100D908` is
+         2.77% in the barrier shape -- NOT dominant. (2) BARRIER (P2): `[w160:bar]` one-node list
+         `0x1045970 next=0 tid=2`; handler re-entered per VSync (`intr_run=3340`); running tid2 ==
+         target tid2 -> releases. (3) DERAIL LOCATED: `VULCAN4_W144_REGS` full GPR dump + disasm show
+         `10294a0: lw v0,40(s0)` / `10294ac: jalr v0` inside `sub_01029388` (a callback dispatcher
+         with no static caller), where `s0 = [0x10362F0]` is the head of a doubly-linked callback list
+         (unlink helper `sub_01029350` writes the head at `sw v1,25328(v0)`). s0 is garbage
+         (0x24E785F8/0x9280261B/0xE9A2F5EF); ra=0x10294B4 and sp=0x1FFFF60 == the W136 derail
+         signature. So the derail is a CORRUPTED CALLBACK LIST, not the barrier. Suite 497/497. Gate
+         v3 FAILS: `functions_entered=2422 below 20000 -- short nondeterministic shape`.
+NEXT:    (1) the gate's short-shape failure is the DECODE SPIN (dominant), not the barrier; (2) the
+         derail's corruptor: watch the callback nodes (`VULCAN4_W192_STORE`) or the guest heap
+         allocator reusing a live node; (3) the picture still needs the W188 parse-chain block solved
+         (screen setup sub_01000558 never completes). Barrier CLOSED as not dominant.

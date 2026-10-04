@@ -71,3 +71,62 @@ Instrument the `$ra` save/restore of `sub_0100AE78` (`sd ra,104(sp)` on entry, `
 `0x100B040`) across a derailing run and name who overwrites the slot — the parse/decrypt chain
 (`0x100F390`, `0x100D380` XOR loop) or the scheduler's resume of the RTOS wait. The barrier (dish 12)
 is closed as **not dominant**.
+
+---
+
+## W193 — the derail, located: `jalr [s0+40]` in the callback dispatcher `sub_01029388`
+
+**Dish:** `12-barrier-invocation` (resume). **Result:** ❌ no picture change; gate still fails
+(`functions_entered=2422 below 20000`). **Probes:** `VULCAN4_W190_RA`, `VULCAN4_W192_LIST`,
+`VULCAN4_W192_STORE` (all OFF by default).
+
+### The derail is the W136 signature, now named to the instruction
+
+The `pc_outside_generated_table` class has a stable signature (W136: `ra=0x10294B4`, `sp=0x1FFFF60`,
+every register garbage). With the full GPR dump (`VULCAN4_W144_REGS`) it is one instruction:
+
+```
+10294a0: lw    v0,40(s0)     ; callback = s0->0x28
+10294ac: jalr  v0            ; *** jump to garbage ***
+10294b0: lw    a3,48(s0)     ; (delay slot)
+10294b4: move  a1,v0         ; return point == the ra in every derail log
+```
+
+This is inside `sub_01029388` (`0x1029388-0x1029630`), a **callback dispatcher**: at entry it reads the
+doubly-linked list head `s0 = [0x10362F0]` (`lw s0,24(0x10362D8)`, `0x10293D0`), walks it, and calls
+each node's callback at `[s0+40]`. The unlink helper `sub_01029350` confirms the list: it writes the
+head at `sw v1,25328(v0)` = `0x10362F0`. `sub_01029388` has **no static caller** — it is itself
+reached by `jalr` (a callback). So the wall is a **corrupted callback list**: `s0` (and therefore
+`[s0+40]`) is garbage (`0x24E785F8` / `0x9280261B` / `0xE9A2F5EF` across runs — the W136 repeating
+pattern). The full register file at the jump is derived entirely from `s0`, which is why every
+register is garbage.
+
+### Shape distribution this session (n=17 boots)
+
+| class | count | `functions_entered` | top XFER |
+|---|---|---|---|
+| `livelocked_in_syscall` (decode spin) | ~13 | 5.2k–6.1k | `0x1005890`/`0x10089c8`/`0x10089d4` 33.32% each |
+| `wallclock_deadline` (good) | 2 | up to 23776 | `0x100afa0` |
+| `pc_outside_generated_table` (derail) | 2 | ~2.1k–2.2k | `0x100d380`=16368 |
+
+The barrier `0x100D908` is **not** the dominant site in any of them (2.77% in the barrier shape).
+The gate's printed failure (`functions_entered=2422 below 20000`) comes from the short shapes, and the
+dominant short shape is the **decode spin**, not the barrier.
+
+### What is named (dish P2)
+- **Barrier:** one-node list `0x1045970` (`next=0`, `tid=2`); handler re-entered per VSync
+  (`intr_run=3340`); running thread is tid2 = target, so it releases. It is not a never-returning stall.
+- **Dominant short-shape wall:** the decode spin `sub_010088E8` (`0x1005890`), 33.32% each of three
+  sites — the shape W180 called a shape-A artefact; it is the dominant halt class right now.
+- **Derail (when it fires):** corrupted callback list at `0x10362F0`; `jalr [s0+40]` in
+  `sub_01029388`; same `ra=0x10294B4` signature as W136. Memory corruption, not the barrier.
+
+### Gate (authoritative, honest)
+`GATE FAIL: functions_entered=2422 below 20000 — short nondeterministic shape`. Suite **497/497**.
+
+### NEXT
+Two independent blockers for a picture: (1) the short shapes (decode spin / derail) truncate the run
+below the gate's 20000; (2) even the good shape (FE=37898) is still the disclaimer because the screen
+setup `sub_01000558` blocks in the parse chain (W188). The derail's corruptor is the next concrete
+target: watch who writes the callback nodes (`VULCAN4_W192_STORE`) or whether the guest heap
+allocator reuses a live node.

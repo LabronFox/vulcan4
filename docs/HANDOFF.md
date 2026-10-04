@@ -2843,3 +2843,20 @@ NEXT:    decide whether the decode's `arg2` should be a DIFFERENT (parsed-data) 
          measurement: at `0x1008c9c`, log which branch ran and which node `sp+52` holds, capturing the
          pointer live. Graphic unchanged; goal gate failed.
 
+---
+
+## 2026-10-04 18:5x · CAMPAIGN re-arm (dishes 06/07) · stuck (REDIRECT)
+
+WALL:    the GOOD-SHAPE wall is the RTOS wait in `sub_0100AE78` (top XFER `0x0100afa0`, 52.25%), NOT
+         the decode. `functions_entered=37898 halt=wallclock_deadline gs_packets=8255`.
+DID:     Wrote `.auto/queue/06-is-the-decode-the-wall.txt` and `.auto/queue/07-good-shape-wait.txt`.
+         Worked dish 06: ran four 90 s boots with the decoder-entry probe (`VULCAN4_W162_DECODE`).
+MEASURED:table — run1 FE=21218 `wallclock_deadline` top `0x0100afa0` dec=0; run3 FE=20980 top
+         `0x0100afa0` dec=0; runs 2/4 derailed (`pc_outside_generated_table`, top `0x0100d380`) dec=0.
+         **The decode `sub_010088E8` is entered 0 times in every good-shape run** — W172-W179 chased a
+         shape-A artefact (present only when `halt=livelocked_in_syscall`, top `0x01005890`).
+         Suite 497/497. Gate v3 FAILS (byte-identical disclaimer).
+NEXT:    dish `07-good-shape-wait.txt` — instrument the GOOD-SHAPE wait: the scratchpad byte
+         `sub_0100AE78` polls (poll loop `0x0100AF50`, `s0 = 0x70002050+(3*id)<<2+29`), its value over
+         the run, and which guest pc(s) should set it. Decode track CLOSED as a shape-A artefact.
+

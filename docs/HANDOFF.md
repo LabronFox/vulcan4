@@ -2792,3 +2792,20 @@ NEXT:    the buffer-selection step at the clone (`0x1008264`): why does `dst` re
          data (`0x1895250`) and not the `arg2` data (`0x18952a0`)? Dish `05-trace-parse-node.txt`
          should start there. No graphic change; the goal gate stays failed.
 
+---
+
+## 2026-10-04 18:2x · dish 04 re-run 2 (W177b) · stuck
+
+WALL:    the decode work buffer. The guest never leaves the 2005 disclaimer.
+DID:     Printed the caller's slots at the `sub_01008080` clone memcpy (`0x1008264`).
+MEASURED:`from=0x1008264 dst=0x1895370 src=0x18952a0 len=0x4 sp+36=0x1895310(+4=0x1)
+         sp+52=0x1895270(+4=0x2)`; at the decode `arg1 dp=0x1895370 w0=1`, `arg2 dp=0x18953c0 w0=0`.
+         So the clone for the decoder's `arg2` **source slot** (`sp+52`) writes to `0x1895370`, which
+         is `arg1`'s buffer; the decoder's `arg2` node (`0x1895390`) is a different node 0x50 away and
+         stays zero. Node identity / slot routing is the defect, one hop before `sub_01008C50`.
+         Suite 497/497. Gate v3 FAILS (byte-identical disclaimer).
+NEXT:    the node-identity mismatch: which of the 0x50-stride pair `sub_01008080`'s clone is meant to
+         fill, and why `sp+52`'s clone output (`0x1895370`) is read as `arg1` while the decoder's
+         `arg2` (`0x18953c0`) is the untouched sibling. Dish `05-trace-parse-node.txt`. Graphic
+         unchanged; goal gate failed.
+

@@ -75,3 +75,22 @@ decoder's work buffer writes to the `arg1` side of a 0x50-stride pair, and the d
 `arg2` side. Next measurement: at the clone (`0x1008264`), print which struct slot `$s5`/`$s2` point
 at and why the destination resolves to `arg1 dp` instead of `arg2 dp`; and confirm in the same run
 whether `arg2`'s data (`0x18952a0`) is written by ANY pc other than `0x1008ce0` (W172 said no).
+
+### W177 addendum 2 — the slots at the clone (same run)
+
+The clone memcpy now also prints the caller's `sp+36` / `sp+52` (sub_01008080's slots that become
+sub_01008C50's `$a1` / `$a2`, i.e. the decoder's `arg1` / `arg2` sources):
+
+```
+[w177:memcpy] from=0x1008264 dst=0x1895370 src=0x18952a0 len=0x4
+              sp+36=0x1895310(+4=0x1)  sp+52=0x1895270(+4=0x2)
+[w162:dec]    a1=0x1895340 dp=0x1895370 w0=1  (arg1)
+              a2=0x1895390 dp=0x18953c0 w0=0  (arg2)
+```
+
+- The clone for `sp+52` (the decoder's `arg2` **source slot**) writes its output to **`0x1895370`**,
+  which at the decode is **`arg1`'s** data buffer.
+- The decoder's `arg2` node (`0x1895390`, data `0x18953c0`) is a **different** node, 0x50 away, and is
+  never populated.
+- So the clone populates one node of a 0x50-stride pair and the decoder reads the other. The mismatch
+  is **node identity / slot routing**, exactly one hop before `sub_01008C50`'s clone.

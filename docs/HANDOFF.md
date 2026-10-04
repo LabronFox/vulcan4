@@ -2750,3 +2750,27 @@ control fired on another address.
    before/after pair proves nothing — that is how I nearly reverted a correct fix in W112.
 3. Keep R3's real acceptance in view: `halt` not `livelocked_in_syscall`, `true_guest_exits > 0`, and a
    window capture showing something past the disclaimer. The PNG is the product.
+
+---
+
+## 2026-10-04 18:09 · CAMPAIGN re-arm (dishes 04/05) · stuck
+
+WALL:    the decode work buffer. `sub_010088E8`'s `$a2` data (`0x18953c0`) is zero-filled by
+         `0x1008ce0` and is NEVER the destination of any copy in the whole run (W175), so
+         `func_1005870` compares work(0) < target(1) forever and the guest never leaves GT4's 2005
+         disclaimer.
+DID:     Wrote `.auto/queue/04-decode-arg2-source.txt` and `.auto/queue/05-trace-parse-node.txt`.
+         Worked dish 04: added a guest-LOAD observer (`VULCAN4_W176_LOAD`, OFF by default) and proved
+         the parse reads the CORE.GT4 buffer. **P2 (missing file→parse link) is REFUTED.**
+MEASURED:newest log `boot_w170_171139.log` `functions_entered=37898 true_guest_entries=1344106
+         halt=wallclock_deadline gs_packets=8255 frames_presented=4697 bios_files=0`, top XFER
+         `0x0100afa0=197919(52.25%)` (the RTOS sleep loop). W176 run: the parse reads CORE.GT4's own
+         bytes sequentially ≥768 KB (`maxoff=0xc0000`) at pcs `0x100f4c0/0x100f748/0x100f6a8`
+         (inside `sub_0100F390`), so the file→parse link exists. Suite 497/497. Gate v3 FAILS
+         (capture byte-identical to the disclaimer).
+NEXT:    the drop is INSIDE the parse: the bytes are read and then the decode's node is born zero.
+         Next dish `05-trace-parse-node.txt` — watch `sub_0100F390`'s copy destinations and the buffer
+         that should become `arg2` (`0x18953c0`), keyed on the pointer captured at the event (heap
+         reuse makes fixed-address watches ambiguous). Also unchanged: the campaign's finish line is
+         milestone 2 (`VULCAN4 FRAME source=guest`), whose emitter is still not implemented.
+

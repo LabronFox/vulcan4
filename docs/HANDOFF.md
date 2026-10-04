@@ -2984,3 +2984,20 @@ MEASURED:poll addresses by id: `id=0 -> 0x7000206d`, `id=1 -> 0x70002079`, `id=2
 NEXT:    dish `10-game-state-from-disclaimer.txt` (the wall is GT4's screen/state, not the runtime);
          re-check the shape distribution first and pick the dominant wall. Graphic unchanged.
 
+---
+
+## 2026-10-04 20:1x · dish 10 (W184) · screen state located
+
+WALL:    GT4's own screen/state machine (the disclaimer never advances). Dish 10 asks to name it.
+DID:     Read the game's screen path from the ELF.
+MEASURED:screen fn `0x1000BA0` renders a fade over 151 frames and iterates the table at `0x102DCA8`
+         (entry0=0, entry1=-1), exiting when (a) an entry is negative, or (b) `[0x1047A84] != 0`
+         (`0x1000C34`). State words: `0x1047A84` (set to 1 at `0x1000DB0`) and `0x1047A88` (set at
+         `0x1000DDC`, which calls the thread/sema wrappers `0x101f460`/`0x101f440`). The dispatcher
+         that calls `0x1000BA0` has NO static `jal` -- a runtime/computed function pointer. So the
+         "which screen" gate and its advance branch are named (dish 10 P2 met). Suite 497/497. Gate
+         v3 FAILS (byte-identical disclaimer).
+NEXT:    instrument `0x1047A84`/`0x1047A88` (store watch) + the `0x102DCA8` table over a run; if they
+         never change, the screen loop is stuck before the advance. Watch the function-pointer table
+         too (dispatcher is indirect). Graphic unchanged; goal gate failed.
+

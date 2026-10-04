@@ -3575,3 +3575,23 @@ MEASURED:`w239a-d` (livelocked + wallclock shapes): the ONLY writer of 0x1895480
 NEXT:    instrument sub_0100F390's jalr callback table (0x1036AC0) at the emitter layer to see whether
          the parse ever jalr's the stream's [+0]=0x1012658 continuation; if it never does, the parse is
          incomplete for this merge (possible absent GT4.VOL input) -- name the file/callback.
+
+---
+
+## 2026-10-05 0x:xx · dish 20 (W220b) · I/O + positive control + merge-exit stated · gate failed
+
+WALL:    the shape-A decode spin sub_010088E8 never exits (the stream has no producer).
+DID:     Closed the dish's remaining steps: the I/O check (step 4), the positive control (step 1), and
+         the merge-exit statement (step 3). W220's wide watch already showed the array is written only
+         by the rotator.
+MEASURED:(step4) the parse's own data IS served (core.gt4 opened from the CD provider, read by the
+         parse W176/W178); the only failed open is the MEMORY CARD (`result=-4`, mc0/.../core.gt4) which
+         is the R5 path and not the bit-source. (positive control) the wide watch fires 600+ times on
+         0x1895480 (all pc=0x1007774) and on 0x18951F0/0x1895200 + the 0x70002050 control in earlier runs
+         -- the all-zero array is measured, not blind. (step3) the merge exits when func_10057F0 returns
+         >=0, i.e. when the rotated words compare equal; with the array all-zero the rotate stays 0. A
+         producer must write a non-zero bit at 0x1895480 (or extend the bound) -- it never runs. Suite
+         497/497. Gate v3 FAILS.
+NEXT:    instrument sub_0100F390's jalr callback table (0x1036AC0) at the emitter layer to see whether
+         the parse ever jalr's the stream's [+0]=0x1012658 continuation; if not, the parse is incomplete
+         for this merge. This is the first item that genuinely needs the recompiler emitter layer.

@@ -50,9 +50,33 @@ nothing ever fills it — so the merge cannot terminate and the disclaimer never
 ## Gate (authoritative, honest)
 `GATE FAIL` (v3, byte-identical disclaimer). Suite **497/497**.
 
+## W220b — the I/O check (step 4): the parse's input is present; the memory card is not
+
+The log (`boot_w238c.log`) shows the parse's own data is served — `core.gt4` is opened from the runtime's
+CD provider and the parse reads it (W176/W178) — while the **memory-card** open fails:
+```
+[MC] Open ... host='/mnt/ssd/gt4/work/mc0/BASCUS-97328GAMEDATA/core.gt4' ... result=-4
+```
+That failure is the memory-card path (R5, forbidden) and is **not** the bit-source: the stream's array is
+written only by the rotator (measured), so no I/O read feeds it in this run.
+
+## Positive control (step 1, required)
+
+The wide watch fires **600+ times** on the target base word `0x1895480` (all from `0x1007774`), and the
+`0x18951F0`/`0x1895200` targets and the `0x70002050` control fired in the earlier W217 runs. So the
+observer sees the array, and the all-zero value is a real measurement, not a blind probe.
+
+## Merge EXIT stated in stream terms (step 3)
+
+`func_1007738` returns after the rotate; its caller `sub_010088E8` exits when `func_10057F0` returns
+>= 0 (`bltz` not taken). For that, the two rotated words must compare equal. The rotated word is
+`(word<<1)|carry`; with the array all-zero it stays 0. **A producer must write a non-zero bit at
+`[0x1895480]` (or extend the bound) so the rotate produces unequal/ordered words.** That producer never
+runs — the only writer is the rotator itself.
+
 ## NEXT
 The stream is a consumer with no producer in this run. Either the parse is supposed to feed the array
-from a source that is absent (GT4.VOL data / a second input the build does not supply), or the merge is
-being driven at the wrong point. The next measurement is the parse callback in `sub_0100F390`'s `jalr`
-table (`0x1036AC0`) that should `jalr` into the stream's `[+0]=0x1012658` continuation — instrument it at
-the recompiler emitter layer, since dispatch-level probes cannot see indirect calls inside the parse.
+from a source absent from the build, or the merge is driven at the wrong point. The next measurement is
+the parse callback in `sub_0100F390`'s `jalr` table (`0x1036AC0`) that should `jalr` into the stream's
+`[+0]=0x1012658` continuation — instrument it at the recompiler emitter layer, since dispatch-level
+probes cannot see indirect calls inside the parse.

@@ -2968,3 +2968,19 @@ NEXT:    (1) the good-shape RTOS event is named (DMA/GS completion; the loop is 
          pick the current dominant wall. Dish `10-game-state-from-disclaimer.txt` stands for the
          disclaimer; consider re-opening the decode ONLY as a shape-A speed/advance item, not a picture.
 
+---
+
+## 2026-10-04 20:0x · dish 08 re-run (W185) · event named; good shape still not captured
+
+WALL:    the good-shape RTOS loop's event (dish 08, P2).
+DID:     Added an entry probe at `sub_0100AE78` (`VULCAN4_W185_WAIT`, OFF by default) logging the id +
+         the poll byte it waits on, then ran it.
+MEASURED:poll addresses by id: `id=0 -> 0x7000206d`, `id=1 -> 0x70002079`, `id=2 -> 0x70002085`
+         (s1 = 0x70002050 + (3*id)<<2 + 29). The byte is 0/1 at entry and toggles (W181b). So the wait
+         is on **DMA/GS completion**, signalled by the VSync/GS handler clearing the byte, and the loop
+         is RELEASED each frame -- no unmet event at the RTOS loop. A good-shape run (`FE>=20000`, top
+         `0x0100afa0`) still did not come up: this attempt derailed (`FE=2287`, top `0x0100d380`), and
+         the last several sessions' boots are mostly shape A / derail. Suite 497/497. Gate v3 FAILS.
+NEXT:    dish `10-game-state-from-disclaimer.txt` (the wall is GT4's screen/state, not the runtime);
+         re-check the shape distribution first and pick the dominant wall. Graphic unchanged.
+

@@ -70,3 +70,53 @@ The frame pump: `0x100AFA0` (poll loop `[s0]`) and `sub_0100B628` (`[0x70002050]
 of thousands of times — find who is meant to advance `[s0]`/`[0x70002050]` (the "what releases the wait"
 question), and why the disclaimer's later setup calls (`0x1004424 → 0x1010BD0` etc.) are entered only 8
 times in a whole run. That is the lever.
+
+---
+
+## W211 — the (H-starve)/(H-long) number: `0x100AFA0` costs 336–680 eeCycles per visit and yields
+
+`VULCAN4_W210_TREE` now also logs the eeCycle delta at each visit to the two top waits. Measured
+across four shapes (`w214a` `livelocked_in_syscall`, `w214b/c` `pc_outside`, `w214d` `wallclock_deadline`):
+
+```
+[w211:afa0] n=1 eeCycle=6929657 delta=6929657 tid=1
+[w211:afa0] n=2 eeCycle=6930140 delta=483     tid=2
+[w211:afa0] n=3 eeCycle=6932532 delta=2392    tid=2
+[w211:afa0] n=4 eeCycle=6933212 delta=680     tid=2
+[w211:afa0] n=5 eeCycle=6933652 delta=440     tid=2
+[w211:afa0] n=6 eeCycle=6933988 delta=336     tid=2
+[w211:afa0] n=7 eeCycle=6934668 delta=680     tid=2
+[w211:afa0] n=8 eeCycle=6935108 delta=440     tid=2
+```
+
+- After the first visit (tid1, at the RTOS setup), **every visit is on tid2** and costs **336–680
+  eeCycles**. A `sce_SleepThread` that busy-spun or failed to yield would produce a large or
+  near-zero-interval delta; a **sub-1000-cycle delta per visit is the signature of a wait that yields
+  and returns a fresh slice**, exactly as W210's disassembly showed (`0x100AFA0 = jal 0x101F340`,
+  which is `li v1,50 ; syscall`).
+- So **H-starve is refuted by number, not just by disassembly**: the render thread is not burning
+  cycles in the wait; it hands the CPU off each visit.
+
+## W211 — `0x1000E00` is unreachable in these runs (the positive-control gap)
+
+`0x1000E00` (which sets `[0x1047A84]=1`, the disclaimer-exit flag) has **one caller**, `0x1000618`
+inside `sub_01000558`. The subtree scoreboard shows `sub_01000558` (`0x1000558`, `count=1`) and its
+chain to `0x10043A4 → 0x100F8C8`, but **never** `0x1000608`/`0x1000610`/`0x1000618` (the tail that
+follows `sub_010047C0`'s return). `[w211:tail]` fires **0 times** in every run. So the flag is not
+merely late — its call site is never reached, because `sub_01000558`'s next statement after the
+`0x10005D4 → 0x10047C0` call (i.e. `0x1000608`) is never dispatched.
+
+**Positive control:** the probe *does* see the chain complete when it happens (the `w210j/k/w213b`
+scoreboards print every node with a `last_ms`), so a `[w211:tail]` count of 0 is a real "this call site
+is never reached", not a blind probe.
+
+## W211 — the W204 async-pool overlap, re-checked
+
+Not consistent with the setup tree looping (the tree completes in ~0.5–0.75 s and no node loops). It is
+still a real defect (the pool's first stack sits in the main frame) and a candidate for the
+`livelocked_in_syscall` shapes, but it is **not** what keeps `sub_01000558` from reaching `0x1000608`.
+
+## Corrected wall, in one line
+`sub_01000558` reaches the`0x10005D4 → 0x10047C0` call, whose tree completes, but the statement after
+it (`0x1000608`, which leads to `0x1000E00` and sets the disclaimer flag) is **never reached**; the top
+wait `0x100AFA0` is a **yielding SleepThread (336–680 cycles/visit)**, not a starve source.

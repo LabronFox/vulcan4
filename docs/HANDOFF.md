@@ -3306,3 +3306,26 @@ MEASURED:(1) THE TREE COMPLETES: good shapes (w210j/k, FE~7900) print every node
 NEXT:    the frame pump -- who advances the polled bytes `[s0]` (0x100AFA0's loop) and `[0x70002050]`
          (sub_0100B628); and why the disclaimer's later setup calls (0x1004424 -> 0x1010BD0) are entered
          only 8 times in a whole run. The W204 async-pool/main-stack overlap is still real and unlanded.
+
+---
+
+## 2026-10-05 0x:xx · dish 15 (W211) · the wait is a yield (336-680 cycles) and the tail call is unreachable · gate failed
+
+WALL:    the screen setup `sub_01000558` never returns. Dish 15: name the dominating/never-returning
+         call and settle (H-starve) vs (H-long) at 0x100AFA0.
+DID:     Extended `VULCAN4_W210_TREE` with per-visit eeCycle deltas at 0x100AFA0/0x100B678, a
+         `sub_01000558`-tail probe (`[w211:tail]`), and made the scoreboard dump periodically (a parked
+         guest makes no more dispatches, so the halt-gated dump was silent).
+MEASURED:(1) H-STARVE REFUTED BY NUMBER: `[w211:afa0]` deltas are 483/2392/680/440/336/680/440
+         eeCycles, all on tid2 after the first tid1 visit -- a yielding wait (sub-1000 cycles/visit),
+         matching `0x100AFA0 = jal 0x101F340` (sce_SleepThread, syscall 0x32). The render thread is not
+         burning cycles in the wait; it hands the CPU off. (2) THE TREE COMPLETES: scoreboard nodes
+         0x1000558..0x101D2A0 all have a last_ms (<750 ms) in good shapes. (3) `0x1000E00` IS
+         UNREACHABLE: its one caller 0x1000618 (in sub_01000558's tail after the 0x10047C0 call) is
+         NEVER dispatched -- `[w211:tail]` fires 0 times in every run; the scoreboard never sees
+         0x1000608/0x1000610/0x1000618. Positive control: the probe does see the tree complete, so the
+         zero is real. Suite 497/497. Gate v3 FAILS.
+NEXT:    why 0x1000608 (the statement after `0x10005D4 -> 0x10047C0`) is never reached even though the
+         tree completes -- is 0x1000558 itself resumed/abandoned after the call, or does the main frame
+         lose its PC? This is the concrete next measurement; the W204 pool/main-stack overlap remains a
+         live suspect for it.

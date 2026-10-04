@@ -3202,3 +3202,23 @@ NEXT:    a DETERMINISTIC reproduction of the race: pin the scheduler's thread-sw
          data-race detector (TSan-style) on RDRAM, or single-thread-replay the SleepThread yield
          sequence. Then the store is reproducible and the writer is named. Every slowdown hides it, so
          the watchpoint route is closed.
+
+---
+
+## 2026-10-05 0x:xx · CAMPAIGN re-arm (dish 14) · the screen setup waits on a slow gzip decompressor
+
+WALL:    the screen setup `sub_01000558` never returns, so the 2005 disclaimer never advances. Its
+         parse chain ends in `sub_0100F390`, a gzip decompressor of the "in.notice2005.img" stream.
+DID:     Wrote `.auto/queue/14-screen-setup-parse-return.txt` and worked it: added `VULCAN4_W203_PARSE`
+         (decompressor entry + advance-flag probe, OFF by default).
+MEASURED:the decompressor PROGRESSES but slowly: `[w203:parse]` output pointer `[0x20]` advances
+         0x1051A40 -> 0x106DAEC then 0x12BF100 -> 0x170FB99 (~39 entries in 60 s, ~8.8 KB/entry ~=
+         5.7 KB/s, ~28 % of the 6.1 MB buffer). It is NOT stuck. `[w203:flag]`: entries to
+         0x1000DC0/0x1000E00/0x1000E30 = **0** in every run (60 s and 180 s) -- the only setter of the
+         disclaimer-exit flag `[0x1047A84]=1` is never reached. The 180 s/300 s runs derail
+         (`pc_outside_generated_table`, FE~2100-2500, the W202 race) before the decompressor can finish.
+         Suite 497/497. Gate v3 FAILS (byte-identical disclaimer).
+NEXT:    the decompressor's throughput -- is the inner bit-decode loop the pole, or is it starved by the
+         decode spin `sub_010088E8` (33 % of transfers in the common shape)? Measure the instruction
+         split between `sub_0100F390`'s loop and `sub_010088E8`; then speed the inner loop or name why
+         it runs at 5.7 KB/s. The W202 derail still truncates the long runs.

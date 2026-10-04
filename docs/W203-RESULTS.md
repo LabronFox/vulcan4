@@ -111,3 +111,47 @@ call tree sharing the CPU with a spinning render loop.
 Instrument the **whole setup subtree** (`sub_010047C0`'s call tree) to find the one call that is
 entered most / never returns, rather than the parse. And decide whether the RTOS wait `0x100AFA0`
 should block (yield the CPU) instead of spinning, since it is the single biggest transfer site.
+
+---
+
+## W209 — the block is inside the decompressor's LAST block: the copy loop runs on while the stream pointer stalls
+
+`VULCAN4_W209_SUB` (setup-subtree dispatches) in a good shape (`w209c`, `FE=52099`,
+`halt=wallclock_deadline`) shows the chain reach the parse caller and stop:
+
+```
+n=17 0x10047E0 -> 0x100B6F8    (sub_010047C0)
+n=18 0x10047EC -> 0x1004500
+n=19 0x100451C -> 0x1004308
+n=20 0x1004360 -> 0x1000FD8    (6.1 MB memset)
+n=21 0x1004368 -> 0x1010B10
+n=22 0x100438C -> 0x100ED78
+n=23 0x10043A4 -> 0x100F8C8    (the parse caller)  <-- and no continuation
+```
+
+`0x1004308`'s next call after `0x100F8C8` (`0x1004424 -> 0x1010BD0`) **never happens** — so the chain is
+blocked inside `sub_0100F8C8`/`sub_0100F390`, not after it.
+
+`[w203:parse]` in two good shapes stops at the **same block**:
+
+```
+n=46 wall_ms=647 [0x20]=0x13945E3  [0x34]=0 [0x3c]=0   (a NEW stream: output pointer jumps back)
+n=47 wall_ms=663 [0x20]=0x139478E  [0x34]=0 [0x3c]=0
+n=48 wall_ms=730 [0x20]=0x139478E  [0x38]=0xff [0x3c]=0   <-- SAME output pointer
+```
+
+and `[w203:parse]` then stops (47–48 entries total; the run goes on for another 100 s). `[w206:copy]`
+on the inner loop `0x100F800` shows it is **still running** — `s1` advances (`0x015F206A → 0x01776C05`,
+~1.6 MB) with small `s3` (3–0x6D) per pass — while the decompressor's stream/output pointer **stalls**
+at `0x139478E`. So the decompressor is grinding through one block whose byte-copy runs long without the
+stream advancing.
+
+## Corrected wall, in one line
+`sub_01000558` is blocked inside the gzip decompressor `sub_0100F390` (via `sub_0100F8C8`): after ~46
+fast blocks it hits a block whose copy loop `0x100F800` runs on (s1 advancing ~1.6 MB) while the
+stream pointer stalls at `0x139478E`, so `0x1000E00` is never reached and the disclaimer never advances.
+
+## NEXT
+Dump the block's input bytes at `[s0+0x10]`/the stalled stream pointer and the loop's exit condition in
+`sub_0100F390`; decide whether the input is a corrupt stream (from the XOR/decrypt path) or a genuine
+long block. That is the next measurement.

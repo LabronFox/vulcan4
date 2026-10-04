@@ -3265,3 +3265,24 @@ MEASURED:**CORRECTION -- W203's "5.7 KB/s, slow decompressor" was the ENTRY rate
 NEXT:    instrument the WHOLE setup subtree (`sub_010047C0`'s call tree) to find the one call entered
          most / never returning. And decide whether the RTOS wait 0x100AFA0 (45 % of transfers) should
          block/yield instead of spinning.
+
+---
+
+## 2026-10-05 0x:xx · dish 14 (W209) · block is the decompressor's last block · gate failed
+
+WALL:    the screen setup `sub_01000558` never returns. Dish 14: name why.
+DID:     Added `VULCAN4_W209_SUB` (setup-subtree dispatch trace). Ran good shapes (`w209c` FE=52099,
+         `w209d` FE=51362).
+MEASURED:the chain reaches the parse caller and STOPS: `[w209:sub]` n=17..23 `0x10047C0 -> 0x1004500
+         -> 0x1004308 -> 0x1000FD8 -> 0x1010B10 -> 0x100ED78 -> 0x100F8C8`, and `0x1004308`'s NEXT call
+         (`0x1004424 -> 0x1010BD0`) never happens -- so the block is INSIDE `sub_0100F8C8`/
+         `sub_0100F390`, not after it. `[w203:parse]` stops at the SAME block in two shapes: n=46/47/48
+         all `[0x20]=0x139478E` (output pointer stalls; `[0x34]=0 [0x3c]=0`), and the parse then stops
+         (47-48 entries) while the run continues 100 s more. `[w206:copy]` shows the inner loop
+         `0x100F800` STILL RUNNING -- `s1` advances `0x015F206A -> 0x01776C05` (~1.6 MB) with small `s3`
+         -- while the stream/output pointer stalls. So the decompressor grinds one block whose copy loop
+         runs on without the stream advancing. tid1 is Ready at 0x100f800 (the parse); XFER top is the
+         render thread's RTOS wait `0x100afa0`=53 %. Suite 497/497. Gate v3 FAILS.
+NEXT:    dump the block's input bytes at the stalled stream pointer and the loop exit condition in
+         `sub_0100F390`; decide whether the input is a corrupt stream (from the XOR/decrypt path) or a
+         genuine long block.

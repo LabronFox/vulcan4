@@ -110,3 +110,41 @@ unresolved fact is that `sub_01000558` is entered **once** and its post-`0x10047
 Why `0x1000558` is entered once and never re-entered, and why `0x1000608` never dispatches even though
 `0x10047C0` returns — trace the main frame's PC across the `0x10047C0` → return boundary. A measured
 `jr $ra` capture needs `PS2X_STRICT_RETURN_DIAGNOSTICS`, which this build does not set.
+
+---
+
+## W214 — the answer: `sub_01000558` is inside `sub_010047C0`'s deep call chain at halt, never past it
+
+The dish-16 NEXT asked: why is `0x1000558` entered once and `0x1000608` never dispatched even though
+`0x10047C0` returns? **Measured answer: it is not a lost PC — the main thread is still inside the
+`0x10047C0` subtree when the budget expires.**
+
+- A targeted probe (`[w214:resume]`, arrivals to `0x10005D8..0x1000624` — the tail of `sub_01000558`
+  after the `jal 0x10047C0` at `0x10005D4`) fires **0 times in every shape** (`w219a-d`).
+- The XFER histogram contains **none** of `0x10005DC`/`0x1000604`/`0x1000608`/`0x1000610`/`0x1000618`
+  as source sites — `sub_01000558` never executes a statement past the `0x10005D4` call.
+- At halt, **tid1's parked PC is inside the parse subtree**, never in `sub_01000558`:
+  - `w219a` `livelocked_in_syscall`: `pc=0x100F800 ra=0x1010A70 sp=0x1FFC760` (inside `sub_0100F390`)
+  - `w219c` `wallclock_deadline`: `pc=0x10089C8 ra=0x10089DC sp=0x1FFFBA0` (the decode spin in `sub_010088E8`)
+  - `w219d` `wallclock_deadline`: `pc=0x100F2C0 ra=0x10101B8 sp=0x1FFC1D0`
+- The full chain is `sub_01000558 (0x10005D4) → sub_010047C0 → sub_01004500 → sub_01004308 →
+  sub_0100F8C8 → sub_0100F390` (parse) and, on some paths, the decode spin `sub_010088E8`. **All of
+  that is inside `sub_010047C0`.** tid1 is `status=Ready waitReason=1` (sleeping between slices) at the
+  parked PC.
+
+**So the "setup never returns" is a DEPTH problem, not a lost-PC problem:** `sub_01000558` is a single
+call whose subtree contains the CORE.GT4 parse and the decode, and the run's budget expires with tid1
+still deep inside it. The advance flag `0x1000E00` is never reached because its only caller
+(`0x1000618`) is *after* the entire subtree returns.
+
+**This subsumes and corrects the earlier "blocked" framings:** W209 said "blocked in the decompressor"
+(retracted); W210 said "the tree completes" (true for the *sampled node entries*, but the sampled
+subtree did **not** return past `0x10047C0` within the budget). The two are reconciled by time: the
+nodes are entered and re-entered (returns>0 when measured with `VULCAN4_RETURNS`), but the whole
+subtree does not finish before the halt.
+
+## The lever this names
+Two independent routes to get past it: (1) **speed** — the decode spin `sub_010088E8` (33 % of transfers
+in the shape-A class) shares the CPU with the parse; making the run cover more of the subtree per
+budget lets it return; (2) **depth** — the subtree's size itself. Either way the deliverable is the same:
+get tid1 past `0x10005DC`, which is the first statement that can lead to `0x1000608 → 0x1000E00`.

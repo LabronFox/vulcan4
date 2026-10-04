@@ -3373,3 +3373,21 @@ MEASURED:(a) WRITERS RUN: `[0x70002050]` incremented 1->2->3->4->5 by `0x100D8B4
 NEXT:    trace main-frame PC across the `0x10047C0` return boundary; why is `0x1000558` entered once and
          0x1000608 never dispatched even though 0x10047C0 returns 6400+ times? Watch the resume PC of
          sub_01000558 after its 0x10047C0 call.
+
+---
+
+## 2026-10-05 0x:xx · dish 16 follow-up (W214) · the setup is deep, not lost · gate failed
+
+WALL:    the screen setup `sub_01000558` never returns past `sub_010047C0`.
+DID:     Added `[w214:resume]` (arrivals to 0x10005D8..0x1000624, the tail after the 0x10047C0 call).
+MEASURED:0x10005DC (the statement after `jal 0x10047C0` @0x10005D4) is NEVER reached: `[w214:resume]`
+         fires 0x in every shape, and the XFER histogram has none of 0x10005DC/0x1000604/0x1000608/
+         0x1000610/0x1000618. At halt tid1's parked PC is INSIDE the 0x10047C0 subtree -- w219a
+         pc=0x100F800 (sub_0100F390), w219c pc=0x10089C8 (decode spin sub_010088E8), w219d pc=0x100F2C0.
+         So `sub_01000558` is a single call whose subtree contains the parse AND the decode; the budget
+         expires with tid1 still deep inside it. This reconciles W209 (retracted: "blocked in the
+         decompressor") and W210 ("tree completes": nodes are re-entered, but the subtree does not
+         RETURN past 0x10047C0 in budget). Suite 497/497. Gate v3 FAILS.
+NEXT:    get tid1 past 0x10005DC -- either speed the decode spin sub_010088E8 (shares CPU with the
+         parse) or reduce the subtree depth; that is the first statement that leads to 0x1000608 ->
+         0x1000E00 and the disclaimer flag.

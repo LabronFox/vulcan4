@@ -2860,3 +2860,19 @@ NEXT:    dish `07-good-shape-wait.txt` — instrument the GOOD-SHAPE wait: the s
          `sub_0100AE78` polls (poll loop `0x0100AF50`, `s0 = 0x70002050+(3*id)<<2+29`), its value over
          the run, and which guest pc(s) should set it. Decode track CLOSED as a shape-A artefact.
 
+---
+
+## 2026-10-04 19:0x · dish 07 (W181) · stuck (wall moved again)
+
+WALL:    the good-shape RTOS loop. The guest never leaves the 2005 disclaimer.
+DID:     Instrumented the scratchpad RTOS struct (`VULCAN4_W181_SP`, OFF by default) that
+         `sub_0100AE78` polls.
+MEASURED:runs 1-3 came back shape A (`functions_entered=11646/11684/11664`, top `0x01005890`) — the
+         good shape is nondeterministic. In them the poll byte `0x7000206d` **is written (6x)** and the
+         whole struct is written many times (VSync handler `0x100d884/0x100d890/0x100d8a4` among the
+         writers). So **the wait flag is NOT frozen** — refutes dish 07's leading hypothesis. Suite
+         497/497. Gate v3 FAILS.
+NEXT:    the wall is UPSTREAM of the loop: name the EVENT the loop waits for by capturing its exit
+         condition / return value and the caller `0x0100DE80`'s decision in a GOOD-shape run. Dish
+         `08-good-shape-event.txt`. Graphic unchanged; goal gate failed.
+

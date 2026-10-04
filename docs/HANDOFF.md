@@ -3001,3 +3001,21 @@ NEXT:    instrument `0x1047A84`/`0x1047A88` (store watch) + the `0x102DCA8` tabl
          never change, the screen loop is stuck before the advance. Watch the function-pointer table
          too (dispatcher is indirect). Graphic unchanged; goal gate failed.
 
+---
+
+## 2026-10-04 20:2x · dish 10 resume (W186) · state words are live
+
+WALL:    GT4's screen/state machine (the disclaimer never advances).
+DID:     Store watch on `0x1047A80-0x1047A8F` and the table `0x102DCA8-0x102DCEF`
+         (`VULCAN4_W186_SCREEN`, OFF by default).
+MEASURED:the state words ARE written: `0x1047A80=0x9 @0x10009C4`; `0x1047A84=0 @0x1000A14`;
+         `0x1047A88=0 @0x1000A1C`; `0x1047A8C=0x1051A40 @0x1000960`; the table entries
+         `0x102DCB0=8`, `0x102DCB8=8`, `0x102DCC0=2`, `0x102DCC8=0/0x10519C0`, `0x102DCD0=0x10519F0`
+         (writers in the `0x1003Dxx-0x10041xx` setup code). So the screen state machine is LIVE, not
+         frozen -- the wall is not "a state word nobody writes". (This run derailed early: `FE=2145`,
+         top `0x0100d380`.) Suite 497/497. Gate v3 FAILS.
+NEXT:    get a full run (shape A/good) with `VULCAN4_W186_SCREEN` and read the flag/table values at
+         halt: does `0x1047A84` ever reach 1 (screen done) or does the table index stall? The
+         dispatcher is indirect, so also watch the function-pointer table it calls. Graphic unchanged;
+         goal gate failed.
+

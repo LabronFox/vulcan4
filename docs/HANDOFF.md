@@ -3244,3 +3244,24 @@ MEASURED:(1) TRACK B REFUTED for tid2: `[w204:invstack]`/`[w204:pool]` show the 
 NEXT:    fix the main-thread-stack / callback-pool overlap in the runtime (reserve the main stack size
          below 0x1FFFFFF0 and start m_asyncCallbackStackTop under it) and re-measure the parse and the
          derail rate. For the tid2 writer, only a deterministic scheduler (`--switchpoint=<n>`) is left.
+
+---
+
+## 2026-10-05 0x:xx · dish 14 (W207/W208) · CORRECTION: the parse is FAST · gate failed
+
+WALL:    the screen setup `sub_01000558` never returns. Dish 14 re-run: name why.
+DID:     Added wall-clock stamps to `VULCAN4_W203_PARSE`, a `VULCAN4_W206_COPY` probe on the inner copy
+         loop `0x100F800`, and a `sub_0100F8C8`-call probe.
+MEASURED:**CORRECTION -- W203's "5.7 KB/s, slow decompressor" was the ENTRY rate, not the decode rate.**
+         With timestamps: `[w203:parse]` n=1 wall_ms=0 -> n=49 wall_ms=731, output [0x20] 0x1051A40 ->
+         0x189313A (~99 % of the 6.1 MB buffer). The decompressor is FAST (~49 blocks in ~730 ms).
+         `[w206:copy]` shows the inner loop converges (s3 small 5..0x102, s1 advances
+         0x010601E6->0x0156391B). `[w203:f8c8]` shows the parse caller loops ~48 iterations then returns.
+         `[w188:setup]` shows the chain UNWINDS past the parse: n=15 ->0x100F8C8, n=16 0x1004424 ->
+         0x1010BD0, n=17 0x1004530 -> 0x101D2A0. So `sub_01000558` waits on a LONG SEQUENCE OF SETUP
+         CALLS, not the decompressor. Good shape (w208b FE=14797 wallclock_deadline): top XFER
+         0x0100afa0=45 % (the render thread's RTOS vsync wait), 0x0100b678=17 %, 0x0100d380=12 %; tid1
+         Ready at 0x100f800 (prio3), tid2 Running (prio2). Suite 497/497. Gate v3 FAILS.
+NEXT:    instrument the WHOLE setup subtree (`sub_010047C0`'s call tree) to find the one call entered
+         most / never returning. And decide whether the RTOS wait 0x100AFA0 (45 % of transfers) should
+         block/yield instead of spinning.

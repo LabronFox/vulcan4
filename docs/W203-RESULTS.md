@@ -53,3 +53,61 @@ The decompressor's throughput: is the inner bit-decode loop the bottleneck, or i
 decode spin `sub_010088E8` (33 % of all transfers in the common shape)? Measure the guest's instruction
 split between `sub_0100F390`'s loop and `sub_010088E8`, then either speed the inner loop or find why it
 runs at 5.7 KB/s. And the derail (W202) still truncates the long runs.
+
+---
+
+## W207/W208 — CORRECTION: the parse is FAST; the earlier "5.7 KB/s" was the entry rate, not the decode rate
+
+The W203 conclusion above is **wrong on the rate** and must be corrected. Adding wall-clock stamps
+(`VULCAN4_W203_PARSE`, `[w203:parse] entry n=.. wall_ms=..`) shows the decompressor is **not slow**:
+
+```
+entry n=1  wall_ms=0    [0x20]=0x1051a40
+entry n=3  wall_ms=2    [0x20]=0x105cb32
+entry n=30 wall_ms=720  [0x20]=0x187a5ec
+entry n=49 wall_ms=731  [0x20]=0x189313a     <- ~99% of the 6.1 MB buffer (end 0x18953CC)
+```
+
+**~49 blocks in ~730 ms.** The earlier "5.7 KB/s" divided 60 s by the number of *entries*, but the
+guest does other work between entries, so it measured the schedule, not the decompressor. The parse
+itself is fast.
+
+`VULCAN4_W206_COPY` on the inner copy loop `0x100F800` confirms it **converges**: the length `s3` is
+small (5–0x102) and the source `s1` advances run to run (`0x010601E6 → 0x0156391B`), with `s2 = s1 +
+len`.
+
+The parse's caller `sub_0100F8C8` (`[w203:f8c8]`) is a loop that runs **~48 iterations**
+(`0x10101B0 → 0x100EDC8`, `0x10105D8 → 0x100EDC8`, `0x1010A40 → 0x100EDC8`, `0x1010A68 → 0x100F390`)
+and then returns.
+
+## Where the time actually goes
+
+`VULCAN4_W188_DISP` shows the chain **does unwind** past the parse:
+
+```
+n=15 from=0x10043A4 -> 0x100F8C8     (the parse caller)
+n=16 from=0x1004424 -> 0x1010BD0     (sub_01004308 continues AFTER 0x100F8C8 returns)
+n=17 from=0x1004530 -> 0x101D2A0     (sub_01004500 continues)
+```
+
+so `sub_01000558` is waiting on a **long sequence of setup calls** (`0x10047C0 → 0x1004500 →
+0x1004308 → 0x100F8C8 → 0x100F390 → 0x1010BD0 → 0x101D2A0 → …`), not on the decompressor.
+
+And the good-shape XFER (w208b, `FE=14797`, `halt=wallclock_deadline`) is dominated by the **render
+thread**, not the parse:
+
+```
+top: 0x0100afa0=59163(44.99%) 0x0100b678=22394(17.03%) 0x0100d380=16368(12.45%)
+THREAD id=1 status=Ready pc=0x100f800   (the parse/setup, prio 3)
+THREAD id=2 status=Running pc=0x101f348 (the render, prio 2)
+```
+
+So the setup chain (tid1, prio3) runs against a render thread (tid2, prio2) that spends **45 % of all
+transfers in its RTOS vsync wait `0x100AFA0`**; `[w173:switch]` shows the two threads alternating
+slices (~65536 eeCycles each). The setup chain does not finish inside the budget because it is a long
+call tree sharing the CPU with a spinning render loop.
+
+## Corrected NEXT
+Instrument the **whole setup subtree** (`sub_010047C0`'s call tree) to find the one call that is
+entered most / never returns, rather than the parse. And decide whether the RTOS wait `0x100AFA0`
+should block (yield the CPU) instead of spinning, since it is the single biggest transfer site.

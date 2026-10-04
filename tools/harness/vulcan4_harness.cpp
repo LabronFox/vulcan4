@@ -2336,6 +2336,23 @@ int main(int argc, char *argv[])
                           << std::endl;
             }
         }
+        // W206 (Sanji). THE PARSE'S BYTE-COPY LOOP AT 0x100F800. The decompressor's inner copy loop is
+        // where tid1 parks between yields; log its bound registers so "converging" vs "stuck" is a
+        // number. OFF unless VULCAN4_W206_COPY.
+        {
+            static const bool s_w206On = (std::getenv("VULCAN4_W206_COPY") != nullptr);
+            static int s_w206N = 0;
+            if (s_w206On && s_w206N < 40 && ctx.pc == 0x100f800u)
+            {
+                ++s_w206N;
+                std::cout << "VULCAN4 W206 COPY pc=0x100f800"
+                          << " s1=0x" << toHex(getRegU32(&ctx, 17))
+                          << " s2=0x" << toHex(getRegU32(&ctx, 18))
+                          << " s3=0x" << toHex(getRegU32(&ctx, 19))
+                          << " t1=0x" << toHex(getRegU32(&ctx, 9))
+                          << " t4=0x" << toHex(getRegU32(&ctx, 12)) << std::endl;
+            }
+        }
         // W201 (Sanji). IS sub_0100AE78 ENTERED AT A RESUME LABEL (prologue skipped)? If the harness
         // re-enters it at a pc other than 0x100AE78, `sd ra,104(sp)` never ran for that entry and the
         // epilogue reads whatever the stack held. OFF unless VULCAN4_W201_RESUME.

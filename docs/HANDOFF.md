@@ -3468,3 +3468,21 @@ MEASURED:`w231a-d` (livelocked_in_syscall, FE~7.6k): the two `+0x10` fields func
 NEXT:    the merge's input stream -- func_1007738 walks the struct at 0x1FFFBA0 (bound +8=1, base +0x14);
          find what should advance it. This is the same 0x1fffba0 wire W122 chased; a store watch on
          [0x1FFFBA0+8] and its base names the producer or proves it never runs.
+
+---
+
+## 2026-10-05 0x:xx · dish 18 re-run (W218) · spin -1 source DISAMBIGUATED; W216 REFUTED · gate failed
+
+WALL:    the shape-A decode spin sub_010088E8 never exits; func_1005870 returns -1 (W216).
+DID:     Extended `VULCAN4_W215_SPIN` with dispatch-level counters: bne-taken vs fall-through at
+         0x1005888, func_10057F0's return histogram, the +0x10 min/max, and the exit-target count.
+MEASURED:`w234d` (halt=livelocked_in_syscall, FE~6.5k): c5870=49,973,317 bnePredTaken=0
+         c57f0_fallthrough=49,973,317 ret_neg=49,973,317 ret_zero=0 ret_pos=0 exits=0; [a0+10]=[a1+10]=0
+         (min=max=0); [w218:cmp] a0=0x1fffba0 a1=0x18951f0 c0=1 c1=1 e0lo=0x1895360 e1lo=0x1895310.
+         So the 0x1005888 bne is NEVER taken (fields equal) -- W216's "the unequal +0x10 bne returns -1"
+         is REFUTED; every call falls through to func_10057F0, which returns -1 from its +0x14
+         ELEMENT-ARRAY compare (the arrays differ), and func_1005870 passes that -1 so the loop never
+         exits. W216's probe could not fail (printed -1 at a target both paths reach); the counters split
+         the paths. Also fixed my own backwards element comparison (recorded). Suite 497/497. Gate FAILS.
+NEXT:    find what writes the two +0x14 element arrays (e0lo/e1lo, 0x1895360/0x1895310, moving between
+         runs) and why they never become equal; a store watch on the array bases names the producer.

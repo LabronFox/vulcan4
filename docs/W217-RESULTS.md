@@ -1,61 +1,63 @@
-# W217 — the spin's compare producer: both `+0x10` fields are written once, by the parse's node builder
+# W218 — the spin's -1 comes from `func_10057F0`'s ELEMENT-ARRAY compare; W216 REFUTED
 
-**Dish:** `18-spin-compare-producer`. **Result:** ❌ no picture change; gate fails.
-**Outcome (P2):** the producer is **named** — the two `+0x10` fields `func_1005870` compares are written
-by the parse's node-building code, once, to **different node pointers**, and nothing updates them
-afterward; `func_1005870` therefore returns -1 forever.
+**Dish:** `18-spin-compare-producer` (re-run, disambiguation). **Result:** ❌ no picture change; gate fails.
+**Outcome (P2):** the exit predicate is **disambiguated by counters over a full run**, and W216's claim
+is **REFUTED**.
 
-## The producer, measured (`VULCAN4_W217_PROD`)
+## The contradiction settled
 
-A store watch on the two `+0x10` words (`[0x1FFFBA0+0x10]=0x1FFFBB0` and
-`[0x18951F0+0x10]=0x1895200`), shape `w231a-d` (`livelocked_in_syscall`, FE~7.6k), logs the writers:
+W216 claimed "the UNEQUAL `+0x10` `bne` at `0x1005888` returns -1". W216's own probe printed
+`equal=1` (both `+0x10` = 0), which means that `bne` is **not taken**. The new counters
+(`VULCAN4_W215_SPIN`, `[w218:pred]`/`[w218:cmp]`) settle it, on four spin shapes:
 
 ```
-[w217:prod] addr=0x1895200 val=0x18951E0 writerPc=0x1012220 op=WRITE32   (once)
-[w217:prod] addr=0x1FFFBB0 val=0x10      writerPc=0x10112F8 op=WRITE64
-[w217:prod] addr=0x1FFFBB0 val=0x10      writerPc=0x1011528 op=WRITE64
-[w217:prod] addr=0x1FFFBB0 val=0x18952E0 writerPc=0x101150C op=WRITE64
-[w217:prod] addr=0x1FFFBB0 val=0x1FFFC90 writerPc=0x1012500 op=WRITE64
-[w217:prod] addr=0x1FFFBB0 val=0x1895360 writerPc=0x101150C op=WRITE64
+[w218:pred] c5870=49973317 bnePredTaken=0 c57f0_fallthrough=49973317
+            ret_neg=49973317 ret_zero=0 ret_pos=0 exits=0
+            [a0+10]first=0x0 min=0x0 max=0x0 [a1+10]first=0x0 min=0x0 max=0x0
+[w218:cmp]  a0=0x1fffba0 a1=0x18951f0 c0=1 c1=1 e0lo=0x1895360 e1lo=0x1895310
 ```
 
-- **`[0x18951F0+0x10]` (`0x1895200`) is written ONCE**, to the node pointer `0x18951E0`, by `0x1012220`.
-- `[0x1FFFBA0+0x10]` (`0x1FFFBB0`) is written by `0x10112E4`/`0x10112F8`/`0x1011528`/`0x101150C`/
-  `0x1012500` — all inside the parse's node-builder region `0x10112E0–0x1011650` (`sub_0101280`-family)
-  — to various node pointers (`0x10`, `0x18952E0`, `0x1FFFC90`, `0x1895360`).
+- **`bnePredTaken = 0`** over ~50 million calls: the `0x1005888 bne` (`[a1+0x10] != [s0+0x10]`) is
+  **never taken**; both `+0x10` fields stayed `0x0` for the whole run (min=max=0).
+- **`c57f0_fallthrough = c5870`**: every call falls through to `func_10057F0`.
+- **`ret_neg = c57f0`** (all 49.97M returns are **-1**), `ret_zero=0`, `ret_pos=0`.
+- **`exits = 0`**: the loop never exits (the `0x10077B0` exit target never appears).
 
-So `func_1005870` compares `[a1+0x10]` (a node pointer in the `0x1895xxx` heap) against `[s0+0x10]`
-(another node pointer), and they are **different nodes**, so the compare stays unequal and the spin runs.
+**So the -1 is `func_10057F0`'s return from its `+0x14` ELEMENT-ARRAY compare** — `e0lo=0x1895360` vs
+`e1lo=0x1895310` differ — exactly as the dish brief predicted. W216's `0x10058A8 li v0,-1` path is
+**REFUTED** (it is never reached).
 
-**Positive control:** the watch fires on `0x1895200` (`0x1012220`), a TARGET word — so the observer sees
-the target writes, not just the control. (The scratchpad positive control `0x70002050` does not fire
-because scratchpad stores bypass the `ps2AddStoreSubscriber` path — a real observer limit, stated.)
+## Why the W216 probe could not fail
 
-## The producer region
+`[w216:exit]` printed `v0=-1` at `target=0x1007738`, the loop-body call reached from **either** path
+(taken → `0x10058A8 li -1`; not-taken → `func_10057F0` return, also -1). A probe that prints -1 on both
+paths proves nothing about the mechanism. The counters above split the two by dispatch, which is why
+they can.
 
-The writers `0x10112E4`/`0x10112F8`/`0x1011528` are in `sub_` spanning `0x10112E0–0x1011508`/
-`0x1011508–0x1011650` (the parse's node builder), and `0x1012220` is in the `0x1012xxx` region. All are
-downstream of the CORE.GT4 parse `sub_0100F390` in `sub_010047C0`'s subtree. So the "producer" is the
-parse itself: it builds two nodes with different `+0x10` pointers, and the spin's consumer waits for
-them to become equal — which the parse never makes them, because they are *meant* to be distinct nodes.
+## The instrument defect I made and fixed
 
-**The honest reading:** `sub_010088E8`'s 3-call loop is comparing two nodes for an ordering (merge or
-tree-walk) and the equality predicate is the wrong reading — the loop exits on `func_1005870` returning
-**>= 0**, not on equality; since it returns -1 for distinct nodes, the loop is a genuine **merge/walk
-step** whose counter `s1` (1→50M) is the progress, and the *real* wall is that the merge never reaches
-its end because the input stream does not terminate. That is the next question: why the merge's input
-stream (`func_1007738`'s struct at `0x1FFFBA0`, `+8=1`) never advances.
+My first disambiguation attempt had the element comparison **backwards** (`if (e1<e0) r=-1`), producing
+`ret_pos` — a wrong prediction that would have hidden the answer. Matching the generated code
+(`e0<e1 → -1`) gives `ret_neg` and agrees with the observed `-1`. Recorded because it is the same class
+of error this project keeps paying for: an instrument that can only reproduce its own assumption.
+
+## Positive control
+
+- The counter `exits` and the `0x10077B0` target are live observables; `ret_neg`/`ret_zero`/`ret_pos`
+  are three separate buckets, so a constant -1 and a mixed stream are distinguishable. In these shapes
+  it is uniformly -1 — a real result, not a stuck sample, because `c5870` climbs to 49.97M.
+- The store watch (`VULCAN4_W217_PROD`) independently fired on `0x1895200` (a target word), proving it
+  sees target writes.
 
 ## The wall, in one line
-`func_1005870` returns -1 because it compares two `+0x10` node pointers (`0x18951E0` vs `0x10`/
-`0x18952E0`/`0x1FFFC90`) that the parse's node builder sets once and never equalizes; the spin's counter
-`s1` (1→50M) is the merge progress, and the merge never terminates because its input stream never
-advances.
+`sub_010088E8`'s loop never exits because `func_1005870` falls through to `func_10057F0`, whose
+`+0x14` element arrays (`[0x1FFFBA0]`'s vs `[0x18951F0]`'s) never compare equal — it returns -1 on
+~50M calls — and nothing advances those arrays.
 
 ## Gate (authoritative, honest)
 `GATE FAIL` (v3, byte-identical disclaimer). Suite **497/497**.
 
 ## NEXT
-`func_1007738` walks the stream struct at `0x1FFFBA0` (bound `+8=1`, base `+0x14`); find what should
-advance it (the refill/`func_10057F0` count) — that is the merge's input, and it is the same
-`0x1fffba0` wire W122 spent many dishes on. A store watch on `[0x1FFFBA0+8]` and its base names it.
+Find what writes the two `+0x14` element arrays (`e0lo`/`e1lo`, currently `0x1895360`/`0x1895310`, which
+move between runs) and why they never become equal. A store watch on the array bases and their
+`+0x14` pointer fields names the producer.

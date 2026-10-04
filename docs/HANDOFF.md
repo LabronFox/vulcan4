@@ -2774,3 +2774,21 @@ NEXT:    the drop is INSIDE the parse: the bytes are read and then the decode's 
          reuse makes fixed-address watches ambiguous). Also unchanged: the campaign's finish line is
          milestone 2 (`VULCAN4 FRAME source=guest`), whose emitter is still not implemented.
 
+---
+
+## 2026-10-04 18:1x · dish 04 re-run (W177) · stuck
+
+WALL:    the decode work buffer. `sub_010088E8`'s `$a2` data is born zero; the guest never leaves the
+         2005 disclaimer.
+DID:     Took W176's named next measurement: logged every `jal 0x101e81c` (memcpy) call site
+         (`VULCAN4_W177_MEMCPY`, OFF by default). The `sub_01008080` clone memcpy for the decode's
+         `$a2` source **does run**, but it writes to the `arg1` side of a 0x50-stride pair.
+MEASURED:`[w177:memcpy] from=0x1008264 dst=0x1895250 src=0x1895180 len=0x4` while the decode's
+         `arg1 dp=0x1895250 w0=1` and `arg2 dp=0x18952a0 w0=0`; `arg1 nd=0x1895220`, `arg2 nd=0x1895270`
+         (0x50 apart). So the clone populates the `arg1` buffer and the decoder reads the `arg2` one.
+         W176 (same wall, earlier): the parse DOES read CORE.GT4 sequentially ≥768 KB, so P2 is
+         REFUTED. Suite 497/497. Gate v3 FAILS.
+NEXT:    the buffer-selection step at the clone (`0x1008264`): why does `dst` resolve to the `arg1`
+         data (`0x1895250`) and not the `arg2` data (`0x18952a0`)? Dish `05-trace-parse-node.txt`
+         should start there. No graphic change; the goal gate stays failed.
+

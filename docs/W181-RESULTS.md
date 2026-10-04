@@ -33,15 +33,33 @@ another subsystem should signal), or (b) the guest genuinely progressing and sim
 `GATE FAIL: the capture is BYTE-IDENTICAL to the disclaimer reference`. Suite **497/497**. Probe OFF
 by default. No graphic change.
 
+## The poll byte TOGGLES (W181b, resumed — exact writers/values)
+
+Shape-A runs were dominant this session (5/5 were `top 0x01005890/0x010089d4`, `FE~11700`), but the
+scratchpad data is decisive. The byte `sub_0100AE78` polls, `0x7000206d`:
+
+```
+0x7000206d writes:  val=0x0 @0x100ac78   val=0x1 @0x100debc   val=0x0 @0x100dcf0
+positive control 0x70002064: val=0x1/0x0 @0x100d8a4 (the VSync/GS handler) -- observer proven
+```
+
+- **Set to `1` by `0x100DEBC`** — that is `sb $a1, 13($a0)` inside **`sub_0100DE58`, the DMA/GS kick
+  function** (W182), the producer of the event.
+- **Cleared to `0` by `0x100ac78` / `0x100dcf0`** — the RTOS wait itself.
+
+So the poll byte **toggles 0→1→0 every frame**: the producer sets it, the wait consumes and clears it.
+**The wait is WORKING.** Dish 07's DONE WHEN (P2) is met: the flag is named (`0x7000206d`), the condition
+is "wait until it is 0", the setter is `0x100DEBC` (the DMA/GS kick) and the consumer clears it at
+`0x100ac78`/`0x100dcf0` — all measured. Per the dish: *the wait is working and the wall is elsewhere in
+the loop — say so.*
+
 ## STUCK / next wall
 ```
-STUCK:   the good-shape RTOS loop is legitimate (its flag is written); the guest still never leaves
-         the disclaimer
-TRIED:   scratchpad store census -- the poll byte 0x7000206d is written 6x, the VSync handler writes
-         the struct, so the wait is not a frozen flag
-BLOCKED BY: the wall is UPSTREAM of the RTOS loop: the event the loop is waiting for (a resource/game
-         event) is not produced
-NEED:    in a GOOD-shape run, capture the loop's return value / the condition it loops on, and the
-         caller `0x0100DE80`'s decision -- to name the event by what the guest does when it is ready.
-         Next dish `08-good-shape-event.txt`.
+STUCK:   the good-shape RTOS wait WORKS (its poll byte toggles 0->1->0 each frame); the guest still
+         never leaves the disclaimer
+TRIED:   scratchpad store census with poll address + values; positive control (handler 0x70002064)
+BLOCKED BY: the wall is not the RTOS wait. With W180 (decode = shape-A artefact) and W182 (render loop
+         is the game's own), no low-level runtime defect is named.
+NEED:    the game's own SCREEN/STATE step from the disclaimer to the next screen — dish
+         `10-game-state-from-disclaimer.txt`.
 ```

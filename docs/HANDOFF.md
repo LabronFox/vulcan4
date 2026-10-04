@@ -2913,3 +2913,19 @@ NEXT:    The campaign's stop condition is met in substance (a frame from GT4's o
          declare milestone 2 met and ask the captain to re-scope, or write dish `10-game-state-from-
          disclaimer.txt` (trace GT4's screen/state machine from the disclaimer).
 
+---
+
+## 2026-10-04 19:3x · dish 07 resume (W181b) · the RTOS wait WORKS
+
+WALL:    the good-shape RTOS wait (`sub_0100AE78`). Dish 07 asks: name the polled flag + condition +
+         setter, or say the wait works.
+DID:     Scratched the poll byte's exact writers/values over a run (`VULCAN4_W181_SP`).
+MEASURED:`0x7000206d` (the poll byte) **toggles**: `val=1 @0x100DEBC` (set by the DMA/GS kick
+         `sub_0100DE58`, `sb $a1,13($a0)`) then `val=0 @0x100ac78`/`0x100dcf0` (cleared by the wait).
+         Positive control `0x70002064` toggles under the VSync handler `0x100d8a4`. So the wait is
+         WORKING -- dish 07's P2 is met (flag named, condition "wait until 0", setter `0x100DEBC`).
+         This session all 5 good-shape attempts came back shape A (`top 0x01005890/0x010089d4`,
+         `FE~11700`); the good shape is rare right now. Suite 497/497. Gate v3 FAILS.
+NEXT:    wall is the game's own screen/state step (no runtime defect). Dish
+         `10-game-state-from-disclaimer.txt`. Graphic unchanged; goal gate failed.
+

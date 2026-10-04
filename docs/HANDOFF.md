@@ -3151,3 +3151,31 @@ NEXT:    (1) the gate's short-shape failure is the DECODE SPIN (dominant), not t
          derail's corruptor: watch the callback nodes (`VULCAN4_W192_STORE`) or the guest heap
          allocator reusing a live node; (3) the picture still needs the W188 parse-chain block solved
          (screen setup sub_01000558 never completes). Barrier CLOSED as not dominant.
+
+---
+
+## 2026-10-04 22:xx · dish W196 (corrupted $ra) · MECHANISM 3 NAMED · gate failed
+
+WALL:    sub_0100AE78 (tid2, the render thread) returns through a corrupted $ra (0x1003FC00/0x0240302D/
+         0xA303C50C/NULL); wild jump off the disclaimer render thread.
+DID:     Added W195 (harness stack-window dump at the derail), W197 (per-dispatch slot watch), W201
+         (resume-entry watch), W190/W192 (store probes). Ruled out candidates 1 and 2 by disassembly;
+         named candidate 3 with a measurement.
+MEASURED:(1) DERAIL: `WILDPC dead=ra=0x1003FC00/0x0240302D/0xA303C50C sp=0x010459E0 v0=0xFFFFFFFF
+         last_good=0x0100F800`, thread tid2 (entry 0x1000BA0); tid1 Ready at 0x100F800. (2) MECHANISM 3:
+         `W195 slotwin` shows `ra == [sp-8]` in every derail -- the epilogue read the correct slot and
+         the slot held garbage; the window [sp-16,sp+8] is packet-like data and the garbage s0. (3)
+         CANDIDATES 1/2 RULED OUT for sub_0100AE78: disasm has exactly one `sd ra,104(sp)` (0x100AEC8),
+         one `ld ra,104(sp)` (0x100B040), one `jr ra` (0x100B044), and a symmetric -112/+112 frame; its
+         callees are leaf Di/Ei/SleepThread wrappers. (4) WRITER INTERVAL: W197 shows the wild value
+         appearing between `0x100afa0->0x101f340` (SleepThread) and `0x100d908->0x10202e8` (VSync
+         handler's GetThreadId) on tid2. The handler runs on a fresh reserveAsyncCallbackStack stack
+         (EeScheduler.cpp:1796 sets sp=0, invocationStackTop() gives a fresh stack). (5) W201 shows the
+         function IS resumed correctly at 0x100afa8/0x100af50 with the frame base intact -- the resume
+         path preserves sp. (6) OBSERVER EFFECT: without a store watch 3/8 boots derail; with the W122
+         subscriber or the harness WATCH_LO/HI observer (~9x) 0/6-8 derail. Suite 497/497. Gate v3
+         FAILS (no picture change).
+NEXT:    a NON-PERTURBING capture of the store to 0x010459D8 (hardware watchpoint under gdb on the host
+         RDRAM address, or a guard page) to get the exact pc. Then fix in the correct layer (runtime if
+         our code, game override if one guest function, recompiler if a codegen class). The writer runs
+         on tid2 across the SleepThread -> VSync-handler transition.

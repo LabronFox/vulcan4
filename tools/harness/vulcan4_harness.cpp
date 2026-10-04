@@ -2210,6 +2210,35 @@ int main(int argc, char *argv[])
                                                                : std::string("NONE"))
                       << " ra=" << toHex(raNow) << " sp=" << toHex(spNow)
                       << " v0=" << toHex(v0Now) << " s0=" << toHex(s0Now) << std::endl;
+
+            // W195 (Sanji). WHICH MECHANISM? For a `jr $ra` return out of sub_0100AE78 the prologue
+            // saved $ra at (entry_sp - 112) + 104 == entry_sp - 8, and the epilogue's delay slot
+            // `addiu sp,sp,112` has already restored sp to entry_sp by the time we get here. So the
+            // slot the return read is sp-8. Print a window of stack words around it: if [sp-8] == ra
+            // the slot itself was written (mechanism 3); if [sp-8] != ra the restore read elsewhere
+            // (mechanism 2); if the whole window is data-looking, something bulk-copied over it.
+            {
+                auto rd = [&](int32_t delta) -> uint32_t
+                {
+                    const int64_t a = static_cast<int64_t>(spNow) + delta;
+                    uint32_t w = 0u;
+                    if (a >= 0 && a + 4 <= 0x02000000)
+                    {
+                        std::memcpy(&w, rdram + a, 4);
+                    }
+                    return w;
+                };
+                std::cout << "VULCAN4 W195 slotwin sp=" << toHex(spNow)
+                          << " [sp-16]=" << toHex(rd(-16))
+                          << " [sp-12]=" << toHex(rd(-12))
+                          << " [sp-8]=" << toHex(rd(-8))
+                          << " [sp-4]=" << toHex(rd(-4))
+                          << " [sp]=" << toHex(rd(0))
+                          << " [sp+4]=" << toHex(rd(4))
+                          << " [sp+8]=" << toHex(rd(8))
+                          << " | ra==[sp-8]? " << ((rd(-8) == raNow) ? "YES (slot written)" : "NO (wrong slot / elsewhere)")
+                          << std::endl;
+            }
             break;
         }
 
@@ -2303,6 +2332,23 @@ int main(int argc, char *argv[])
                 std::cout << "VULCAN4 W188 ENTER pc=" << toHex(ctx.pc)
                           << " ra=" << toHex(getRegU32(&ctx, 31))
                           << " sp=" << toHex(getRegU32(&ctx, 29))
+                          << " prev=" << (lastResolvedPcValid ? toHex(lastResolvedPc) : std::string("NONE"))
+                          << std::endl;
+            }
+        }
+        // W201 (Sanji). IS sub_0100AE78 ENTERED AT A RESUME LABEL (prologue skipped)? If the harness
+        // re-enters it at a pc other than 0x100AE78, `sd ra,104(sp)` never ran for that entry and the
+        // epilogue reads whatever the stack held. OFF unless VULCAN4_W201_RESUME.
+        {
+            static const bool s_w201On = (std::getenv("VULCAN4_W201_RESUME") != nullptr);
+            static int s_w201N = 0;
+            if (s_w201On && s_w201N < 40 && ctx.pc >= 0x100ae78u && ctx.pc < 0x100b048u)
+            {
+                ++s_w201N;
+                std::cout << "VULCAN4 W201 ENTER pc=" << toHex(ctx.pc)
+                          << " ra=" << toHex(getRegU32(&ctx, 31))
+                          << " sp=" << toHex(getRegU32(&ctx, 29))
+                          << " slot[sp-8]=" << toHex([&]{ uint32_t w=0; const uint32_t a=(getRegU32(&ctx,29)-8u)&0x01FFFFFFu; if(a+4<=0x02000000u) std::memcpy(&w, rdram+a, 4); return w; }())
                           << " prev=" << (lastResolvedPcValid ? toHex(lastResolvedPc) : std::string("NONE"))
                           << std::endl;
             }

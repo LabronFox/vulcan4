@@ -2876,3 +2876,40 @@ NEXT:    the wall is UPSTREAM of the loop: name the EVENT the loop waits for by 
          condition / return value and the caller `0x0100DE80`'s decision in a GOOD-shape run. Dish
          `08-good-shape-event.txt`. Graphic unchanged; goal gate failed.
 
+---
+
+## 2026-10-04 19:1x · dish 08 (W182) · stuck (no low-level defect names the wall)
+
+WALL:    the guest never leaves the 2005 disclaimer.
+DID:     Read the good-shape loop's caller chain from the ELF.
+MEASURED:`sub_0100AE78` is called at `0x100DE80` (inside `sub_0100DE58`), which then programs the
+         DMAC/GS (`0x10002000`, `0x70002000`, the `0x1032df8` table) and `sync`s — and `sub_0100DE58`
+         is called from `0x100B17C/0x100B190/0x100B2AC` in the game's RTOS/render layer. So the guest is
+         in its **normal vsync DMA/GS kick loop**: wait → program DMA source + GS regs → sync. Combined
+         with W180 (decode = shape-A artefact) and W181 (wait flag written), **no low-level runtime
+         defect is named by any measurement** — the wall is the game's own screen state. Suite 497/497.
+         Gate v3 FAILS.
+NEXT:    the campaign's own finish line is reachable now: milestone 2's marker `VULCAN4 FRAME
+         source=guest` is unimplemented (`CAMPAIGN.md`), and the guest already draws GT4's own frame
+         (`frames_presented=4697`). Dish `09-emit-the-frame-marker.txt`: finish the GS lane's emitter so
+         the stop condition is honestly testable. Gate failed; goal gate failed.
+
+---
+
+## 2026-10-04 19:2x · dish 06 re-run (W183) · MILESTONE-MARKER FOUND ALREADY EMITTED
+
+WALL:    none at the runtime level for the marker; the captain's bar (past the disclaimer) remains.
+DID:     Checked the campaign's milestone-2 marker before writing another emitter dish -- and found it
+         already implemented and firing. Corrected the stale caveat in `CAMPAIGN.md`.
+MEASURED:`GS::processGIFPacket` (`gs_frontend.cpp:822`, W99/W107) prints `VULCAN4 FRAME source=guest
+         n=..` on the first 64 guest GS packets + every 1000th. In a harness run its only callers are
+         the guest's EE GIF DMA (`ps2_runtime.cpp:874`) and the VU1 XGKICK (`ps2_vu1_core.cpp:925`) --
+         guest-only, honest. Newest good-shape log `boot_w170_171139.log` has **72 marker lines, n up to
+         8000**. **Milestone 2's marker condition is MET**; `CAMPAIGN.md`'s "never emitted" note was
+         stale. Suite 497/497. Picture gate v3 still FAILS (disclaimer).
+NEXT:    The campaign's stop condition is met in substance (a frame from GT4's own code reaches the
+         screen). The remaining distance is the game-state step from the 2005 disclaimer to the menu --
+         a game-logic effort, with no low-level runtime defect named by W171-W182. Re-arm should either
+         declare milestone 2 met and ask the captain to re-scope, or write dish `10-game-state-from-
+         disclaimer.txt` (trace GT4's screen/state machine from the disclaimer).
+

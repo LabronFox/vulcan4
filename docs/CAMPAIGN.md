@@ -20,7 +20,7 @@ The full Stage 1 ladder (nobody plans past this yet):
 | # | Milestone | Machine-readable marker | Gate |
 |---|---|---|---|
 | **1** | Guest boots **past its own startup** (its CRT init is done; real game code runs) | `functions_entered` in the boot report | `functions_entered >= 1000` |
-| **2** | 🏁 **A FRAME from GT4's own code** — guest traffic reaches the GS | `VULCAN4 FRAME source=guest` in the log | **CAMPAIGN DONE**. ⚠ **The string is currently never emitted by any code path** — it exists in this file and in `docs/HANDOFF.md`, but nothing prints it, so this milestone can be neither reached nor missed honestly until the GS lane's emitter is finished. |
+| **2** | 🏁 **A FRAME from GT4's own code** — guest traffic reaches the GS | `VULCAN4 FRAME source=guest` in the log | **CAMPAIGN DONE**. ✅ **CORRECTED 2026-10-04 (W183): the marker IS emitted.** `GS::processGIFPacket` (`gs_frontend.cpp:822`, W99/W107) prints `VULCAN4 FRAME source=guest n=..` on the first 64 guest GS packets and every 1000th; in a harness run its only callers are the guest's EE GIF DMA (`ps2_runtime.cpp:874`) and the VU1 XGKICK (`ps2_vu1_core.cpp:925`), so the marker is guest-only and honest. The newest good-shape log (`boot_w170_171139.log`) carries 72 marker lines with `n` up to **8000** — **the marker condition is MET**. The earlier note ("never emitted by any code path") was stale. The captain's stricter bar — past the 2005 disclaimer to the menu — is NOT met, and is a game-state effort, not a named runtime defect. |
 | 3 | 3D — a car and a track through the VU1 path | `VULCAN4 FRAME has3d=true` | later |
 | 4 | Input — menus navigable, a pad works | `VULCAN4 INPUT source=player` | later |
 | 5 | A race you can drive | `VULCAN4 RACE drivable=true` | later |

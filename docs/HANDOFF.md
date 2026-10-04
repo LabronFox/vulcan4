@@ -3523,3 +3523,20 @@ MEASURED:`w236a-f` (6 shapes, mixed livelocked_in_syscall / wallclock_deadline):
 NEXT:    name the parse call supposed to feed the stream a second node (the merge's other input) and why
          it does not run; the stream's [+0]=0x1012658 is a code pointer -- find its jalr users and trace
          the feeder. If gated on GT4.VOL data absent from the build, that is the input.
+
+---
+
+## 2026-10-05 0x:xx · dish 19 (W219b) · the stream feeder runs ONCE · gate failed
+
+WALL:    the shape-A decode spin sub_010088E8 never exits (the merge makes no progress).
+DID:     Added a counter for the stream's refill `0x1005AB8` (called by func_1007738 when the rotated
+         carry is 1) under VULCAN4_W215_SPIN.
+MEASURED:`w237a` (halt=livelocked_in_syscall): refill1005AB8=1 against c5870=49,973,331 spin
+         iterations. So the bit-buffer stream at 0x1FFFBA0 is filled ONCE and then the carry stays 0,
+         the refill is never re-entered, and bound/base never advance. The feeder is func_1007738's
+         refill 0x1005AB8 (writes a bit into [base+i*4], adjusts bound at 0x1005af8/0x1005b30); its
+         callers are all inside func_1007738 (0x100779c/0x1007a04/0x1007bf8). This locates W122's
+         unnamed "producer of the first bit" to the refill and counts it. Suite 497/497. Gate v3 FAILS.
+NEXT:    trace what should set func_1007738's carry to 1 after the first fill -- the byte/bit source the
+         parse feeds the +0x14 array from; watch the array write from the parse and whether it is reached
+         after the first fill.

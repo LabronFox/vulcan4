@@ -61,7 +61,44 @@ fixed sorted-list keys (`0x0` vs `0x1`) and can never terminate.
 ## Gate (authoritative, honest)
 `GATE FAIL` (v3, byte-identical disclaimer). Suite **497/497**.
 
+## W219b — the feeder NAMED and its run count MEASURED: `0x1005AB8`, **1 run**
+
+`func_1007738` (`0x1007738`) rotates the stream's bit array and, **only when the shifted-out carry bit
+is non-zero**, calls the refill **`0x1005AB8`**:
+
+```
+1007758: lw   v0,20(a3)        ; base
+1007768: lw   a0,0(v1)         ; word
+100776c: sll  v0,a0,1          ; word<<1
+1007770: or   v0,v0,a2         ; | carry
+1007774: sw   v0,0(v1)         ; write back
+1007784: srl  a2,a0,0x1f       ; carry = top bit
+1007788: beqz a2,0x10077a4     ; carry==0 -> return (no refill)
+100779c: jal  0x1005AB8        ; carry!=0 -> REFILL (writes a new bit into the stream)
+```
+
+`0x1005AB8` writes `[base + i*4] = a2` (a bit) and adjusts the bound (`0x1005af8`, `0x1005b30`) — it is
+the stream's feeder. The counter (`[w218:pred]`, shape `w237a` `livelocked_in_syscall`) measures its
+run count:
+
+```
+[w218:pred] c5870=49973331 ... exits=0 refill1005AB8=1
+```
+
+**The refill runs exactly ONCE for the whole run**, against **49,973,331** spin iterations. So the stream
+is filled once (its initial bit) and then the carry stays 0 forever, the refill is never re-entered, and
+the bound/base never advance. The producer that *should* feed more bits is the byte-source upstream of
+`func_1007738`'s carry — i.e. the parse that should supply input to this merge — and it never runs.
+
+## The contract, stated plainly
+The stream at `0x1FFFBA0` is a **bit buffer**: bound `+8`, base `+0x14`, whose feeder `0x1005AB8` is
+called from `func_1007738` when the rotated-out carry is 1. It runs **once**; after that the buffer's
+carry is 0 on every iteration, so no refill and no progress. The merge `func_1007738`/`func_10057F0` is
+waiting for input bits that the (parse) producer never supplies — the same "producer of the first bit"
+W122 left unnamed, now located to the refill `0x1005AB8` and counted.
+
 ## NEXT
-Name the parse call that is *supposed* to feed the stream a second node (the merge's other input) and
-why it does not run: the stream's `[+0]=0x1012658` is a code pointer — find its users (a `jalr [ptr]`)
-and trace the feeder. If the parse is gated on GT4.VOL data absent from the build, that is the input.
+Trace what should set `func_1007738`'s carry to 1 after the first fill — the byte/bit source the parse
+feeds the stream from. `0x1005AB8`'s callers are all in `func_1007738` (`0x100779c`/`0x1007a04`/
+`0x1007bf8`); the source is whatever fills the `+0x14` array before the rotate. Watch the array write
+from the parse and whether the parse reaches it after the first fill.

@@ -3103,3 +3103,27 @@ NEXT:    the wall is a NAMED block inside the screen setup: the parse chain 0x10
          terminate (spin / blocked file read / bound never reached). This re-opens the parse as the
          wall, now with a concrete consumer: the disclaimer cannot advance until it returns. The early
          barrier (dish 12) and GT4.VOL data remain open. Graphic unchanged; goal gate failed.
+
+---
+
+## 2026-10-04 20:5x · dish 12 (W189) · barrier named but NOT dominant · gate failed
+
+WALL:    dish 12 asked for the early barrier at 0x100D908. Measured: it is not the dominant stall.
+DID:     Ran 4 boots with `VULCAN4_W160_BARRIER` + `VULCAN4_W173_SWITCH`; measured the shape
+         distribution and the barrier, then named the ACTUAL dominant wall.
+MEASURED:(1) SHAPES (45 s, entries=3M): w189a/b/d `halt=pc_outside_generated_table` FE=2145/2247/2422,
+         top XFER `0x100d380`=16368; w189c `livelocked_in_syscall` top `0x1005890/0x10089c8/0x10089d4`
+         33.32% each. The barrier `0x100D908` is only 2.77% (w189b, 991). (2) BARRIER (P2): `[w160:bar]`
+         s0=0x1045970 s1=0x70002088 *s1=0x1045970 [node=0x1045970 next=0x0 tid=0x2] -- a ONE-node list
+         that terminates; callee 0x10202E8 compares GetThreadId(0x2F) with tid=2, running thread IS tid2,
+         so it releases. `inv_by_kind=[intr=3336] intr_run=3340 vblanks=333` -- handler re-entered per
+         VSync, not stuck. W173: 154 switches to tid1, 146 to tid2. (3) DOMINANT WALL: `VULCAN4 WILDPC`
+         dead=0x1003A020 / 0x1003FC00 / 0x00000000 -- 0x1003FC00 and 0x1003A020 are in `.rodata`
+         (0x1036D80..0x10401F8), w189d jumps to NULL. The jump is the `jr $ra` at 0x100B044 (epilogue of
+         sub_0100AE78, the RTOS/render wait), ra restored from sp+104; registers garbage (s0=0x6B5D03B5,
+         a0=0x637508B0); the derailing thread is tid2 (entry 0x1000BA0). missing_functions=0. Suite
+         497/497. Gate v3 FAILS (no new capture; short shapes).
+NEXT:    instrument the ra save/restore of sub_0100AE78 (`sd ra,104(sp)` entry, `ld ra,104(sp)` @
+         0x100B040) across a derailing run and name who overwrites the slot -- the parse/decrypt chain
+         (0x100F390, the 0x100D380 XOR loop) or the scheduler's resume of the RTOS wait. Barrier CLOSED
+         as not dominant. Graphic unchanged; goal gate failed.

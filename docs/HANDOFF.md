@@ -3039,3 +3039,20 @@ NEXT:    dish `12-barrier-invocation.txt`: instrument `EeScheduler::dispatchIrq`
          resumed, and is tid1 runnable-but-unscheduled? Name which. Then dish `11-screen-dispatcher`
          once the guest reliably gets past the barrier. Graphic unchanged; goal gate failed.
 
+---
+
+## 2026-10-04 20:4x · dish 11 (W185) · the screen dispatcher is DYNAMIC
+
+WALL:    GT4's screen/state advance past the disclaimer (dish 11).
+DID:     Searched the ELF for a static screen-pointer table / computed `jal` to `0x1000BA0`.
+MEASURED:**no static dispatcher exists.** Pointers into `0x1000xxx` in the image: `.data` 1 (the ELF
+         entry `0x01000000`), `.rodata` 0, `.rdata` 0; no `addiu ...,0xba0`; no direct `jal 0x1000ba0`.
+         So the call to the screen fn is computed at runtime (a `.bss`/heap screen-vtable built by the
+         game's own loader). `VULCAN4_W186_SCREEN` only ever saw the 22 setup writes -- the screen loop
+         is a good-shape path and this session's boots stall at the early barrier (`FE~2000`). Also:
+         `GT4.VOL` (2.29 GiB) is NOT extracted in `/mnt/ssd/gt4/work/` (only `vol_head.bin`, 8 MiB).
+         Suite 497/497. Gate v3 FAILS.
+NEXT:    (1) pass the early barrier (`0x100D908`, dish 12) so the screen loop is reachable; (2) then
+         watch the dynamic `jalr` screen pointer and the `0x102DCA8` index at halt; (3) check whether
+         the screen advance needs `GT4.VOL` data not present in the build. Graphic unchanged.
+

@@ -41,15 +41,37 @@ GATE FAIL: the capture is BYTE-IDENTICAL to the disclaimer reference — the scr
 ```
 Suite **497/497**. Probes OFF by default (`W176/W177/W178`). No graphic change.
 
+## The `arg2` node's producer chain (W179, one run)
+
+Watching the decode's `arg2` node (`0x1895390`) itself:
+```
+node+4  (0x1895394) = 0x0 @0x1008cc0, 0x1 @0x1008cf4, 0x2 @0x1008d40
+node+8  (0x1895398) = 0x1 @0x1008cb8
+node+0xc(0x189539c) = 0x0 @0x1008cc8, 0x1 @0x1005a90
+node+0x10(0x18953a0)= 0x0 @0x1008ccc
+node+0x14(0x18953a4)= 0x0 @0x1008cd4, 0x18953c0 @0x1005a94
+```
+- The node's **fields** (`+4`, `+8`, `+0xc`, `+0x10`) are written by the **empty-path block**
+  `0x1008cb8`-`0x1008d40` (the `0x1008ca4` node creation) — the path that (W174) returns via
+  `b 0x1009008` **without decoding**.
+- Its **data pointer** `+0x14` is set to `0x18953c0` by **`0x1005a94`**, inside the buffer allocator
+  `func_10059E8` (called at `0x1008cd0`), and that buffer's word 0 is then zeroed by `0x1008ce0`.
+- **Nothing ever copies parsed data into `0x18953c0`.**
+
+So the decode is handed a node built by the empty path (its fields and its zeroed data buffer), i.e.
+the node the empty branch created and abandoned. The **drop is named**: node creation
+`0x1008ca4`/`0x1008cb8`-`0x1008cd4`, buffer alloc `0x10059e8` (`+0x14` set at `0x1005a94`), zero at
+`0x1008ce0`, and **no filler**. P2 of the dish is met.
+
 ## STUCK / next wall
 ```
 STUCK:   the loading screen (2005 disclaimer) never ends
-TRIED:   copy-loop destinations (they go to 0x105xxxx, not the nodes); clone dst/src/slots;
-         runner-level absence of any writer to arg2's buffer
-BLOCKED BY: the decode's arg2 node (0x1895390 / data 0x18953c0) has no producer; the parsed bytes sit
-         in 0x105xxxx and the clone fills arg1's sibling instead
-NEED:    decide whether arg2's data pointer should reference one of the parsed 0x105xxxx buffers (then
-         find what writes the node's +0x14) or whether the compare's meaning is inverted (arg2 is the
-         accumulator target and arg3 the source). One next measurement: dump the arg2 node's producer
-         chain at 0x1895390 and compare its +0x14 against the parsed buffers' addresses.
+TRIED:   copy-loop destinations (0x105xxxx, not the nodes); clone dst/src/slots; arg2 node producer
+         chain (empty-path block + allocator + zero, no filler)
+BLOCKED BY: the decode's arg2 node is the empty-path node; its data buffer is allocated+zeroed and no
+         copy ever fills it, while the parsed bytes sit in 0x105xxxx
+NEED:    decide whether the decode's arg2 should be a DIFFERENT (parsed-data) node -- i.e. the caller
+         routed the empty-branch node into the decode -- or the compare meaning is inverted. Next
+         measurement: log at 0x1008c9c which branch ran and which node `sp+52` ends up holding, in one
+         run with the pointer captured live (heap reuse made fixed addresses ambiguous in W172).
 ```

@@ -2826,3 +2826,20 @@ NEXT:    decide whether `arg2`'s `+0x14` should reference a parsed `0x105xxxx` b
          chain at `0x1895390`, comparing its `+0x14` with the parsed buffers. Graphic unchanged; goal
          gate failed.
 
+---
+
+## 2026-10-04 18:4x · dish 05 resume (W179) · stuck
+
+WALL:    the decode work buffer. The guest never leaves the 2005 disclaimer.
+DID:     Dumped the `arg2` node's producer chain in-completion of dish 05's P2 ("name the exact
+         instruction/link where the parsed bytes are dropped").
+MEASURED:node `0x1895390`: fields `+4/+8/+0xc/+0x10` set by the EMPTY-path block `0x1008cb8`-`0x1008d40`
+         (the `0x1008ca4` creation that W174 proved returns via `b 0x1009008` without decoding);
+         `+0x14` set to `0x18953c0` by `0x1005a94` (allocator `func_10059E8`); `0x18953c0` word 0
+         zeroed by `0x1008ce0`; **no filler copy ever writes it**. So the decode is handed the node
+         the empty branch created and abandoned. **P2 met.** Suite 497/497. Gate v3 FAILS.
+NEXT:    decide whether the decode's `arg2` should be a DIFFERENT (parsed-data) node -- the caller
+         routed the empty-branch node into the decode -- or the compare meaning is inverted. Next
+         measurement: at `0x1008c9c`, log which branch ran and which node `sp+52` holds, capturing the
+         pointer live. Graphic unchanged; goal gate failed.
+

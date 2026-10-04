@@ -3286,3 +3286,23 @@ MEASURED:the chain reaches the parse caller and STOPS: `[w209:sub]` n=17..23 `0x
 NEXT:    dump the block's input bytes at the stalled stream pointer and the loop exit condition in
          `sub_0100F390`; decide whether the input is a corrupt stream (from the XOR/decrypt path) or a
          genuine long block.
+
+---
+
+## 2026-10-05 0x:xx · dish 14 re-run (W210) · setup tree COMPLETES; the waits are real syscalls · gate failed
+
+WALL:    the screen setup `sub_01000558` never returns. Dish 14: name the dominating / never-returning
+         call, and settle whether 0x100AFA0 blocks or spins.
+DID:     Added `VULCAN4_W210_TREE` (per-node setup-subtree scoreboard: count + first/last wall_ms).
+MEASURED:(1) THE TREE COMPLETES: good shapes (w210j/k, FE~7900) print every node with a `last_ms` --
+         0x1000558=5ms, 0x10047C0/0x1004500/0x1004308/0x100F8C8/0x1010B10=26-27ms, 0x100F390 count=49
+         last_ms=719, 0x1010BD0 count=8 last_ms=725, 0x101D2A0 count=35 last_ms=741. Nothing loops; the
+         setup tree finishes in ~0.75 s. (2) H-STARVE REFUTED for the top wait sites: 0x100AFA0 is a
+         `jal 0x101F340`, and 0x101F340 is the **sce_SleepThread** wrapper (`li v1,50; syscall` = 0x32),
+         inside a bounded poll loop; 0x100B678 is the SAME SleepThread inside sub_0100B628's
+         `[0x70002050]` wait loop. Both YIELD (call the scheduler), not busy-spin. So W207/W208's
+         "tid1 starved by a spinning RTOS wait" was an inference the histogram could not support and is
+         CORRECTED. Suite 497/497. Gate v3 FAILS (byte-identical disclaimer).
+NEXT:    the frame pump -- who advances the polled bytes `[s0]` (0x100AFA0's loop) and `[0x70002050]`
+         (sub_0100B628); and why the disclaimer's later setup calls (0x1004424 -> 0x1010BD0) are entered
+         only 8 times in a whole run. The W204 async-pool/main-stack overlap is still real and unlanded.

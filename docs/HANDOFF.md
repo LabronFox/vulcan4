@@ -3449,3 +3449,22 @@ MEASURED:`w229c`/`w229f` (halt=livelocked_in_syscall): the back-edge is 0x10089C
          climbs 138M->3.1B. Suite 497/497. Gate v3 FAILS.
 NEXT:    find what writes `[a1+0x10]`/`[s0+0x10]` (a1=0x18951F0) and should make them equal; a store
          watch on the two +0x10 words over a run names the producer or proves it never runs.
+
+---
+
+## 2026-10-05 0x:xx · CAMPAIGN re-arm (dish 18) · the spin's compare producer named · gate failed
+
+WALL:    the shape-A decode spin sub_010088E8 never exits because func_1005870 returns -1 (W216).
+DID:     Wrote `.auto/queue/18-spin-compare-producer.txt` and worked it: added `VULCAN4_W217_PROD`
+         (store watch on the two +0x10 words, widened to catch +0x10).
+MEASURED:`w231a-d` (livelocked_in_syscall, FE~7.6k): the two `+0x10` fields func_1005870 compares are
+         WRITTEN once and never equalized. `[0x18951F0+0x10]` (0x1895200) is written ONCE to the node
+         pointer 0x18951E0 by 0x1012220; `[0x1FFFBA0+0x10]` (0x1FFFBB0) is written by the parse's
+         node-builder region 0x10112E0-0x1011650 (0x10112E4/0x10112F8/0x1011528/0x101150C/0x1012500) to
+         various node pointers (0x10, 0x18952E0, 0x1FFFC90, 0x1895360). So func_1005870 compares two
+         DIFFERENT nodes -> always unequal -> -1 forever. Positive control: the watch fires on the target
+         word 0x1895200 (0x1012220). (Scratchpad control 0x70002050 does not fire -- scratchpad stores
+         bypass ps2AddStoreSubscriber; stated limit.) Suite 497/497. Gate v3 FAILS.
+NEXT:    the merge's input stream -- func_1007738 walks the struct at 0x1FFFBA0 (bound +8=1, base +0x14);
+         find what should advance it. This is the same 0x1fffba0 wire W122 chased; a store watch on
+         [0x1FFFBA0+8] and its base names the producer or proves it never runs.

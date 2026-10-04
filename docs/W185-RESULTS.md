@@ -46,3 +46,25 @@ Two prerequisites before the screen dispatcher is even reachable this session:
 2. once the guest reaches the good shape reliably, read the dynamic screen pointer (watch `jalr` sites
    once the screen loop runs) and the `0x102DCA8` table index at halt. Also check whether the screen
    advance needs `GT4.VOL` data that is not extracted.
+
+---
+
+## W187 — RETRACTION: `0x1000BA0` is never entered; it is not the disclaimer's driver
+
+Good shapes returned this run (`FE=38090 / 24559 / 39105`, top XFER `0x0100afa0`), and a probe on
+**every dispatch whose `targetPc == 0x1000BA0`** (`VULCAN4_W187_DISP`, OFF by default) fired
+**0 times** across all six runs. `0x1000BA0` is a real generated function
+(`g_ps2RecompiledFunctionTable[...] = sub_01000BA0_0x1000ba0`), and the only callers of the render fn
+`0x1000A48` are `0x1000CEC`/`0x1000D44` *inside* it -- yet it is **never dispatched**.
+
+**So W184's "screen loop at 0x1000BA0" is NOT what drives the 2005 disclaimer.** Retracted as the
+driver (the loop body is real, but the function does not run in these boots). The `VULCAN4_W186_SCREEN`
+state probe likewise only ever saw the **22 setup writes** (`0x1047A80=9`, `0x1047A84=0`,
+`0x1047A88=0`, table `0x102DCA8` setup) in every run -- consistent with the function never running.
+
+**What that leaves:** the disclaimer is drawn by the game's running path (the `0x100bxxx` DMA/GS kick
+loop, W182) and its advance is driven by some *other* screen/state code, not `0x1000BA0`. The next
+measurement is to find the actual disclaimer driver: watch which functions are entered in the good
+shape near frame 0, or scan for the screen state variable the running code branches on. No static
+pointer table exists (W185). Suite 497/497. Gate v3 FAILS.
+

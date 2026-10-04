@@ -3056,3 +3056,21 @@ NEXT:    (1) pass the early barrier (`0x100D908`, dish 12) so the screen loop is
          watch the dynamic `jalr` screen pointer and the `0x102DCA8` index at halt; (3) check whether
          the screen advance needs `GT4.VOL` data not present in the build. Graphic unchanged.
 
+---
+
+## 2026-10-04 20:5x · dish 11 re-run (W187) · RETRACTION: 0x1000BA0 never runs
+
+WALL:    the disclaimer's advance past the 2005 screen.
+DID:     Probed EVERY dispatch whose target is `0x1000BA0` (`VULCAN4_W187_DISP`, OFF by default) and
+         ran six boots -- and got good shapes this time.
+MEASURED:good shapes returned (`FE=38090 / 24559 / 39105`, top `0x0100afa0`); the `0x1000BA0`
+         dispatch probe fired **0 times in all six runs**. `0x1000BA0` is a real generated function,
+         but it is **never entered** -- so W184's "screen loop" is **NOT the disclaimer's driver**
+         (retracted as driver; the loop body is real but does not run). `VULCAN4_W186_SCREEN` likewise
+         only ever logs the **22 setup writes** in every run. The disclaimer is drawn by the running
+         `0x100bxxx` DMA/GS kick path; its advance is driven by other screen/state code. Suite 497/497.
+         Gate v3 FAILS.
+NEXT:    find the ACTUAL disclaimer driver: in a good-shape run, watch which functions are entered
+         near frame 0 and which state word the running code branches on (no static pointer table
+         exists). Also still open: the early barrier (dish 12) and whether GT4.VOL data is needed.
+

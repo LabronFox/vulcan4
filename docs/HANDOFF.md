@@ -3504,3 +3504,22 @@ MEASURED:`w235e` (halt=livelocked_in_syscall): func_10057F0 compares e0[0]=0x0 v
 NEXT:    func_10057F0 is used as an equality/ordering test between two different lists; the merge's
          input (func_1007738's stream at 0x1FFFBA0, bound +8=1) is the next measurement -- what should
          advance it (the same 0x1fffba0 wire W122 chased).
+
+---
+
+## 2026-10-05 0x:xx · CAMPAIGN re-arm (dish 19) · the stream is built once, never advanced · gate failed
+
+WALL:    the shape-A decode spin sub_010088E8 never exits (func_10057F0 returns -1; W218b).
+DID:     Wrote `.auto/queue/19-stream-advance-producer.txt` and worked it: added `[w219:stream]` (full
+         struct dump at 0x1FFFBA0) to `VULCAN4_W215_SPIN`, and used the W217 wide watch.
+MEASURED:`w236a-f` (6 shapes, mixed livelocked_in_syscall / wallclock_deadline): the struct at 0x1FFFBA0
+         is [+0]=0x1012658 [+4]=0 [+8]=1 [+c]=1 [+10]=0 [+14]=0x1895480 [+18]=1 [+1c]=0 [+20]=0x1fffcc0
+         [+24]=0 [+28]=1 [+2c]=1, IDENTICAL across ~50M iterations and all shapes. Its writers
+         (`VULCAN4_W217_PROD`) are the parse node-builder region 0x10112E0-0x1011650 / 0x10121xx-0x10125xx
+         (final +0 by 0x10118f4; +8 by 0x10112f0/0x1011524) -- the SAME builder that makes the sorted
+         lists func_10057F0 compares. So one parse pass builds the stream and its lists, sets bound=1,
+         and the merge never advances. Positive control: the watch fires on the target words (0x1FFFBA0
+         @0x10118f4); the struct has 11 distinct non-zero fields. Suite 497/497. Gate v3 FAILS.
+NEXT:    name the parse call supposed to feed the stream a second node (the merge's other input) and why
+         it does not run; the stream's [+0]=0x1012658 is a code pointer -- find its jalr users and trace
+         the feeder. If gated on GT4.VOL data absent from the build, that is the input.

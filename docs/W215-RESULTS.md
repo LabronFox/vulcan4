@@ -40,14 +40,34 @@ Reading `func_10057F0` (full body) for `a2=1, a3=1`:
 1005820..: element loop over [a0+0x14]/[a1+0x14], a2 counts down to -1, then
 1005864: move v0,zero        ; returns 0
 ```
-So for the sampled `1==1` the function **returns 0**, which is **>= 0**, and the caller's
-`bltz $v0, 0x10089C8` at `0x10089DC` should **exit**. Yet the loop runs 155M times. That is the
-contradiction the next probe must resolve: either the sampled `1==1` is a minority state (the fields
-change between samples and only *appear* frozen in the 5M-interval sampling), or the loop is re-entered
-from the other site (`0x1008A04`/`0x1008A3C` also call `func_1005870`) whose caller loops on a
-different predicate. **Honest status: the exit condition's inputs are observed frozen/small, but the
-measured return value that keeps the loop alive is not yet captured — the NEXT probe must log `$v0` at
-`0x10089DC` and `func_10057F0`'s return, not just its inputs.**
+## W216 — the exit predicate, measured: `func_1005870` returns **-1**
+
+The `bltz $v0, 0x10089C8` back-edge is an internal conditional branch, so `dispatchGuestBranch` only
+sees it when it is **taken** — the target is `0x10089C8`, which jumps to `func_1007738`. `VULCAN4_W215_SPIN`
+now logs those arrivals (`[w216:exit]`):
+
+```
+[w216:exit] n=1          at=0x10089c8 target=0x1007738 v0=0xffffffff v0_signed=-1 s1=0x1
+[w216:exit] n=2          ...                                              s1=0x2
+[w216:exit] n=5          ...                                              s1=0x5
+[w216:exit] n=50000000   at=0x10089c8 target=0x1007738 v0=0xffffffff v0_signed=-1 s1=0x2FAF080
+```
+
+**The loop is kept alive by `func_1005870` returning `-1` (0xFFFFFFFF) on every iteration**, and the
+loop counter `s1` climbs from 1 to `0x2FAF080` (50 million). `func_1005870`'s `-1` comes from its
+**unequal** path (`0x1005888 bne v1,v0,0x10058A8 → 0x10058A8 li v0,-1`): the two `+0x10` fields differ.
+The `func_10057F0` `1<1` branch is **not** what keeps it alive (that path returns 0); the **unequal
+`+0x10` compare in `func_1005870`** is.
+
+So the sampled `[a0+0x10]=[a1+0x10]=0` at the *entry* and the `-1` *return* are consistent: `func_1005870`
+compares `[a1+0x10]` vs `[s0+0x10]` where `s0 = a0` **after** `move s0,a0`, and the fields it reads are
+later mutated by the loop's other calls (`func_1007738` at `0x10089C8`), so the entry-time sample does
+not show the value the compare actually sees. **The exit condition is `func_1005870` returning >= 0,
+i.e. `[a1+0x10] == [s0+0x10]`; it returns -1 for the whole run because that equality never holds — the
+producer that should make the two `+0x10` fields equal is upstream.**
+
+**Positive control:** the same probe prints `s1` advancing monotonically (1→50M) and `eeCycle` climbing
+(138M→3.1B), so the loop is genuinely iterating and the `-1` is a real return, not a stuck sample.
 
 ## Cost per run
 

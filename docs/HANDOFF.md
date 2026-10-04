@@ -3430,3 +3430,22 @@ MEASURED:`w225b`/`w225f` (halt=livelocked_in_syscall, FE~5k): the spin is the 3-
 NEXT:    log $v0 at 0x10089DC and func_10057F0's return over the spin; name which site keeps the loop
          alive and what its true predicate is. Positive control required (the 1==1 sampling may be a
          minority state).
+
+---
+
+## 2026-10-05 0x:xx · dish 17 (W216) · the spin's exit predicate is MEASURED (-1) · gate failed
+
+WALL:    the shape-A decode spin sub_010088E8 starves tid1 so sub_01000558 never reaches 0x10005DC.
+DID:     Added `[w216:exit]` to `VULCAN4_W215_SPIN`: log $v0 and the loop counter $s1 at the taken
+         back-edge target 0x10089C8.
+MEASURED:`w229c`/`w229f` (halt=livelocked_in_syscall): the back-edge is 0x10089C8 -> func_1007738,
+         reached with **v0=0xFFFFFFFF (-1)** every iteration, and `s1` climbs 1 -> 0x2FAF080 (50M). So
+         func_1005870 returns -1 because its `+0x10` fields are UNEQUAL (`0x1005888 bne -> 0x10058A8 li
+         v0,-1`); the `func_10057F0` `1<1` path (returns 0) is NOT what keeps it alive. The exit
+         condition is func_1005870 returning >= 0, i.e. `[a1+0x10] == [s0+0x10]`; that equality never
+         holds for the whole run. The entry-time sample showing both +0x10 = 0 is consistent: the fields
+         are mutated by the loop's other call (func_1007738) before the compare, so the producer that
+         should make them equal is upstream. Positive control: s1 advances monotonically and eeCycle
+         climbs 138M->3.1B. Suite 497/497. Gate v3 FAILS.
+NEXT:    find what writes `[a1+0x10]`/`[s0+0x10]` (a1=0x18951F0) and should make them equal; a store
+         watch on the two +0x10 words over a run names the producer or proves it never runs.

@@ -3556,3 +3556,22 @@ MEASURED:`w238a/c/e`: [w220:array] base=0x1895480 word=0x0 changes=0 -- the pars
 NEXT:    find the parse callback that should supply the merge's second element / the stream's next byte
          and prove it never runs -- the byte-source in sub_0100F390's jalr table at 0x1036AC0. If gated
          on GT4.VOL data absent from the build, name that input.
+
+---
+
+## 2026-10-05 0x:xx · dish 19 re-run (W220) · the missing producer is "none" · gate failed
+
+WALL:    the shape-A decode spin sub_010088E8 never exits (the merge's stream never advances).
+DID:     Widened the W217 store watch to the stream's bit-array base 0x1895480..0x1895540.
+MEASURED:`w239a-d` (livelocked + wallclock shapes): the ONLY writer of 0x1895480 is 0x1007774 --
+         func_1007738's OWN rotate write-back (`sw v0,0(v1)`, v0=(word<<1)|carry) -- and every one of the
+         622-630 writes is val=0x0. So the rotator reads 0, writes 0, carry stays 0, the refill 0x1005AB8
+         (which would add a 1 bit and grow the bound) runs once and is never re-triggered. NO producer ever
+         fills the array: the parse builds a LENGTH-1 ALL-ZERO stream for this merge. Positive control:
+         the watch fires 600+ times on the target word, so the zero is a measurement, not a blind probe.
+         The `[+0]=0x1012658` field is a stored code address inside parse helper sub_010124F8 (callers
+         0x1010f90/0x1012818); it is never a dispatch target, and tracing a jalr to it needs the recompiler
+         emitter layer. Suite 497/497. Gate v3 FAILS.
+NEXT:    instrument sub_0100F390's jalr callback table (0x1036AC0) at the emitter layer to see whether
+         the parse ever jalr's the stream's [+0]=0x1012658 continuation; if it never does, the parse is
+         incomplete for this merge (possible absent GT4.VOL input) -- name the file/callback.

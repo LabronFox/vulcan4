@@ -3409,3 +3409,24 @@ MEASURED:`w224b` FE=4959 halt=livelocked_in_syscall: the spin is a tight 3-call 
          control: the census matches the XFER histogram (0x1005890=33.31%). Suite 497/497. Gate v3 FAILS.
 NEXT:    find what writes the +0x8 count func_10057F0 compares and the +0x10 fields func_1005870 compares
          (a1=0x18952E0, a0=0x1FFFA0) and why they stay equal/zero -- that producer is upstream of the spin.
+
+---
+
+## 2026-10-05 0x:xx · dish 17 (W215) · decode spin quantified; exit inputs frozen but return not captured · gate failed
+
+WALL:    the shape-A decode spin sub_010088E8 starves tid1 so sub_01000558 never reaches 0x10005DC.
+DID:     Worked dish 17: `VULCAN4_W215_SPIN` (3-site probe with args, +0x8 counts, +0x10 fields,
+         eeCycle). Then re-measured with the +0x8 counts added.
+MEASURED:`w225b`/`w225f` (halt=livelocked_in_syscall, FE~5k): the spin is the 3-call cycle
+         0x10089D4->func_1005870, 0x1005890->func_10057F0, 0x10089C8->func_1007738, running ~155M
+         iterations in 60 s; the three sites are 33.31% each of transfers. `[a0+8]=1` and `[a1+8]=1`
+         (a0=0x1FFFBA0, a1=0x18952E0) at every sample, `[a0+10]=[a1+10]=0`. eeCycle climbs 211,630,624 ->
+         3,107,274,726 (~14.7x), so it yields but only every ~millions of iterations. BUT: reading
+         func_10057F0 for a2=1,a3=1 it returns 0 (>=0), and the caller's `bltz v0,0x10089C8` at 0x10089DC
+         should exit -- so the sampled inputs do NOT explain the 155M loop. HONEST STATUS: inputs
+         observed frozen/small, but the return value keeping the loop alive is NOT captured; next probe
+         must log $v0 at 0x10089DC and func_10057F0's return, and consider the other callers
+         0x1008A04/0x1008A3C. Suite 497/497. Gate v3 FAILS.
+NEXT:    log $v0 at 0x10089DC and func_10057F0's return over the spin; name which site keeps the loop
+         alive and what its true predicate is. Positive control required (the 1==1 sampling may be a
+         minority state).

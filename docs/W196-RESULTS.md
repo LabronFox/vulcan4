@@ -94,3 +94,45 @@ if it is a codegen class).
 Non-perturbing watchpoint on `0x010459D8`; the writer runs on tid2 in the `SleepThread` → VSync-handler
 window. If it proves to be runtime code writing the guest stack, that is the fix; if guest code, a game
 override.
+
+---
+
+## W202 — it is a genuine RACE: a non-perturbing hardware watchpoint also prevents it
+
+The dish's step B asks for a store-watch on the saved-`$ra` slot. Every software store watch perturbs
+it away, so a **hardware watchpoint** was used instead: `gdb` on `vulcan4_harness`, breaking at
+`PS2Runtime::dispatchGuestBranch` to read `$rsi` (= `rdram`, the 2nd arg because `this` is 1st), then
+`watch *(unsigned int*)(rdram + 0x010459D8)`.
+
+The watchpoint **works** — it fires and resolves the host function:
+```
+Old value = 1
+New value = 0
+#0 sub_0100B828_0x100b828   #1 PS2Runtime::dispatchGuestBranch
+#2 sub_01000A48_0x1000a48   #3 ...   #4 sub_01000BA0_0x1000ba0   (the render thread)
+```
+and with a `> 0x0102DC10` filter it caught `sub_0100BFE0` writing the screen-table pointer
+`0x0102DCA8` to the same address. **Both are frame-reuse writes to a hot stack address** (every render
+pass reuses `0x010459D8`), not the corruption.
+
+**And under the watchpoint the derail does not happen at all.** Six runs with
+`watch … if (*$slot > 0x02000000)` (which would catch the common wild values `0x0240302D`,
+`0xA303C50C`, …) produced **zero hits and zero `WILDPC`**, while the same binary without the watch
+derails ~3/8 boots. So the corruption is a **timing-sensitive race**: any instrument that slows the
+run — a 9x software store observer, or gdb's per-hit stop — removes it. That is why the exact
+instruction is still not in hand.
+
+## Conclusion (dish P2)
+
+- **Candidate 3** (the saved-`$ra` slot is written) — measured: `ra == [sp-8]`, and the window is
+  garbage.
+- Candidates 1 and 2 — ruled out by the guest bytes (one save, one restore, one exit, symmetric frame).
+- The writer is a **race** on tid2's stack across the `SleepThread` → VSync-handler transition; the
+  slot (`0x010459D8`) is a hot address reused every render pass. Software and hardware watches both
+  eliminate the event, so the writer cannot be caught by slowing the run.
+
+## What would pin it (the change needed)
+A **deterministic reproduction**: e.g. a build that pins the scheduler's thread-switch points (so the
+race is not timing-dependent), or a `TSan`-style data-race detector on the RDRAM buffer, or a
+single-threaded replay of the `SleepThread` yield sequence. Then the store is reproducible and the
+writer is named. Without that, every slowdown hides it.

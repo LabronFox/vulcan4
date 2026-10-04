@@ -3179,3 +3179,26 @@ NEXT:    a NON-PERTURBING capture of the store to 0x010459D8 (hardware watchpoin
          RDRAM address, or a guard page) to get the exact pc. Then fix in the correct layer (runtime if
          our code, game override if one guest function, recompiler if a codegen class). The writer runs
          on tid2 across the SleepThread -> VSync-handler transition.
+
+---
+
+## 2026-10-05 0x:xx · dish 13 (W202) · the corrupted-$ra write is a RACE · gate failed
+
+WALL:    sub_0100AE78's saved-$ra slot (0x010459D8 on tid2) is written by a racing writer.
+DID:     Built a hardware-watchpoint capture under gdb (break dispatchGuestBranch, read $rsi=rdram,
+         `watch *(u32*)(rdram+0x010459D8)`); confirmed it resolves the host writer; ran it with a filter
+         for the wild values.
+MEASURED:(1) The watchpoint WORKS: it fired and named `sub_0100B828` writing 0 and `sub_0100BFE0`
+         writing the screen-table pointer 0x0102DCA8 to 0x010459D8 -- both FRAME-REUSE writes (the
+         address is reused every render pass). (2) IT IS A RACE: with the watch armed for the wild
+         values (`if (*$slot > 0x02000000)`) SIX runs produced ZERO hits and ZERO WILDPC, while the
+         same binary without the watch derails ~3/8 boots. Any instrument that slows the run -- a 9x
+         software store observer, or gdb's per-hit stop -- removes the event. (3) The wild value
+         0x0103FC00 is the base of a FUNCTION-POINTER TABLE in .rodata (entries 0x010216F0, 0x0102179C,
+         ...); no instruction references 0x0103FC00 and no raw pointer to it exists in the ELF, so it
+         is computed/loaded at runtime and written to the stack by the racing path. Suite 497/497.
+         Gate v3 FAILS (byte-identical disclaimer).
+NEXT:    a DETERMINISTIC reproduction of the race: pin the scheduler's thread-switch points, run a
+         data-race detector (TSan-style) on RDRAM, or single-thread-replay the SleepThread yield
+         sequence. Then the store is reproducible and the writer is named. Every slowdown hides it, so
+         the watchpoint route is closed.

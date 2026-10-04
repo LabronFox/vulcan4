@@ -3222,3 +3222,25 @@ NEXT:    the decompressor's throughput -- is the inner bit-decode loop the pole,
          decode spin `sub_010088E8` (33 % of transfers in the common shape)? Measure the instruction
          split between `sub_0100F390`'s loop and `sub_010088E8`; then speed the inner loop or name why
          it runs at 5.7 KB/s. The W202 derail still truncates the long runs.
+
+---
+
+## 2026-10-05 0x:xx · dish 14 (W204) · Track B REFUTED for tid2; pool overlaps the MAIN stack · gate failed
+
+WALL:    the corrupted-$ra write on tid2 (0x010459D8). Dish 14: make it deterministic / settle the
+         runtime-overlap hypothesis.
+DID:     Added `VULCAN4_W204_STACK` (invocation-stack + pool-region log) and `VULCAN4_W205_WATCH` (an
+         inline 3-compare slot watch in the WRITE32/WRITE64 macros, 32- and 64-bit stores).
+MEASURED:(1) TRACK B REFUTED for tid2: `[w204:invstack]`/`[w204:pool]` show the invocation stacks at
+         0x1FF7FF0-0x1FFFFF0 (only 2 allocated), while tid2's frame is [0x01045970,0x01045A80). ~250 MB
+         apart, NO overlap -- the writer is not our async-callback stack pool. (2) NEW DEFECT: the pool
+         DOES overlap the MAIN thread's stack -- harness sets main `$sp=0x1FFFFFF0` (harness:1579) and the
+         pool's first stack is [0x1FFBFF0,0x1FFFFF0], inside the main frame; a VSync handler on the main
+         thread writes into its live frame. It is on tid1, not tid2, so not the slot's writer, but a real
+         runtime defect and a candidate for the parse going wrong. (3) TRACK A: the inline slot-watch
+         (3 compares, far cheaper than the 9x observer) ALSO removes the race -- 3/8 derails with it OFF,
+         0/16 with it ON. The race is microsecond-sensitive; the last observation route is closed.
+         Suite 497/497. Gate v3 FAILS (byte-identical disclaimer).
+NEXT:    fix the main-thread-stack / callback-pool overlap in the runtime (reserve the main stack size
+         below 0x1FFFFFF0 and start m_asyncCallbackStackTop under it) and re-measure the parse and the
+         derail rate. For the tid2 writer, only a deterministic scheduler (`--switchpoint=<n>`) is left.

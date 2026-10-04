@@ -3329,3 +3329,26 @@ NEXT:    why 0x1000608 (the statement after `0x10005D4 -> 0x10047C0`) is never r
          tree completes -- is 0x1000558 itself resumed/abandoned after the call, or does the main frame
          lose its PC? This is the concrete next measurement; the W204 pool/main-stack overlap remains a
          live suspect for it.
+
+---
+
+## 2026-10-05 0x:xx · dish 15 (W212/W213) · waits are released; W209 RETRACTED · gate failed
+
+WALL:    the screen setup `sub_01000558` never returns. Dish 15: find what releases the two frame-pump
+         waits, and reconcile W209-vs-W210.
+DID:     Added `VULCAN4_W212_WAIT` (store watch on the two waited words) and a `returns` counter in the
+         W210 node scoreboard.
+MEASURED:(a) BOTH WAITS ARE RELEASED BY LIVE WRITERS. `[0x70002050]` (sub_0100B628's wait) is written
+         every VSync by `0x100D8B4` in the GS/VSync handler, incrementing 1->2->3->4->5. `0x7000206D`
+         (0x100AFA0's poll byte) toggles: `0x100DEBC` sets 1, `0x100DCF0`/`0x100AC78` clear 0. Positive
+         controls `0x70002064` (0x100D8A4) and the per-thread flags 0x70002079/0x70002085 also toggle.
+         So these are ordinary frame pacing, NOT the wall. (b) W209 RETRACTED: the shapes are the same
+         (`w209c`/`w210j`/`w216b` all `wallclock_deadline` or `livelocked_in_syscall`, FE 7.8k-24k) and
+         the node scoreboard shows `0x1010BD0` (the call AFTER 0x100F8C8) entered 8 times with last_ms=725
+         and `0x100F390` 49 times last_ms=719 -- the chain is NOT blocked in the decompressor. W209's
+         entry-only probes confused "last sample inside the decode" with "never returns". (c) THE RETURNS
+         COUNTER IS INCONCLUSIVE: it reads 0 for every node because generated `jr $ra` returns are inline
+         and do not go through dispatchGuestBranch on this build (needs PS2X_STRICT_RETURN_DIAGNOSTICS).
+         So the count=1 leaves remain return-UNPROVEN. Suite 497/497. Gate v3 FAILS.
+NEXT:    trace the main frame's PC across the `0x10047C0` -> return boundary; why is `sub_01000558`
+         (0x1000558) entered once and `0x1000608` never dispatched even though `0x10047C0` returns?

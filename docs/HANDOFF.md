@@ -3651,3 +3651,19 @@ NEXT:    re-aim at the 0x1FFFBA0 bit buffer's producer directly: find the parse 
          after the first fill to add a second element/bit (trace sub_0100F8C8's loop exit s4==s6 and
          whether it refills the func_1007738 stream), or decide the merge is single-element by design
          and sub_010088E8 is the wrong caller.
+
+---
+
+## 2026-10-05 0x:xx · dish 22 re-run (W223b) · the gate coincidence is ZERO · gate failed
+
+WALL:    the shape-A decode spin never exits; the 0x1FFFBA0 stream has no producer.
+DID:     Added coincidence counters to the emitter guard probe (gate2 0x100F464: a2neg/eq/coincide).
+MEASURED:`w246a-d` (4 shapes, both halt classes): g464=288849 a2neg=288849 eq=0 coincide=0. So at gate2
+         EVERY visit has a2<0 (gate1 would fall through) but t0==t2 NEVER happens, and the two gates
+         NEVER coincide. The callback 0x100F498 needs (a2<0 AND t0==t2); that state occurs ZERO times.
+         Combined with W223's reframe (t0 != t2 is the normal 'window not exhausted' state), the wall is
+         that t0 never advances to t2 at an a2<0 moment -- i.e. the window never exhausts at the right
+         time, so the refill callback is never invoked. Suite 497/497. Gate v3 FAILS.
+NEXT:    whether t0 should advance toward t2 (a refill that never happens) or the consumer is fed the
+         wrong window; re-aim at the 0x1FFFBA0 bit buffer's producer (W219/W220) rather than this
+         decompressor window.

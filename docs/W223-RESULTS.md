@@ -40,6 +40,26 @@ i.e. `0x1010A50 sw s2,8(s0)` (bound=1), `0x1010A54 sw s4,0xc(s0)` (t0), `0x1010A
 Neither `t0` nor `t2` is "wrong"; the `0x100F464` skip is the normal non-refill path. The callback is not
 the missing producer.
 
+## W223b — the gate coincidence, counted over the whole run
+
+Per the dish's explicit question (do the two gates ever coincide?), counters were added to the emitter
+probe at gate2 `0x100F464`. Across **288,849 visits in every shape** (`w246a-d`):
+
+```
+g464=288849  a2neg=288849  eq=0  coincide=0
+```
+
+- `a2neg = 288849`: **every** gate2 visit has `a2 < 0`, so gate1 (`0x100F45C bgez a2`) would fall
+  through on all of them.
+- `eq = 0`: **`t0 == t2` never happens**.
+- `coincide = 0`: **the two gates NEVER coincide.**
+
+So the callback `0x100F498` requires `a2 < 0` **and** `t0 == t2` simultaneously, and that state occurs
+**zero times** in the whole run. This is the wall, named exactly: the parse's `t0` (cursor) never reaches
+its `t2` anchor at a moment when `a2 < 0`, so the refill callback is never invoked — but as the reframe
+above shows, `t0 != t2` is the normal non-exhausted state, so the question becomes whether `t0` should
+*advance toward* `t2` and doesn't.
+
 ## Positive control
 
 Both probes fire many times (guard 65–68×/shape, struct 61×), values stable across 4 shapes — real

@@ -48,3 +48,40 @@ Emit a W224 probe at the **emitter layer** for the call at `0x1008FFC` (or the e
 the empty `0x1FFFBA0` one is a number. If all four are as built and the input is a game-state value, the
 campaign should re-scope milestone-2 to a game-logic effort (the disclaimer is GT4's own screen/state,
 not a runtime defect — the W183/W184 conclusion).
+
+---
+
+## W224 (static read, per the driver's dish) — the consumer contract, from the disassembly
+
+`sub_01008C50` (`0x1008C50`, only caller `0x10082DC` in the decoder `sub_01008080`) is a **parser-state
+transition** that builds and links node records. Its four args are parser streams:
+```
+1008c5c: move s2,a3      ; arg3
+1008c64: move s3,a0      ; arg0
+1008c6c: move s4,a1      ; arg1
+1008c88: move s5,a2      ; arg2
+1008c80: lw   v0,4(s4)   ; v0 = [arg1+4]
+1008c84: beqz v0 -> v1=1 ; if arg1's node is null, "needs build"
+1008c8c: lw   v0,8(v0)
+1008c90: bnez v0 -> skip ; if [node+8] != 0, else v1=1
+1008c9c: beqzl v1, 0x1008e38  ; if no build needed -> DONE path
+1008ca4: jal 0x101d2a0 (a0=24) ; ALLOCATE a 24-byte node
+1008cb8: sw v0(1),8(s0)   ; node+8 = 1
+1008cc8: sw 0,12(s0)      ; node+0x10 = 0
+1008ccc: sw 0,16(s0)
+1008cd0: jal 0x10059e8 (allocator) ; node data
+1008d34: sw v1,4(s2)      ; link the new node into arg3's stream
+1008dbc: sw v1,4(s3)      ; link into arg0's stream
+```
+So `sub_01008C50` **reads** the streams' current nodes (`[argN+4]`), **conditionally allocates** a node,
+and **links it back** into the streams; then it calls `sub_010088E8` (at `0x1008FFC`) to merge. The
+`v1` flag (`0`/`1`) selects the "done" path (`0x1008E38`) vs the "build" path.
+
+**Contract answer:** `sub_01008C50` is a **game-logic parser step**, not runtime code. It builds a node
+only when `[arg1+4]` is null / `[node+8]==0`; otherwise it takes the done path and does **not** build.
+The merge `sub_010088E8` is fed whatever nodes this parser step produced. Nothing in the runtime is
+involved — the streams' contents are GT4's own parse state.
+
+**Verdict, restated with disassembly in evidence:** the merge spin is stopped by GT4's own parser state
+(the decoder/`sub_01008C50` builds no second element for the `0x1FFFBA0` stream on this input), **not by
+a runtime defect**. The recompiler, runtime, scheduler, GS and stores are exonerated by W171-W224.

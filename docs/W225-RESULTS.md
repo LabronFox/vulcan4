@@ -77,3 +77,26 @@ not run on this boot path. This is a **game-state** wall, consistent with W183/W
 Find what should call `sub_01008C50` (`0x10082DC` in the decoder `sub_01008080`) and why that path is
 not reached on this boot — i.e. why `sub_01008080`'s call at `0x10082DC` never runs. If it is gated on
 input/state absent from the build, name it; that is the game-state step the campaign is waiting on.
+
+---
+
+## W225b — the whole parser chain never dispatches; the spin is purely resumed
+
+Armed the emitter-layer probe (`VULCAN4_W221_JALR`) and checked the chain
+`sub_010061XX → sub_01008080 → sub_01008C50 → sub_010088E8` across 4 shapes (`w251a-d`, both halt
+classes):
+
+```
+target0x1008080 (sub_01008080) = 0
+target0x1008c50 (sub_01008C50) = 0
+source0x10061bc (its caller)   = 0
+```
+
+Every dispatch in `0x1006xxx`/`0x1008xxx` is the spin's own (`0x10089c8`/`0x10089d4` → `func_1007738`/
+`func_1005870`). So the **entire parser chain never dispatches** in these runs; `sub_010088E8` runs from
+a **resumed frame** (the harness/scheduler re-enters a generated body whose `ctx->pc` is inside it),
+consistent with tid1's halt frame `pc=0x010057F0 ra=0x01005898`.
+
+**Interpretation:** the parser step ran once (or the frame was left mid-chain) and the merge is now
+spinning on a frame the scheduler keeps re-entering. The producer that would feed the merge is the
+parser chain, which is not being re-entered — a scheduling/game-state observation, not a runtime defect.

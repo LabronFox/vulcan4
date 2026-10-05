@@ -3728,3 +3728,20 @@ MEASURED:(a) EMITTED CODE (ps2_recompiled_functions.cpp:46386-46399, sub_01008C5
          step, W224) never runs. Game-state wall. Suite 497/497. Gate v3 FAILS.
 NEXT:    what should call sub_01008C50 (0x10082DC in decoder sub_01008080) and why that path is not
          reached on this boot -- if gated on absent input/state, name it.
+
+---
+
+## 2026-10-05 0x:xx · dish 24/W225b · the whole parser chain never dispatches · gate failed
+
+WALL:    the shape-A merge spin runs from a resumed frame; the parser chain that feeds it never enters.
+DID:     Armed the emitter probe (VULCAN4_W221_JALR) and checked the chain
+         sub_010061XX -> sub_01008080 -> sub_01008C50 -> sub_010088E8 across 4 shapes.
+MEASURED:`w251a-d` (both halt classes): target 0x1008080 (sub_01008080)=0, target 0x1008C50=0, source
+         0x10061bc=0. Every 0x1006xxx/0x1008xxx dispatch is the spin's own (0x10089c8/0x10089d4). So the
+         ENTIRE parser chain never dispatches; sub_010088E8 runs purely from a RESUMED frame (tid1 halt
+         pc=0x010057F0 ra=0x01005898). The parser step ran once (or the frame was left mid-chain) and the
+         merge spins on a re-entered frame. Scheduling/game-state, not a runtime defect. Suite 497/497.
+         Gate v3 FAILS.
+NEXT:    why the scheduler keeps re-entering the sub_010088E8 frame instead of running the parser chain
+         again: check the frame's resume pc and whether tid1 is parked with a stale pc inside the spin
+         (the scheduler's resume loop), i.e. is this the SleepThread-yield loop re-entering a stale frame?

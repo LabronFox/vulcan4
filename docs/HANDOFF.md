@@ -3689,3 +3689,21 @@ NEXT:    decide the consumer contract: read sub_010088E8's entry conditions (0x1
          read of sub_01008C50 plus the stream's expected bound. If the parse never builds a 2-element
          stream, that is the game's own state and the campaign should re-scope (milestone-2 blocker is a
          game-state step, not a runtime defect).
+
+---
+
+## 2026-10-05 0x:xx · CAMPAIGN re-arm (dish 23) · sub_010088E8 is inlined; game-state verdict · gate failed
+
+WALL:    the shape-A decode spin sub_010088E8 never exits; its merge stream 0x1FFFBA0 has no producer.
+DID:     Wrote `.auto/queue/23-merge-consumer-contract.txt` and worked it: added `[w224:merge]` (log the
+         four streams a0..a3 + bounds) at the merge entry.
+MEASURED:`sub_010088E8` is INLINED: a probe at targetPc==0x10088E8 fires 0x across shapes while its
+         internal sites 0x1005890/0x10089c8/0x10089d4 are 33.31% each (w249a/e, w248a) -- the emitter
+         inlines the `jal 0x10088e8` at 0x1008FFC, so its four caller streams cannot be logged at the
+         dispatch layer (same blindness as W129). At the spin, func_1005870's a0=0x1FFFBA0 (W218), so the
+         merge stream IS 0x1FFFBA0 -- single-element, all-zero, written only by its rotator (W220/W223c).
+         VERDICT: this is a GAME-STATE / producer question, NOT a runtime defect -- the decoder
+         sub_01008080 does not supply a second element; runtime/GS/scheduler are exonerated by
+         W171-W223. Suite 497/497. Gate v3 FAILS.
+NEXT:    emitter-layer probe at the 0x1008FFC call (or sub_010088E8 entry) to log its four a0..a3
+         bounds; if the input is a game-state value, re-scope milestone-2 to a game-logic effort.

@@ -3595,3 +3595,22 @@ MEASURED:(step4) the parse's own data IS served (core.gt4 opened from the CD pro
 NEXT:    instrument sub_0100F390's jalr callback table (0x1036AC0) at the emitter layer to see whether
          the parse ever jalr's the stream's [+0]=0x1012658 continuation; if not, the parse is incomplete
          for this merge. This is the first item that genuinely needs the recompiler emitter layer.
+
+---
+
+## 2026-10-05 0x:xx · dish 20 (W221) · the parse callback table is NEVER dispatched · gate failed
+
+WALL:    the shape-A decode spin never exits; the stream 0x1895480 has no producer (W220).
+DID:     Instrumented the EMITTER layer (control_flow_emitter.cpp:195, the single indirect-dispatch
+         choke point) with a W221 probe (VULCAN4_W221_JALR, OFF by default), after the W129 precedent;
+         rebuilt ps2_recomp, regenerated (RECOMP_EXIT=0, 2081 probe sites), rebuilt the harness.
+MEASURED:(positive control) VULCAN4_W221_JALR=1 -> 87 [w221:jalr] lines in 30 s vs 0 when unset; it fires
+         on the spin's 3 calls and the 0x102xxxx handlers, so it is not blind. (answer) across 6 shapes
+         (w240a-f, both halt classes): target=0x1012658 = 0 hits, and NO indirect dispatch has a source
+         in the parse region 0x100F390-0x1010A68 -- in particular source=0x100F498 (the parse's callback
+         jalr through table 0x1036AC0, W203) fires 0 times. So sub_0100F390's callback table is NEVER
+         dispatched; the parse never reaches the point where it would jalr the continuation 0x1012658.
+         That is the missing producer: a parse callback that is never called. Suite 497/497. Gate FAILS.
+NEXT:    the parse reaches 0x100F390 but never 0x100F498 (its callback jalr) -- find the branch between
+         them that is not taken (the table-select/bound guard in sub_0100F390) and name the register/
+         condition that never becomes true. That is the parse's stop point, at instruction level.

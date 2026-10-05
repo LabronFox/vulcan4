@@ -122,3 +122,34 @@ frames entered at (1)/(2). The W225b zero is a real zero, correctly explained.
 **Refines W226 (a):** option (i) is right in spirit (resume/re-entry, not a call) but the exact case is
 the **harness arrival loop** (`vulcan4_harness.cpp:2409`) plus scheduler resume, not a `0x010057F0`
 resume case in `sub_010088E8`.
+
+---
+
+## W226c — the arrival loop DOES see the parser chain: entered by table lookup, not dispatch
+
+A harness arrival probe (`VULCAN4_W226_ARRIVE`, OFF by default) logs every arrival at `ctx.pc` inside
+`sub_010088E8`/`sub_01008C50`/`func_10057F0` by the harness's own loop
+(`vulcan4_harness.cpp:2409` table lookup). Measured (`w252a/c/d/f`, `livelocked_in_syscall`):
+
+```
+VULCAN4 W226 ARRIVE pc=0x01008cac ra=0x01008cac sp=0x01fffc20 prev=0x01008cac n=356
+VULCAN4 W226 ARRIVE pc=0x01008d70 ra=0x01008d70 sp=0x01fffc20 prev=0x01008d70 n=370
+VULCAN4 W226 ARRIVE pc=0x01008d9c ra=0x01008d9c sp=0x01fffc20 prev=0x01008d9c n=396
+```
+
+**The parser function `sub_01008C50` IS running** — entered by the **harness arrival loop** at its
+internal pcs (`0x1008CAC`, `0x1008D70`, `0x1008D9C`), with `ra == pc == prev` (a table-lookup
+re-entry, no call). So:
+
+- **W225b's "the whole parser chain NEVER runs" is REFUTED.** The chain runs; it is entered by the
+  harness's table lookup (and resumed/re-entered at internal labels), which `dispatchGuestBranch`
+  cannot see. W225b's zero was a **probe-visibility artefact**, not "the chain never runs" — this is
+  essentially option (iii): the dispatch probe was blind to the entry, not that no entry happened.
+- **The W221 emitter probe and the W225b conclusion both measured the wrong layer** for this question:
+  `dispatchGuestBranch` sees only `jal`/`jr` transfers *emitted through it*; the harness's arrival loop
+  and the scheduler resume enter functions directly at `ctx.pc`.
+
+**Corrected (a):** tid1's frame reaches `sub_010088E8`/`func_10057F0` through the **harness arrival loop
+(`vulcan4_harness.cpp:2409`) and scheduler resume (`EeScheduler.cpp:353/1440`)**, demonstrated by the
+arrival probe firing on `sub_01008C50`'s internal pcs. `0x10057F0` is entered as a table slot (the frame's
+pc = the function entry), not a resume case.

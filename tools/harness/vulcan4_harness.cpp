@@ -2286,6 +2286,25 @@ int main(int argc, char *argv[])
         }
 
         ++functionsEntered;
+        // W226c. WHERE DOES THE SPIN'S FRAME ENTER? The harness arrival loop enters functions by
+        // TABLE LOOKUP at ctx.pc (vulcan4_harness.cpp:2409), which bypasses dispatchGuestBranch, so the
+        // W221 probe cannot see it. Log every arrival at a pc in the spin region or func_10057F0, with
+        // the predecessor, so the entry path is measured. OFF unless VULCAN4_W226_ARRIVE.
+        {
+            static const bool s_w226On = (std::getenv("VULCAN4_W226_ARRIVE") != nullptr);
+            static int s_w226N = 0;
+            const bool spinRegion = (ctx.pc >= 0x10088e8u && ctx.pc < 0x1009068u) ||
+                                    (ctx.pc == 0x10057f0u);
+            if (s_w226On && s_w226N < 60 && spinRegion)
+            {
+                ++s_w226N;
+                std::cout << "VULCAN4 W226 ARRIVE pc=" << toHex(ctx.pc)
+                          << " ra=" << toHex(getRegU32(&ctx, 31))
+                          << " sp=" << toHex(getRegU32(&ctx, 29))
+                          << " prev=" << (lastResolvedPcValid ? toHex(lastResolvedPc) : std::string("NONE"))
+                          << " n=" << functionsEntered << std::endl;
+            }
+        }
         // W96. PROGRESS, ON BY DEFAULT, ONE LINE PER 50,000 ENTRIES. With the store observer now
         // opt-in the default run prints nothing at all until it ends, which makes a four-hour run
         // indistinguishable from a hung one -- and "calling a slow run dead" is this project's most

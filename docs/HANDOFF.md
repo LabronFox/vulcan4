@@ -3766,3 +3766,21 @@ MEASURED:(a) The emitted sub_010088E8 body (ps2_recompiled_functions.cpp:43943) 
 NEXT:    the scheduler frame refresh: why the parked frame's pc is left inside the spin rather than the
          parser after the 0x32 SleepThread yield -- should the yield rewind to the parser call, not resume
          the callee?
+
+---
+
+## 2026-10-05 0x:xx · dish 25/W226c · the parser chain DOES run (harness table entry) · gate failed
+
+WALL:    the shape-A merge spin never exits; whether the parser chain runs (W225b said no).
+DID:     Added a harness arrival probe (VULCAN4_W226_ARRIVE) logging every table-lookup entry at a pc in
+         sub_010088E8/sub_01008C50/func_10057F0.
+MEASURED:`w252a/c/d/f` (livelocked_in_syscall): the arrival loop enters sub_01008C50 at internal pcs
+         0x01008cac/0x01008d70/0x01008d9c (n=356/370/396) with ra==pc==prev -- a harness TABLE-LOOKUP
+         re-entry (vulcan4_harness.cpp:2409), invisible to dispatchGuestBranch. So the parser chain DOES
+         run; W225b's "never runs" was a PROBE-VISIBILITY ARTEFACT (option iii). The dispatch layer and the
+         emitter probe both measured the wrong layer for entry: only jal/jr emitted through
+         dispatchGuestBranch are visible; the harness arrival loop + scheduler resume (EeScheduler.cpp:353/
+         1440) enter functions directly at ctx.pc. Suite 497/497. Gate v3 FAILS.
+NEXT:    the scheduler frame refresh after the 0x32 SleepThread yield: does the parked tid1 frame resume
+         inside the spin instead of continuing the parser chain? Watch the arrival pc sequence around the
+         yield.

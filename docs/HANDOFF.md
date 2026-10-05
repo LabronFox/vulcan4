@@ -3667,3 +3667,25 @@ MEASURED:`w246a-d` (4 shapes, both halt classes): g464=288849 a2neg=288849 eq=0 
 NEXT:    whether t0 should advance toward t2 (a refill that never happens) or the consumer is fed the
          wrong window; re-aim at the 0x1FFFBA0 bit buffer's producer (W219/W220) rather than this
          decompressor window.
+
+---
+
+## 2026-10-05 0x:xx · dish 22 (W223c) · producer re-confirmed absent; next is game-logic · gate failed
+
+WALL:    the shape-A decode spin never exits; the 0x1FFFBA0 bit buffer has no producer.
+DID:     Re-aimed at the 0x1FFFBA0 bit buffer per W223's NEXT; ran a full-run wide watch and a layout
+         check.
+MEASURED:`w247a`: over a full 60 s run the ONLY writer of the bit-array base 0x1895480 is 0x1007774
+         (the rotator), 624x, all val=0x0 -- no producer ever writes it. Layout: 0x1895480 is ~0xB4 past
+         the 6.1 MB decompressor output buffer end (0x12BF100+6119116=0x18953CC), so it is a SEPARATE
+         small allocation the parse made; the decompressor window struct (s0=0x1FFCED0, W223) is a
+         DIFFERENT object from the merge stream (0x1FFFBA0). So the merge consumes a single-element,
+         all-zero stream that the parse built but never feeds. This is now a GAME-LOGIC question: is the
+         merge meant to be fed more input (missing), or is sub_010088E8 the wrong caller? Dispatch-level
+         and store-level probes cannot answer it; it needs the consumer's contract. Suite 497/497. Gate
+         v3 FAILS.
+NEXT:    decide the consumer contract: read sub_010088E8's entry conditions (0x1008FFC jal 0x10088e8
+         from sub_01008C50) and whether it is called with a single-element stream by design -- a static
+         read of sub_01008C50 plus the stream's expected bound. If the parse never builds a 2-element
+         stream, that is the game's own state and the campaign should re-scope (milestone-2 blocker is a
+         game-state step, not a runtime defect).

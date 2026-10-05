@@ -88,3 +88,37 @@ feed it) is not re-run. The next measurement is the scheduler's **frame refresh*
 pc is left inside the spin rather than the parser after the SleepThread yield — i.e. whether the
 SleepThread-resume should rewind to the parser call, not resume the callee. This is the
 SleepThread-yield-loop question, now correctly labelled (0x32).
+
+---
+
+## W226b — the exact non-dispatch entry paths, quoted
+
+The `switch (ctx->pc)` resume machinery is real, but the strict option-(i) claim ("`0x010057F0` is a
+resume case") is **false**: `0x10057F0` is the *entry* of `func_10057F0`, whose emitted resume switch
+(`ps2_recompiled_functions.cpp:27168`) accepts only `0x1005830`:
+```
+void sub_010057F0_0x10057f0(...) {
+    switch (ctx->pc) { case 0x1005830u: goto label_1005830; default: break; }
+    ctx->pc = 0x10057f0u;
+```
+So the correct answer is the **general resume/table path**, and there are exactly two non-dispatch entry
+sites in the harness/runtime:
+
+1. **Harness arrival loop** — `tools/harness/vulcan4_harness.cpp:2409`:
+   `g_ps2RecompiledFunctionTable[slot](rdram, &ctx, &runtime);`
+   It reads `ctx.pc` and calls the generated function directly. **This is how tid1's frame at
+   `pc=0x010057F0` executes** — a table-lookup entry at the frame's pc, invisible to
+   `dispatchGuestBranch` (which is why the W221 probe saw no `0x10088xx` dispatch).
+
+2. **Scheduler resume** — `EeScheduler.cpp:353` and `:1440`:
+   `function(m_rdram, &context, &m_runtime);`
+   Re-enters a parked thread's frame at its saved pc (the SleepThread/`0x32` yield and interrupt
+   servicing path).
+
+**Both bypass `dispatchGuestBranch`, so the emitted call at `0x1008FFC` (a real
+`dispatchGuestBranch`) is simply never reached** — the parser chain never runs; the spin executes from
+frames entered at (1)/(2). The W225b zero is a real zero, correctly explained.
+
+**Refines W226 (a):** option (i) is right in spirit (resume/re-entry, not a call) but the exact case is
+the **harness arrival loop** (`vulcan4_harness.cpp:2409`) plus scheduler resume, not a `0x010057F0`
+resume case in `sub_010088E8`.

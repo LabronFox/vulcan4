@@ -3707,3 +3707,24 @@ MEASURED:`sub_010088E8` is INLINED: a probe at targetPc==0x10088E8 fires 0x acro
          W171-W223. Suite 497/497. Gate v3 FAILS.
 NEXT:    emitter-layer probe at the 0x1008FFC call (or sub_010088E8 entry) to log its four a0..a3
          bounds; if the input is a game-state value, re-scope milestone-2 to a game-logic effort.
+
+---
+
+## 2026-10-05 0x:xx · dish 24/W225 · "inlined" REFUTED: the call is real, its CALLER never runs · gate failed
+
+WALL:    the shape-A merge spin runs from a resumed frame; the parser step that feeds it never enters.
+DID:     Investigated the emitted code at 0x1008FFC and the emitter-layer dispatch log.
+MEASURED:(a) EMITTED CODE (ps2_recompiled_functions.cpp:46386-46399, sub_01008C50 body): `0x1008ffc jal
+         func_10088E8` is emitted as a REAL `dispatchGuestBranch(rdram, ctx, 0x10088E8u, 0x1008FFCu,
+         0x1009004u, DirectCall, "JAL")` -- NOT inlined. W224's "inlined via
+         emitDirectFunctionJumpIfAvailable" is REFUTED (that helper applies only to StaticBranchKind::Jump,
+         control_flow_emitter.cpp:218). jal target math: 0x0c40223a -> imm 0x223a -> 0x01000000|(0x223a<<2)
+         = 0x010088E8 (correct). (b) WHY THE PROBE SAW ZERO: the emitter-layer W221 probe (armed, w250
+         livelocked_in_syscall) records 0 targets in 0x10088xx and 0 dispatches of 0x1008C50 -- the CALLER
+         sub_01008C50 is NEVER entered; only the spin's own sites 0x10089c8/0x10089d4 dispatch. At halt
+         tid1 pc=0x010057F0 ra=0x01005898 (inside sub_010088E8, the spin) reached by RESUME, not a call
+         from sub_01008C50. Positive control: W221 probe fires 87x/30s on vs 0 off and records real
+         dispatches, so the zero is real. VERDICT: sub_010088E8 is resumed; its caller (a game-logic parser
+         step, W224) never runs. Game-state wall. Suite 497/497. Gate v3 FAILS.
+NEXT:    what should call sub_01008C50 (0x10082DC in decoder sub_01008080) and why that path is not
+         reached on this boot -- if gated on absent input/state, name it.

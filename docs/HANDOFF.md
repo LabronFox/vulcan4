@@ -3631,3 +3631,23 @@ MEASURED:`w242a-f` (6 shapes): [w222:guard] n=1 pc=0x0100f45c taken=0 a2=0xfffff
          fires 65-68x/shape, values stable. Suite 497/497. Gate v3 FAILS.
 NEXT:    why t0 != t2 at 0x100F464 -- trace where t2=0x01036D7F is set (the expected anchor) and what
          advances t0 past it (0x01036E28); find which side is wrong (anchor label or input offset).
+
+---
+
+## 2026-10-05 0x:xx · dish 22 (W223) · t0!=t2 is NORMAL; W221's callback reading refuted · gate failed
+
+WALL:    the shape-A decode spin never exits (the 0x1FFFBA0 stream has no producer).
+DID:     Worked dish 22: added W223 struct-field logging and a wide watch on the decompressor struct
+         s0=0x1FFCED0 to trace where t0/t2 are set.
+MEASURED:`w243a-d` (4 shapes): the decompressor struct s0=0x1FFCED0 has [+8]bound=1 [+c]t0=0x1036E28
+         [+10]t2=0x1036D7F [+14]base=0, frozen all run. The writers (W217_PROD) show sub_0100F8C8 sets
+         them at 0x1010A50/54/58 then `jal 0x100F390` at 0x1010A68. sub_0100F8C8 (0x100F8C8) is the SAME
+         decompressor shape: loads s4=[s0+0xc] (cursor), s6=[s0+0x10] (end), loops `bne s4,s6` with s4+=4,
+         refilling only when s4==s6. So t0!=t2 = "window NOT exhausted" and the 0x100F498 callback is a
+         REFILL, correctly NOT invoked while input remains. So W221's "callback never dispatched" is
+         CORRECT behaviour, not a defect -- neither t0 nor t2 is wrong. Positive control: guard fires
+         65-68x/shape, struct 61x, stable. Suite 497/497. Gate v3 FAILS.
+NEXT:    re-aim at the 0x1FFFBA0 bit buffer's producer directly: find the parse call that should run
+         after the first fill to add a second element/bit (trace sub_0100F8C8's loop exit s4==s6 and
+         whether it refills the func_1007738 stream), or decide the merge is single-element by design
+         and sub_010088E8 is the wrong caller.

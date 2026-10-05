@@ -3745,3 +3745,24 @@ MEASURED:`w251a-d` (both halt classes): target 0x1008080 (sub_01008080)=0, targe
 NEXT:    why the scheduler keeps re-entering the sub_010088E8 frame instead of running the parser chain
          again: check the frame's resume pc and whether tid1 is parked with a stale pc inside the spin
          (the scheduler's resume loop), i.e. is this the SleepThread-yield loop re-entering a stale frame?
+
+---
+
+## 2026-10-05 0x:xx · dish 25/W226 · entry is RESUME; halt syscall IS 0x32/SleepThread · gate failed
+
+WALL:    the shape-A merge spin never exits; the parser chain that feeds it never dispatches (W225b).
+DID:     Answered W226 (a) entry path and (b) the halt syscall number; produced a FRESH window capture.
+MEASURED:(a) The emitted sub_010088E8 body (ps2_recompiled_functions.cpp:43943) begins with
+         `switch(ctx->pc){ case 0x100894cu...case 0x1008a78u: goto label_...}` -- the frame is
+         RE-ENTERED BY RESUME at one of those labels, so no dispatchGuestBranch into 0x10088xx is ever
+         recorded (W225b's zero is real). tid1 pc=0x010057F0 is inside func_10057F0, dispatched from the
+         spin's own jal 0x10089D4. (b) DISASSEMBLY at 0x101F340: `24030032 li v1,50; 0000000c syscall` --
+         the halt syscall is 50 = 0x32. db-syscalls.md says 0x32=SleepThread, 0x10=AddIntcHandler. So the
+         HARNESS label (SCE syscall 0x32 (SleepThread)) is CORRECT and HANDOFF.md:2559's retraction
+         ("SleepThread is 0x10") is WRONG -- a retraction of a retraction; 0x32/0x33/0x35 are valid.
+         (c) FRESH capture this run: DISPLAY=:99 import -window 0x200007 menu-attempt-062216.png
+         (640x448, 16 colours, mean 4256.18); verify-menu now judges it -> GATE FAIL (perceptual diff
+         1.539 < 6). Suite 497/497.
+NEXT:    the scheduler frame refresh: why the parked frame's pc is left inside the spin rather than the
+         parser after the 0x32 SleepThread yield -- should the yield rewind to the parser call, not resume
+         the callee?

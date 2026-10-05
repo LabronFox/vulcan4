@@ -3614,3 +3614,20 @@ MEASURED:(positive control) VULCAN4_W221_JALR=1 -> 87 [w221:jalr] lines in 30 s 
 NEXT:    the parse reaches 0x100F390 but never 0x100F498 (its callback jalr) -- find the branch between
          them that is not taken (the table-select/bound guard in sub_0100F390) and name the register/
          condition that never becomes true. That is the parse's stop point, at instruction level.
+
+---
+
+## 2026-10-05 0x:xx · dish 21 (W222) · the parse's stop point is 0x100F464 (t0 != t2) · gate failed
+
+WALL:    the parse never dispatches its callback (W221); the stream has no producer.
+DID:     Added a translator-emitted probe (VULCAN4_W222_GUARD) at the two gates that guard the callback
+         jalr 0x100F498, rebuilt ps2_recomp, regenerated (2 sites), rebuilt the harness.
+MEASURED:`w242a-f` (6 shapes): [w222:guard] n=1 pc=0x0100f45c taken=0 a2=0xfffffff8 t0=0x01036e28
+         t2=0x01036d7f; n=2 pc=0x010f464 taken=1 (t0=0x01036e28 != t2=0x01036d7f); then gate1 taken=1
+         (a2>=0). So the callback is skipped at 0x100F464 because t0 != t2 -- the parse branches to
+         0x100F4C0 and never runs the jalr at 0x100F498. This is why W221 saw the callback 0x100F498
+         dispatched 0 times. t0=0x01036E28 is the current gzip input position; t2=0x01036D7F is the
+         expected anchor (where the stream began) -- they disagree by ~0xA9. Positive control: the probe
+         fires 65-68x/shape, values stable. Suite 497/497. Gate v3 FAILS.
+NEXT:    why t0 != t2 at 0x100F464 -- trace where t2=0x01036D7F is set (the expected anchor) and what
+         advances t0 past it (0x01036E28); find which side is wrong (anchor label or input offset).

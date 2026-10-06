@@ -298,6 +298,24 @@ is **0**, so `FUN_010047C0` skips the stream copy and returns 0 (its `FUN_0101E8
 `$v0` at `0x010047F4` (PCSX2 breakpoint) vs ours; and, if it differs, walking `FUN_01004500`'s own
 return path (it calls `FUN_01006F90` after the filler).
 
+## 14. HARDWARE A/B: `FUN_01004500` returns `iVar3 == 0` — hardware 1, ours 0
+
+PCSX2 restarted fresh, breakpoint at `0x010047F4`, read live: **`v0 = 0x00000001`** (and
+`s0=0x01FFFD10`, `s1=0x01051A10`, `sp=0x01FFFC50`). Ours is `v0=0`.
+
+`FUN_01004500`'s tail is `return iVar3 == 0;`. So hardware's `iVar3 = 0` (→ `true`), ours `iVar3 != 0`
+(→ `false`). Where `iVar3` comes from:
+
+- if `iStack_6c` is null/empty → the compare is skipped (`bVar2` path) and `iVar3` is derived from
+  `iStack_5c`;
+- otherwise `iVar3 = FUN_01005870(iStack_6c)` — **the stream compare** (`jal func_1005870`, the same
+  comparator that sat in the merge loop).
+
+`iStack_6c`/`iStack_5c` are the parsed stream objects filled by `FUN_01006F90` (called right after the
+filler). So the remaining divergence is in those parsed streams: ours compares non-equal, hardware
+equal. The next measurement is the A/B of `iStack_6c`/`iStack_5c` (and `FUN_01005870`'s return) at
+`0x01004500` — the merge inputs already match, so the divergence is one level below `FUN_01006F90`.
+
 `VULCAN4_W122_BARRIER=1` (force the barrier word) no longer moves the wall to the merge (that is fixed);
 it derails instead. Probes added (all OFF by default): `VULCAN4_W229_BAR`, `VULCAN4_W229_SET`,
 `VULCAN4_W229_THR`, `VULCAN4_W229_STK`, `VULCAN4_W229_IRQ`, `VULCAN4_W229_ARR`.

@@ -1350,7 +1350,8 @@ static void w229ArrStoreObserver(uint32_t addr, uint32_t size, uint64_t val,
                                  const R5900Context *c, const char *op, uint32_t)
 {
     if (!g_w229arrArm) return;
-    if (addr >= g_w229arrLo && addr < g_w229arrHi && g_w229arrW < 40u)
+    if (addr >= g_w229arrLo && addr < g_w229arrHi && g_w229arrW < 40u
+        && static_cast<uint32_t>(val) == 0u)
     {
         ++g_w229arrW;
         std::cout << "VULCAN4 W229 W addr=" << toHex(addr) << " size=" << size
@@ -2337,8 +2338,8 @@ int main(int argc, char *argv[])
                 if (!s_w229arrReg) { ps2AddStoreSubscriber(&w229ArrStoreObserver); s_w229arrReg = true; }
                 if (s_w229arrN == 1)
                 {
-                    g_w229arrLo = getRegU32(&ctx, 29) & 0x01FFFFFFu;
-                    g_w229arrHi = g_w229arrLo + 0x50u;
+                    g_w229arrLo = (getRegU32(&ctx, 29) + 0x40u) & 0x01FFFFFFu;
+                    g_w229arrHi = g_w229arrLo + 8u;
                     g_w229arrArm = true;
                 }
                 else if (s_w229arrN == 2)

@@ -150,3 +150,28 @@ stack floor so the two can never overlap. This is a runtime change in `EeSchedul
 `VULCAN4_W229_FILLER=1` on the harness; `[w229:fill]` (entry), `[w229:trace]` (body, `f4` before/after
 each call), `[w229:out]` (post-filler struct), `[w229:w]` (store observer, names the writer). Hardware
 A/B: PCSX2 paused at `0x01004404` / BP `0x01004524`.
+
+## 8. FIX LANDED — IRQ handlers nest on the interrupted stack (struct now matches hardware)
+
+`EeScheduler::dispatchIrq` (`EeScheduler.cpp:1808`) now sets the handler invocation's `$sp` to the live
+interrupted `$sp` (`m_runtime.cpu()`) instead of `0`; the old async-stack path still applies when there
+is no live `$sp`. `VULCAN4_W229_NONEST=1` restores the old behaviour for A/B. Runtime `.cpp` only — no
+`.h`, no `runner/*.cpp`.
+
+**Verified (3/3 runs, `[w229:out]`):** the parser struct now matches hardware **exactly**:
+
+```
+ours / hardware: f0=0x1051a10 f4=0x12bf100 f8=0x5d5ecc fC=0x12bf102 f10=0x80 f14=0x12bf184 f18=0x80 f1c=0x12bf204 f20=0x5d5dc8
+```
+
+Before the fix `f0`/`f4`/`f10`/`f18` were `0`. A/B (fix on vs `NONEST=1`): both settings show both run
+shapes (`pc_outside_generated_table` at ~2.2k and `livelocked_in_syscall` at ~7.2k), so **no regression**
+— the change only removes the clobber.
+
+**Still not the menu.** The run now derails at `pc_outside_generated_table` with PC `0x0`,
+`last_good=0x01009004` (the tail of `sub_01008C50`), `ra=0x0`. Two candidates: (a) a **deferred**
+invocation whose captured `$sp` is stale by the time it runs (the handler's frame then lands on the
+interrupted frame), or (b) a genuinely deeper parser wall now that the struct is correct. Next:
+`VULCAN4_W229_NONEST` A/B with a longer budget, and a watch on the handler invocation's run-time vs
+dispatch-time `$sp`. **No picture change; gate not yet a real pass.**
+

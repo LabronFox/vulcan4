@@ -270,6 +270,34 @@ Also observed in a long run: GT4 repeatedly opens `/BASCUS-97328GAMEDATA/core.gt
 and gets `result=-4` (no save), and re-runs the path-copy. PCSX2 reaches the menu without a save too,
 so the MC failure is not expected to be the blocker.
 
+**The hang, named.** A 3-minute run ends `halt=guest_cycle_no_progress` with
+`tid1@prio1:pc=0x01000638(running)`. `0x1000638` is `FUN_01000558`'s **failure infinite-loop**
+(`01000638: nop x5; 0100064c: b 0x01000638`). Per the decompile, that loop is taken only when
+`FUN_010047c0` (the loader's top-level parse) returns 0 — i.e. **our parse reports failure** and the
+loader spins forever. That (not just the VSync wall) is why the screen freezes. `FUN_010047c0`'s return
+value is the next thing to measure side by side (it is `v0` at the `bnel $s1,zero,0x1000658` at
+`0x1000630`).
+
+## 13. THE PARSE RETURNS 0 (traced to the instruction)
+
+`VULCAN4_W229_FAIL=1` (with `VULCAN4_W229_FILLER=1`) traces the loader chain. The path is exact:
+
+```
+src=0x10005d4 tgt=0x10047c0   FUN_01000558 calls FUN_010047C0 (param_1 = 0x1ffffb0)
+src=0x10047e0 tgt=0x100b6f8   FUN_010047C0 calls FUN_0100B6F8
+src=0x10047ec tgt=0x1004500   FUN_010047C0 calls FUN_01004500  (v0=0x1 in the delay slot)
+src=0x10005fc tgt=0x102cbf8   back in FUN_01000558, s1=FUN_010047C0's return = 0x0  <-- ZERO
+```
+
+At `0x10047F4` the generated code is `beqz $v0, 0x10048D8` — `$v0` is `FUN_01004500`'s return. Ours
+is **0**, so `FUN_010047C0` skips the stream copy and returns 0 (its `FUN_0101E81C` call at
+`src=0x10048C0` never fires), and `FUN_01000558` takes the `s1==0` fail loop at `0x1000638`.
+
+**So the live blocker is now `FUN_01004500` returning 0** — the same function whose filler
+(`FUN_01004308`) now produces a hardware-correct struct. The next measurement is the hardware A/B for
+`$v0` at `0x010047F4` (PCSX2 breakpoint) vs ours; and, if it differs, walking `FUN_01004500`'s own
+return path (it calls `FUN_01006F90` after the filler).
+
 `VULCAN4_W122_BARRIER=1` (force the barrier word) no longer moves the wall to the merge (that is fixed);
 it derails instead. Probes added (all OFF by default): `VULCAN4_W229_BAR`, `VULCAN4_W229_SET`,
 `VULCAN4_W229_THR`, `VULCAN4_W229_STK`, `VULCAN4_W229_IRQ`, `VULCAN4_W229_ARR`.

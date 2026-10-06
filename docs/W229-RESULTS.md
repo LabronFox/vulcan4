@@ -253,20 +253,26 @@ async region now sits **below** GT4's `[0x1ff8000, 0x2000000]` main stack. Handl
 
 Two nondeterministic shapes remain, and the **screen is still the 16-colour disclaimer**:
 
-1. **The W122 thread barrier.** `FUN_0100d838` (the guest's **VSync handler**) walks three thread-wait
-   lists on the scratchpad and calls `func_010202E8(targetTid)` for each — which loops until
-   `sce_GetThreadId() == targetTid`, suspending itself in between. Measured (`VULCAN4_W229_BAR`):
-   `src=0x100d908 targetTid=2 runTid=2` — it should exit, yet the loop dominates (99.98% of transfers
-   in one run: `0x100d908=166,972,830`). `tid1` sits at the decompressor `0x100f800` (`wait=sleep`) and
-   never runs, so the barrier can never observe it running. `sleepCurrentCalls=12480`. This is the
-   W122 wall, unchanged by the W229 fixes.
+1. **The W122 VSync-handler thread-wake loop.** `FUN_0100d838` is the guest's **cause-2 (VSync)
+   handler**; it walks three scratchpad thread-wait lists and calls `sce_iWakeupThread(target)` for
+   each node. Measured (`VULCAN4_W229_BAR`): the head is `scratchpad[0x70002088] = 0x1045970` (a node
+   **on tid2's own stack**), the list has **1 node**, and the call is
+   `src=0x100d908 targetTid=2 runTid=2`. So it is NOT a growing list and NOT a GetThreadId barrier
+   (W122's "0x10202E8 = GetThreadId loop" was a mis-map: `0x10202E8` is the `sce_iWakeupThread` thunk;
+   the GetThreadId loop is `entry_1020400`). The 166M transfers at `0x100d908` in one shape are the
+   handler being re-entered across checkpoints. `tid1` sits at the decompressor `0x100f800`
+   (`wait=sleep`) and never runs. This is the W122 scheduler wall, unchanged by the W229 fixes.
 2. **The `tid2` corrupted-`ra` derail.** `dead=0x88468107/0xb7a70010/0xb30058df`, `last_good=0x100f800`
    (`FUN_0100f390`'s `jr $ra`), `sp=0x10459e0`. Installing a store observer perturbs the race away
    (W148/W197's Heisenbug), so it could not be caught this session.
 
+Also observed in a long run: GT4 repeatedly opens `/BASCUS-97328GAMEDATA/core.gt4` on the memory card
+and gets `result=-4` (no save), and re-runs the path-copy. PCSX2 reaches the menu without a save too,
+so the MC failure is not expected to be the blocker.
+
 `VULCAN4_W122_BARRIER=1` (force the barrier word) no longer moves the wall to the merge (that is fixed);
-it derails instead — the barrier is not the only blocker. Probes added (all OFF by default):
-`VULCAN4_W229_BAR`, `VULCAN4_W229_SET`, `VULCAN4_W229_THR`, `VULCAN4_W229_STK`, `VULCAN4_W229_IRQ`.
+it derails instead. Probes added (all OFF by default): `VULCAN4_W229_BAR`, `VULCAN4_W229_SET`,
+`VULCAN4_W229_THR`, `VULCAN4_W229_STK`, `VULCAN4_W229_IRQ`, `VULCAN4_W229_ARR`.
 
 
 

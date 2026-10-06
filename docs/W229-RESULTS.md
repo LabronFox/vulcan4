@@ -231,4 +231,42 @@ suspended `sub_01008C50` frame) — likely the yield/resume path resetting `$sp`
 second invocation getting an overlapping stack. `VULCAN4_W229_ARR` reproduces both arrivals and the
 writer.
 
+## 11. FIX LANDED — async-callback stacks moved BELOW GT4's main stack (both walls gone)
+
+The root of the whole family: our runtime runs interrupt/callback handlers on an **async-callback stack
+reserved downward from `PS2_RAM_SIZE`** (`ps2_runtime.cpp`), but **GT4 sets its own main thread stack to
+the very top** — `SetupThread(stack=0x1ff8000, size=0x8000)` → top `0x2000000` (measured with
+`VULCAN4_W229_SET`). The two regions overlap entirely, so a handler frame lands on live guest data.
+
+**Fix:** `m_asyncCallbackStackTop = 0x01FF0000u` (both reset sites in `ps2_runtime.cpp`) — the reserved
+async region now sits **below** GT4's `[0x1ff8000, 0x2000000]` main stack. Handlers keep `sp=0` in
+`dispatchIrq` so the queue still assigns them the async stack.
+
+**Verified after the fix:**
+- Parser struct matches hardware again: `f0=0x1051a10 f4=0x12bf100 f8=0x5d5ecc fC=0x12bf102 f10=0x80
+  f14=0x12bf184 f18=0x80 f1c=0x12bf204 f20=0x5d5dc8` (`[w229:out]`).
+- **The 63M merge spin is gone**: the top XFER sites are no longer `0x01005890/0x010089c8/0x010089d4`;
+  runs last the full budget (`wallclock_deadline`, ~1500-2700 frames).
+- Suite green 497/497. Committed nested `e7effb1` + docs/probes.
+
+## 12. THE REMAINING WALLS (both pre-existing, deeper)
+
+Two nondeterministic shapes remain, and the **screen is still the 16-colour disclaimer**:
+
+1. **The W122 thread barrier.** `FUN_0100d838` (the guest's **VSync handler**) walks three thread-wait
+   lists on the scratchpad and calls `func_010202E8(targetTid)` for each — which loops until
+   `sce_GetThreadId() == targetTid`, suspending itself in between. Measured (`VULCAN4_W229_BAR`):
+   `src=0x100d908 targetTid=2 runTid=2` — it should exit, yet the loop dominates (99.98% of transfers
+   in one run: `0x100d908=166,972,830`). `tid1` sits at the decompressor `0x100f800` (`wait=sleep`) and
+   never runs, so the barrier can never observe it running. `sleepCurrentCalls=12480`. This is the
+   W122 wall, unchanged by the W229 fixes.
+2. **The `tid2` corrupted-`ra` derail.** `dead=0x88468107/0xb7a70010/0xb30058df`, `last_good=0x100f800`
+   (`FUN_0100f390`'s `jr $ra`), `sp=0x10459e0`. Installing a store observer perturbs the race away
+   (W148/W197's Heisenbug), so it could not be caught this session.
+
+`VULCAN4_W122_BARRIER=1` (force the barrier word) no longer moves the wall to the merge (that is fixed);
+it derails instead — the barrier is not the only blocker. Probes added (all OFF by default):
+`VULCAN4_W229_BAR`, `VULCAN4_W229_SET`, `VULCAN4_W229_THR`, `VULCAN4_W229_STK`, `VULCAN4_W229_IRQ`.
+
+
 

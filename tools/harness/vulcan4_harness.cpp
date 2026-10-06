@@ -2370,6 +2370,7 @@ int main(int argc, char *argv[])
                 ++s_w227N;
                 auto rd32 = [&](uint32_t a) -> uint32_t {
                     const uint32_t o = a & 0x1FFFFFFFu;
+                    if (o > 0x02000000u - 4u) return 0u;
                     return static_cast<uint32_t>(rdram[o]) |
                            (static_cast<uint32_t>(rdram[o + 1u]) << 8) |
                            (static_cast<uint32_t>(rdram[o + 2u]) << 16) |

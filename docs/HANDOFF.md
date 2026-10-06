@@ -24,6 +24,18 @@ through the vtable at `sp+0x44` (`&DAT_01036ac0`, method `+0x14=0x01010b00`), (2
 recompiled body (bound it with a write-watch on our `struct+4`), (3) resume at an interior label.
 Hardware A/B standing (PCSX2 paused; DebugServer `127.0.0.1:21512`).
 
+**SOLVED (W229d/e, same dish): IT IS NOT THE INFLATE CODE — IT IS A STACK COLLISION WITH AN IRQ
+HANDLER.** A store observer armed on the struct caught the writer: `writerPc=0x10293a4`,
+`sd s5,0x50(sp)`, the prologue of `FUN_01029388` — the guest's **IRQ 0xb handler** (registered by
+`FUN_01028de8` via `AddIntcHandler(0xb,0x1029388,0,0)`). Its `sp=0x1ffff60`, so `sp+0x50=0x1ffffb0`
+lands on the parser struct. **Cause:** the runtime runs interrupts as scheduled invocations on an
+"async callback stack" reserved downward from `PS2_RAM_SIZE` (`ps2_runtime.cpp:5324/5338`,
+`m_asyncCallbackStackTop=0x2000000`), which is **the same address the main thread's `$sp` starts at**
+(`ps2_runtime.cpp:5861`) — the two regions overlap. Hardware nests the IRQ handler on the interrupted
+thread's stack, so it cannot clobber live data. **FIX candidate:** run interrupt invocations below the
+interrupted thread's `$sp` (nest as hardware does), or move the async-callback-stack region clear of
+the thread stack. Runtime only (`EeScheduler.cpp`/`ps2_runtime.cpp`), no `.h`, no `runner/*.cpp`.
+
 **Suite unchanged.** No fix landed. Menu not reached.
 
 ---

@@ -105,3 +105,48 @@ Hardware A/B is already standing (PCSX2 paused; DebugServer `127.0.0.1:21512`); 
 `0x01FFFD14` from a fresh boot to prove hardware never writes it after the filler.
 
 **No fix landed yet. No picture change. Suite unchanged (probe is OFF by default).**
+
+## 6. THE ROOT CAUSE — an IRQ handler runs on a stack that overlaps the main thread's stack
+
+The W229d store observer (armed on the struct at the inflate call site `0x010043A4`) caught the exact
+writer:
+
+```
+[w229:w] addr=0x1ffffb0 size=8 val=0x0 writerPc=0x10293a4 op=WRITE64   <-- covers struct +0 and +4
+```
+
+`0x010293A4` is `sd s5,0x50(sp)` — the **prologue of `FUN_01029388`**. Ghidra: `FUN_01029388` is a
+**guest interrupt handler** — it is registered by `FUN_01028de8` with
+`AddIntcHandler(0xb, 0x1029388, 0, 0)` (IRQ 0xb). Its frame base is `sp = 0x1ffff60`, so its save area
+`sp+0x50 = 0x1ffffb0` lands **exactly on the main thread's parser struct** (`+0`, `+4`). The main
+thread was interrupted inside `FUN_0100F8C8`.
+
+Why the overlap: the runtime runs guest interrupts as **separate scheduled invocations** on a reserved
+"async callback stack", not nested on the interrupted thread's stack:
+
+- `EeScheduler::dispatchIrq` sets the invocation `sp = 0` (`EeScheduler.cpp:1809`); when the queued
+  invocation runs, `invocationStackTop()` (`EeScheduler.cpp:1555`) assigns it
+  `reserveAsyncCallbackStack(0x4000, 16)` (`ps2_runtime.cpp:5324`).
+- `reserveAsyncCallbackStack` hands out stacks downward from `m_asyncCallbackStackTop = PS2_RAM_SIZE`
+  (`0x02000000`, `ps2_runtime.cpp:5338-5358`) — **the same address the main thread's `$sp` starts at**
+  (`m_cpuContext.r[29] = PS2_RAM_SIZE - 0x10 = 0x01FFFFF0`, `ps2_runtime.cpp:5861`).
+- So the async callback stack `[0x1FFC000, 0x2000000]` **overlaps the main thread's live stack**, and
+  the first IRQ handler frame clobbers whatever the main thread keeps near the top — here the parser
+  struct at `0x01FFFD10`-equivalent / ours at `0x1ffffb0`.
+
+On real hardware an EE interrupt **nests on the interrupted thread's stack** (the handler pushes below
+the current `$sp`), so it cannot clobber live data above it. Ours cannot, because it runs the handler
+on a fresh top-of-RAM stack. Hardware's parser struct sits `0x2F0` below the stack top; ours sits
+`0x50` below, so ours is the one in the collision zone.
+
+**FIX CANDIDATE (not yet landed):** run interrupt invocations on the interrupted thread's stack (the
+saved `$sp` at dispatch time), i.e. make the IRQ invocation nest below the current `$sp` exactly as the
+hardware does — or, minimally and safely, move the async-callback-stack region below the main thread's
+stack floor so the two can never overlap. This is a runtime change in `EeScheduler.cpp` /
+`ps2_runtime.cpp`; **no `.h`** (project law), no `runner/*.cpp`.
+
+## 7. REPRODUCE
+
+`VULCAN4_W229_FILLER=1` on the harness; `[w229:fill]` (entry), `[w229:trace]` (body, `f4` before/after
+each call), `[w229:out]` (post-filler struct), `[w229:w]` (store observer, names the writer). Hardware
+A/B: PCSX2 paused at `0x01004404` / BP `0x01004524`.

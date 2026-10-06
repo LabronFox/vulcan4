@@ -362,6 +362,14 @@ i.e. from ≈`+0x170000` **ours is shifted 0x30000 earlier than hardware** — t
 the loader hang, and the frozen disclaimer. Next: bound the exact divergence start between `+0x100000`
 and `+0x170000` and find which decode step drops the 0x30000 bytes.
 
+**It is a block REORDER, not a single shift.** Ours' `+0x160000` = hardware's `+0x110000` (ours' data
+appears *later* there), while ours' `+0x1a0000` = hardware's `+0x1d0000` (ours *earlier*): the two
+buffers hold the same code/data but at permuted offsets. A linear gzip inflate would never reorder its
+output, so the suspect is not a simple bitstream desync — it is whatever fills this 6 MB region
+(the filler's `FUN_0100F8C8` inflate writes through `0x12bf100`, but its measured output window was
+empty, so a later copy/decode step is the more likely filler). Locating that writer is the next step
+(`VULCAN4_W229_*` probes remain, all OFF by default).
+
 `VULCAN4_W122_BARRIER=1` (force the barrier word) no longer moves the wall to the merge (that is fixed);
 it derails instead. Probes added (all OFF by default): `VULCAN4_W229_BAR`, `VULCAN4_W229_SET`,
 `VULCAN4_W229_THR`, `VULCAN4_W229_STK`, `VULCAN4_W229_IRQ`, `VULCAN4_W229_ARR`.

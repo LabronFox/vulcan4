@@ -175,3 +175,27 @@ interrupted frame), or (b) a genuinely deeper parser wall now that the struct is
 `VULCAN4_W229_NONEST` A/B with a longer budget, and a watch on the handler invocation's run-time vs
 dispatch-time `$sp`. **No picture change; gate not yet a real pass.**
 
+## 9. THE PAYOFF — the parser/merge inputs now match hardware, and the spin is GONE
+
+With the §8 fix, the merge (`sub_010088E8`, the W227 wall) now receives **populated 32-element
+streams** — and they are **byte-identical to PCSX2**:
+
+```
+[w227:merge] tgt=0x10088e8 src=0x1008ffc a0=0x1895450 a1=0x18953f0 a2=0x1895420 a3=0x18957e0 ra=0x1009004
+[w227:struct] i=1 p=0x18953f0 count=0x20 base=0x18956c0 w0=0x3bace481 w1=0x8259142d   <- hardware W227 §4
+[w227:struct] i=2 p=0x1895420 count=0x20 base=0x1895750 w0=0xc4531b7f w1=0x7da6ebd2   <- hardware W227 §4
+```
+
+The old wall — a 63-million-iteration spin at `0x01005890`/`0x010089c8`/`0x010089d4` — is **gone**.
+The XFER census in a clean run is now flat (`top 0x01007a04=6.67%`, no dominant site), i.e. the guest
+is doing real work, not spinning. The run lasts **~7 s / 360 frames** (was 1.4 s before the fix; the
+`VULCAN4_W227_MERGE` harness probe segfaults on an out-of-bounds read, use the runtime probe).
+
+**But the SCREEN IS UNCHANGED.** Our window is still the **16-colour disclaimer** (perceptual diff 1.5
+vs the reference, 640×448, mean 16.6). So the CPU now gets past the parser/merge, but the picture does
+not move — the next wall is **not** the merge. The new derail is a different one: the run ends with
+`tid2` at `pc=ra=0x08438ee5` (KSEG, outside the table), `sp=0x010459e0` — the W122/W148/W197
+corrupted-`ra` on the second scheduler thread, now exposed because the merge no longer spins. That,
+and/or the screen still waiting, is the next dish.
+
+

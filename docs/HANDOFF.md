@@ -38,6 +38,11 @@ the thread stack. Runtime only (`EeScheduler.cpp`/`ps2_runtime.cpp`), no `.h`, n
 
 **Suite unchanged.** No fix landed. Menu not reached.
 
+**RESULT OF THE FIX (W229 §9):** the merge inputs now match hardware **byte-for-byte**
+(`count=0x20`, `w0=0x3bace481 w1=0x8259142d` / `0xc4531b7f 7da6ebd2`) and the 63M-iteration spin at
+`0x01005890` is **GONE**; the run now lasts ~7 s / 360 frames (was 1.4 s). **The SCREEN IS UNCHANGED**
+(16-colour disclaimer). New derail: `tid2` `pc=ra=0x08438ee5` (the W122/W148/W197 corrupted-`ra` on the
+second scheduler thread), now exposed. Next dish: that corruption, and why the screen does not advance.
 ---
 
 ## 2026-10-05 · W228 (PHASE 1: find the struct's writer) · no fix, but the writer is NAMED and EXONERATED

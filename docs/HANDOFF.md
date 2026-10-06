@@ -1,3 +1,110 @@
+## 2026-10-06 · W229 (the filler is reached and correct; the INFLATE zeroes it) · no fix yet, culprit NAMED
+
+**GOAL:** past the disclaimer → menu. **Gate:** `.auto/verify-menu.sh`. **Result:** no picture change yet.
+Full write-up: `docs/W229-RESULTS.md`.
+
+**DID:** added `VULCAN4_W229_FILLER` (runtime probe, OFF by default) at `FUN_01004308` entry AND body
+(`ps2_runtime.cpp::dispatchGuestBranch`), and read hardware ground truth in PCSX2 (found still paused
+at the W228 store `0x01004404`).
+
+**FOUND (measured, both sides):**
+- Ours **REACHES** the filler with the **same entry struct** `{obj=0x1051a10, 0, 0}` as hardware →
+  W228's "never fires / different `s2`" branches are both refuted.
+- Ours **allocates `0x12bf100`** (same as hardware), memsets 6 MB, and sets `struct+4=0x12bf100`
+  (trace n=10) — the allocator and the buffer store are correct.
+- Then `FUN_0100F8C8` (a **gzip inflate**, `0x8b1f`, `0x100f8c8–0x1010b00`) runs and
+  **`struct+4` becomes 0** (trace n=d, `f4=0x0`). Hardware's final struct is
+  `+0=0x01051a10 +4=0x012bf100 +8=0x005d5ecc +c=0x012bf102 +10=0x80 +14=0x012bf184 +18=0x80 +1c=0x012bf204 +20=0x5d5dc8`.
+- Every downstream field is derived from `*(struct+4)`; with `base=0` ours yields exactly the observed
+  `+c=2 +10=0 +14=4 +18=0 +1c=4 +20=0x5d5ec8`, feeding the parser wrong data → length-1 stream → the
+  `sub_010088E8` merge spin.
+
+**NEXT:** why does the recompiled `FUN_0100F8C8` corrupt its caller? Check (1) the indirect call
+through the vtable at `sp+0x44` (`&DAT_01036ac0`, method `+0x14=0x01010b00`), (2) a stray store in the
+recompiled body (bound it with a write-watch on our `struct+4`), (3) resume at an interior label.
+Hardware A/B standing (PCSX2 paused; DebugServer `127.0.0.1:21512`).
+
+**Suite unchanged.** No fix landed. Menu not reached.
+
+---
+
+## 2026-10-05 · W228 (PHASE 1: find the struct's writer) · no fix, but the writer is NAMED and EXONERATED
+
+**GOAL:** past the disclaimer → menu. **Gate:** `.auto/verify-menu.sh`. **Result:** no picture change.
+Full write-up: `docs/W228-RESULTS.md`.
+
+**DID (read-only investigation):** ran the W227 §13 next step — a PCSX2 **write-watch** on the parser
+stream struct `0x01FFFD10..0x01FFFD2C`. It fired at PC **`0x01004404`** (`sw $v0, 0x14($s2)`).
+
+**FOUND:**
+- The writer is **`FUN_01004308`** (called only from `FUN_01004500` at `0x0100451c`). It fills
+  `+0x14/+0x18/+0x1c/+0x20` from the buffer at `s1` (`0x012BF1xx`). Hardware state at the write:
+  `s0=0x012BF100 s1=0x01FFFD14 s2=0x01FFFD10 v1=0x012BF182 a3=0x80 ra=0x010043AC`.
+- **OUR EMITTED `sub_01004308_0x1004308` (line 18248) IS BYTE-FOR-BYTE CORRECT** — the same four
+  stores at lines 18488/18503/18515/18533. **The filler is not the bug.**
+
+**CONCLUSION:** the empty struct is caused **upstream of `FUN_01004308`** — either the function is
+never reached, or it is reached with a different `s2`, or the inputs (`s1`/`v1`/`a3`) differ. Matches
+W227 §9 ("the divergence is in the code that FEEDS the parser, several levels up").
+
+**NEXT (one measurement, branches):** probe our `FUN_01004308` **entry** (`targetPc==0x1004308`),
+dump `a0/a1/a2/a3/s0/s1/s2/ra/sp` + the struct. If it never fires → chase the control-flow derail
+(`pc_outside_generated_table`, corrupted `ra`, W148). If it fires with different inputs → walk the
+caller chain `FUN_01004500 → FUN_010047c0 → FUN_01000558`.
+
+**Tooling:** PCSX2-MCP DebugServer client command timeout shortened 10s→3s
+(`debug-server-client.ts`, rebuilt). **Suite unchanged.**
+
+---
+
+## 2026-10-05 · W227 (PCSX2 A/B ground truth) · gate-failed (no picture change) but WALL LOCATED
+
+**WALL:** the `sub_010088E8` merge spin. The campaign flip-flopped on "runtime defect vs game state"
+for 26 dishes (W219–W226d). This dish ran **retail GT4 in PCSX2 beside our recomp** and settled it.
+
+**DID:** Stood up PCSX2 v2.9.96 + our DebugServer (Linux port — **verified end-to-end for the first
+time**: `[DebugServer] Listening on 127.0.0.1:21512`, `pcsx2_connect` OK). Booted retail GT4 to the
+**intro/menu** with the captain's BIOS + ISO. Set breakpoints on every address our recomp spins on and
+compared state. Added a `VULCAN4_W227_MERGE` probe (OFF by default) that dumps the four merge-input
+structs at the inline `jal 0x10088e8` in `ps2_runtime.cpp::dispatchGuestBranch`.
+
+**MEASURED (the whole point — side by side):**
+- **Real GT4 reaches the menu; ours is stuck at the 2005 disclaimer** (real captures 29k–40k colours vs
+  our 16).
+- **Real GT4 enters the SAME code** — `func_1007738` (returns after ~28 cycles), `sub_010088E8`, the
+  merge loop — and its merge loop **CONVERGES** (`0x10089dc` `v0=-1` first pass, then `v0=+1`; exits
+  `0x10089e4` after ~4,940 cycles ≈ 1,000 iterations). **Ours spins 63,395,851 times** at
+  `0x1005890`/`0x10089c8`/`0x10089d4` (33.32% each) and never exits.
+- **THE SIDE-BY-SIDE (count at struct `+8`):** real GT4 `a1/a2/a3` = **`0x20` (32)**; ours = **`0x1`**.
+  Real data buffers populated with pseudo-random words; ours hold `0`/`1`.
+  → **our parser builds a length-1 stream where hardware builds 32 populated elements.**
+- **CORE.GT4 IS served** (`VULCAN4_W163_FIOREAD`: `fd=5 req=2020861 got=2020861`), and the merge data
+  is **not** raw CORE.GT4 bytes (searched; not found) — it is computed.
+
+**RETRACTED (measured, so nobody re-chases):** the HANDOFF claim that `func_1005AB8`'s `$s1` is "never
+set from `$a0`" is **FALSE** — real prologue `0x1005ac0 dmove s1,a0`, and our emitted
+`sub_01005AB8_0x1005ab8` **does** emit it. `sub_010088E8`'s prologue translation also matches the real
+disassembly. Neither is the bug.
+
+**NEXT:** the producer. `sub_01008C50` sets `count=1` on its **empty-input** branch (`bVar2`), and real
+GT4 takes the non-empty branch. Find who feeds the input list to `sub_01008C50` (`FUN_01008080` →
+`FUN_01005D48`) and why ours is empty. Cheapest decisive tools: a PCSX2 **write-watch** on a real-GT4
+struct base, and Ghidra decompile of `FUN_01005D48`/`FUN_01008080`. Full write-up: `docs/W227-RESULTS.md`.
+
+**UPDATE (same dish, §9):** the control flow is **correct** — a runtime-dispatch probe proves our
+recomp calls the chain `FUN_010047c0 → FUN_01004500 → FUN_01006f90 → sub_01005D48 → sub_01008080 →
+sub_01008C50 → sub_010088E8` with the right source PCs. So W224/W225's "never dispatches" is refuted.
+The parser produces `count=1` streams because **its input list is built with 1 element where hardware
+builds 32**. The divergence is in the data-structure code that FEEDS the parser, several levels up.
+Next: break at `FUN_01004500`/`FUN_010047c0` in PCSX2, read the node fields it consumes, compare to
+ours; the question is where `0x20` (32) originates.
+
+
+**Suite:** unchanged (probe is OFF by default). **No fix landed. No speedup claimed.**
+
+---
+
+
    **ITERATION 54 -- THE FULL LIST OF WRITES TO A RUNNING THREAD'S CONTEXT. THREE REAL ASSIGNMENTS, AND
    NONE OF THEM CAN INSTALL `0xdfb0`. THE REVIEWER'S HYPOTHESIS 2 IS ELIMINATED.**
 

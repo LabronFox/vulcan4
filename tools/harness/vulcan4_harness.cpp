@@ -2305,6 +2305,47 @@ int main(int argc, char *argv[])
                           << " n=" << functionsEntered << std::endl;
             }
         }
+        // W227. THE MERGE INPUTS, dumped on OUR side to compare against PCSX2 ground truth.
+        // Real GT4 reaches sub_010088E8 with a0/a1/a2/a3 pointing at populated structs
+        // (count(+8)=0x20, real data buffers). This prints the same four structs in our recomp.
+        // OFF unless VULCAN4_W227_MERGE.
+        {
+            static const bool s_w227On = (std::getenv("VULCAN4_W227_MERGE") != nullptr);
+            static int s_w227N = 0;
+            if (s_w227On && s_w227N < 8 && ctx.pc >= 0x10088e8u && ctx.pc < 0x1009068u)
+            {
+                ++s_w227N;
+                auto rd32 = [&](uint32_t a) -> uint32_t {
+                    const uint32_t o = a & 0x1FFFFFFFu;
+                    return static_cast<uint32_t>(rdram[o]) |
+                           (static_cast<uint32_t>(rdram[o + 1u]) << 8) |
+                           (static_cast<uint32_t>(rdram[o + 2u]) << 16) |
+                           (static_cast<uint32_t>(rdram[o + 3u]) << 24);
+                };
+                std::cout << "VULCAN4 W227 MERGE n=" << s_w227N
+                          << " pc=" << toHex(ctx.pc)
+                          << " a0=" << toHex(getRegU32(&ctx, 4))
+                          << " a1=" << toHex(getRegU32(&ctx, 5))
+                          << " a2=" << toHex(getRegU32(&ctx, 6))
+                          << " a3=" << toHex(getRegU32(&ctx, 7))
+                          << " s2=" << toHex(getRegU32(&ctx, 18))
+                          << " ra=" << toHex(getRegU32(&ctx, 31))
+                          << " sp=" << toHex(getRegU32(&ctx, 29)) << std::endl;
+                const uint32_t regs[4] = { getRegU32(&ctx, 4), getRegU32(&ctx, 5),
+                                           getRegU32(&ctx, 6), getRegU32(&ctx, 7) };
+                for (int i = 0; i < 4; ++i)
+                {
+                    const uint32_t p = regs[i];
+                    const uint32_t base = rd32(p + 0x14u);
+                    std::cout << "VULCAN4 W227 STRUCT[" << i << "] p=" << toHex(p)
+                              << " count(+8)=" << toHex(rd32(p + 8u))
+                              << " fC(+C)=" << toHex(rd32(p + 0xCu))
+                              << " base(+14)=" << toHex(base)
+                              << " w0=" << toHex(rd32(base))
+                              << " w1=" << toHex(rd32(base + 4u)) << std::endl;
+                }
+            }
+        }
         // W96. PROGRESS, ON BY DEFAULT, ONE LINE PER 50,000 ENTRIES. With the store observer now
         // opt-in the default run prints nothing at all until it ends, which makes a four-hour run
         // indistinguishable from a hung one -- and "calling a slow run dead" is this project's most

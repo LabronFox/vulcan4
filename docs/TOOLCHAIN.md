@@ -769,3 +769,104 @@ installed you will get different build timings. Nothing else changes; pass
   `apt-get` line in §3 — notably X11 + GL headers, because raylib builds from source.
 - **The guest image is referenced by path and never copied in.** A stranger needs their own copy
   of the ELF. Obtaining one is out of scope and not documented anywhere in this repo.
+
+---
+
+## 13. RE TOOLING — Ghidra (GhydraMCP) + PCSX2 (DebugServer), installed 2026-10-05
+
+Source: the community `ps2-recomp-Agent-SKILL` (hkmodd) recommendation. Installed because the
+project needs **ground truth** — watching the real binary/emulator instead of guessing at GT4.
+
+### 13.1 Ghidra + EmotionEngine + GhydraMCP  [DONE]
+
+| Piece | Version | Path |
+|---|---|---|
+| Ghidra | 12.1.4 PUBLIC | `/mnt/ssd/tools/ghidra/ghidra_12.1.4_PUBLIC` |
+| GhydraMCP extension | v2.2.0-rc.3 | `Extensions/Ghidra/GhydraMCP-v2.2.0-rc.3-...zip` |
+| EmotionEngine Reloaded | v2.1.38 (built for Ghidra 12.1.4) | `Extensions/Ghidra/ee.zip` |
+| MCP bridge | repo main | `/mnt/ssd/tools/ghydramcp/bridge_mcp_hydra.py` |
+| Bridge venv | mcp==1.9.4, requests | `/mnt/ssd/tools/ghydramcp/venv` |
+| Launcher | - | `/mnt/ssd/tools/ghidra/launch-ghidra.sh` |
+
+**Run it:** `bash /mnt/ssd/tools/ghidra/launch-ghidra.sh` (the GUI needs the X session, so this is
+a human step).
+
+**What still needs a human, once:** open Ghidra, load GT4's ELF, accept the EmotionEngine module,
+leave CodeBrowser open. The plugin logs `HydraMCP HTTP server started on port 8192` to its console.
+After that the agent drives Ghidra entirely over MCP: `instances_list` -> `instances_use` ->
+`functions_decompile` / `xrefs_list` / `data_list_strings`.
+
+**Gotchas hit and fixed:**
+- The README's `pip install mcp` gives mcp 2.x, where `mcp.server.fastmcp` was renamed. Pin `mcp<2`
+  (we use 1.9.4). System pip is PEP 668 blocked, hence the venv.
+- Ghidra 12.1.4 needs Java 21+; box has OpenJDK 25.
+- The EmotionEngine plugin must match the Ghidra version exactly — 12.1.4 asset used.
+
+### 13.2 PCSX2 + DebugServer  [BRIDGE INSTALLED, EMULATOR PENDING]
+
+The MCP half is done and connected. The emulator half is **not** — and the reason is real:
+
+| Piece | State |
+|---|---|
+| Node MCP bridge (`pcsx2-mcp-server`) | built at `/mnt/ssd/tools/PCSX2-MCP/pcsx2-mcp-server/dist/index.js` |
+| DebugServer patch source | `/mnt/ssd/tools/PCSX2-MCP/pcsx2-plugin/DebugServer.cpp` |
+
+**The Windows problem.** hkmodd/PCSX2-MCP releases ship a **Windows-only** `pcsx2-qt.exe` with
+DebugServer compiled in. There is no Linux binary. Upstream Linux PCSX2 (apt 1.6.0 is ancient; use
+PCSX2/pcsx2 source) has **no DebugServer**, so without building one only the Pine-IPC tools work —
+no breakpoints, no `step`, no register reads. Those are the whole point.
+
+**Good news:** `DebugServer.cpp` (1011 lines) is genuinely cross-platform — every Windows construct
+(`winsock2`, `SOCKET`, `closesocket`) is inside `#ifdef _WIN32`, with POSIX `sys/socket.h` fallbacks.
+It calls PCSX2 internals (`DebugInterface.h`, `Breakpoints.h`, `MipsStackWalk.h`), so the port is a
+**build integration**: clone PCSX2 source, drop the two files in `pcsx2/DebugTools/`, add them to
+CMakeLists, call `DebugServer::Start()` from `VMManager::Initialize()` / `Stop()` from `Shutdown()`,
+and hook `OnBreakpointHit()`. Then a full Qt6/wx PCSX2 build.
+
+**Cost + rule 11:** this is a multi-hour compile and needs Qt6 + wxWidgets. When undertaken it must
+run `-j4` under `nice -n 10` / `ionice -c3` — the box also hosts the live Minecraft server.
+
+**Until then:** `pcsx2_connect` will report no emulator. Everything else (Ghidra) works.
+
+### 13.3 DONE 2026-10-05 — Linux PCSX2 + DebugServer built
+
+Built successfully. Binary: `/mnt/ssd/tools/pcsx2-src/build-pcsx2/bin/pcsx2-qt` (43 MB, ELF x86-64,
+`DebugServer::Start(int)` symbol present, no missing shared libs).
+
+**How it was built (all capped -j4, nice 10, ionice idle — law 11):**
+
+| Step | What | Where |
+|---|---|---|
+| 1 | PCSX2 source (shallow, main `144a19b`) | `/mnt/ssd/tools/pcsx2-src` |
+| 2 | System deps (Qt6 base, ninja, XCB dev set, xkbcommon-x11, nasm, libx264/opus dev, ECM) | `apt` |
+| 3 | PCSX2's bundled deps (Qt 6.11.2, SDL3, plutovg, plutosvg, rapidyaml, shaderc, KDDockWidgets, libbacktrace, libpng/jpeg/webp/lz4/zstd) | `/mnt/ssd/tools/pcsx2-deps/prefix` |
+| 4 | FFmpeg 7.1.5 (apt's 6.1.1 is below PCSX2's >=7.1 requirement) | same prefix |
+| 5 | PCSX2 configure + build | `/mnt/ssd/tools/pcsx2-src/build-pcsx2` |
+
+Build scripts (all idempotent-ish, detached via `systemd-run --user`):
+`/mnt/ssd/tools/pcsx2-deps/{build-deps-capped.sh,run-deps.sh,build-ffmpeg.sh,build-pcsx2.sh}`.
+
+**DebugServer API port (upstream PCSX2 moved on — 5 fixes in `DebugServer.cpp`):**
+
+| Old (hkmodd v1.0.0) | Upstream current | Fix |
+|---|---|---|
+| `cpu->read8(a, valid)` / `cpu->write8` | `Read8(a, &valid)` / `Write8` | pointer + caps |
+| `cpu->read32(a, valid)` | `Read32(a, &valid)` | pointer + caps |
+| `MipsStackWalk::Walk(cpu,pc,ra,sp,entry,stackTop)` | `Walk(...,entry)` (5 args) + `cpu->StackTrace(thread)` | use `StackTrace` |
+| `MemCheck::numHits` | `totalHits` | rename |
+| `MEMCHECK_LOG` | *(removed)* — log-only = `MEMCHECK_IGNORE` | map |
+
+Integration: `DebugServer.cpp/.h` in `pcsx2/DebugTools/`, added to `pcsx2/CMakeLists.txt`
+(sources + headers), `DebugServer::Start()` called at the end of `VMManager::Initialize()`,
+`DebugServer::Stop()` at the top of `VMManager::Shutdown()`. `OnBreakpointHit()` left as upstream's
+no-op (it does nothing yet; wiring it buys nothing until it notifies clients).
+
+**⚠️ Not yet verified end-to-end.** `DebugServer::Start()` only fires when a **VM boots**, so
+proving port 21512 requires a PS2 BIOS + a disc in PCSX2 — which needs the captain. To test:
+run `pcsx2-qt`, load GT4, confirm the log shows `[DebugServer] Listening on 127.0.0.1:21512`, then
+the MCP's `pcsx2_connect` should succeed. Until then the build is proven, the runtime binding isn't.
+
+**Build traps hit (for next time):** the dep script `rm -fr`s each source dir every run → **not
+resumable** (it rebuilt Qt Base twice). It also reads patches from `$SCRIPTDIR/../common/` → the
+`common/` dir had to be placed at `/mnt/ssd/tools/common/`. Missing Qt xcb devlibs silently fail the
+Qt configure with a cryptic feature-condition error.

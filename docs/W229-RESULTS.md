@@ -316,6 +316,26 @@ filler). So the remaining divergence is in those parsed streams: ours compares n
 equal. The next measurement is the A/B of `iStack_6c`/`iStack_5c` (and `FUN_01005870`'s return) at
 `0x01004500` — the merge inputs already match, so the divergence is one level below `FUN_01006F90`.
 
+## 15. HARDWARE A/B OF THE TWO COMPARE STREAMS — hardware's are EQUAL, ours DIFFER
+
+PCSX2 fresh, breakpoint at `0x01004748` (`jal func_1005870`, the compare inside `FUN_01004500`).
+Hardware `a0` (pre-delay-slot) `= 0x01FFFBE0`, `a1 = 0x01895770`; the delay slot loads
+`a0 = *(0x01FFFBE0+4) = 0x01895740`. Stream contents:
+
+| side | arg | struct `+8` (count) | `+c` | `+14` (base) | base `w0 w1 w2` |
+|---|---|---|---|---|---|
+| hw | a0 | `0x10` | `0x40` | `0x01895c80` | `4bb5e6bf 05e985f7 9bb5bb30` |
+| hw | a1 | `0x10` | `0x10` | `0x018957a0` | `4bb5e6bf 05e985f7 9bb5bb30` |
+| ours | a0 | `0x10` | `0x40` | `0x1895da0` | `4bb5e6bf 05e985f7 9bb5bb30` |
+| ours | a1 | `0x10` | `0x10` | `0x18958c0` | `**893d7a82 4a91273a 7acf5c27**` |
+
+**Hardware's two streams are byte-identical in their payload; ours' second stream differs.** So
+hardware's `FUN_01005870` returns 0 → `iVar3=0` → `FUN_01004500` returns 1 (boot continues); ours'
+returns non-zero → `iVar3!=0` → returns 0 → loader hang. Ours' first stream matches hardware exactly,
+so the corruption is in **the second stream** (`+c=0x10`, base ours `0x18958c0`), which is built by
+`FUN_01004448(auStack_60, param_1+0x1c, …)` / the `iStack_3c` path from `param_1+0xc/+0x10`. That is
+the precise next target.
+
 `VULCAN4_W122_BARRIER=1` (force the barrier word) no longer moves the wall to the merge (that is fixed);
 it derails instead. Probes added (all OFF by default): `VULCAN4_W229_BAR`, `VULCAN4_W229_SET`,
 `VULCAN4_W229_THR`, `VULCAN4_W229_STK`, `VULCAN4_W229_IRQ`, `VULCAN4_W229_ARR`.

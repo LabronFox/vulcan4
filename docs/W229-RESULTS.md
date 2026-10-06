@@ -390,5 +390,19 @@ instrument the decode loop there.
 decompressed data. Either this `0x12bf100` blob is a separate asset/checksum blob (not the parse
 input), or that sample was coincidental — to resolve after the decompressor bisect.
 
+**Bisect (PCSX2 live, buffer base `0x12bf204`):** the output matches at `+0x0/+0x100000/+0x200000/
++0x280000/+0x500000`. Inside `[+0x100000, +0x104000)` the mapping is a **permutation**, not a shift:
+
+| ours offset | hardware offset | bytes |
+|---|---|---|
+| `+0x100000` | `+0x100000` | `27bdffe0 ffb00000 0000802d ffb10008` |
+| `+0x101000` | `+0x102000` | `dfb00000 dfb10008 dfbf0010 03e00008` |
+| `+0x101800` | `+0x100400` | `3c020083 ac43a110 24020001 14820005` |
+| `+0x104000` | `+0x108000` | `2406ffff 8e430004 03a0282d 24630190` |
+
+So the decompressor emits the **same code/data blocks at permuted offsets** — a block-placement
+difference, not a lost bit. `FUN_0100F8C8` is the suspect; the next step is to find where in it the
+output block offset is computed.
+
 
 

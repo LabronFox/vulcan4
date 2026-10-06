@@ -1341,6 +1341,25 @@ constexpr const char *mipsMnemonic(uint32_t insn)
     }
 }
 
+// W229. WHO ZEROES sub_01008C50's saved-$ra slot at sp+0x40 between two arrivals at 0x1009004?
+static uint32_t g_w229arrLo = 0u;
+static uint32_t g_w229arrHi = 0u;
+static bool g_w229arrArm = false;
+static uint32_t g_w229arrW = 0u;
+static void w229ArrStoreObserver(uint32_t addr, uint32_t size, uint64_t val,
+                                 const R5900Context *c, const char *op, uint32_t)
+{
+    if (!g_w229arrArm) return;
+    if (addr >= g_w229arrLo && addr < g_w229arrHi && g_w229arrW < 40u)
+    {
+        ++g_w229arrW;
+        std::cout << "VULCAN4 W229 W addr=" << toHex(addr) << " size=" << size
+                  << " val=" << toHex(static_cast<uint32_t>(val))
+                  << " writerPc=" << toHex(c != nullptr ? c->pc : 0u)
+                  << " op=" << (op != nullptr ? op : "?") << std::endl;
+    }
+}
+
 int main(int argc, char *argv[])
 {
     const std::string usage =
@@ -2303,6 +2322,39 @@ int main(int argc, char *argv[])
                           << " sp=" << toHex(getRegU32(&ctx, 29))
                           << " prev=" << (lastResolvedPcValid ? toHex(lastResolvedPc) : std::string("NONE"))
                           << " n=" << functionsEntered << std::endl;
+            }
+        }
+        // W229. SHAPE-A DERail: the main thread resumes sub_01008C50 at label 0x1009004 (the merge
+        // call's fallthrough) and its epilogue restores $ra from sp+0x40 = 0. Probe that slot.
+        // OFF unless VULCAN4_W229_ARR.
+        {
+            static const bool s_w229arrOn = (std::getenv("VULCAN4_W229_ARR") != nullptr);
+            static int s_w229arrN = 0;
+            if (s_w229arrOn && s_w229arrN < 40 && ctx.pc == 0x1009004u)
+            {
+                ++s_w229arrN;
+                static bool s_w229arrReg = false;
+                if (!s_w229arrReg) { ps2AddStoreSubscriber(&w229ArrStoreObserver); s_w229arrReg = true; }
+                if (s_w229arrN == 1)
+                {
+                    g_w229arrLo = getRegU32(&ctx, 29) & 0x01FFFFFFu;
+                    g_w229arrHi = g_w229arrLo + 0x50u;
+                    g_w229arrArm = true;
+                }
+                else if (s_w229arrN == 2)
+                {
+                    g_w229arrArm = false;
+                }
+                uint32_t saved = 0u;
+                const uint32_t so = (getRegU32(&ctx, 29) + 0x40u) & 0x01FFFFFFu;
+                if (so + 4u <= 0x02000000u) std::memcpy(&saved, rdram + so, 4);
+                std::cout << "VULCAN4 W229 ARR9004 n=" << s_w229arrN
+                          << " ra=" << toHex(getRegU32(&ctx, 31))
+                          << " sp=" << toHex(getRegU32(&ctx, 29))
+                          << " savedAtSp40=" << toHex(saved)
+                          << " s3=" << toHex(getRegU32(&ctx, 19))
+                          << " prev=" << (lastResolvedPcValid ? toHex(lastResolvedPc) : std::string("NONE"))
+                          << std::endl;
             }
         }
         // W227. THE MERGE INPUTS, dumped on OUR side to compare against PCSX2 ground truth.

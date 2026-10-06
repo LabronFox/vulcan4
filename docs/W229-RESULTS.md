@@ -198,4 +198,37 @@ not move — the next wall is **not** the merge. The new derail is a different o
 corrupted-`ra` on the second scheduler thread, now exposed because the merge no longer spins. That,
 and/or the screen still waiting, is the next dish.
 
+## 10. SHAPE A ROOT-CAUSED — a suspended frame is REUSED across a yield
+
+The PC-0 derail (`dead=0x0 last_good=0x01009004 ra=0x0 sp=0x01fffc70`) is **not** `sub_01008C50`
+returning with a legitimately-zero `ra`. The harness arrival probe (`VULCAN4_W229_ARR`, OFF by
+default) shows two arrivals at the merge-return label `0x1009004`:
+
+```
+ARR9004 n=1 ra=0x1009004 sp=0x1fffc20 savedAtSp40=0x010082e4   <- correct caller return
+ARR9004 n=2 ra=0x1009004 sp=0x1fffc20 savedAtSp40=0x00000000   <- ZEROED -> epilogue jr $ra -> PC 0
+```
+
+`sub_01008C50` saves its caller's `$ra` at `sp+0x40` (`0x1fffc60`). A store observer armed on that
+frame (`VULCAN4_W229_ARR`) caught what rewrites it **while `sub_01008C50` is suspended**:
+
+```
+W229 W addr=0x01fffc60 size=8 val=0x01008318 writerPc=0x0100559c op=WRITE64
+W229 W addr=0x01fffc60 size=8 val=0x01008318 writerPc=0x0101d438 op=WRITE64
+W229 W addr=0x01fffc50 ... writerPc=0x0100558c   ; sub_010055XX prologue saves
+```
+
+`0x0100559c` is inside **`sub_010055XX`**, called from `FUN_01004500` (`jal 0x010055e0`) — a *different*
+call chain (the `FUN_01000558 → FUN_010047C0 → FUN_01004500` filler chain) that reuses the **same stack
+addresses** while `sub_01008C50`'s frame is still live. So: the function yielded, its guest frame stayed
+on the stack, and another chain was then run at the **same `$sp`**, overwriting the saved `$ra` (and
+eventually with 0). On resume at `0x1009004` the epilogue restores `ra=0` → PC 0.
+
+This is a **stack/reentrancy defect**, not a translation bug: a suspended guest frame is not protected
+from reuse. It is the same family as §4/§6 (a fresh invocation running at a stack that overlaps live
+guest data). **NEXT:** find why the runtime runs the `FUN_01004500` chain at `sp≈0x1fffc20` (the
+suspended `sub_01008C50` frame) — likely the yield/resume path resetting `$sp` to the thread top, or a
+second invocation getting an overlapping stack. `VULCAN4_W229_ARR` reproduces both arrivals and the
+writer.
+
 

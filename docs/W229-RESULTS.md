@@ -336,6 +336,32 @@ so the corruption is in **the second stream** (`+c=0x10`, base ours `0x18958c0`)
 `FUN_01004448(auStack_60, param_1+0x1c, …)` / the `iStack_3c` path from `param_1+0xc/+0x10`. That is
 the precise next target.
 
+## 16. THE SECOND STREAM IS `SHA-512(decompressed buffer)`, REVERSED — and OUR BUFFER DIFFERS
+
+The second stream is built by `FUN_01004448` → `FUN_01003700` (a 0x80-byte-block feeder) →
+`FUN_01001290` (**SHA-512**) → `FUN_01003938`/`FUN_010010b0` (finalize + byte-swap). It is a
+**SHA-512 of the decompressed 6 MB buffer at `0x12bf204`, length `0x5d5dc8`**.
+
+Proof: the dumped buffer (`VULCAN4_W229_DUMP`, written to `/tmp/w229buf.bin`) hashed in Python gives
+`sha512(buf) = 6479c786…893d7a82`, and `bswap32(sha512(buf))[::-1]` = `893d7a82 4a91273a 7acf5c27
+5d7789fa…` — **exactly ours' computed `a1`**. So the hash function is CORRECT and `a1 = our buffer's
+hash`. The expected value (`a0 = 4bb5e6bf 05e985f7 9bb5bb30…`) is what the correct buffer hashes to.
+
+**So the root divergence is the decompressed 6 MB buffer itself.** Ours and hardware match at
+`+0x0, +0x100000, +0x200000, +0x280000, +0x500000` but **diverge from ≈`+0x170000`**:
+
+```
++B0000   ours   01000224 05008214 01000224 12000324
+         hw     2d20a003 b4fe050c 02000524 44000010
++1a0000  ours   3f000324 8300023c 886843ac 18001116     <- this is hardware's +0x1d0000
++1d0000  hw     3f000324 8300023c 886843ac 18001116
+```
+
+i.e. from ≈`+0x170000` **ours is shifted 0x30000 earlier than hardware** — the decompressed stream is
+**missing/misordering ~0x30000 bytes** before that point. That is the root cause of the failed parse,
+the loader hang, and the frozen disclaimer. Next: bound the exact divergence start between `+0x100000`
+and `+0x170000` and find which decode step drops the 0x30000 bytes.
+
 `VULCAN4_W122_BARRIER=1` (force the barrier word) no longer moves the wall to the merge (that is fixed);
 it derails instead. Probes added (all OFF by default): `VULCAN4_W229_BAR`, `VULCAN4_W229_SET`,
 `VULCAN4_W229_THR`, `VULCAN4_W229_STK`, `VULCAN4_W229_IRQ`, `VULCAN4_W229_ARR`.

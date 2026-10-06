@@ -374,5 +374,21 @@ empty, so a later copy/decode step is the more likely filler). Locating that wri
 it derails instead. Probes added (all OFF by default): `VULCAN4_W229_BAR`, `VULCAN4_W229_SET`,
 `VULCAN4_W229_THR`, `VULCAN4_W229_STK`, `VULCAN4_W229_IRQ`, `VULCAN4_W229_ARR`.
 
+## 17. THE FILLER'S DECOMPRESSOR (`FUN_0100F8C8`) — input matches, output does not
+
+`VULCAN4_W229_INF` dumps the decompressor entry (`targetPc==0x100F8C8`; the filler's call has
+`ra=0x10043AC`). Ours: `sp=0x1ffce10`, `fC=0x10d1ac8` (input), `f10=0x12bf0bd` (input end),
+`f1c=0x12bf100` (output), `f24=0x12bf0ff`. PCSX2 conditional BP `ra==0x010043AC`: `a0=0x01FFCB70`,
+`a1=0x010D1AC8`, `a2=0x012BF0BD`, `s0=0x012BF100` — **same input ptr/end/output**, and the compressed
+input bytes match (`c55b7c0f 747e2f95 d8acb5ef 38ed7c72 …`).
+
+So the divergence is **inside `FUN_0100F8C8`'s own decode** (bitstream desync appearing by `+0x110000`
+of output). It is ~74 KB; the next step is to bisect the output to the exact first differing byte and
+instrument the decode loop there.
+
+**Tension to reconcile:** §9 measured the parser/merge inputs matching hardware, and the parser reads
+decompressed data. Either this `0x12bf100` blob is a separate asset/checksum blob (not the parse
+input), or that sample was coincidental — to resolve after the decompressor bisect.
+
 
 

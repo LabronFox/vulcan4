@@ -467,5 +467,29 @@ That is the same class as §10/§11: a guest function suspended across a yield. 
 whether the resumed `t1`/`t4`/`s1`/`s3` at `0x100f800`/`0x100f418` match the values the MIPS would
 have had, i.e. whether the resume path re-materialises the copy state correctly.
 
+## 21. THE CORRUPTION IS ONE ~12 KB MATCH-COPY RUN
+
+A full byte diff of ours' blob vs hardware's (`/tmp/w229buf_1.bin` vs `/tmp/hwbuf.bin`, 6,118,856
+bytes each) gives **exactly one contiguous run of differences**:
+
+```
+differing bytes: 11,365   run: 0xD521C .. 0xD80B2  (11,926 bytes)
+```
+
+and hardware's bytes over that range are **not present anywhere** in ours' blob. So it is not a shift
+or a block permutation — it is a **single ~12 KB region overwritten with wrong data**, consistent with
+one DEFLATE match (or a short run of matches) decoded with a **wrong distance** (measured at
+`0x1394420`: correct source `0x1394408` = distance `0x18`, ours `0x13943d8` = distance `0x48`), whose
+wrong source cascades for the match length.
+
+So the defect is narrow: **the match-distance decode in `FUN_0100F390` goes wrong once**, producing a
+~12 KB bad copy. Everything else in the 6 MB matches hardware. The next probe is the distance/length
+registers (`s3`, and the window offset) for the match that starts at `0xD521C`, on both sides.
+
+The diagnostic knob `VULCAN4_W229_NOYIELD` (force no checkpoint yields **only** while
+`pc ∈ [0x100f390,0x100f8c8)`, OFF by default) was added to test yield-vs-decode; taking it
+**deadlocks the boot** (the decoder must yield for the rest of the system to run), so it cannot be used
+as-is without a scoped resume.
+
 
 

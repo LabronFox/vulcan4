@@ -1,0 +1,55 @@
+diff --git a/ps2xRecomp/src/lib/ps2_recompiler.cpp b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+index 98ce61f..82f8c07 100644
+--- a/ps2xRecomp/src/lib/ps2_recompiler.cpp
++++ b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+@@ -35,6 +35,34 @@ namespace ps2recomp
+             return ((address + 4) & 0xF0000000u) | (target << 2);
+         }
+ 
++        // W238. A resume/entry slice that spans more than this many instructions is a MISSING
++        // BOUNDARY, not a real function; cap it and report it LOUDLY. Tunable via
++        // PS2RECOMP_MAX_SLICE_INSNS (default 1024).
++        uint32_t w238MaxSliceBytes()
++        {
++            static const uint32_t v = []() {
++                const char *s = std::getenv("PS2RECOMP_MAX_SLICE_INSNS");
++                uint64_t n = (s != nullptr && *s != '\0') ? std::strtoull(s, nullptr, 10) : 1024ull;
++                if (n == 0ull) n = 1024ull;
++                return static_cast<uint32_t>(n) * 4u;
++            }();
++            return v;
++        }
++
++        bool w238CapSlice(uint32_t target, uint32_t &end, const char *where)
++        {
++            const uint32_t cap = w238MaxSliceBytes();
++            if (end > target && (end - target) > cap)
++            {
++                std::cerr << "VULCAN 4 LIMITATION: " << where << " slice at 0x" << std::hex << target
++                          << " spans 0x" << (end - target) << " bytes (> " << std::dec << (cap / 4u)
++                          << " insns) — MISSING BOUNDARY; capping at the cap.\n";
++                end = target + cap;
++                return true;
++            }
++            return false;
++        }
++
+         bool isReservedCxxIdentifier(const std::string &name)
+         {
+             if (name.size() >= 2 && name[0] == '_' && name[1] == '_')
+@@ -528,6 +556,7 @@ namespace ps2recomp
+                         {
+                             sliceEndAddress = nextStartOpt.value();
+                         }
++                        w238CapSlice(target, sliceEndAddress, "entry");
+ 
+                         if (isSimpleReturnThunkStart(*sliceIt) &&
+                             target <= (std::numeric_limits<uint32_t>::max() - 8u))
+@@ -570,6 +599,7 @@ namespace ps2recomp
+                         {
+                             entryEnd = nextStartOpt.value();
+                         }
++                        w238CapSlice(target, entryEnd, "entry");
+                         if (entryEnd <= target)
+                         {
+                             continue;

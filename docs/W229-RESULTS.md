@@ -559,5 +559,19 @@ the resume at `0x100f800` actually re-executes the `sb`/`t1++`.
 Ours writes it **twice** (correct `0x7c`, then wrong `0x2d`). So our decoder makes one **extra** write
 that hardware does not: the re-process is confirmed against the console, not just inferred.
 
+## 26. IT IS DETERMINISTIC — so it is a RECOMPILER translation bug, not a yield race
+
+Two independent runs (`VULCAN4_W229_DUMP`) produce **byte-identical** blobs
+(`cmp /tmp/w229det_1.bin /tmp/w229det_2.bin` → 0), and both differ from hardware at the **same** offset
+`872989` / run `0xD521C..0xD80B2`. The scheduler's yields are nondeterministic, so if they affected the
+decode the output would vary run to run — it does not. Therefore the decode divergence is
+**deterministic** and points at the **recompiler's translation of `FUN_0100F390`** (or a deterministic
+driver step), not at the yield/resume machinery.
+
+That reframes the fix: compare the generated `sub_0100F390_0x100f390` against the MIPS disassembly of
+`0x100f390..0x100f8c8` instruction-by-instruction, focusing on the length/distance decode (the one
+wrong match: length `0x15`/distance `0x48` where correct is `0xc`/`0x18`). A deterministic mis-translated
+instruction is the target; a recompiler patch would go in `tools/patches/`.
+
 
 

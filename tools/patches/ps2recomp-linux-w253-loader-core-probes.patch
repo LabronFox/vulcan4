@@ -1,0 +1,799 @@
+diff --git a/ps2xRecomp/src/lib/control_flow_emitter.cpp b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+index 4b62414..7746782 100644
+--- a/ps2xRecomp/src/lib/control_flow_emitter.cpp
++++ b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+@@ -510,6 +510,28 @@ namespace ps2recomp
+         m_ss << "    {\n";
+         m_ss << "        const bool " << branchTakenVar << " = (" << conditionalBranchExpression() << ");\n";
+ 
++        // W253 probe (2). THE REWIND LOG.
++        //
++        // The bug is a livelock in which the core writer's out pointer walks BACKWARDS and one
++        // 11,461-byte band is rewritten forever. Every other observation of that event is indirect; this
++        // emits the log AT the backward edge, where the registers are still live and no dispatcher can
++        // perturb the timing. Two guards, both compile-time on this branch's own operands:
++        //   * target < pc        -- a BACKWARD edge, which excludes the forward ~2000 branches in the
++        //                           image and the whole engine;
++        //   * pc in [0x0100F390, 0x01011000) -- the core writer + its driver, so nothing outside the
++        //                           DEFLATE path pays.
++        // Registers logged: r9 (t1) = [job+0x20] out ptr, r8 (t0) = [job+0x0C] in ptr, r7 (a3) =
++        // [job+0x00], r6 (a2) = [job+0x08]. Same four as the core-entry probe, so the pair reads as
++        // "<retry #N> pc -> target, out ptr now X".
++        if (target < m_branchInst.address && m_branchInst.address >= 0x0100F390u &&
++            m_branchInst.address < 0x01011000u)
++        {
++            m_ss << fmt::format(
++                "        ::vulcan4W253Jump(0x{:08x}u, 0x{:08x}u, {}, "
++                "GPR_U32(ctx, 9), GPR_U32(ctx, 8), GPR_U32(ctx, 7), GPR_U32(ctx, 6));\n",
++                m_branchInst.address, target, branchTakenVar);
++        }
++
+         // W129. A PROBE EMITTED BY THE TRANSLATOR, not pasted into the generated file (which is
+         // regenerated every build). It is guarded by a runtime env knob so it costs one getenv-free
+         // branch on an inline-visible flag when off, and nothing at all when the knob is unset.
+diff --git a/ps2xRecomp/src/lib/instruction_translator.cpp b/ps2xRecomp/src/lib/instruction_translator.cpp
+index 9376635..2698e26 100644
+--- a/ps2xRecomp/src/lib/instruction_translator.cpp
++++ b/ps2xRecomp/src/lib/instruction_translator.cpp
+@@ -139,6 +139,23 @@ namespace ps2recomp
+             return translateMemoryWrite(inst, effectiveMemoryHint, width, addr, val);
+         };
+ 
++        // W253 probe (1). THE CORE WRITER'S RETRY HEAD.
++        //
++        // 0x0100F418 (`dsll32 v0,a3,0`) is NOT a function entry -- Ghidra reports it as part of
++        // FUN_0100F390 -- it is the re-entry point of the core writer's bit loop, and FIVE of that
++        // function's eight backward edges land on it. It IS a resume case in the generated switch, but
++        // the back edges reach it by direct `goto`, which the per-entry dispatcher cannot observe, so
++        // the counter has to live at the instruction. Emitted here, before the opcode switch, so it
++        // precedes the `dsll32` no matter which sub-translator handles it (it is OPCODE_SPECIAL).
++        // The four registers are the job-struct fields the core consumes: t1 = [s0+0x20] (out ptr),
++        // t0 = [s0+0x0C] (in ptr), a3 = [s0+0x00] (hold), a2 = [s0+0x08] (bits).
++        if (inst.address == 0x0100F418u)
++        {
++            return "::vulcan4W253CoreEnter(0x0100f418u, ctx->pc, GPR_U32(ctx, 9), GPR_U32(ctx, 8), "
++                   "GPR_U32(ctx, 7), GPR_U32(ctx, 6)); " +
++                   m_codeGenerator.translateSpecialInstruction(inst);
++        }
++
+         switch (inst.opcode)
+         {
+         case OPCODE_SPECIAL:
+@@ -194,6 +211,21 @@ namespace ps2recomp
+         case OPCODE_LWU:
+             return fmt::format("SET_GPR_ZE32(ctx, {}, {});", inst.rt, genRead(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+         case OPCODE_SB:
++            // W253 probe (4). THE INVISIBLE BYTE STORE.
++            //
++            // 0x0100F800 (`sb v0,0(t1)`) is the FIRST DIVERGING INSTRUCTION of the whole loader arc:
++            // hardware writes 0x7C, we write 0x2D, at blob offset 0xD521C. Unlike every neighbouring `sw`
++            // it has NO store-watch guard, so the write is unobserved today. The address is a compile-time
++            // constant, so the emit is scoped to that one store and no other `sb` in either image pays for
++            // it; the runtime knob (VULCAN4_W253) then decides whether anything prints.
++            if (inst.address == 0x0100F800u)
++            {
++                return "::vulcan4W253ByteStore(ADD32(GPR_U32(ctx, " + std::to_string(inst.rs) + "), " +
++                       std::to_string(static_cast<int32_t>(inst.immediate)) + "), (uint8_t)GPR_U32(ctx, " +
++                       std::to_string(inst.rt) + "), 0x0100f800u); " +
++                       genWrite(8, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate),
++                                fmt::format("(uint8_t)GPR_U32(ctx, {})", inst.rt)) + ";";
++            }
+             return genWrite(8, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("(uint8_t)GPR_U32(ctx, {})", inst.rt)) + ";";
+         case OPCODE_SH:
+             return genWrite(16, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("(uint16_t)GPR_U32(ctx, {})", inst.rt)) + ";";
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index 498bbe9..9b6b456 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -905,6 +905,96 @@ inline void vulcan4W129CopyProbePrint(const char *where,
+ }
+ 
+ 
++// W253. THE CORE-ENTRY ORDINAL, THE REWIND LOG, AND THE INVISIBLE BYTE STORE.
++//
++// WHY: the loader's DEFLATE decode is CORRECT end to end (0 wrong bytes through w = 6,120,817) and then,
++// 816 bytes before the end, the core writer's OUT POINTER rewinds to blob off 0xD521C and the driver
++// livelocks, rewriting one 11,461-byte band [0xD52CC, 0xD7F91] forever. The writer is FUN_0100F390
++// (guest 0x0100F390), whose retry head is 0x0100F418 -- FIVE of that function's eight backward edges
++// land on it -- and the driver that re-enters it is FUN_0100F8C8 (guest 0x0100F8C8).
++//
++// Neither the retry head nor the byte store at 0x100F800 is visible to the per-entry dispatcher: both
++// run inside one generated function body (the documented reason vulcan4W129CopyProbe lives here too).
++// So all three pieces are emitted BY THE TRANSLATOR, from inline helpers defined here:
++//   (1) vulcan4W253CoreEnter -- prefixed to the instruction at 0x0100F418; counts entries to the retry
++//                              head and prints the four job-struct registers the core consumes.
++//   (2) vulcan4W253Jump      -- emitted at every BACKWARD conditional branch inside
++//                              [0x0100F390, 0x01011000); prints the current ordinal and the same four
++//                              registers, so a rewind reads as "<retry #N> pc -> target".
++//   (4) vulcan4W253ByteStore -- emitted at the byte store 0x100F800, which has NO W130 store-watch
++//                              guard (every neighbouring `sw` does), so today that write is invisible.
++//
++// The knob is read ONCE into a function-local static, so when VULCAN4_W253 is unset every call is a load
++// and a test on an inline-visible variable and nothing is printed: unset = today's behaviour.
++inline bool vulcan4W253On() noexcept
++{
++    static const bool on = std::getenv("VULCAN4_W253") != nullptr;
++    return on;
++}
++
++// The ordinal is shared by the enter counter and the jump log, so a rewind can be read as
++// "retry #N moved the out pointer to X" instead of as an isolated print with no history.
++inline uint64_t &vulcan4W253Ordinal() noexcept
++{
++    static uint64_t ordinal = 0;
++    return ordinal;
++}
++
++inline void vulcan4W253CoreEnter(uint32_t insnAddr, uint32_t ctxPc, uint32_t t1, uint32_t t0,
++                                 uint32_t a3, uint32_t a2) noexcept
++{
++    if (!vulcan4W253On())
++    {
++        return;
++    }
++    const uint64_t n = ++vulcan4W253Ordinal();
++    if (n <= 16u || (n % 100000u) == 0u)
++    {
++        std::fprintf(stderr,
++                     "[w253:core] entry n=%llu insn=0x%08x ctxpc=0x%08x t1=0x%08x t0=0x%08x "
++                     "a3=0x%08x a2=0x%08x\n",
++                     static_cast<unsigned long long>(n), insnAddr, ctxPc, t1, t0, a3, a2);
++    }
++}
++
++inline void vulcan4W253Jump(uint32_t pc, uint32_t target, bool taken, uint32_t t1, uint32_t t0,
++                            uint32_t a3, uint32_t a2) noexcept
++{
++    if (!vulcan4W253On())
++    {
++        return;
++    }
++    static uint64_t jumpHits = 0;
++    ++jumpHits;
++    // BOUNDED ON PURPOSE: the whole bug is a livelock, so an unbounded log is a many-GB file, not a
++    // measurement. The first 64 edges name the shape; the %100000 hits prove it is still going.
++    if (jumpHits <= 64u || (jumpHits % 100000u) == 0u)
++    {
++        std::fprintf(stderr,
++                     "[w253:jump] n=%llu ordinal=%llu pc=0x%08x -> 0x%08x taken=%d t1=0x%08x "
++                     "t0=0x%08x a3=0x%08x a2=0x%08x\n",
++                     static_cast<unsigned long long>(jumpHits),
++                     static_cast<unsigned long long>(vulcan4W253Ordinal()), pc, target, taken ? 1 : 0,
++                     t1, t0, a3, a2);
++    }
++}
++
++inline void vulcan4W253ByteStore(uint32_t addr, uint32_t value, uint32_t writerPc) noexcept
++{
++    if (!vulcan4W253On())
++    {
++        return;
++    }
++    static uint64_t storeHits = 0;
++    ++storeHits;
++    if (storeHits <= 64u || (storeHits % 1000000u) == 0u)
++    {
++        std::fprintf(stderr, "[w253:sb] n=%llu pc=0x%08x addr=0x%08x value=0x%02x\n",
++                     static_cast<unsigned long long>(storeHits), writerPc, addr, value & 0xFFu);
++    }
++}
++
++
+ // W130. THE WRITER-WATCH FILTER AND THE READ PROBE THAT TEACHES IT THE ADDRESSES.
+ //
+ // The watch set holds up to four 32-bit guest addresses. The read probe (emitted by the translator at
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 3d8160f..e1d56e2 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2189,6 +2189,418 @@ static void vulcan4W178CopySub(uint32_t guestAddr,
+     }
+ }
+ 
++// ==============================================================================================
++// W252 (builder-1, TRACK A). SETTLE THE CORE.GT4 DIVERGENCE BY DIRECT OBSERVATION.
++//
++// What is already measured: our decode of CORE.GT4 is byte-identical to hardware for 872,988
++// bytes, then diverges at blob 0xD521C (decode buffer 0xD5320, guest 0x1394420) and re-converges
++// at blob 0xD80B1 -- 11,365 differing bytes, 517 runs, ALL inside one 64 KB bucket. Our diverging
++// bytes are exactly a valid 21-byte copy of the (identical) prefix at distance 72; the reference
++// token stream says hardware emitted a 12-byte copy at distance 24 there. 15 bits vs 18 bits of
++// Huffman budget cannot both be true inside one dynamic block that never re-syncs, yet the bytes
++// DO re-sync. Inference has produced a contradiction. Only the decoder itself can end it.
++//
++// The emitted match-copy (ps2_recompiled_functions.cpp:77897-78470) is:
++//   0x100f758  beql $t5,$zero,0x100f7f8   ; t5 == window base.  LIKELY branch:
++//   0x100f75c  subu $s1,$t1,$s1  (Delay Slot)   taken  -> s1 = src pointer, delay slot EXECUTES
++//                                               not-taken -> delay slot is NULLIFIED, s1 stays = DISTANCE
++//   0x100f760  window path (t5 != 0):  v0 = (t3 - s1) & 0x7FFF; v0 += t5; a1 = t5 + t3
++//   0x100f77c  lbu $v1,0(v0)   source load      <- window source
++//   0x100f780  sb  $v1,0(t1)   DEST store       <- out pointer
++//   0x100f78c  sb  $v1,0(a1)   window MIRROR store (delay slot of the bne at 0x100f788)
++//   0x100f7f8  direct path (t5 == 0): s2 = s1 + s3 (src end); s1 = src
++//   0x100f7fc  lbu $v0,0(s1)   source load
++//   0x100f800  sb  $v0,0(t1)   DEST store
++// So at a store inside either loop:  t1 = out, t4 = out end, s3 = bytes remaining (== L on the
++// first iteration), and s1 is the DISTANCE in the window path or the SOURCE POINTER in the direct
++// path. Registers a2/a3/t0/t2 (bit count / bit buffer / input ptr / input end) are NOT touched by
++// the byte loops, so they still carry the live bit state at the store.
++//
++// That is the whole measurement: log the first stores at and around the divergent word, with the
++// registers, and compare (L, D, bit position) against the reference token stream. READ-ONLY.
++// OFF unless VULCAN4_W252_COPY is set; LO/HI default to the divergent word 0x1394420.
++// ==============================================================================================
++static uint32_t g_w252Lo = 0x01394400u;
++static uint32_t g_w252Hi = 0x01394480u;
++static uint32_t g_w252Cap = 200u;
++static uint32_t g_w252On = 0u;
++static uint32_t g_w252LoopStores = 0u;   // every WRITE8 from the copy loops, any address
++static uint32_t g_w252InRange = 0u;      // those landing in [LO,HI)
++static uint32_t g_w252FirstLogged = 0u;
++static uint32_t g_w252WinLo = 0u;        // W252 WINDOW: print every in-range write with ordinal in [Lo,Hi]
++static uint32_t g_w252WinHi = 0u;        // 0 = window off (the default)
++static uint32_t g_w252LastDst = 0u;      // previous in-range destination, for the REWIND flag
++
++// W252 CHECKPOINT CROSS-REFERENCE. A store ordinal is the only number that can place a scheduler
++// checkpoint against a store. The W229 checkpoint probes fire on EVERY backward edge, so their cap
++// is spent long before the interesting moment; and a checkpoint that returns (due=true) hands control
++// to servicePendingEventsAtCheckpoint() -- which runs GUEST CODE -- between the last store of one run
++// and the first store of the next. If the rewind coincides with such a checkpoint, that is the cause
++// and it is nameable as two adjacent lines. OFF unless VULCAN4_W252_CKW=LO:HI (decimal, on the
++// in-blob write ordinal).
++static uint32_t g_w252CkwLo = 0u;
++static uint32_t g_w252CkwHi = 0u;        // 0 = off (the default)
++
++// W252 REF MODE. Plain range logging has a cap and cannot answer "was a byte an earlier pass wrote
++// CORRECTLY overwritten LATER?" -- the region is decoded more than once. In REF mode every in-range
++// WRITE8 is compared against a reference blob and only the writes whose value DIFFERS are printed,
++// in emission order, uncapped in count. The first such line IS the first divergence. The store index
++// `w=` is the position in emission order; a byte written twice appears twice, so a later bad pass is
++// visible instead of being hidden behind a cap. OFF unless VULCAN4_W252_REF names a file.
++static const unsigned char *g_w252Ref = nullptr;
++static uint64_t g_w252RefLen = 0u;
++static uint32_t g_w252RefBase = 0x012bf204u;
++static uint32_t g_w252RefOn = 0u;
++static uint32_t g_w252Mis = 0u;          // in-range writes whose value != reference
++static uint32_t g_w252MisCap = 60u;      // how many differing writes to print in full
++static uint32_t g_w252StatEvery = 200u;  // print a progress line every N in-range writes (0 = off)
++
++static const char *w252RegName(int r)
++{
++    static const char *const kNames[32] = {
++        "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
++        "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
++        "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
++        "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra"};
++    return (r >= 0 && r < 32) ? kNames[r] : "??";
++}
++
++static void vulcan4W252CopySub(uint32_t guestAddr,
++                               uint32_t size,
++                               uint64_t valueLo,
++                               const R5900Context *ctx,
++                               const char *op,
++                               uint32_t /*flags*/)
++{
++    if (g_w252On == 0u) { return; }
++    const uint32_t pc = (ctx != nullptr) ? ctx->pc : 0u;
++    if (op == nullptr || std::strcmp(op, "WRITE8") != 0) { return; }
++    const bool inLoop = (pc >= 0x100f390u && pc < 0x100f8c8u);
++    if (!inLoop) { return; }
++    if (g_w252LoopStores == 0u)
++    {
++        // Coverage line: proof the probe is installed AND that the copy loops store at all.
++        std::cerr << "[w252:copy] FIRST copy-loop WRITE8 pc=0x" << std::hex << pc
++                  << " dst=0x" << guestAddr << std::dec
++                  << " (range 0x" << std::hex << g_w252Lo << "..0x" << g_w252Hi << ")" << std::dec
++                  << std::endl;
++    }
++    ++g_w252LoopStores;
++    if (guestAddr < g_w252Lo || guestAddr >= g_w252Hi) { return; }
++    ++g_w252InRange;
++
++    // W252 WINDOW. The STAT lines are sampled every 200 in-range writes, so the exact moment the
++    // decoder stops advancing and starts rewriting a band is invisible in them. This prints every
++    // in-range write whose ORDINAL falls in [WIN_LO,WIN_HI], uncapped, together with the previous
++    // destination -- so a rewind (dst jumping backwards) is a number on one line, not an inference.
++    // OFF unless VULCAN4_W252_WIN=LO:HI (decimal).
++    if (g_w252WinHi != 0u && g_w252InRange >= g_w252WinLo && g_w252InRange <= g_w252WinHi)
++    {
++        const uint32_t prev = g_w252LastDst;
++        std::cerr << "[w252:win] w=" << std::dec << g_w252InRange
++                  << " pc=0x" << std::hex << pc
++                  << " dst=0x" << guestAddr
++                  << " (blob=0x" << (guestAddr - g_w252RefBase) << ")"
++                  << " prev=0x" << prev
++                  << (prev != 0u && guestAddr < prev ? " REWIND" : "")
++                  << " ra=0x" << getRegU32(ctx, 31)
++                  << " sp=0x" << getRegU32(ctx, 29)
++                  << " t0=0x" << getRegU32(ctx, 8)
++                  << " t1=0x" << getRegU32(ctx, 9)
++                  << " t2=0x" << getRegU32(ctx, 10)
++                  << " t3=0x" << getRegU32(ctx, 11)
++                  << " t4=0x" << getRegU32(ctx, 12)
++                  << " t5=0x" << getRegU32(ctx, 13)
++                  << " a2=0x" << getRegU32(ctx, 6)
++                  << " a3=0x" << getRegU32(ctx, 7)
++                  << " s0=0x" << getRegU32(ctx, 16)
++                  << " s1=0x" << getRegU32(ctx, 17)
++                  << " s2=0x" << getRegU32(ctx, 18)
++                  << " s3=0x" << getRegU32(ctx, 19)
++                  << " s4=0x" << getRegU32(ctx, 20)
++                  << std::dec << std::endl;
++    }
++    g_w252LastDst = guestAddr;
++
++    const uint32_t val = static_cast<uint32_t>(valueLo) & 0xFFu;
++    bool isMis = false;
++    uint32_t exp = 0u;
++    if (g_w252RefOn != 0u)
++    {
++        // MISMATCH-ONLY. Compare against the reference blob; print only differing writes.
++        const uint32_t off = guestAddr - g_w252RefBase;
++        exp = (static_cast<uint64_t>(off) < g_w252RefLen)
++                  ? static_cast<uint32_t>(g_w252Ref[off]) : 0xFFFFFFFFu;
++        isMis = (val != exp);
++        if (isMis) { ++g_w252Mis; }
++        if (g_w252StatEvery != 0u && (g_w252InRange % g_w252StatEvery) == 0u)
++        {
++            std::cerr << "[w252:copy] STAT w=" << std::dec << g_w252InRange
++                      << " mis=" << g_w252Mis
++                      << " lastdst=0x" << std::hex << guestAddr
++                      << " loopStores=" << std::dec << g_w252LoopStores << std::endl;
++        }
++        if (!isMis || g_w252Mis > g_w252MisCap) { return; }
++    }
++    else if (g_w252InRange > g_w252Cap) { return; }
++
++    const uint64_t seq = ps2NextTraceSequence();
++    if (isMis)
++    {
++        std::cerr << "[w252:copy] MIS=" << std::dec << g_w252Mis
++                  << " w=" << g_w252InRange
++                  << " got=0x" << std::hex << val
++                  << " exp=0x" << exp
++                  << " pc=0x" << pc
++                  << " dst=0x" << guestAddr
++                  << " seq=" << std::dec << seq
++                  << " n=" << g_w252InRange;
++    }
++    else
++    {
++        std::cerr << "[w252:copy] seq=" << std::dec << seq
++                  << " pc=0x" << std::hex << pc
++                  << " dst=0x" << guestAddr
++                  << " val=0x" << val
++                  << " n=" << std::dec << g_w252InRange;
++    }
++    // Every register that the two emitted loops and the decoder state use, by name.
++    static const int kRegs[] = {2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 17, 18, 19, 20, 31};
++    for (int i = 0; i < static_cast<int>(sizeof(kRegs) / sizeof(kRegs[0])); ++i)
++    {
++        std::cerr << " " << w252RegName(kRegs[i]) << "=0x" << std::hex << getRegU32(ctx, kRegs[i]);
++    }
++    // Decoded meaning, so a reader does not have to re-derive it: in the window path s1 is the
++    // DISTANCE; in the direct path it is the SOURCE. s3 is the remaining byte count (== L first).
++    const uint32_t t5 = getRegU32(ctx, 13);
++    const uint32_t t1 = getRegU32(ctx, 9);
++    const uint32_t s1 = getRegU32(ctx, 17);
++    std::cerr << " | path=" << (t5 == 0u ? "DIRECT" : "WINDOW")
++              << " L=s3=0x" << std::hex << getRegU32(ctx, 19)
++              << " D=" << (t5 == 0u ? "src" : "s1") << "=0x" << s1
++              << " out=0x" << t1
++              << " (out-off-in-blob=0x" << (t1 - 0x12bf204u) << ")"
++              << " winIdx=0x" << getRegU32(ctx, 11)
++              << " winBase=0x" << t5
++              << " bitbuf=a3=0x" << getRegU32(ctx, 7)
++              << " bitcnt=a2=0x" << getRegU32(ctx, 6)
++              << " inPtr=t0=0x" << getRegU32(ctx, 8)
++              << " inEnd=t2=0x" << getRegU32(ctx, 10);
++    if (g_w252FirstLogged == 0u)
++    {
++        g_w252FirstLogged = 1u;
++        const uint32_t inPtr = getRegU32(ctx, 8);
++        const uint32_t bitCnt = getRegU32(ctx, 6);
++        // inPtr counts a full word past the one currently held, so consumed bits are
++        // 8*(inPtr-BASE) - (bitCnt+32) when the stream has been refilled at least once.
++        const long long absBits = static_cast<long long>(inPtr - (0x10d1ac0u + 6u)) * 8LL
++                                  - static_cast<long long>(bitCnt + 32u);
++        std::cerr << " FIRST-EVENT absbits(est)=0x" << std::hex << absBits
++                  << " (" << std::dec << absBits << ")" << std::hex;
++    }
++    std::cerr << std::dec << std::endl;
++}
++
++// ==============================================================================================
++// W252B (builder-1 / TRACK A). AN INSTRUMENT THAT CAN SAY ZERO. The W252 subscriber returns early
++// unless op == "WRITE8" AND pc is inside the decoder AND dst is in [LO,HI); it is therefore blind to
++// wider writes and to every pc outside 0x100f390-0x100f8c8, and a zero from it is not evidence
++// about a region at all (that mistake is recorded in docs/W252-RESULTS.md, A3 + its retraction).
++// This one has NO op filter, NO size filter and NO pc filter: every store of any width that touches
++// [LO,HI) is counted, and the first CAP are printed with pc/ra/op/size/value. Two liveness controls
++// ride along (total store calls, and stores into the hot stack window) so "0 hits" and "never ran"
++// are distinguishable, and a progress line is printed every 500000 calls so a silent run is visible.
++// READ-ONLY, OFF unless VULCAN4_W252B_HIT is set. LO/HI are HEX; CAP is decimal.
++// ==============================================================================================
++static uint32_t g_w252BLo = 0u;
++static uint32_t g_w252BHi = 0u;          // 0 = off (the default): unset env reproduces today exactly
++static uint32_t g_w252BCap = 200u;
++static uint32_t g_w252BHits = 0u;        // stores touching [LO,HI)
++static uint32_t g_w252BCalls = 0u;       // every store, anywhere (liveness control)
++static uint32_t g_w252BCtrl = 0u;        // stores into the stack window (positive control)
++
++// W252B REF MODE. A REFERENCE blob (the hardware blob, byte for byte) turns "these bytes are wrong"
++// into "THIS store, from THIS pc, wrote THIS wrong value". Every byte of every store in [LO,HI) is
++// compared against ref[addr - REFBASE] and only the mismatching bytes are printed, in emission
++// order, so the LAST mismatch for an address is the surviving one. OFF unless VULCAN4_W252B_REF.
++static const unsigned char *g_w252BRef = nullptr;
++static uint32_t g_w252BRefBase = 0u;
++static uint32_t g_w252BRefLen = 0u;
++static uint32_t g_w252BMis = 0u;
++static uint32_t g_w252BMisCap = 400u;
++
++// W252B TAIL RING. When the first mismatching store is found, WHAT the decoder did immediately
++// before it is the question: a literal that is wrong means the BIT READER was already misaligned,
++// and the misalignment was caused by a token a few stores earlier. The last 32 in-window stores are
++// kept verbatim (ordinal, addr, value, pc, op) and dumped, oldest first, on the first mismatch.
++struct W252BRec { uint32_t idx; uint32_t addr; uint32_t val; uint32_t pc; const char *op; };
++static W252BRec g_w252BRing[32];
++static uint32_t g_w252BRingPos = 0u;
++
++// W252B SEQUENCE MAP. Whether the decoder's out pointer ever goes BACKWARDS inside the window is
++// the difference between "one linear decode" and "several passes over the same bytes", and the ring
++// says it does (0x139cfff -> 0x139441f, measured). This prints every non-sequential step so the pass
++// structure is visible instead of inferred. Duplicates (the pc==0 fast-path echo) are skipped.
++static uint32_t g_w252BPrevAddr = 0u;
++static uint32_t g_w252BSeqLines = 0u;
++static uint32_t g_w252BSeqCap = 3000u;
++
++// W252B. The store observer hands us a context but no RDRAM, and at the fault the decoder's STREAM
++// STRUCT (s0) is the thing that matters: bit buffer, bit count, input pointer, window index. Capture
++// the host RDRAM pointer once from PS2Runtime::run(), where it is in scope.
++static uint8_t *g_w252BRdram = nullptr;
++
++static uint32_t vulcan4W252BLoad32(uint32_t guestAddr)
++{
++    return (g_w252BRdram != nullptr) ? *reinterpret_cast<const uint32_t *>(g_w252BRdram + (guestAddr & 0x01FFFFFFu)) : 0u;
++}
++
++static void vulcan4W252BDumpStreamStruct(uint32_t s0)
++{
++    if (g_w252BRdram == nullptr) { std::cerr << "[w252b:str] no rdram captured" << std::endl; return; }
++    std::cerr << "[w252b:str] struct=0x" << std::hex << s0
++              << " buf=0x" << vulcan4W252BLoad32(s0 + 0x00u)
++              << " bufHi=0x" << vulcan4W252BLoad32(s0 + 0x04u)
++              << " nbits=" << std::dec << vulcan4W252BLoad32(s0 + 0x08u)
++              << " in=0x" << std::hex << vulcan4W252BLoad32(s0 + 0x0cu)
++              << " inEnd=0x" << vulcan4W252BLoad32(s0 + 0x10u)
++              << " winBase=0x" << vulcan4W252BLoad32(s0 + 0x14u)
++              << " winIdx=" << std::dec << vulcan4W252BLoad32(s0 + 0x18u)
++              << " out=0x" << std::hex << vulcan4W252BLoad32(s0 + 0x20u)
++              << " outEnd=0x" << vulcan4W252BLoad32(s0 + 0x24u)
++              << " s8=0x" << vulcan4W252BLoad32(s0 + 0x30u)
++              << " m38=0x" << vulcan4W252BLoad32(s0 + 0x38u)
++              << " m3c=0x" << vulcan4W252BLoad32(s0 + 0x3cu)
++              << std::dec << std::endl;
++}
++
++static void vulcan4W252BDumpRing()
++{
++    std::cerr << "[w252b:tail] ---- last 32 in-window stores, oldest first ----" << std::endl;
++    for (uint32_t k = 0u; k < 32u; ++k)
++    {
++        const uint32_t i = (g_w252BRingPos + k) & 31u;
++        const W252BRec &r = g_w252BRing[i];
++        if (r.idx == 0u) { continue; }
++        std::cerr << "[w252b:tail] n=" << std::dec << r.idx
++                  << " addr=0x" << std::hex << r.addr
++                  << " val=0x" << r.val
++                  << " pc=0x" << r.pc
++                  << " op=" << (r.op != nullptr ? r.op : "?") << std::dec << std::endl;
++    }
++    std::cerr << "[w252b:tail] ---- end ----" << std::endl;
++}
++
++static void vulcan4W252BSub(uint32_t guestAddr,
++                            uint32_t size,
++                            uint64_t valueLo,
++                            const R5900Context *ctx,
++                            const char *op,
++                            uint32_t /*flags*/)
++{
++    if (g_w252BHi == 0u) { return; }
++    const uint32_t span = (size != 0u) ? (size - 1u) : 0u;
++    const uint32_t last = guestAddr + span;
++    ++g_w252BCalls;
++    if (guestAddr >= 0x1fff0000u && guestAddr < 0x1ffff000u) { ++g_w252BCtrl; }
++    const bool inWin = (last >= g_w252BLo) && (guestAddr < g_w252BHi);
++    if (inWin)
++    {
++        ++g_w252BHits;
++        const uint32_t curPc = (ctx != nullptr ? ctx->pc : 0u);
++        if (curPc != 0u)
++        {
++            // The pc==0 echo is the fast-path duplicate of the store just seen; it would otherwise
++            // make every single store look like a backwards jump.
++            if (g_w252BSeqLines < g_w252BSeqCap &&
++                g_w252BPrevAddr != 0u && guestAddr != g_w252BPrevAddr + 1u)
++            {
++                ++g_w252BSeqLines;
++                std::cerr << "[w252b:seq] n=" << std::dec << g_w252BHits
++                          << " prev=0x" << std::hex << g_w252BPrevAddr
++                          << " addr=0x" << guestAddr
++                          << " delta=" << std::dec << static_cast<int32_t>(guestAddr - g_w252BPrevAddr - 1u)
++                          << " val=0x" << std::hex << static_cast<uint32_t>(valueLo)
++                          << " pc=0x" << curPc
++                          << " op=" << (op != nullptr ? op : "?") << std::dec << std::endl;
++            }
++            g_w252BPrevAddr = guestAddr;
++            g_w252BRing[g_w252BRingPos & 31u] = W252BRec{g_w252BHits, guestAddr,
++                                                         static_cast<uint32_t>(valueLo),
++                                                         curPc, op};
++            g_w252BRingPos = (g_w252BRingPos + 1u) & 31u;
++        }
++        if (g_w252BHits <= g_w252BCap)
++        {
++            std::cerr << "[w252b:hit] n=" << std::dec << g_w252BHits
++                      << " addr=0x" << std::hex << guestAddr
++                      << " size=" << std::dec << size
++                      << " val=0x" << std::hex << static_cast<uint32_t>(valueLo)
++                      << " pc=0x" << (ctx != nullptr ? ctx->pc : 0u)
++                      << " ra=0x" << (ctx != nullptr ? getRegU32(ctx, 31) : 0u)
++                      << " a0=0x" << (ctx != nullptr ? getRegU32(ctx, 4) : 0u)
++                      << " a1=0x" << (ctx != nullptr ? getRegU32(ctx, 5) : 0u)
++                      << " op=" << (op != nullptr ? op : "?") << std::dec << std::endl;
++        }
++        if (g_w252BRef != nullptr && size <= 8u)
++        {
++            // Scalar stores only. A bulk op (memset/memcpy) is reported as ONE call covering the
++            // whole span; the two in this run both run BEFORE the decode and are fully overwritten,
++            // and counting their transient bytes buries the signal (10.5M false mismatches, measured).
++            for (uint32_t i = 0u; i < size; ++i)
++            {
++                const uint32_t a = guestAddr + i;
++                const uint32_t off = a - g_w252BRefBase;
++                if (off >= g_w252BRefLen) { continue; }
++                const uint32_t got = static_cast<uint32_t>((valueLo >> (8u * i)) & 0xFFu);
++                const uint32_t exp = static_cast<uint32_t>(g_w252BRef[off]);
++                if (got == exp) { continue; }
++                ++g_w252BMis;
++                if (g_w252BMis == 1u)
++                {
++                    vulcan4W252BDumpRing();
++                    if (ctx != nullptr)
++                    {
++                        vulcan4W252BDumpStreamStruct(getRegU32(ctx, 16));
++                        // Full GPR snapshot at the faulting store: the decoder keeps its stream
++                        // struct in s0 (bit buffer, bit count, in ptr, window index, out ptr).
++                        for (uint32_t r = 1u; r < 32u; ++r)
++                        {
++                            std::cerr << "[w252b:reg] $" << std::dec << r
++                                      << "=0x" << std::hex << getRegU32(ctx, r)
++                                      << ((r % 4u == 0u) ? "\n" : "  ");
++                        }
++                        std::cerr << std::dec << std::endl;
++                    }
++                }
++                if (g_w252BMis <= g_w252BMisCap)
++                {
++                    std::cerr << "[w252b:MIS] mis=" << std::dec << g_w252BMis
++                              << " hit=" << g_w252BHits
++                              << " addr=0x" << std::hex << a
++                              << " off=0x" << off
++                              << " ours=0x" << got
++                              << " ref=0x" << exp
++                              << " sz=" << std::dec << size
++                              << " pc=0x" << std::hex << (ctx != nullptr ? ctx->pc : 0u)
++                              << " ra=0x" << (ctx != nullptr ? getRegU32(ctx, 31) : 0u)
++                              << " a0=0x" << (ctx != nullptr ? getRegU32(ctx, 4) : 0u)
++                              << " a1=0x" << (ctx != nullptr ? getRegU32(ctx, 5) : 0u)
++                              << " op=" << (op != nullptr ? op : "?") << std::dec << std::endl;
++                }
++            }
++        }
++    }
++    if ((g_w252BCalls % 500000u) == 0u)
++    {
++        std::cerr << "[w252b:live] calls=" << std::dec << g_w252BCalls
++                  << " hits=" << g_w252BHits
++                  << " ctrl=" << g_w252BCtrl
++                  << " mis=" << g_w252BMis
++                  << " lastAddr=0x" << std::hex << guestAddr << std::dec << std::endl;
++    }
++}
++
+ // W181 (Sanji). WHO SETS THE GOOD-SHAPE RTOS FLAG? sub_0100AE78's poll loop (0x0100AF50) waits for a
+ // byte in the scratchpad RTOS struct (s0 = 0x70002050+(3*id)<<2+29). Log every store in
+ // 0x70002000-0x70002100 with writer pc + value. READ-ONLY, OFF unless VULCAN4_W181_SP is set.
+@@ -3096,8 +3508,20 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+                     const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                              std::chrono::steady_clock::now() - s_t0).count();
+                     const uint32_t s = getRegU32(ctx, 4);
++                    // W253. THE FOUR JOB FIELDS THAT MATTER, FIRST.
++                    //
++                    // The core writer FUN_0100F390 reads its whole job from the struct at a0:
++                    //   +0x00 a3  (hold)      -> 0x100f3d4 `ld a3,0x00(s0)`
++                    //   +0x08 a2  (bits)      -> 0x100f3f0 `lw a2,0x08(s0)`
++                    //   +0x0C t0  (in ptr)    -> 0x100f3f4 `lw t0,0x0C(s0)`
++                    //   +0x14 t5  (wsize)     -> 0x100f3fc `lw t5,0x14(s0)`
++                    //   +0x20 t1  (out ptr)   -> 0x100f404 `lw t1,0x20(s0)`
++                    // The old line printed [0x10][0x18][0x20][0x34][0x38][0x3c][0x44] and NOT these,
++                    // so the one run that would have answered "is the job in pointer or the window size
++                    // wrong at entry" could not. [0x0C] and [0x14] are the two that were missing.
+                     std::cerr << "[w203:parse] entry n=" << n << " wall_ms=" << ms << " a0=0x" << std::hex << s
+                               << " [0]=0x" << rd32p(s + 0u) << " [8]=0x" << rd32p(s + 8u)
++                              << " [0xC]=0x" << rd32p(s + 0xCu) << " [0x14]=0x" << rd32p(s + 0x14u)
+                               << " [0x10]=0x" << rd32p(s + 0x10u) << " [0x18]=0x" << rd32p(s + 0x18u)
+                               << " [0x20]=0x" << rd32p(s + 0x20u) << " [0x34]=0x" << rd32p(s + 0x34u)
+                               << " [0x38]=0x" << rd32p(s + 0x38u) << " [0x3c]=0x" << rd32p(s + 0x3cu)
+@@ -3577,6 +4001,115 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         }
+     }
+ 
++    {
++        // W252 (TRACK A). Direct observation of the CORE.GT4 match-copy at the divergent word.
++        // OFF unless VULCAN4_W252_COPY is set: unset => no subscriber registered, no branch taken.
++        static const bool s_w252On = (std::getenv("VULCAN4_W252_COPY") != nullptr);
++        static bool s_w252Installed = false;
++        if (s_w252On && !s_w252Installed)
++        {
++            s_w252Installed = true;
++            g_w252On = 1u;
++            if (const char *lo = std::getenv("VULCAN4_W252_LO")) { g_w252Lo = static_cast<uint32_t>(std::strtoul(lo, nullptr, 16)); }
++            if (const char *hi = std::getenv("VULCAN4_W252_HI")) { g_w252Hi = static_cast<uint32_t>(std::strtoul(hi, nullptr, 16)); }
++            if (const char *cap = std::getenv("VULCAN4_W252_N")) { g_w252Cap = static_cast<uint32_t>(std::strtoul(cap, nullptr, 10)); }
++            if (const char *win = std::getenv("VULCAN4_W252_WIN"))
++            {
++                const char *colon = std::strchr(win, ':');
++                if (colon != nullptr)
++                {
++                    g_w252WinLo = static_cast<uint32_t>(std::strtoul(win, nullptr, 10));
++                    g_w252WinHi = static_cast<uint32_t>(std::strtoul(colon + 1, nullptr, 10));
++                }
++            }
++            // CHECKPOINT CROSS-REFERENCE window. Same LO:HI shape as WIN, but read at the checkpoint
++            // probe in eeCheckpointDue so a checkpoint can be placed against a store ordinal.
++            if (const char *ckw = std::getenv("VULCAN4_W252_CKW"))
++            {
++                const char *colon = std::strchr(ckw, ':');
++                if (colon != nullptr)
++                {
++                    g_w252CkwLo = static_cast<uint32_t>(std::strtoul(ckw, nullptr, 10));
++                    g_w252CkwHi = static_cast<uint32_t>(std::strtoul(colon + 1, nullptr, 10));
++                }
++            }
++            // REF MODE: name a reference blob and every in-range write is compared against it; only
++            // the differing writes are printed, in emission order. Covers the whole blob by default,
++            // because the question is "does a LATER decode pass overwrite a correct byte?".
++            if (const char *refPath = std::getenv("VULCAN4_W252_REF"))
++            {
++                static std::vector<unsigned char> s_w252RefBuf;
++                if (const char *rb = std::getenv("VULCAN4_W252_REFBASE")) { g_w252RefBase = static_cast<uint32_t>(std::strtoul(rb, nullptr, 16)); }
++                if (const char *mc = std::getenv("VULCAN4_W252_MISCAP")) { g_w252MisCap = static_cast<uint32_t>(std::strtoul(mc, nullptr, 10)); }
++                if (const char *se = std::getenv("VULCAN4_W252_STAT")) { g_w252StatEvery = static_cast<uint32_t>(std::strtoul(se, nullptr, 10)); }
++                if (FILE *rf = std::fopen(refPath, "rb"))
++                {
++                    unsigned char chunk[1u << 16];
++                    size_t n = 0u;
++                    while ((n = std::fread(chunk, 1u, sizeof(chunk), rf)) != 0u)
++                    {
++                        s_w252RefBuf.insert(s_w252RefBuf.end(), chunk, chunk + n);
++                    }
++                    std::fclose(rf);
++                    if (!s_w252RefBuf.empty())
++                    {
++                        g_w252Ref = s_w252RefBuf.data();
++                        g_w252RefLen = s_w252RefBuf.size();
++                        g_w252RefOn = 1u;
++                        g_w252Lo = g_w252RefBase;
++                        g_w252Hi = g_w252RefBase + static_cast<uint32_t>(g_w252RefLen);
++                    }
++                }
++                std::cerr << "[w252:copy] REF=" << refPath << " bytes=" << std::dec << g_w252RefLen
++                          << " base=0x" << std::hex << g_w252RefBase
++                          << (g_w252RefOn != 0u ? " LOADED" : " LOAD-FAILED")
++                          << " miscap=" << std::dec << g_w252MisCap << std::endl;
++            }
++            ps2AddStoreSubscriber(&vulcan4W252CopySub);
++            std::cerr << "[w252:copy] ARMED range=[0x" << std::hex << g_w252Lo << ",0x" << g_w252Hi
++                      << ") cap=" << std::dec << g_w252Cap << " ref=" << g_w252RefOn << std::endl;
++        }
++    }
++
++    {
++        // W252B (TRACK A). Unfiltered store observer; see the section comment by its definition.
++        // OFF unless VULCAN4_W252B_HIT is set: unset => no subscriber registered, byte-identical run.
++        static const bool s_w252BOn = (std::getenv("VULCAN4_W252B_HIT") != nullptr);
++        static bool s_w252BInstalled = false;
++        if (s_w252BOn && !s_w252BInstalled)
++        {
++            s_w252BInstalled = true;
++            if (const char *lo = std::getenv("VULCAN4_W252B_LO")) { g_w252BLo = static_cast<uint32_t>(std::strtoul(lo, nullptr, 16)); }
++            if (const char *hi = std::getenv("VULCAN4_W252B_HI")) { g_w252BHi = static_cast<uint32_t>(std::strtoul(hi, nullptr, 16)); }
++            if (const char *cap = std::getenv("VULCAN4_W252B_CAP")) { g_w252BCap = static_cast<uint32_t>(std::strtoul(cap, nullptr, 10)); }
++            if (const char *mcap = std::getenv("VULCAN4_W252B_MISCAP")) { g_w252BMisCap = static_cast<uint32_t>(std::strtoul(mcap, nullptr, 10)); }
++            // REF MODE. Load the reference blob once, keep it alive for the process lifetime.
++            if (const char *refp = std::getenv("VULCAN4_W252B_REF"))
++            {
++                static std::vector<unsigned char> s_w252BRefBuf;
++                std::ifstream rf(refp, std::ios::binary);
++                if (rf)
++                {
++                    s_w252BRefBuf.assign(std::istreambuf_iterator<char>(rf), std::istreambuf_iterator<char>());
++                    g_w252BRef = s_w252BRefBuf.empty() ? nullptr : s_w252BRefBuf.data();
++                    g_w252BRefLen = static_cast<uint32_t>(s_w252BRefBuf.size());
++                    if (const char *rb = std::getenv("VULCAN4_W252B_REFBASE")) { g_w252BRefBase = static_cast<uint32_t>(std::strtoul(rb, nullptr, 16)); }
++                    std::cerr << "[w252b:MIS] REF loaded " << std::dec << g_w252BRefLen
++                              << " bytes from " << refp << " refbase=0x" << std::hex << g_w252BRefBase << std::dec << std::endl;
++                }
++                else
++                {
++                    std::cerr << "[w252b:MIS] REF OPEN FAILED: " << refp << std::endl;
++                }
++            }
++            ps2AddStoreSubscriber(&vulcan4W252BSub);
++            std::cerr << "[w252b:hit] ARMED range=[0x" << std::hex << g_w252BLo << ",0x" << g_w252BHi
++                      << ") cap=" << std::dec << g_w252BCap
++                      << (g_w252BRef != nullptr ? " MIS-mode=ON" : " MIS-mode=off")
++                      << (g_w252BHi != 0u ? "" : "  WARNING: HI==0 means the observer is INERT") << std::endl;
++        }
++    }
++
+     {
+         static const bool s_w181On = (std::getenv("VULCAN4_W181_SP") != nullptr);
+         static bool s_w181Installed = false;
+@@ -6072,6 +6605,10 @@ void PS2Runtime::postEeEvent(EeEvent event)
+ 
+ bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
+ {
++    // W252B. Capture the host RDRAM base for the store observer. This runs on the guest's own
++    // execution path (the recompiled code calls it on every backward edge), so it is reached
++    // whether or not anyone ever calls PS2Runtime::run().
++    if (g_w252BRdram == nullptr) { g_w252BRdram = m_memory.getRDRAM(); }
+     const bool due = m_eeScheduler->checkpointDue(cycles);
+     // W229 DIAGNOSTIC: log the decoder's checkpoint state (pc/regs) when VULCAN4_W229_CK is set.
+     if (std::getenv("VULCAN4_W229_CK") != nullptr)
+@@ -6156,6 +6693,34 @@ bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
+             }
+         }
+     }
++    // W252 CHECKPOINT CROSS-REFERENCE. Printed at the checkpoint itself, with the current in-blob
++    // write ordinal, so a checkpoint can be read against the [w252:win] store lines around it. This
++    // sits AFTER the servicePendingEventsAtCheckpoint() call above, so a due=1 line means guest event
++    // code has already been given the chance to run before the caller resumes. Uncapped in ordinal
++    // terms but still bounded by the window the caller asks for. OFF unless VULCAN4_W252_CKW=LO:HI.
++    if (g_w252CkwHi != 0u && g_w252InRange >= g_w252CkwLo && g_w252InRange <= g_w252CkwHi)
++    {
++        static uint32_t s_w252CkN = 0u;
++        if (s_w252CkN < 20000u)
++        {
++            ++s_w252CkN;
++            std::cerr << "[w252:ck] n=" << std::dec << s_w252CkN
++                      << " w=" << g_w252InRange
++                      << " pc=0x" << std::hex << m_cpuContext.pc
++                      << " due=" << std::dec << (due ? 1 : 0)
++                      << " lastdst=0x" << std::hex << g_w252LastDst
++                      << " t0=0x" << getRegU32(&m_cpuContext, 8)
++                      << " t1=0x" << getRegU32(&m_cpuContext, 9)
++                      << " t2=0x" << getRegU32(&m_cpuContext, 10)
++                      << " a2=0x" << getRegU32(&m_cpuContext, 6)
++                      << " a3=0x" << getRegU32(&m_cpuContext, 7)
++                      << " s0=0x" << getRegU32(&m_cpuContext, 16)
++                      << " s1=0x" << getRegU32(&m_cpuContext, 17)
++                      << " s2=0x" << getRegU32(&m_cpuContext, 18)
++                      << " s3=0x" << getRegU32(&m_cpuContext, 19)
++                      << " ra=0x" << getRegU32(&m_cpuContext, 31) << std::dec << std::endl;
++        }
++    }
+     return due;
+ }
+ 
+@@ -6333,6 +6898,8 @@ void PS2Runtime::presentFrame()
+ void PS2Runtime::run()
+ {
+     m_stopRequested.store(false, std::memory_order_relaxed);
++    // W252B. Capture the host RDRAM base for the store observer (see the W252B section).
++    g_w252BRdram = m_memory.getRDRAM();
+     ps2_stubs::resetSifState();
+     resetIop();
+     ps2_stubs::resetAudioStubState();

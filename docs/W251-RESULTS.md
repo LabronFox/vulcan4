@@ -174,3 +174,36 @@ named wall, and it is the one measured above: the loader never enters the engine
 `0x80075000` is not "the engine". The engine is `0x00100000..0x00617A14`; `0x800xxxxx` is the
 uncached KSEG0 alias of RDRAM, and `0x80075000` is 0x75000 — 0x8B000 bytes *below* the engine base.
 Two different low-RDRAM code regions share this boot and only one of them is a recompilation target.
+
+## Mechanical dish gate (`bash .auto/verify-dish.sh`) — exit 0
+
+```
+=== VULCAN 4 dish gate — 2026-10-07 20:22 ===
+PASS  suite 497 tests, 0 failed
+PASS  newest commit authored as the captain
+PASS  working tree clean
+INFO  verify-menu.sh: not passed (last lines below) — screen is not the menu yet
+      structural sig  : capture 3 colours / nonblack 0.1173   vs reference 14 / 0.1150
+      GATE FAIL: STRUCTURAL MATCH to the disclaimer
+INFO  newest capture: /mnt/ssd/vulcan4-build/run/w251-capture.png
+INFO  newest log: /mnt/ssd/vulcan4-build/run/w251-trace.log
+      halt=wallclock_deadline
+INFO  missing-function hits in that log: 6
+=== RESULT: MECHANICAL CLAIMS HOLD ===
+```
+
+Suite **497/497**. The 6 "missing-function hits" are the six copies of the one LOUD
+`syscall 0x5b override handler 0x80075000` limitation above — named, not silent.
+
+## Resume from here
+
+1. **The emit is done and does not need touching.** 19,403/19,403 authoritative entries, verified by
+   an independent reader. Re-running `PS2RECOMP_ENTRY_ADDR_CSV=$B/engine-symbols.csv` reproduces it.
+2. **The next wall is upstream of the emit and it is now precisely located**: the loader opens
+   `CORE.GT4` and never populates RDRAM `0x00100000..0x00617A14`, so no engine function is ever
+   entered. Fix that, not the recompiler. The instrument that settled it costs nothing: run with
+   `VULCAN4_TRACE=<big>` and classify `[Dispatch] target_pc` by image range.
+3. The loader's spin is at `0x01000638` (tid1, 22.7 % of the PC histogram) with tid2 at
+   `0x0101f348` also Ready — the guest is *working*, not blocked, and reaches the wall-clock
+   deadline. Do not read `halt=wallclock_deadline` as a hang.
+4. Do not confuse `0x80075000` with the engine. The engine base is `0x00100000`.

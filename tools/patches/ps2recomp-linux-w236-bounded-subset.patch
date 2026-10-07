@@ -1,0 +1,71 @@
+diff --git a/ps2xRecomp/src/lib/control_flow_analyzer.cpp b/ps2xRecomp/src/lib/control_flow_analyzer.cpp
+index 3ca4179..7f29036 100644
+--- a/ps2xRecomp/src/lib/control_flow_analyzer.cpp
++++ b/ps2xRecomp/src/lib/control_flow_analyzer.cpp
+@@ -5,6 +5,7 @@
+ #include "ps2recomp/recompiler_reporter.h"
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <cstring>
+ 
+ namespace ps2recomp
+@@ -430,14 +431,22 @@ namespace ps2recomp
+                     m_reporter->recordIndirectFallbackPromotion(function.name, jumpAddresses, instructionAddresses.size());
+                 }
+ 
+-                for (uint32_t addr : instructionAddresses)
++                // W236. An unresolved JR/JALR normally turns EVERY instruction of the function
++                // into an entry point, which explodes the emitted TU (a 10k-instruction engine
++                // function -> ~450k lines). PS2RECOMP_NO_FALLBACKS drops the indirect-fallback set
++                // (the direct control flow is still emitted); unresolved indirect jumps then fail
++                // LOUDLY at runtime instead. OFF by default -> the loader is unchanged.
++                if (std::getenv("PS2RECOMP_NO_FALLBACKS") == nullptr)
+                 {
+-                    if (addr >= function.start && addr < function.end)
++                    for (uint32_t addr : instructionAddresses)
+                     {
+-                        result.entryPoints.insert(addr);
+-                        // Keep labels and runtime registration for unresolved JR/JALR targets
+-                        // without emitting a local switch over every possible target.
+-                        result.indirectFallbackEntryPoints.insert(addr);
++                        if (addr >= function.start && addr < function.end)
++                        {
++                            result.entryPoints.insert(addr);
++                            // Keep labels and runtime registration for unresolved JR/JALR targets
++                            // without emitting a local switch over every possible target.
++                            result.indirectFallbackEntryPoints.insert(addr);
++                        }
+                     }
+                 }
+             }
+diff --git a/ps2xRecomp/src/lib/ps2_recompiler.cpp b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+index af679c1..b4ee06f 100644
+--- a/ps2xRecomp/src/lib/ps2_recompiler.cpp
++++ b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+@@ -1203,7 +1203,13 @@ namespace ps2recomp
+                     return std::nullopt;
+                 };
+                 std::unordered_set<uint32_t> reach;
+-                std::vector<uint32_t> work;
++                std::vector<uint32_t> work; // FIFO frontier (bounded BFS)
++                size_t workHead = 0u;
++                size_t maxFns = std::numeric_limits<size_t>::max();
++                if (const char *cap = std::getenv("PS2RECOMP_MAX_FUNCTIONS"); cap != nullptr && *cap != '\0')
++                {
++                    maxFns = static_cast<size_t>(std::strtoull(cap, nullptr, 10));
++                }
+                 auto seedReach = [&](uint32_t a)
+                 {
+                     if (const std::optional<uint32_t> c = containing(a))
+@@ -1221,8 +1227,8 @@ namespace ps2recomp
+                 }
+                 while (!work.empty())
+                 {
+-                    const uint32_t s = work.back();
+-                    work.pop_back();
++                    if (reach.size() >= maxFns) { break; }
++                    const uint32_t s = work[workHead++];
+                     auto it = m_decodedFunctions.find(s);
+                     if (it == m_decodedFunctions.end())
+                     {

@@ -1,0 +1,261 @@
+diff --git a/ps2xRecomp/src/lib/ps2_recompiler.cpp b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+index 15ba9e8..d187d29 100644
+--- a/ps2xRecomp/src/lib/ps2_recompiler.cpp
++++ b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+@@ -22,6 +22,7 @@
+ #include <limits>
+ #include <functional>
+ #include <thread>
++#include <iomanip>
+ 
+ namespace fs = std::filesystem;
+ static std::chrono::steady_clock::time_point w234Te;
+@@ -35,6 +36,17 @@ namespace ps2recomp
+             return ((address + 4) & 0xF0000000u) | (target << 2);
+         }
+ 
++        // W251. The authoritative entry-point CSV, and the ONE definition of "the probe is on":
++        // unset OR empty means OFF, so `PS2RECOMP_ENTRY_ADDR_CSV= ` reproduces today's behaviour
++        // exactly. Reading std::getenv() directly at the use sites turned an empty value into a
++        // half-armed probe (the replacement block stayed off while the coverage report fired), which
++        // is the kind of asymmetry that makes an "OFF by default" claim untrue.
++        const char *w251EntryAddrCsv()
++        {
++            const char *s = std::getenv("PS2RECOMP_ENTRY_ADDR_CSV");
++            return (s != nullptr && *s != '\0') ? s : nullptr;
++        }
++
+         // W238. A resume/entry slice that spans more than this many instructions is a MISSING
+         // BOUNDARY, not a real function; cap it and report it LOUDLY. Tunable via
+         // PS2RECOMP_MAX_SLICE_INSNS (default 1024).
+@@ -1058,6 +1070,200 @@ namespace ps2recomp
+             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
+             m_codeGenerator->setEmitInstructionComments(true);
+ 
++            // ── W251. AUTHORITATIVE ENTRY POINTS (tool change; OFF by default) ───────────────────────
++            //
++            // WHY. On a symbol-less raw image the function list is a GUESS: extractFunctions() scans
++            // for plausible prologues and finds 18,903 of them for GT4's engine, while Ghidra's own
++            // analysis of the same bytes found 19,403 functions at 19,403 known starts. The recompiler
++            // was therefore emitting 2.8 % of the engine's real functions and every miss was silent —
++            // the guest called a start we never emitted and the loader-style fallback produced an
++            // unrelated slice, or nothing at all.
++            //
++            // WHAT. PS2RECOMP_ENTRY_ADDR_CSV=<path> names a list of AUTHORITATIVE function STARTS
++            // (address-first CSV; the extra columns are ignored, so Ghidra's
++            // `address,name,size,thunk,external` export is consumed directly). When set, m_functions is
++            // REPLACED by the exact partition of those starts over their executable section:
++            // function i spans [start_i, start_{i+1}), and the last function ends at the section end.
++            // Ghidra's own `size` column is NOT used — measured 2026-10-07, 17,815 of the 19,403 rows
++            // have size <= 8, so it cannot express a boundary; the next start can.
++            //
++            // This is a TOOL input (tools/patches/), not a hand-edit of generated output. The loader
++            // path never sets the variable, so it stays byte-for-byte identical. Every address that is
++            // asked for and cannot be honoured is reported as a LOUD `VULCAN 4 LIMITATION` line —
++            // never silent garbage.
++            if (const char *w251CsvPath = w251EntryAddrCsv(); w251CsvPath != nullptr)
++            {
++                std::ifstream w251Stream(w251CsvPath);
++                if (!w251Stream)
++                {
++                    m_reporter.error("entry-addr-csv", std::string("VULCAN 4 LIMITATION: cannot open authoritative entry-point CSV '") + w251CsvPath + "' — refusing to fall back to prologue guessing");
++                    return false;
++                }
++
++                std::vector<uint32_t> w251Requested;
++                {
++                    std::string w251Line;
++                    size_t w251LineNo = 0;
++                    while (std::getline(w251Stream, w251Line))
++                    {
++                        ++w251LineNo;
++                        // First CSV field only; trim both ends; tolerate a header row and blank lines.
++                        const size_t w251First = w251Line.find_first_not_of(" \t\r\n");
++                        if (w251First == std::string::npos)
++                        {
++                            continue;
++                        }
++                        const size_t w251Comma = w251Line.find(',', w251First);
++                        std::string w251Field = w251Line.substr(
++                            w251First,
++                            w251Comma == std::string::npos ? std::string::npos : w251Comma - w251First);
++                        const size_t w251Last = w251Field.find_last_not_of(" \t\r\n");
++                        if (w251Last == std::string::npos)
++                        {
++                            continue;
++                        }
++                        w251Field.resize(w251Last + 1);
++                        if (w251Field.rfind("0x", 0) == 0 || w251Field.rfind("0X", 0) == 0)
++                        {
++                            w251Field.erase(0, 2);
++                        }
++                        // Strict hex, so a header ("address") is skipped rather than silently read as 0.
++                        bool w251IsHex = !w251Field.empty() && w251Field.size() <= 8;
++                        uint32_t w251Value = 0;
++                        for (const char w251Ch : w251Field)
++                        {
++                            const int w251Digit = std::isdigit(static_cast<unsigned char>(w251Ch))
++                                                      ? (w251Ch - '0')
++                                                      : (std::tolower(static_cast<unsigned char>(w251Ch)) >= 'a' &&
++                                                         std::tolower(static_cast<unsigned char>(w251Ch)) <= 'f')
++                                                            ? (std::tolower(static_cast<unsigned char>(w251Ch)) - 'a' + 10)
++                                                            : -1;
++                            if (w251Digit < 0)
++                            {
++                                w251IsHex = false;
++                                break;
++                            }
++                            w251Value = (w251Value << 4) | static_cast<uint32_t>(w251Digit);
++                        }
++                        if (!w251IsHex)
++                        {
++                            if (w251LineNo == 1)
++                            {
++                                continue; // header row
++                            }
++                            std::ostringstream w251Msg;
++                            w251Msg << "VULCAN 4 LIMITATION: authoritative entry-point CSV line " << w251LineNo
++                                    << " ('" << w251Field << "') is not a hex address — row ignored";
++                            m_reporter.warning("entry-addr-csv", w251Msg.str());
++                            continue;
++                        }
++                        w251Requested.push_back(w251Value);
++                    }
++                }
++
++                if (w251Requested.empty())
++                {
++                    m_reporter.error("entry-addr-csv", std::string("VULCAN 4 LIMITATION: authoritative entry-point CSV '") + w251CsvPath + "' contained no readable hex addresses");
++                    return false;
++                }
++
++                std::sort(w251Requested.begin(), w251Requested.end());
++                w251Requested.erase(std::unique(w251Requested.begin(), w251Requested.end()), w251Requested.end());
++
++                // The section the starts live in, and the exclusive end of the last function.
++                const Section *w251Section = nullptr;
++                for (const auto &w251Sec : m_sections)
++                {
++                    if (w251Sec.isCode && w251Sec.size > 0 &&
++                        w251Requested.front() >= w251Sec.address &&
++                        w251Requested.front() < w251Sec.address + w251Sec.size)
++                    {
++                        w251Section = &w251Sec;
++                        break;
++                    }
++                }
++                if (w251Section == nullptr)
++                {
++                    std::ostringstream w251Msg;
++                    w251Msg << "VULCAN 4 LIMITATION: authoritative entry point 0x" << std::hex
++                            << w251Requested.front() << " is not inside any executable section";
++                    m_reporter.error("entry-addr-csv", w251Msg.str());
++                    return false;
++                }
++                const uint32_t w251SpanEnd = w251Section->address + w251Section->size;
++
++                std::vector<uint32_t> w251Boundaries;
++                w251Boundaries.reserve(w251Requested.size() + 2u);
++                size_t w251Outside = 0;
++                for (const uint32_t w251Addr : w251Requested)
++                {
++                    if (w251Addr < w251Section->address || w251Addr >= w251SpanEnd)
++                    {
++                        ++w251Outside;
++                        std::ostringstream w251Msg;
++                        w251Msg << "VULCAN 4 LIMITATION: authoritative entry point 0x" << std::hex << w251Addr
++                                << " lies outside the executable section [0x" << w251Section->address << ", 0x"
++                                << w251SpanEnd << ") — NOT emitted";
++                        m_reporter.warning("entry-addr-csv", w251Msg.str());
++                        continue;
++                    }
++                    w251Boundaries.push_back(w251Addr);
++                }
++
++                // The guest's own entry point is a real function start by definition. It is usually
++                // ELF metadata rather than a Ghidra symbol, so it is added as an extra boundary and
++                // said out loud rather than assumed.
++                const uint32_t w251Entry = m_bootstrapInfo.valid ? m_bootstrapInfo.entry : m_elfParser->getEntryPoint();
++                bool w251EntryAdded = false;
++                if (w251Entry >= w251Section->address && w251Entry < w251SpanEnd &&
++                    !std::binary_search(w251Boundaries.begin(), w251Boundaries.end(), w251Entry))
++                {
++                    w251Boundaries.push_back(w251Entry);
++                    w251EntryAdded = true;
++                }
++                std::sort(w251Boundaries.begin(), w251Boundaries.end());
++                w251Boundaries.erase(std::unique(w251Boundaries.begin(), w251Boundaries.end()), w251Boundaries.end());
++
++                std::vector<Function> w251Authoritative;
++                w251Authoritative.reserve(w251Boundaries.size());
++                for (size_t w251I = 0; w251I < w251Boundaries.size(); ++w251I)
++                {
++                    Function w251Fn{};
++                    w251Fn.start = w251Boundaries[w251I];
++                    w251Fn.end = (w251I + 1u < w251Boundaries.size()) ? w251Boundaries[w251I + 1u] : w251SpanEnd;
++                    if (w251Fn.end <= w251Fn.start)
++                    {
++                        std::ostringstream w251Msg;
++                        w251Msg << "VULCAN 4 LIMITATION: authoritative entry point 0x" << std::hex << w251Fn.start
++                                << " has no room before the next start (end 0x" << w251Fn.end << ") — NOT emitted";
++                        m_reporter.warning("entry-addr-csv", w251Msg.str());
++                        continue;
++                    }
++                    std::ostringstream w251Name;
++                    w251Name << "sub_" << std::hex << std::setw(8) << std::setfill('0') << w251Fn.start;
++                    w251Fn.name = w251Name.str();
++                    w251Authoritative.push_back(std::move(w251Fn));
++                }
++
++                const size_t w251Before = m_functions.size();
++                m_functions = std::move(w251Authoritative);
++
++                std::ostringstream w251Summary;
++                w251Summary << "W251 authoritative entry points: replaced " << w251Before << " guessed function(s) with "
++                            << m_functions.size() << " from '" << w251CsvPath << "' (requested " << w251Requested.size()
++                            << ", outside section " << w251Outside << ", elf-entry-boundary "
++                            << (w251EntryAdded ? "added" : "already present") << ")";
++                m_reporter.progress(w251Summary.str());
++                if (w251EntryAdded)
++                {
++                    std::ostringstream w251Msg;
++                    w251Msg << "VULCAN 4 LIMITATION: the ELF entry point 0x" << std::hex << w251Entry
++                            << " is not one of the authoritative CSV starts — it was added as an extra function boundary"
++                            << " so the guest's first instruction remains reachable";
++                    m_reporter.warning("entry-addr-csv", w251Msg.str());
++                }
++            }
++
+             fs::create_directories(m_config.outputPath);
+ 
+             return true;
+@@ -1342,6 +1548,29 @@ namespace ps2recomp
+                 m_reporter.warning("decode", msg.str());
+             }
+ 
++            // W251. COVERAGE CHECK, and it is the whole point of the dish: an authoritative start that
++            // was NOT decoded produces no generated function, so the guest calls into nothing and the
++            // failure is otherwise silent. Every one of them is named here as a LOUD limitation.
++            if (w251EntryAddrCsv() != nullptr)
++            {
++                size_t w251Undecoded = 0;
++                for (const auto &w251Fn : m_functions)
++                {
++                    if (w251Fn.isRecompiled || w251Fn.isStub || w251Fn.isSkipped)
++                    {
++                        continue;
++                    }
++                    ++w251Undecoded;
++                    m_reporter.warningAt(
++                        "entry-addr-csv", w251Fn.name, w251Fn.start,
++                        "VULCAN 4 LIMITATION: authoritative entry point was not recompiled — no generated function exists at this address");
++                }
++                std::ostringstream w251Msg;
++                w251Msg << "W251 coverage: " << m_functions.size() << " function(s) in the emitted set, "
++                        << w251Undecoded << " undecoded";
++                m_reporter.progress(w251Msg.str());
++            }
++
+             m_reporter.progress("recompilation pass completed");
+             return correctnessCriticalFailureCount == 0u;
+         }

@@ -149,10 +149,22 @@ fi
 FFMPEG=$(pkg-config --libs libavcodec libavformat libavutil libswresample libswscale)
 # W240. The runtime-loaded ENGINE image (second recompilation target) links BESIDE the loader. Its
 # objects come from the bounded-TU emit (recomp_engine_small) and use DISTINCT table symbols.
+#
+# W251. WHICH emit, named explicitly, because the default must not move. The W251 authoritative
+# engine (19,404 functions from Ghidra's ground truth) is a DIFFERENT object set in a different
+# directory, and silently linking the old 758-function set while believing you measured the new one
+# is exactly the failure this variable exists to prevent. Unset → recomp_engine_small, byte-for-byte
+# the previous build.
+ENGINE_DIR=${VULCAN4_ENGINE_DIR:-"$B/recomp_engine_small"}
+echo "build_harness: engine objects from $ENGINE_DIR"
 ENGINE_OBJS=""
-for o in "$B"/recomp_engine_small/ps2_recompiled_functions_*.o "$B"/recomp_engine_small/register_functions.o; do
+for o in "$ENGINE_DIR"/ps2_recompiled_functions_*.o "$ENGINE_DIR"/register_functions.o; do
     [ -f "$o" ] && ENGINE_OBJS="$ENGINE_OBJS $o"
 done
+if [ -z "$ENGINE_OBJS" ]; then
+    echo "build_harness: NO engine objects in $ENGINE_DIR -- the engine image would be unreachable" >&2
+    exit 1
+fi
 nice -n 10 g++ -o vulcan4_harness harness.o register_functions.o ps2_recompiled_functions.o $ENGINE_OBJS \
   "$B/ps2xRuntime/libps2_runtime.a" "$B/ps2xIOP/libps2_iop.a" \
   "$B/_deps/raylib-build/raylib/libraylib.a" $FFMPEG -lpthread -ldl -lm -lrt -lX11

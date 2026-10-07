@@ -37,6 +37,7 @@
 //   See docs/FIRST-BOOT.md for the exact command line. Needs libps2_runtime.a, libps2_iop.a,
 //   raylib, ffmpeg and the generated translation unit from ps2_recomp.
 
+#include <set>
 #include "ps2_guest_progress.h"
 #include "ps2_runtime.h"
 #include "ps2_syscalls.h"
@@ -1594,10 +1595,35 @@ int main(int argc, char *argv[])
     runtime.eeScheduler().setDriverAdvancesSchedulerContext(true);
 
     const uint32_t entryPoint = ctx.pc;
-    uint32_t tableBase = g_ps2RecompiledFunctionTableBase;
-    uint32_t tableEnd = g_ps2RecompiledFunctionTableEnd;
-    uint32_t tableSlots = g_ps2RecompiledFunctionTableSlotCount;
-    PS2Runtime::RecompiledFunction *activeTable = g_ps2RecompiledFunctionTable;
+    const uint32_t tableBase = g_ps2RecompiledFunctionTableBase;
+    const uint32_t tableEnd = g_ps2RecompiledFunctionTableEnd;
+    const uint32_t tableSlots = g_ps2RecompiledFunctionTableSlotCount;
+
+    // W241. UNIFIED FUNCTION RESOLUTION. The loader image [0x01000008,0x0102dbec) and the
+    // runtime-loaded engine image [0x00100008,0x00616d94) form ONE address space: entering the
+    // engine must NOT remove the loader's entries and vice versa. Every lookup consults both.
+    auto resolveFunction = [](uint32_t pc) -> PS2Runtime::RecompiledFunction
+    {
+        if ((pc & 3u) != 0u) return nullptr;
+        if (pc >= g_ps2RecompiledFunctionTableBase && pc < g_ps2RecompiledFunctionTableEnd)
+        {
+            const uint32_t s = (pc - g_ps2RecompiledFunctionTableBase) >> 2;
+            if (s < g_ps2RecompiledFunctionTableSlotCount && g_ps2RecompiledFunctionTable[s] != nullptr)
+                return g_ps2RecompiledFunctionTable[s];
+        }
+        if (pc >= g_ps2EngineFunctionTableBase && pc < g_ps2EngineFunctionTableEnd)
+        {
+            const uint32_t s = (pc - g_ps2EngineFunctionTableBase) >> 2;
+            if (s < g_ps2EngineFunctionTableSlotCount && g_ps2EngineFunctionTable[s] != nullptr)
+                return g_ps2EngineFunctionTable[s];
+        }
+        return nullptr;
+    };
+    auto inAnyImage = [](uint32_t pc)
+    {
+        return (pc >= g_ps2RecompiledFunctionTableBase && pc < g_ps2RecompiledFunctionTableEnd)
+            || (pc >= g_ps2EngineFunctionTableBase && pc < g_ps2EngineFunctionTableEnd);
+    };
 
     // The PS2 ABI hands the entry point $sp pointing near the top of RDRAM and $a0/$a1 zeroed.
     // The entry block reads *0x01041800 into a0, so $gp and the data segment are already in
@@ -1648,6 +1674,7 @@ int main(int argc, char *argv[])
 
     std::unordered_map<uint32_t, std::string> functionNames; // address -> name, first time seen
     std::map<uint32_t, GuestCall> missing;                  // address -> named call
+    std::set<uint32_t> missingBoundaryAddresses;            // W241: every unmapped in-image address
     std::vector<uint32_t> pcOrder;                          // first-seen order, for the report
 
     uint32_t previousPc = 0xffffffffu;
@@ -2209,7 +2236,7 @@ int main(int argc, char *argv[])
         }
 
         // ---- resolve the current PC to a generated function
-        if ((ctx.pc & 3u) != 0u || ctx.pc < tableBase || ctx.pc >= tableEnd)
+        if ((ctx.pc & 3u) != 0u || !inAnyImage(ctx.pc))
         {
             haltReason = kHaltOutOfTable;
             haltPc = ctx.pc;
@@ -2271,30 +2298,11 @@ int main(int argc, char *argv[])
             break;
         }
 
-        uint32_t slot = (ctx.pc - tableBase) >> 2;
-        if (slot >= tableSlots || activeTable[slot] == nullptr)
+        PS2Runtime::RecompiledFunction resolvedFn = resolveFunction(ctx.pc);
+        if (resolvedFn == nullptr)
         {
-            // W240. CROSS-IMAGE JUMP: the pc may belong to the OTHER image's table (engine <->
-            // loader). Resolve it in both directions before declaring the guest lost.
-            PS2Runtime::RecompiledFunction *alt =
-                (activeTable == g_ps2RecompiledFunctionTable) ? g_ps2EngineFunctionTable
-                                                              : g_ps2RecompiledFunctionTable;
-            const bool altIsEngine = (alt == g_ps2EngineFunctionTable);
-            const uint32_t altBase = altIsEngine ? g_ps2EngineFunctionTableBase : g_ps2RecompiledFunctionTableBase;
-            const uint32_t altEnd = altIsEngine ? g_ps2EngineFunctionTableEnd : g_ps2RecompiledFunctionTableEnd;
-            const uint32_t altSlots = altIsEngine ? g_ps2EngineFunctionTableSlotCount : g_ps2RecompiledFunctionTableSlotCount;
-            if ((ctx.pc & 3u) == 0u && ctx.pc >= altBase && ctx.pc < altEnd)
-            {
-                const uint32_t altSlot = (ctx.pc - altBase) >> 2;
-                if (altSlot < altSlots && alt[altSlot] != nullptr)
-                {
-                    tableBase = altBase; tableEnd = altEnd; tableSlots = altSlots; activeTable = alt;
-                    slot = altSlot;
-                }
-            }
-        }
-        if (slot >= tableSlots || activeTable[slot] == nullptr)
-        {
+            missingBoundaryAddresses.insert(ctx.pc);
+
             // NAMED, NEVER SILENT. Record the address, the analyzer's name if it has one, and
             // stop here rather than jumping into nothing.
             GuestCall &call = missing[ctx.pc];
@@ -2586,7 +2594,7 @@ int main(int argc, char *argv[])
         // the run grind on a parked thread.
         try
         {
-            activeTable[slot](rdram, &ctx, &runtime);
+            resolvedFn(rdram, &ctx, &runtime);
         }
         catch (const EeDispatcherTransfer &)
         {
@@ -2680,28 +2688,12 @@ int main(int argc, char *argv[])
                 // guest image. GT4's loader passes entry=0x100008 (low RDRAM, the 0x100000 page),
                 // which is NOT in the ELF's PT_LOAD .text (0x1000000). The recompiler emits guest
                 // code from the ELF only, so it cannot execute runtime-loaded/relocated code.
-                auto entryMapped = [&](uint32_t b, uint32_t e, uint32_t n,
-                                        PS2Runtime::RecompiledFunction *t, uint32_t a)
+                const bool xMapped = (resolveFunction(xEntry) != nullptr);
+                if (xMapped)
                 {
-                    if ((a & 3u) != 0u || a < b || a >= e)
-                    {
-                        return false;
-                    }
-                    const uint32_t s = (a - b) >> 2;
-                    return s < n && t[s] != nullptr;
-                };
-                bool xMapped = entryMapped(tableBase, tableEnd, tableSlots, activeTable, xEntry);
-                if (!xMapped && entryMapped(g_ps2EngineFunctionTableBase, g_ps2EngineFunctionTableEnd,
-                                            g_ps2EngineFunctionTableSlotCount, g_ps2EngineFunctionTable,
-                                            xEntry))
-                {
-                    tableBase = g_ps2EngineFunctionTableBase;
-                    tableEnd = g_ps2EngineFunctionTableEnd;
-                    tableSlots = g_ps2EngineFunctionTableSlotCount;
-                    activeTable = g_ps2EngineFunctionTable;
-                    xMapped = true;
-                    std::cout << "VULCAN4 EXECPS2 -> engine table [" << toHex(tableBase) << ","
-                              << toHex(tableEnd) << ") entry=" << toHex(xEntry) << std::endl;
+                    std::cout << "VULCAN4 EXECPS2 -> unified resolve entry=" << toHex(xEntry)
+                              << " (engine " << toHex(g_ps2EngineFunctionTableBase) << ","
+                              << toHex(g_ps2EngineFunctionTableEnd) << ")" << std::endl;
                 }
                 if (!xMapped)
                 {
@@ -3140,6 +3132,9 @@ int main(int argc, char *argv[])
     // (W71), so it under-reports real guest function entries by roughly a thousand. ps2_log's counter
     // is incremented inside every recompiled function, so it counts what actually ran. Both are
     // printed, and the honest one is labelled.
+    std::cout << "VULCAN4 MISSING-BOUNDARIES n=" << missingBoundaryAddresses.size() << " :";
+    for (uint32_t a : missingBoundaryAddresses) std::cout << " 0x" << toHex(a);
+    std::cout << std::endl;
     std::cout << "VULCAN4 BOOT REPORT functions_entered=" << functionsEntered
               << " true_guest_entries=" << ps2_log::entryCounter().load()
               << " true_guest_exits=" << ps2_log::exitCounter().load()

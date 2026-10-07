@@ -1,4 +1,4 @@
-# W252 — loader→engine handoff — acceptance criteria FINAL (T2) · Track C done
+# W252 — loader→engine handoff — acceptance criteria FINAL (T2) · Tracks A/B/C/D closed
 
 Dish: make the loader's DEFLATE decode of CORE.GT4 byte-identical to hardware so GT4's engine code
 is actually entered. W251: emit 19,403/19,403 but the engine is entered **zero** times. Track A
@@ -130,6 +130,33 @@ not the gate's own boot. **The `halt=` line the gate prints is only trustworthy 
 writing `$B/run/*.log` at the same time.** Until that is fixed (a gate-owned log path, or a
 `VULCAN4_GATE_LOG` pin), read the gate's halt line as "newest boot on the box", never as "the gate's
 boot". Recorded so nobody later quotes this baseline as a statement about the product.
+
+### Post-commit gate re-run — MECHANICAL CLAIMS HOLD (raw, exit 0)
+
+Run 2026-10-07 20:40, after this doc was committed (`3d776b9`, author `Or Golan <or024662@gmail.com>`),
+saved verbatim at `/mnt/ssd/tmp/w252-gate-2.txt`:
+
+```
+=== VULCAN 4 dish gate — 2026-10-07 20:40 ===
+PASS  suite 497 tests, 0 failed
+PASS  newest commit authored as the captain
+PASS  working tree clean
+INFO  verify-menu.sh: not passed (last lines below) — screen is not the menu yet
+      newest capture : /mnt/ssd/vulcan4-build/run/w251-capture.png
+      structural sig  : capture 3 colours / nonblack 0.1173   vs reference 14 / 0.1150
+      GATE FAIL: STRUCTURAL MATCH to the disclaimer: only 3 colours and a non-black fraction (0.1173) within 0.05 of the reference (0.1150). That is dark-grey-text-on-black at some fade level - the disclaimer is STILL on screen, whatever the perceptual diff says.
+INFO  newest capture: /mnt/ssd/vulcan4-build/run/w251-capture.png
+INFO  newest log: /mnt/ssd/vulcan4-build/run/w252-ourhash.log
+      halt=stuck_in_syscall
+INFO  missing-function hits in that log: 6
+=== RESULT: MECHANICAL CLAIMS HOLD ===
+```
+
+`GATE_EXIT=0`. The only change from the 20:30 baseline is `FAIL working tree dirty` → `PASS working
+tree clean`: the previous exit 1 was *bookkeeping only*. The picture gate still fails on the
+disclaimer, and the `halt=` line still comes from a **seat's** log (`w252-ourhash.log`), not the
+gate's own boot — the confound above is still live at 20:40. **The product claim of this dish is
+therefore NOT "we pass the gate"; it is the byte-level first divergence in Track A.**
 
 ## Machine state — disk and load (the rule-6 check)
 

@@ -2346,6 +2346,21 @@ int main(int argc, char *argv[])
                           << std::endl;
             }
         }
+        // W229s. DOES THE DRIVER FUN_0100F8C8 RESUME at its post-jal pc (0x1010a70) while the decoder
+        // is still suspended? Log arrivals there. OFF unless VULCAN4_W229_DDRIVE.
+        {
+            static const bool s_w229ddOn = (std::getenv("VULCAN4_W229_DDRIVE") != nullptr);
+            static int s_w229ddN = 0;
+            if (s_w229ddOn && s_w229ddN < 200 && ctx.pc == 0x1010a70u)
+            {
+                ++s_w229ddN;
+                std::cout << "VULCAN4 W229 DDRIVE pc=0x1010a70 ra=" << toHex(getRegU32(&ctx, 31))
+                          << " sp=" << toHex(getRegU32(&ctx, 29))
+                          << " s7(out)=0x" << toHex(getRegU32(&ctx, 23))
+                          << " prev=" << (lastResolvedPcValid ? toHex(lastResolvedPc) : std::string("NONE"))
+                          << std::endl;
+            }
+        }
         // W229. SHAPE-A DERail: the main thread resumes sub_01008C50 at label 0x1009004 (the merge
         // call's fallthrough) and its epilogue restores $ra from sp+0x40 = 0. Probe that slot.
         // OFF unless VULCAN4_W229_ARR.

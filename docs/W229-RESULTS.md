@@ -528,5 +528,16 @@ Next: trace where the decoder's `$t1` is lost between the yield and the resume (
 return path, the caller `FUN_0100F8C8` epilogue when it unwinds on a yield, or the scheduler's
 context save). This is the same family as the §10/§11 suspended-state work.
 
+## 24. THE GATE IS FALSE-PASSING — a human must eyeball the capture
+
+A fresh window-only capture of the harness (640×448, **16 colours** = the 2005 disclaimer) run through
+`verify-menu.sh` exits **0 ("GATE PASS")**: the reference `.disclaimer-reference.png` is compared at
+32×32 grey and gives a perceptual diff of **13.3** (threshold 6), because the stored reference does not
+match our current disclaimer render. So the gate currently **passes on the disclaimer** and cannot be
+trusted as the sole decider — the menu is **not** reached (verified: fresh capture is 16 colours).
+
+This is a gate/asset defect, not a product result: the real deliverable (a capture of GT4's own menu)
+is still absent.
+
 
 

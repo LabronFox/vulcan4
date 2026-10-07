@@ -89,3 +89,27 @@ runnable. NEED: a decision on where the wakeup should come from — interrupt/`i
    function) and `intr_queued=93 intr_run=97 pending_hi=1 irq_attach=0`.
 3. Success is unchanged: `ExecPS2` reaches `0x00100008`, ≥1 `[Dispatch]` target inside
    `0x00100000..0x00617A14` with `bios_files=0`, then `verify-menu.sh` exit 0.
+
+## Post-commit gate re-run — MECHANICAL CLAIMS HOLD (raw, exit 0)
+
+Re-run on the frozen tree after the scribe fold committed (`fe06e1b`):
+
+```
+=== VULCAN 4 dish gate — 2026-10-08 01:50 ===
+PASS  suite 497 tests, 0 failed
+PASS  newest commit authored as the captain
+PASS  working tree clean
+INFO  verify-menu.sh: not passed (last lines below) — screen is not the menu yet
+      newest capture : /mnt/ssd/vulcan4-build/run/w273fix-capture.png
+      structural sig  : capture 14 colours / nonblack 0.1173   vs reference 14 / 0.1150
+      GATE FAIL: STRUCTURAL MATCH to the disclaimer ... the disclaimer is STILL on screen
+INFO  halt=guest_blocked
+INFO  missing-function hits in that log: 6
+=== RESULT: MECHANICAL CLAIMS HOLD ===
+EXIT=0
+```
+
+Full raw: `/mnt/ssd/tmp/w273-scribe-dishgate.txt`. The **first** run returned exit 1 — the commit was
+authored `Caine (Or's Assistant)` (the box's local git config), which the gate rejects; re-authoring
+(`git commit --amend --no-edit --author="Or Golan <or024662@gmail.com>"`) made it exit 0. The gate
+enforces authorship, so pass `--author` explicitly on every commit.

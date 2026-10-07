@@ -434,5 +434,25 @@ So the failure is a **DEFLATE decode/back-reference divergence inside `FUN_0100F
 `FUN_0100F8C8` driver) that rewrites already-correct output. Next: instrument the literal vs
 back-reference branch at `0x100f800` around the `0x1394420` write and compare with hardware.
 
+## 19. THE DECODER'S OUTPUT POINTER — monotonic, with one anomaly, and a shared dest
+
+`VULCAN4_W229_HUF` logs each `FUN_0100F390` invocation's `a0`/`out`/`in`. The output pointer is
+monotonic across the whole blob **except call #23 = `0x0`** (`0x155e56a` → `0x0` → `0x1591ce5`) — a
+decoder call handed an output pointer of zero.
+
+The match-copy writer (`VULCAN4_W229_OW`, registers now printed): the divergent word `0x1394420` is
+written by **two calls**, both with `t1` (the decoder's output local / `puVar9`) = `0x1394420`:
+
+```
+call 11: hufOut=0x1393103  s1=0x1394408 (distance 0x18)  v0=0x7c   correct
+call 49: hufOut=0x189313a  s1=0x13943d8 (distance 0x48)  v0=0x2d   wrong
+```
+
+But call 49's *entry* output is `0x189313a` while its copy dest is `0x1394420` (earlier) — so within
+call 49 the output local moved **backward**. The decompiler shows the decoder writing `*puVar9` and,
+on an output-buffer flush (`puVar9 == puVar12`), **reloading `puVar9 = *(param_1+4)`** after calling the
+driver callback at vtable+0x1c. So a driver callback that resets the stream's output pointer would do
+exactly this. Next: instrument that flush/callback path and the `0x0` call-23 case.
+
 
 

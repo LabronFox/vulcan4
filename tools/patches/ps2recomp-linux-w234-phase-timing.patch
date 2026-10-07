@@ -1,0 +1,66 @@
+diff --git a/ps2xRecomp/src/lib/ps2_recompiler.cpp b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+index f8565c3..af679c1 100644
+--- a/ps2xRecomp/src/lib/ps2_recompiler.cpp
++++ b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+@@ -13,6 +13,7 @@
+ #include <cctype>
+ #include <condition_variable>
+ #include <cstring>
++#include <chrono>
+ #include <exception>
+ #include <mutex>
+ #include <queue>
+@@ -23,6 +24,7 @@
+ #include <thread>
+ 
+ namespace fs = std::filesystem;
++static std::chrono::steady_clock::time_point w234Te;
+ 
+ namespace ps2recomp
+ {
+@@ -914,7 +916,9 @@ namespace ps2recomp
+                 m_elfParser->loadGhidraFunctionMap(m_config.ghidraMapPath);
+             }
+ 
++            const auto w234Ta = std::chrono::steady_clock::now();
+             m_functions = m_elfParser->extractFunctions();
++            if (std::getenv("PS2RECOMP_PHASE_TIMING") != nullptr) { std::cerr << "[w234] DISCOVERY " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-w234Ta).count() << "ms functions=" << m_functions.size() << std::endl; }
+             m_symbols = m_elfParser->extractSymbols();
+             m_sections = m_elfParser->getSections();
+             m_relocations = m_elfParser->getRelocations();
+@@ -1083,6 +1087,7 @@ namespace ps2recomp
+                 }
+             }
+ 
++            const auto w234Td = std::chrono::steady_clock::now();
+             for (auto &function : m_functions)
+             {
+                 m_reporter.recordFunctionProcessed();
+@@ -1255,7 +1260,10 @@ namespace ps2recomp
+                 m_reporter.progress(msg.str());
+             }
+ 
++            if ((std::getenv("PS2RECOMP_PHASE_TIMING") != nullptr)) { std::cerr << "[w234] DECODE " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-w234Td).count() << "ms functions=" << m_functions.size() << std::endl; }
++            const auto w234Tr = std::chrono::steady_clock::now();
+             discoverAdditionalEntryPoints();
++            if ((std::getenv("PS2RECOMP_PHASE_TIMING") != nullptr)) { std::cerr << "[w234] RESUME-COLLECT " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-w234Tr).count() << "ms" << std::endl; }
+ 
+             if (failedCount > 0)
+             {
+@@ -1409,6 +1417,8 @@ namespace ps2recomp
+             }
+ 
+             m_reporter.recordGeneratedFunctions(outputFunctions.size());
++            w234Te = std::chrono::steady_clock::now();
++            if ((std::getenv("PS2RECOMP_PHASE_TIMING") != nullptr)) { std::cerr << "[w234] EMIT-START functions=" << outputFunctions.size() << std::endl; }
+ 
+             const size_t outputWorkerCount = m_config.lowMemoryMode ? 1 : resolveOutputWorkerCount(m_config.outputWorkerThreads);
+             if (outputFunctions.size() > 1 && outputWorkerCount > 1)
+@@ -1711,6 +1721,7 @@ namespace ps2recomp
+                     msg << "wrote combined output to " << outputPath;
+                     m_reporter.progress(msg.str());
+                 }
++                if ((std::getenv("PS2RECOMP_PHASE_TIMING") != nullptr)) { std::cerr << "[w234] EMIT " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-w234Te).count() << "ms" << std::endl; }
+             }
+             else
+             {

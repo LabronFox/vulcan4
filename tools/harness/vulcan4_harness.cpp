@@ -1604,6 +1604,7 @@ int main(int argc, char *argv[])
 
     // ------------------------------------------------------------------ execute
     uint64_t functionsEntered = 0;
+    uint32_t execPS2Relaunches = 0; // W231: EE syscall 0x07 ExecPS2 relaunches performed
     uint64_t distinctPcs = 0;
     // W16: distinct_pcs=167 says HOW MUCH code the guest visited and nothing about WHERE it spent
     // its life. Every wall so far had to be located by reading call chains by hand out of the
@@ -2630,6 +2631,60 @@ int main(int argc, char *argv[])
             else if (serviced == EeServiceResult::Blocked)
             {
                 ++blockedOnServicing;
+            }
+        }
+
+        // ---- ExecPS2 (EE syscall 0x07): the guest loader re-execs the game.
+        //
+        // On hardware the kernel clears all state and starts a fresh priority-0 main thread at
+        // `entry`. The syscall handler cannot do that in place (its stub would resume the old
+        // frame and this loop holds a reference to the current thread's context), so it recorded
+        // the request and stopped the guest. Here -- after the invocation has returned, so no
+        // context reference is live -- rebuild a fresh launch context, clear kernel state, and
+        // restart the loop. RDRAM is deliberately NOT touched: the loaded game data must survive
+        // the relaunch, which is the whole point of ExecPS2 on this game.
+        {
+            uint32_t xEntry = 0u, xGp = 0u, xArgc = 0u, xArgv = 0u;
+            if (runtime.consumePendingExecPS2(xEntry, xGp, xArgc, xArgv))
+            {
+                // Fail LOUDLY and honestly if the relaunch target is not part of the recompiled
+                // guest image. GT4's loader passes entry=0x100008 (low RDRAM, the 0x100000 page),
+                // which is NOT in the ELF's PT_LOAD .text (0x1000000). The recompiler emits guest
+                // code from the ELF only, so it cannot execute runtime-loaded/relocated code.
+                const uint32_t xSlot = (xEntry - tableBase) >> 2;
+                const bool xMapped = (xEntry & 3u) == 0u && xEntry >= tableBase && xEntry < tableEnd
+                                     && xSlot < tableSlots
+                                     && g_ps2RecompiledFunctionTable[xSlot] != nullptr;
+                if (!xMapped)
+                {
+                    std::cerr << "VULCAN 4 LIMITATION: ExecPS2 (EE syscall 0x07) entry "
+                              << toHex(xEntry) << " is outside the recompiled guest image ["
+                              << toHex(tableBase) << "," << toHex(tableEnd) << ") — GT4's loader "
+                                 "re-executes into low RDRAM (the 0x100000 page), which is not part "
+                                 "of the ELF's PT_LOAD .text; the recompiler emits ELF code only, so "
+                                 "Stage 1 cannot execute runtime-loaded code." << std::endl;
+                    runtime.clearStop();
+                    haltReason = "execps2_unmapped_entry";
+                    haltPc = xEntry;
+                    haltDetail = "ExecPS2 entry " + toHex(xEntry) + " outside the generated table ["
+                                 + toHex(tableBase) + "," + toHex(tableEnd) + ")";
+                    break;
+                }
+
+                R5900Context fresh{};
+                fresh.pc = xEntry;
+                fresh.r[4] = _mm_set_epi64x(0, static_cast<int64_t>(xArgc));
+                fresh.r[5] = _mm_set_epi64x(0, static_cast<int64_t>(xArgv));
+                fresh.r[28] = _mm_set_epi64x(0, static_cast<int64_t>(xGp));
+                fresh.r[29] = _mm_set_epi64x(0, static_cast<int64_t>(PS2_RAM_SIZE - 0x10u));
+                runtime.clearStop();
+                runtime.eeScheduler().reset(rdram, fresh);
+                previousPc = 0xffffffffu;
+                ++execPS2Relaunches;
+                std::cout << "VULCAN4 EXECPS2 relaunch#" << execPS2Relaunches
+                          << " entry=" << toHex(xEntry) << " gp=" << toHex(xGp)
+                          << " argc=" << xArgc << " argv=" << toHex(xArgv) << std::endl;
+                continue;
             }
         }
 

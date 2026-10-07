@@ -1,8 +1,8 @@
 diff --git a/ps2xRecomp/src/lib/control_flow_analyzer.cpp b/ps2xRecomp/src/lib/control_flow_analyzer.cpp
-index ed7578d..e8f90e8 100644
+index ed7578d..3ca4179 100644
 --- a/ps2xRecomp/src/lib/control_flow_analyzer.cpp
 +++ b/ps2xRecomp/src/lib/control_flow_analyzer.cpp
-@@ -85,9 +85,24 @@ namespace ps2recomp
+@@ -85,9 +85,27 @@ namespace ps2recomp
              const Function *containingFn = findContainingExternalFunction(target);
              if (!containingFn)
              {
@@ -16,7 +16,10 @@ index ed7578d..e8f90e8 100644
 +                // standalone guest function bounded by the next known function.
 +                // Upstream: PS2Recomp silently ignored direct jumps into un-symbolised
 +                // executable regions.
-+                if (isExecutableAddress(target))
++                // Only the discovery path (allFunctions != nullptr) has the section list needed
++                // to classify the target. The emitter path passes allFunctions == nullptr and has
++                // always dropped these; keep that behaviour there.
++                if (allFunctions != nullptr && isExecutableAddress(target))
 +                {
 +                    result.externalEntryPoints.insert(target);
 +                }

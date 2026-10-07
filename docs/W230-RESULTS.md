@@ -73,3 +73,42 @@ a3=0x3` — the self-relaunch into the main ELF.
   given entry with argc/argv) — a different lane from the recompiler gap.
 - The oracle stays a diagnostic; the shipped crack is still the decoder's deterministic 12 KB
   corruption (§W229 §21–§27).
+
+## 7. W231 — ExecPS2 (EE syscall 0x07) implemented; the relaunch target is not recompilable
+
+Ground truth (read first): `resources/db-syscalls.md:26` and `resources/09-ps2tek.md` (07h) —
+`ExecPS2(entry, gp, argc, argv)`: clears all internal kernel state and starts a fresh priority-0
+main thread at `entry`; must not return. PCSX2 does NOT HLE ExecPS2 (it runs the real BIOS —
+`pcsx2/R5900OpcodeImpl.cpp:982` only sets a debug breakpoint), so the corpus + the stub table are the
+truth: the loader's stub at `0x101F070` is `addiu v1,7; syscall 0; jr $ra` and the caller at
+`0x1028AD0` sets `a0=s1(entry)  a1=s2(gp)  a2=s0(argc)  a3=*(0x1036678)+4(argv)`.
+
+Implementation (runtime, `Kernel/Syscalls/System.cpp`): syscall 0x07 resolves entry/gp/argc/argv,
+logs ONE line `[execps2] entry=… gp=… argc=… argv=…`, and calls `PS2Runtime::requestExecPS2(...)`,
+which records the request and `requestStop()`s the guest. A syscall stub CANNOT reset the machine in
+place (its emitted `jr $ra` would resume the old frame, and the driver holds a reference to the
+current thread's context), so the DRIVER (`tools/harness/vulcan4_harness.cpp`) performs the relaunch
+after the invocation returns: it rebuilds a fresh launch context (GPRs zeroed, `pc=entry`, `sp=top of
+RDRAM`, `a0=argc`, `a1=argv`, `gp=gp`), clears kernel state (`EeScheduler::reset`), and restarts the
+loop. **RDRAM is deliberately untouched** — the loaded game data must survive, which is the point.
+
+Measured (oracle ON):
+```
+[execps2] entry=0x100008 gp=0x0 argc=2 argv=0x3
+VULCAN 4 LIMITATION: ExecPS2 (EE syscall 0x07) entry 0x00100008 is outside the recompiled guest
+  image [0x01000008,0x0102dbec) — GT4's loader re-executes into low RDRAM (the 0x100000 page),
+  which is not part of the ELF's PT_LOAD .text; the recompiler emits ELF code only, so Stage 1
+  cannot execute runtime-loaded code.
+halt=execps2_unmapped_entry
+```
+The ELF has exactly two PT_LOAD segments — `.text` @0x01000000 and `.data` @0x0102DC80. There is **no**
+segment at 0x100000, so `0x100008` is RDRAM the loader populates at runtime (a second-stage image or a
+copied engine), which static recompilation cannot emit. This is a genuine Stage-1 LIMITATION, reported
+loudly instead of silently returning 0 (the previous behaviour, which then parked at `guest_blocked`).
+
+Suite: 497/497. (The W230 gap-entry fix initially called `isExecutableAddress()` in the emitter path
+too, where `allFunctions == nullptr` and the section list is unusable — 5/6 suite crashes. Guarded to
+the discovery path only; green again.)
+
+The recompiler-gap fix (`tools/patches/ps2recomp-linux-w230-gap-entrypoints.patch`) and the ExecPS2
+runtime change (`tools/patches/ps2recomp-linux-w231-execps2.patch`) are both committed.

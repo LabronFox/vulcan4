@@ -1,0 +1,115 @@
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 69c53c1..5e62a18 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -602,6 +602,16 @@ public:
+ 
+     void requestStop();
+     bool isStopRequested() const;
++    void clearStop();
++
++    // ---- ExecPS2 (EE syscall 0x07) ---------------------------------------------------
++    // The guest loader re-execs the game. On hardware the kernel clears its state and starts a
++    // fresh priority-0 main thread at `entry`. A recompiled guest cannot reset the machine from
++    // inside a syscall: the emitted stub's `jr $ra` would resume the OLD frame and the driver
++    // holds a reference to the current thread's context (clearing it would dangle that reference).
++    // So the handler records the request and stops the guest; the driver performs the relaunch.
++    void requestExecPS2(uint32_t entry, uint32_t gp, uint32_t argc, uint32_t argv);
++    bool consumePendingExecPS2(uint32_t &entry, uint32_t &gp, uint32_t &argc, uint32_t &argv);
+ 
+     // ---- guest syscall accounting (read-only) ----------------------------------------
+     //
+@@ -936,6 +946,11 @@ private:
+     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
+     std::atomic<bool> m_missingFunctionReported{false};
+     std::atomic<bool> m_stopRequested{false};
++    std::atomic<bool> m_pendingExecPS2{false};
++    uint32_t m_execPS2Entry = 0u;
++    uint32_t m_execPS2Gp = 0u;
++    uint32_t m_execPS2Argc = 0u;
++    uint32_t m_execPS2Argv = 0u;
+     DebugUiCallback m_debugUiInitCallback = nullptr;
+     DebugUiCallback m_debugUiDrawCallback = nullptr;
+     DebugUiCallback m_debugUiShutdownCallback = nullptr;
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 27dc279..09b58c8 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -376,6 +376,33 @@ namespace ps2_syscalls
+             return;
+         }
+ 
++        if (syscallId == 0x07u)
++        {
++            // ExecPS2(entry, gp, argc, argv): the guest loader re-execs the game. On hardware the
++            // kernel clears all internal state and starts a fresh priority-0 main thread at
++            // `entry` (09-ps2tek 07h). A recompiled syscall stub cannot reset the machine in place
++            // -- its emitted `jr $ra` would resume the OLD frame and the driver holds a reference
++            // to the current thread's context -- so record the relaunch and stop the guest; the
++            // driver performs it at a safe point. This function must not return on hardware; here
++            // it returns only far enough to yield.
++            const uint32_t entry = getRegU32(ctx, 4);
++            const uint32_t gp = getRegU32(ctx, 5);
++            const uint32_t argc = getRegU32(ctx, 6);
++            const uint32_t argv = getRegU32(ctx, 7);
++            if (runtime == nullptr)
++            {
++                std::cerr << "VULCAN 4 LIMITATION: ExecPS2 (EE syscall 0x07) with no runtime — "
++                             "cannot relaunch the guest; returning 0 instead." << std::endl;
++                setReturnS32(ctx, 0);
++                return;
++            }
++            std::cerr << "[execps2] entry=0x" << std::hex << entry << " gp=0x" << gp
++                      << std::dec << " argc=" << argc
++                      << " argv=0x" << std::hex << argv << std::dec << std::endl;
++            runtime->requestExecPS2(entry, gp, argc, argv);
++            return;
++        }
++
+         static std::mutex s_unknownMutex;
+         static std::unordered_map<uint32_t, uint64_t> s_unknownCounts;
+         {
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 0717b00..5544b03 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -5965,6 +5965,39 @@ bool PS2Runtime::isStopRequested() const
+     return m_stopRequested.load(std::memory_order_relaxed);
+ }
+ 
++void PS2Runtime::clearStop()
++{
++    // Clears only this object's stop flag. EeScheduler::reset() clears its own m_stopRequested,
++    // so the ExecPS2 relaunch (which calls reset) needs both halves: this one and the reset.
++    m_stopRequested.store(false, std::memory_order_relaxed);
++}
++
++void PS2Runtime::requestExecPS2(uint32_t entry, uint32_t gp, uint32_t argc, uint32_t argv)
++{
++    // Record the relaunch request and stop the guest so the driver can perform it at a safe
++    // point (outside the current invocation frame). See the header for why it cannot reset here.
++    m_execPS2Entry = entry;
++    m_execPS2Gp = gp;
++    m_execPS2Argc = argc;
++    m_execPS2Argv = argv;
++    m_pendingExecPS2.store(true, std::memory_order_release);
++    requestStop();
++}
++
++bool PS2Runtime::consumePendingExecPS2(uint32_t &entry, uint32_t &gp, uint32_t &argc, uint32_t &argv)
++{
++    if (!m_pendingExecPS2.load(std::memory_order_acquire))
++    {
++        return false;
++    }
++    entry = m_execPS2Entry;
++    gp = m_execPS2Gp;
++    argc = m_execPS2Argc;
++    argv = m_execPS2Argv;
++    m_pendingExecPS2.store(false, std::memory_order_release);
++    return true;
++}
++
+ EeScheduler &PS2Runtime::eeScheduler()
+ {
+     return *m_eeScheduler;

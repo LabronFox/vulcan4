@@ -1,0 +1,61 @@
+# W273 -- do not leave the EE scheduler descheduled with no successor.
+#
+# Apply from the PS2Recomp tree root:  git apply tools/patches/ps2recomp-linux-w273-preempt-successor.patch
+# (or `patch -p1 < ...`), then rebuild ps2xRuntime.
+#
+# WHY. EeScheduler::applyPendingPreemption deschedules the running thread (m_currentThreadId = 0)
+# and leaves the promotion of a successor to the next iteration of EeScheduler::run()
+# (selectReady -> makeRunning). A driver that is NOT run() never takes that iteration. The
+# harness (tools/harness/vulcan4_harness.cpp) is such a driver: it reads currentContext()
+# directly, gets nullptr while m_currentThreadId == 0, and falls back to PS2Runtime::m_cpuContext.
+# That frame is a SHADOW of the main thread, refreshed only at guest-return points
+# (copyMainContextToRuntime), so the driver then RE-ENTERS a frozen copy of whatever frame was
+# published last, at the program counter it was published with.
+#
+# MEASURED COST, on the whole engine image rather than on a symptom. GT4's loader inflates
+# CORE.GT4 into staging at 0x12BF100 and memcpy's the engine image to 0x00100000
+# (src=0x12BF234 dst=0x100000 size=5339668 = 0x517A14, pc=0x10048C8, tid=2). With this hole open,
+# a frozen copy of the LZ77 copy loop published at its yield pc 0x100F800 was re-entered and
+# stored one byte, so the loader's inflate band at staging 0x1394420 came out 0x2D instead of
+# 0x7C (the disc's own zlib says 0x7C at decoded offset 0xD5320 = engine 0x001D51EC). The engine
+# image is what GT4 executes, so that byte is inside the code we are about to run.
+#
+# Full-image A/B (VULCAN4_RDRAM_DUMP added to the harness by the same dish):
+#   baseline, hole open   : RDRAM 0x00100000..0x00617A14 ALL ZEROS, 0/5339668 bytes placed
+#   fix present           : 4007203/5339668 non-zero, 0 mismatches vs zlib.decompressobj(-15)
+#                           over CORE.GT4[6:], i.e. byte-for-byte the disc's own image
+#
+# OFF by default in the sense that matters: this only closes a hole in an invariant the scheduler
+# already claims to hold. It fires only after a preemption that descheduled the current thread,
+# and it does exactly what run() would have done on its next iteration. With no preemption
+# (VULCAN4_EE_SLICE made large) the function is never reached and behaviour is unchanged.
+#
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 25feef4..4a6e44b 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -2453,6 +2453,24 @@ void EeScheduler::applyPendingPreemption()
+     m_currentThreadId = 0;
+     m_rescheduleRequested = false;
+     m_timeSliceExpired = false;
++
++    // W273. Descheduling with no successor is a hole in this scheduler's own invariant.
++    // EeScheduler::run() closes it on the next loop iteration (selectReady -> makeRunning), but
++    // a driver that is NOT run() -- the harness -- never does, and reads currentContext()
++    // instead. That returns nullptr while m_currentThreadId == 0, so the driver falls back to
++    // PS2Runtime::m_cpuContext. That frame is a SHADOW of the main thread, refreshed only at
++    // guest-return points (copyMainContextToRuntime), so the driver then RE-ENTERS a frozen
++    // copy of whatever frame was published last, at the program counter it was published with.
++    //
++    // Measured cost (W272/W151 vs W272-run152): the loader's inflate band at 0x1394420 came
++    // out 0x2d instead of 0x7c because a frozen copy of the LZ77 copy loop, published at its
++    // yield pc 0x100f800, was re-entered and stored one byte. Making the EE time slice huge --
++    // i.e. no preemption, so this function never fires -- removed the wrong byte entirely, and
++    // the run still completed. Close the hole here instead of asking every driver to.
++    if (GuestThread *next = selectReady())
++    {
++        makeRunning(*next);
++    }
+ }
+ 
+ void EeScheduler::servicePendingEventsAtCheckpoint() noexcept

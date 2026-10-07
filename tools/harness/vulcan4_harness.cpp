@@ -2083,7 +2083,19 @@ int main(int argc, char *argv[])
         g_guestThreadId = runtime.eeScheduler().currentThreadId();
 
         R5900Context *const schedulerFrame = runtime.eeScheduler().currentContext();
-        R5900Context &ctx = schedulerFrame != nullptr ? *schedulerFrame : runtime.cpu();
+
+        // W273. `runtime.cpu()` is PS2Runtime::m_cpuContext -- the main thread's SHADOW, refreshed
+        // only at guest-return points, so its pc sits wherever the guest last returned. Falling
+        // back to it whenever the scheduler has no current thread hands the driver a FROZEN frame
+        // to re-enter. W272 measured the cost as exactly one wrong inflate byte at 0x1394420
+        // (0x2d where the disc's own zlib says 0x7c), because a frozen copy of the LZ77 copy loop
+        // was re-entered at its yield pc 0x100f800. The live frame is GuestThread::activeContext();
+        // take that, and only reach for the shadow if there is no main thread at all.
+        GuestThread *const mainThread = runtime.eeScheduler().thread(EeScheduler::kMainThreadId);
+        R5900Context *const liveFrame = schedulerFrame != nullptr ? schedulerFrame
+                                       : (mainThread != nullptr ? &mainThread->activeContext()
+                                                                : nullptr);
+        R5900Context &ctx = liveFrame != nullptr ? *liveFrame : runtime.cpu();
 
         // ---- G1.8g: is the guest actually able to run?
         //
@@ -2933,6 +2945,63 @@ int main(int argc, char *argv[])
     // has already returned, so joining it would be joining the current thread.
     runtime.requestStop(); // tell the watchdog thread to exit its wait loop
     watchdog.join();
+
+    // W273. THE ENGINE IMAGE, OFF THE MACHINE.
+    //
+    // `VULCAN4_RDRAM_DUMP=<addr>:<len>[:<path>]` (hex addr, hex len) writes that slice of RDRAM to a
+    // file once the guest has stopped. Three probes already cover this ground and none of them can
+    // answer the actual question:
+    //   - W30BIGCOPY says WHERE a copy went and HOW BIG it was, but not what landed there;
+    //   - W45BEFORE snapshots 4096 bytes of RDRAM BEFORE a store, which is the wrong side of it;
+    //   - the store observer sees individual writes, not the finished image.
+    // "Is GT4's engine image correct in RDRAM?" is a whole-image question, so it needs a whole-image
+    // dump. Default path is under the run dir; the length is clamped to RDRAM so a typo cannot read
+    // off the end of the array. Env-gated: unset means this block does not execute and the run is
+    // byte-for-byte what it was before.
+    if (const char *dumpSpec = std::getenv("VULCAN4_RDRAM_DUMP"))
+    {
+        unsigned dumpAddr = 0u;
+        unsigned dumpLen = 0u;
+        char dumpPath[512] = {0};
+        const int dumpFields = std::sscanf(dumpSpec, "%x:%x:%511s", &dumpAddr, &dumpLen, dumpPath);
+        if (dumpFields >= 2)
+        {
+            const char *const resolvedDumpPath =
+                dumpFields >= 3 ? dumpPath : "/mnt/ssd/vulcan4-build/run/rdram_dump.bin";
+            constexpr unsigned kRdramBytes = 0x02000000u; // 32 MB, the EE's flat RDRAM window
+            if (dumpAddr < kRdramBytes)
+            {
+                const unsigned clampedLen =
+                    dumpLen > (kRdramBytes - dumpAddr) ? (kRdramBytes - dumpAddr) : dumpLen;
+                std::ofstream dumpOut(resolvedDumpPath, std::ios::binary | std::ios::trunc);
+                if (dumpOut)
+                {
+                    dumpOut.write(reinterpret_cast<const char *>(rdram + dumpAddr),
+                                  static_cast<std::streamsize>(clampedLen));
+                    dumpOut.flush();
+                    std::cout << "VULCAN4 RDRAM_DUMP addr=0x" << std::hex << dumpAddr << " len=0x"
+                              << clampedLen << std::dec << " path=" << resolvedDumpPath
+                              << " ok=" << (dumpOut.good() ? 1 : 0) << "\n";
+                }
+                else
+                {
+                    std::cout << "VULCAN4 RDRAM_DUMP addr=0x" << std::hex << dumpAddr << " len=0x"
+                              << clampedLen << std::dec << " path=" << resolvedDumpPath
+                              << " ok=0 (open failed)\n";
+                }
+            }
+            else
+            {
+                std::cout << "VULCAN4 RDRAM_DUMP addr=0x" << std::hex << dumpAddr << std::dec
+                          << " REFUSED: outside RDRAM\n";
+            }
+        }
+        else
+        {
+            std::cout << "VULCAN4 RDRAM_DUMP REFUSED: expected <hexaddr>:<hexlen>[:<path>], got '"
+                      << dumpSpec << "'\n";
+        }
+    }
 
     // W93. Stop sampling and print the histogram. After the watchdog join, so the samples cover the
     // boot and nothing else, and before the thread dump so a profile failure cannot cost us the

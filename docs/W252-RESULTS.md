@@ -1670,3 +1670,244 @@ Logs: `/mnt/ssd/tmp/w253-probe-run.log` (ON), `/mnt/ssd/tmp/w253-off-run.log` (O
 The rewind is bracketed to a 100,000-jump window by the current `%100000` bound. Tightening it to a
 per-rewind print (log only when t1 DECREASES) is a one-line change and is the obvious next probe if
 the measurer needs the exact jump.
+
+---
+
+## Track A — MEASURER (oracle), session 4 · the first divergence is LIVE-CONFIRMED at the instruction, and the stale-table mechanism is falsified
+
+Appended 2026-10-07 by measurer. Instruments: PCSX2 debug oracle pid 3795917 (DebugServer 127.0.0.1:21512,
+launched paused at PC 0x01000008 then resumed with BP armed) and the W253 harness
+(`/mnt/ssd/vulcan4-build/run/vulcan4_harness`). Probe log `/mnt/ssd/tmp/w252meas/misG.log`.
+
+### A10. The oracle fired at the exact instruction — register-by-register
+
+Breakpoint `0x0100F800 [t1 == 0x1394420]` **FIRED**; EE PC paused at **0x0100F800**; GPR read live.
+
+| reg | HARDWARE (PCSX2) | OURS (harness) | |
+|---|---|---|---|
+| `v0` byte stored | **`0x7C`** | **`0x2D`** | **DIVERGE** |
+| `s3` match length L | `0x0C` = 12 | `0x15` = 21 | DIVERGE |
+| `s1` match source | `0x01394408` | `0x013943D8` | DIVERGE |
+| `s2` = s1 + L | `0x01394414` | `0x013943ED` | DIVERGE |
+| `a3` hold | `0x47281F44` | `0x51CA07D1` | DIVERGE |
+| `a2` bit count | `0x0A` = 10 | `0x08` = 8 | DIVERGE |
+| `v1` | `0x07` | `0x0A` | DIVERGE |
+| `t1` dst | `0x01394420` | `0x01394420` | same |
+| `t0` in ptr | `0x0110300C` | `0x0110300C` | same |
+| `t2` in end | `0x012BF0BD` | `0x012BF0BD` | same |
+| `t4` +0x24 | `0x012BF0FF` | `0x012BF0FF` | same |
+| `t5` window/path | `0x0` | `0x0` | same (DIRECT) |
+| `ra` | `0x01010A70` | `0x01010A70` | same |
+
+Hardware's `s1 = dst − 24` and `s3 = 12` ⇒ **L=12, D=24**. Ours `s1 = dst − 72`, `s3 = 21` ⇒ **L=21, D=72**.
+Hardware is truth: `decode[873224] = 0x7C = decode[dst−24]`; ours `decode[873176] = 0x2D = decode[dst−72]`.
+
+### A11. Retractions and corrections to A6/A9 (session 3)
+
+1. **Retract "`0x2D = decode[0xD5300] = out[dest−32]`" (A6).** The measured distance is **72**, not 32:
+   live `s1 = 0x013943D8`, `dst = 0x01394420`, `t1 − s1 = 0x48 = 72`; `s3 = 21`. A6's own later line
+   ("L=21, D=72") is the correct one; the `dest−32` arithmetic was wrong.
+2. **Address algebra made explicit.** `ref.bin == decode[260:]` (verified by bytes), so
+   **decoded offset = ref-offset + 260**. `0xD521C = 872,988` (NOT 873,244). Dst `0x01394420`
+   = ref-off `0xD521C` = decoded **873,248** — A6's `full-decode 0xD5320` is this same address.
+3. **A9's redirect is not sufficient.** A9 concluded "bit/hold accounting at input bit 1,616,375".
+   The bit position is *identical* on both sides (1,616,375) and the input pointer `t0` is *byte-identical*;
+   what differs is which symbol the tables resolve there.
+
+### A12. Falsified: "our engine decodes block 4 with block 42's stale tables"
+
+`/mnt/ssd/tmp/w252meas/firstdiff.py` builds both block-4 and block-42 Huffman tables and decodes block 4
+with each: **they disagree at block 4's very FIRST token** — bit 1,597,819, out offset 868,355
+(true/block-4: `lit 108`; block-42: `lit 190`). The engine was byte-correct for the **1,591 tokens**
+between 868,355 and 873,248 and only then diverged. So the tables were correct at block 4's start and
+wrong at token 132663: this is a **mid-block, single-token event**, not a whole-block table mixup.
+What we *did* measure: L=21/D=72 at bit 1,616,375 is produced **only** by block 42's tables
+(`/mnt/ssd/tmp/w252meas/probesearch.py`, unique among all 43 blocks + FIXED); block 4's tables give
+L=12/D=24 there, consuming 15 bits vs our 17. Both holds are uniquely locatable in the 2 MB body:
+`0x47281F44` only at bit 1,616,390 (= 1,616,375 + 15, hardware); `0x51CA07D1` only at bit 1,616,392
+(= 1,616,375 + 17, ours).
+
+### A13. Related number, worth the builder's attention
+
+The harness's byte counter at the mismatch is `w = 6,120,817` = **1,701 bytes past the decoded length
+6,119,116**. The engine is already past a completed pass when it writes the bad byte. `misG.log` holds
+**40 MIS events** (seq 12..51); state changes at seq=32 (`a3 0x51CA07D1 → 0xdeea2a39`,
+`t0 0x110300C → 0x1103010`, `a2 0x8 → 0x15`), then keeps diverging.
+
+### A14. Handoff
+
+Instrument `job+0x30`/`job+0x34` (length/distance Huffman table bases, written through the out-params
+of `FUN_0100EDC8` at 0x01010A34 / 0x01010A38 — see A7) at the `FUN_0100F8C8` table-build step, and
+`job+0x00`/`job+0x08` (hold / bit count) at stream bit 1,616,375. Note the competing board claim that
+0x0100F800 is a "literal-RUN / zero-distance copy": the measured registers contradict it —
+`s2 = s1 + s3` with `s3 = 12` and `t1 − s1 = 24` make this a real LZ77 match copy with a nonzero distance.
+
+## Track A — MEASURER (oracle), session 5 · the translation is CLEAN; the divergence is a SECOND decode pass that overwrites correct bytes
+
+**Verdict on the inherited task ("name the mis-translated instruction"): there is none.**
+FUN_0100F8C8 is 1,166/1,166 instructions identical to PCSX2's native disassembler; FUN_0100F390
+360/360; FUN_0100EDC8 370/370; **0 word mismatches**. The premise is falsified.
+
+### A15. The two values, the hardware side, and the first disagreeing instruction
+
+| | value |
+|---|---|
+| address | staging `0x01394420` = decoded `873,248` (`0xD5320`) = blob `0xD521C` |
+| **hardware** | **`0x7C`** |
+| **ours** | **`0x2D`** |
+| first disagreement | store PC **`0x0100F800` `sb $v0,0($t1)`** (match-copy store, FUN_0100F8C8) |
+
+Hardware is `0x7C`, confirmed three independent ways: (1) the byte-verified decoder
+(`/mnt/ssd/tmp/w252meas/toks2.py`) yields `byte@873248 = 0x7C`; (2) live staging in ref.bin carries
+`0x7C`; (3) `pcsx2_find_pattern 2D3000007C00458CA651110C` hits **exactly once, at `0x001D51E8`** —
+putting `7c 00 45 8c` at **`0x001D51F4` of the hardware ENGINE image**.
+
+### A16. Two decode passes over the same 128 bytes — the first is ours and it is perfect
+
+`/mnt/ssd/tmp/w252-ow/ow.log` (300 attributed stores, probe `VULCAN4_W229_OW=1`) groups into exactly
+two passes over the window `[0x1394400, 0x139447F)`:
+
+* **Pass A — `hufCall=11`, `hufIn=0x11026FC`, `hufOut=0x1393103`**, 159 stores, `0x1394400..0x139447F`.
+  Its store stream reconstructs hardware's token stream EXACTLY, token for token: `L=4 D=18224`,
+  `LIT 48`, `L=6 D=2440`, **`L=12 D=24` at `t1=0x1394420` from `s1=0x1394408`** (`7C 00 45 8C A6 51
+  11 0C 00 00 A4 8C` — the correct bytes), `LIT 8`, `L=4 D=24`, `LIT 56`, `L=6 D=5160`, `L=12 D=24`,
+  `L=4 D=544`. **Ours' first decode is byte- and token-perfect against hardware.**
+* **Pass B — `hufCall=49`, `hufIn=0x12BE6D0`, `hufOut=0x189313A`**, 141 stores, `0x139441F..0x139447F`.
+  Writes **`0x2D`** at `0x1394420` via **`L=21 D=72`** (`s1=0x13943D8`, `s2=0x13943ED`, `s3=0x15`), and
+  `0x00` over `0xA6` at `0x1394424`. `0x189313A − 0x12BF100 = 0x5D403A` = **blk43's out_start** — the
+  *final* (BFINAL) chunk — yet its stores land **5,238,042 bytes behind** its own output pointer.
+
+The band is exactly `[0xD521C, 0xD80B1]`; ours' `band` source bytes are **identical on both sides**
+(`staging 0x13943D8` = `2D 30 00 00 00 00 B0 FF …` in ours *and* ref), and ours' `0x1394420..+21`
+equals its own `0x13943D8..+21` — the D=72 match, faithfully executed into the wrong destination.
+`ours[0xD80B2:] == ref[0xD80B2:]` → **True** (5,233,942 bytes byte-identical to EOF).
+
+### A17. Falsified this session (each by a run, not by argument)
+
+1. **No bit-offset explains it.** Brute-force deltas −4..+6 at decoded 873,248
+   (`/mnt/ssd/tmp/w252meas/delta.py`): **no delta yields (MATCH, 21, 72)**.
+2. **Not a 0x500000 address alias.** `0x1894420 − 0x500000 = 0x1394420` is arithmetically exact, but
+   `ref[0x5D521C] = 0xDC` and `ours[0x5D521C] = 0xDC` (both sides identical there); match count of
+   ours' band against ref at +0x500000 is **220 / 11,926** (chance).
+3. **Not an overlapping-copy fold.** Band periodicity: `0x48` → ours 4.6% (ref 11.8%), `0x18` → 7.7%,
+   `0x50` → 4.7%, `0xD0` → 4.3%. No fold.
+4. **Not a copy of anything in the reference.** 16-byte probes at band `+0x24, +0x48, +0x800, +0x1000,
+   +0x2000` occur **zero times** in ref and nowhere else in ours. Pass B emits *novel* bytes, YET the
+   stream re-syncs exactly at `0xD80B2` — a precise, finite `[0x1394420, 0x1394E5D)` replacement.
+
+### A18. Handoff (successor question, for builder/architect)
+
+**Which call re-enters the chunk decoder with its output pointer effectively at `0x139441F` while the
+job's `hufOut` cursor reads `0x189313A`?** Instrument the chunk-call site: log caller PC + the `out`
+argument + the decoder's internal store base at `hufCall=49`. Related open numbers: thousands of stores
+past staging end (`0x189541C` ×2046, `0x18953EC` ×1942, `0x18953F8` ×1720) and the harness byte counter
+reaching `6,120,817` = 1,701 past decoded length (A13). `which.py` (block-table search for ours' token
+across all 43 blocks) is still unrun — it aborts with `KeyError: 2` because the table cache is only
+built in the dynamic-block branch.
+
+### A19. A18 ANSWERED — the re-entry is not the decoder's caller, it is the DRIVER re-entering a frozen frame
+
+**builder-spin, 2026-10-08.** A18 asked which call re-enters the decoder at `0x139441F`. There is no such
+call. The corrupt store is made by the harness itself, from a frame that is not the guest's live one.
+
+**The hole, by code (no guessing):**
+
+- `EeScheduler::applyPendingPreemption()` (`EeScheduler.cpp:2438`) ends with `enqueueReady(*self, ...);
+  m_currentThreadId = 0;` — it **deschedules the running thread and installs no successor**.
+- `EeScheduler::run()` closes that hole on its next loop iteration (`EeScheduler.cpp:214`: `selectReady()
+  -> makeRunning(*next)`). **The harness driver never calls `run()`.**
+- `vulcan4_harness.cpp:2086` binds the frame each iteration: `currentContext()`, else `runtime.cpu()`.
+  `currentContext()` is `currentThread()->activeContext()` and returns **nullptr** while
+  `m_currentThreadId == 0`, so the driver falls back to `runtime.cpu()` = `PS2Runtime::m_cpuContext`.
+- `m_cpuContext` is a **shadow** of the main thread, refreshed *only* at guest-return points
+  (`copyMainContextToRuntime()`, `EeScheduler.cpp:2931`). Its `pc` is wherever the guest last
+  *returned*, not where it is.
+- The generated copy loop yields with `ctx->pc = 0x100F800u; if (runtime->eeCheckpointDue()) return;`
+  (generated line 78337-78340; resume case line 76414). So a publish taken near a yield freezes the
+  shadow at `pc=0x100f800` with a complete, self-consistent LZ77 register bank from that pass.
+
+**The consequence, by bytes:** after a preemption the driver re-enters that frozen frame at `0x100F800`
+and executes the store `label_100f800 WRITE8(t1, v0)` with the frozen `t1`. That is the `0x2d` at
+`0x1394420`, and it is why the corrupt store carries `decN=49` (a stale counter), `m20=0x1894fcc` (job
+memory is in RDRAM, shared, and current) while `t1=0x1394420` and `s1/s2/s3 = 0x13943d8/0x13943ed/0x15`
+are a coherent copy from an earlier pass. No `[w267:dec]` line appears for it because the driver calls
+`resolvedFn` directly, not `dispatchGuestBranch`.
+
+**The A/B (both `exit 0`, no rebuild, run 151 vs run 152):**
+
+| run | env | band byte `0x1394420` | `[w268:band]` |
+|---|---|---|---|
+| 151 | default slice | **`0x2d` WRONG** | decN=11 then decN=49 |
+| 152 | `VULCAN4_W229_SLICE=100000000` | **`0x7c` CORRECT** | decN=11 only; decN=49 never writes the band |
+
+Run 151 logged 57 × `prio` preemptions; with the slice made huge `checkpointDue` never reaches the
+`prio` branch, so `applyPendingPreemption` never fires, the hole never opens, and the corruption is
+absent **while the run still completes**. That is a clean isolation, not a confound.
+
+**Probe-validity correction (this also retracts the previous window's headline).** `eeCheckpointDue`
+(`ps2_runtime.cpp:6959`) reads `m_cpuContext.pc` — the shadow — for its `VULCAN4_W229_CK`,
+`VULCAN4_W229_NOYIELD` and `VULCAN4_W229_NOCOPY` gates. The earlier claim "`[w229:ck]` = 2000 lines, ALL
+at `pc=0x100f800`, frozen `t1`/`s1`/`s3`" is therefore **the shadow's frozen pc, not a frozen loop**, and
+must not be used as evidence. The store-observer probes (`[w229:w]`, `[w268:band]`) receive the real
+`ctx` and remain valid.
+
+**Fix (two sites, both structural, neither a probe):**
+
+1. `EeScheduler::applyPendingPreemption()` now promotes the next runnable thread
+   (`selectReady() -> makeRunning(*next)`) after descheduling, so `m_currentThreadId != 0` whenever a
+   ready queue is non-empty — the invariant `run()` was relying on.
+2. `vulcan4_harness.cpp:2086` no longer falls back to the stale shadow: when the scheduler has no
+   current thread it takes the main thread's **live** frame, `activeContext()`, and only reaches
+   `runtime.cpu()` if there is no main thread at all.
+
+**Still open from A18's "related numbers":** the stores past staging end (`0x189541C` ×2046 etc.) and the
+byte counter at `6,120,817` = 1,701 past decoded length have not been re-measured since the fix — if they
+persist they are a second, unrelated defect and get their own section.
+
+### A21. The engine image, whole: 0/5339668 bytes placed → 0 mismatches against the disc
+
+A19/A20 measured the fix through an inflate band and a staging byte. That is a symptom of a symptom
+— the band is 49 bytes and the byte that mattered is one staging address. This settles it on the
+**finished artifact**: the engine image in RDRAM, all of it, compared to the disc's own zlib.
+
+A new env-gated probe was added for this, and nothing else: `VULCAN4_RDRAM_DUMP=<hexaddr>:<hexlen>[:<path>]`
+in `tools/harness/vulcan4_harness.cpp`, which writes a slice of RDRAM to a file after `watchdog.join()`
+and before the boot report. Unset, the block does not execute. No existing probe could answer this:
+`W30BIGCOPY` names where a copy went and how big it was but not what landed there; `W45BEFORE` snapshots
+4096 bytes **before** a store; the store observer sees individual writes, not a finished image.
+
+Comparison is byte-for-byte against the container's own decoder:
+`zlib.decompressobj(-15).decompress(CORE.GT4[6:])` → 6119116 B, and the image's byte `i` is the decode's
+byte `0x134 + i` (`decoded_offset = 0x134 + (E - 0x100000)`).
+
+| build | halt | outer disp. | `gs_packets` | frames | frame_reg_writes | engine image |
+|---|---|---|---|---|---|---|
+| **true baseline** (neither fix) | `stuck_in_syscall` | 3794 | 30 | 1117 | 5 | **ALL ZEROS — 0/5339668 placed** |
+| harness `liveFrame` fix only (EeScheduler hole still open) | `guest_blocked` | 611 | 40 | 339 | 7 | **0 mismatches** |
+| both fixes (A20 site 1 + site 2) | `guest_blocked` | 723/611* | 130 | 347 | 25 | **0 mismatches** |
+
+\* 723 is the A20 run (with `VULCAN4_W229_OW=1 VULCAN4_W267_DEC=1`); 611 is without them. The
+probe pair costs dispatches, which is its own reason never to compare runs by a counter.
+
+Baseline detail, verbatim: at engine `0x00100008` the image reads `00` where the disc says `28`
+(`0x70000c28 padduw $at,$zero,$zero`, the engine's first instruction), and the region's non-zero byte
+count is **0 of 5339668**. The placed image is not damaged — it is *absent*. So the mission's premise
+("the loader opens `CORE.GT4` but never populates RDRAM `0x00100000..0x00617A14`") is **true of the
+unpatched tree** and **false after A20**. With the harness fix alone the image is byte-perfect, which
+places the whole defect in the driver's frame selection, not in the decode and not in the copy.
+
+Three runs, three dumps, three independent decodes of the same disc file. The baseline build was
+produced by reverting `EeScheduler.cpp` with `git checkout` in the subrepo and rebuilding
+`libps2_runtime.a` (`make -j2 ps2_runtime`); the true baseline additionally reverted the harness
+`liveFrame` hunk in the source, built, and copied the binary aside. Restore was verified by
+`cmp -s` against the pre-experiment binary: **byte-identical**, so the A/B is between two binaries that
+differ only in the fix.
+
+**Still open (unchanged, and now the next dish):** the load path completes but the loader never reaches
+its hand-off. Both fixed-build runs halt `guest_blocked` with the main thread parked on `sema#7`
+(`pc=0x0101f468`, `wait=sema#7`, `woken=0`) and no other thread runnable — `sema#7` is created and
+waited on but never signalled (`sce_SignalSema` a0 values 5,6,6,2,4,5; never 7). `ExecPS2` — the
+loader's own re-exec into the engine at entry `0x100008` (harness handler at
+`vulcan4_harness.cpp:2706`) — **never fires in either build**, so engine entry is gated on the `sema#7`
+wakeup, not on the image. The only `VULCAN 4 LIMITATION` printed is the `syscall 0x5b` override handler
+at `0x80075000` having no generated function in either image, 6 times — the next place to look.

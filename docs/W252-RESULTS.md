@@ -1911,3 +1911,35 @@ loader's own re-exec into the engine at entry `0x100008` (harness handler at
 `vulcan4_harness.cpp:2706`) — **never fires in either build**, so engine entry is gated on the `sema#7`
 wakeup, not on the image. The only `VULCAN 4 LIMITATION` printed is the `syscall 0x5b` override handler
 at `0x80075000` having no generated function in either image, 6 times — the next place to look.
+
+### A22. The dish gate, run and recorded raw
+
+`bash .auto/verify-dish.sh` — **exit 0**, on commit `5774b00`:
+
+```
+PASS  suite 497 tests, 0 failed
+PASS  newest commit authored as the captain
+PASS  working tree clean
+INFO  verify-menu.sh: not passed (last lines below) — screen is not the menu yet
+INFO  newest capture: w252b1probe2-capture.png  halt=stuck_in_syscall  missing-function hits: 6
+=== RESULT: MECHANICAL CLAIMS HOLD ===
+```
+
+`bash .auto/verify-menu.sh` — **exit 1**. A fresh capture was taken on the fixed binary
+(`tools/harness/run_capture.sh w273fix 2000000 14 3`, `halt=guest_blocked`, `frames_presented=350`),
+because the gate judges the newest PNG in the run directory and the previous one was a W252 artefact:
+
+```
+newest capture : /mnt/ssd/vulcan4-build/run/w273fix-capture.png
+structural sig : capture 14 colours / nonblack 0.1173   vs reference 14 / 0.1150
+GATE FAIL: STRUCTURAL MATCH to the disclaimer
+```
+
+So there is **no picture** — the screen is still the 2005 disclaimer. This dish does not claim one.
+
+**The engine-entered gate cannot pass, and this is structural, not a shortfall.** The loader's
+generated unit contains **zero** `dispatchGuestBranch` calls whose target lies in
+`0x00100000..0x00617A14`: 1887 `DirectCall` + 38 `DirectJump`, all loader-range, and the string
+`0x00100008` does not occur in it at all. Nothing in the loader branches to the engine image; the
+hand-off is `ExecPS2`, which does not fire. A gate on "≥1 dispatch target in the engine range" is a
+gate on a path that no generated code contains until the loader gets past `sema#7`.

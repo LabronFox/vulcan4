@@ -2330,7 +2330,7 @@ int main(int argc, char *argv[])
         {
             static const bool s_w229dresOn = (std::getenv("VULCAN4_W229_DRES") != nullptr);
             static int s_w229dresN = 0;
-            if (s_w229dresOn && s_w229dresN < 60 && ctx.pc >= 0x100f390u && ctx.pc < 0x100f8c8u
+            if (s_w229dresOn && s_w229dresN < 2000 && ctx.pc >= 0x100f390u && ctx.pc < 0x100f8c8u
                 && ctx.pc != 0x100f390u)
             {
                 ++s_w229dresN;
@@ -2339,6 +2339,9 @@ int main(int argc, char *argv[])
                           << " sp=" << toHex(getRegU32(&ctx, 29))
                           << " s1=0x" << toHex(getRegU32(&ctx, 17))
                           << " t1=0x" << toHex(getRegU32(&ctx, 9))
+                          << " rt1=0x" << toHex(getRegU32(&runtime.cpu(), 9))
+                          << " rs1=0x" << toHex(getRegU32(&runtime.cpu(), 17))
+                          << " rtid=" << runtime.eeScheduler().currentThreadId()
                           << " prev=" << (lastResolvedPcValid ? toHex(lastResolvedPc) : std::string("NONE"))
                           << std::endl;
             }

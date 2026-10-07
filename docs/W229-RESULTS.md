@@ -512,5 +512,21 @@ So the fix target is the **resume**: when `FUN_0100F390` is re-entered at an int
 exactly, and it does not. Next: dump the stream's bit state (`param_1[0..2]`) at every decoder resume
 and compare to a straight-through run.
 
+## 23. THE RESUME LOSES THE COPY STATE — `t1=0x0` on entry at `0x100f800`
+
+`VULCAN4_W229_DRES` (harness arrival probe for `pc ∈ [0x100f390,0x100f8c8)`) reports **86 resumes at
+`0x100f800`, every one with `t1=0x0`**. `t1` is the copy destination (`sb $v0,0($t1)` at `0x100f800`),
+so the resumed decoder runs its copy loop with a **NULL destination** — the loop state (`t1`, and by
+implication `s1`/`s3`) is **not carried across the yield**.
+
+The back-edge at `0x100f864` (`bnel $s1,$s2,→0x100f800`, delay `lbu $v0,0($s1)` then
+`ctx->pc = 0x100F800u; if (runtime->eeCheckpointDue()) return;`) *should* resume at `0x100f800` with the
+live `t1`/`s1`, but the resumed context has `t1=0`. That is the defect that lets a decode position be
+re-processed and corrupt the output.
+
+Next: trace where the decoder's `$t1` is lost between the yield and the resume (the emitter's checkpoint
+return path, the caller `FUN_0100F8C8` epilogue when it unwinds on a yield, or the scheduler's
+context save). This is the same family as the §10/§11 suspended-state work.
+
 
 

@@ -1,0 +1,57 @@
+diff --git a/ps2xRecomp/src/lib/ps2_recompiler.cpp b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+index 82f8c07..15ba9e8 100644
+--- a/ps2xRecomp/src/lib/ps2_recompiler.cpp
++++ b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+@@ -1551,11 +1551,51 @@ namespace ps2recomp
+ 
+                 writeCombinedOutputPreamble(combinedOutput);
+ 
++                // W239. BOUNDED TU SPLITTING (tool change). One 40 MB TU still needs a multi-GB
++                // cc1plus; emit deterministic part files ps2_recompiled_functions_NN.cpp (<=
++                // PS2RECOMP_TU_BYTES each, default 8 MB) so -j4 compiles them in parallel and
++                // rebuilds are incremental. The aggregate registration TU (register_functions.cpp)
++                // is unchanged. OFF-by-default size only affects this output stage.
++                size_t w239Target = 8u << 20;
++                if (const char *tu = std::getenv("PS2RECOMP_TU_BYTES"); tu != nullptr && *tu != '\0')
++                {
++                    const unsigned long long parsed = std::strtoull(tu, nullptr, 10);
++                    if (parsed != 0ull)
++                    {
++                        w239Target = static_cast<size_t>(parsed);
++                    }
++                }
++                auto w239PartPath = [&](size_t index)
++                {
++                    char name[64];
++                    std::snprintf(name, sizeof(name), "ps2_recompiled_functions_%02zu.cpp", index);
++                    return fs::path(m_config.outputPath) / name;
++                };
+                 if (outputWorkerCount <= 1)
+                 {
++                    size_t w239Part = 0;
++                    size_t w239PartBytes = 0;
++                    std::ofstream w239Out(w239PartPath(0));
++                    writeCombinedOutputPreamble(w239Out);
+                     for (const Function *function : outputFunctions)
+                     {
+-                        combinedOutput << generateFunctionCode(*m_codeGenerator, *function, false) << "\n\n";
++                        const std::string code = generateFunctionCode(*m_codeGenerator, *function, false);
++                        if (w239PartBytes != 0 && (w239PartBytes + code.size()) > w239Target)
++                        {
++                            w239Out.close();
++                            ++w239Part;
++                            w239PartBytes = 0;
++                            w239Out.open(w239PartPath(w239Part));
++                            writeCombinedOutputPreamble(w239Out);
++                        }
++                        w239Out << code << "\n\n";
++                        w239PartBytes += code.size();
++                    }
++                    w239Out.close();
++                    {
++                        std::ostringstream msg;
++                        msg << "wrote " << (w239Part + 1) << " bounded TU part(s) of <= " << (w239Target / (1024u * 1024u)) << " MB";
++                        m_reporter.progress(msg.str());
+                     }
+                 }
+                 else

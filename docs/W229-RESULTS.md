@@ -573,5 +573,14 @@ That reframes the fix: compare the generated `sub_0100F390_0x100f390` against th
 wrong match: length `0x15`/distance `0x48` where correct is `0xc`/`0x18`). A deterministic mis-translated
 instruction is the target; a recompiler patch would go in `tools/patches/`.
 
+Spot-check result: the MIPS of `0x100f390..0x100f608` (obtained live via PCSX2's disassembler) matches
+our emitted `sub_0100F390` instruction-for-instruction across the Huffman tree walk, the literal write
+(`0x100f4ec sb`), the window write (`0x100f500 sb`) and both loop controls (`0x100f508 bne→0x100f418`,
+`0x100f864 bnel→0x100f800`) — including the `sllv`/`dsllv` masking and the branch-likely delay slots.
+So the mis-translation, if that is what it is, is not in those regions. The other deterministic
+candidate is the **Huffman-table build in the driver `FUN_0100F8C8`** (`0x1010900..0x1010a00`, the
+`0x120`-entry code-length tables at `sp+0x500`/`sp+0x574`): a single wrong table entry would deterministically
+mis-decode exactly the symbols that use it, which matches the single ~12 KB bad run.
+
 
 

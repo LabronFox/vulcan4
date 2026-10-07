@@ -404,5 +404,35 @@ So the decompressor emits the **same code/data blocks at permuted offsets** — 
 difference, not a lost bit. `FUN_0100F8C8` is the suspect; the next step is to find where in it the
 output block offset is computed.
 
+## 18. FULL-BUFFER DUMP + THE CORRUPTION IS A DOUBLE-WRITE BY THE HUFFMAN DECODER
+
+PCSX2's DebugServer socket (`{cmd:'read_memory',...}` newline-JSON on `127.0.0.1:21512`) was driven
+directly to dump the whole buffer, and the compressed input was dumped too:
+
+- **The compressed input is byte-identical** — `/tmp/ourscmp.bin` vs hardware's dump over
+  `0x10d1ac0..0x12bf0bd` (2,020,861 bytes) → `cmp -l` prints nothing.
+- **The output blob's first difference is at byte `872988` (`0xD4FDC...` i.e. output offset `0xD521C`,
+  absolute `0x1394420`)**: ours lacks hardware's `7c 00 45 8c` (`lw a1,0x7c(v0)`), present instead is
+  `2d 30 00 00`.
+
+A store-observer watch on that word (`VULCAN4_W229_OW`) caught the writer — and the tell:
+
+```
+[w229:w] addr=0x1394420 val=0x7c writerPc=0x100f800   <-- CORRECT, written first
+... (0x00,0x45,0x8c)
+[w229:w] addr=0x1394420 val=0x2d writerPc=0x100f800   <-- WRONG, overwrites it
+```
+
+So the blob is **decoded correctly, then partly overwritten**. The writer is `FUN_0100F390`
+(`0x100f800`/`0x100f4ec`), a **DEFLATE Huffman decoder** (literal branch `uVar18==0x10` writes a byte;
+`0x0f` is the end-of-block; back-references copy from a 32 KB window at `iVar13`). Its only caller is
+`FUN_0100F8C8` at `0x1010A68`, and it is invoked repeatedly (one call per deflate block;
+`VULCAN4_W229_HUF` shows the output pointer `f20` advancing monotonically: `0x12bf100`, `0x12e1695`,
+`0x131bb24`, …).
+
+So the failure is a **DEFLATE decode/back-reference divergence inside `FUN_0100F390`** (or its
+`FUN_0100F8C8` driver) that rewrites already-correct output. Next: instrument the literal vs
+back-reference branch at `0x100f800` around the `0x1394420` write and compare with hardware.
+
 
 

@@ -2136,6 +2136,24 @@ int main(int argc, char *argv[])
             break;
         }
 
+        // W247. OFF-by-default probe at the engine's FindAddress(0x83) loop head: args + slots.
+        {
+            static const bool s_w247On = (std::getenv("VULCAN4_FINDADDR") != nullptr);
+            static uint32_t s_w247N = 0;
+            if (s_w247On && s_w247N < 24u && (ctx.pc == 0x5B7408u || ctx.pc == 0x5B74ECu))
+            {
+                ++s_w247N;
+                auto rw = [&](uint32_t a) -> uint32_t { uint32_t v = 0u; const uint32_t q = a & 0x1FFFFFFFu; if (q + 4u <= 0x02000000u) std::memcpy(&v, rdram + q, 4u); return v; };
+                std::cout << "[w247] pc=" << toHex(ctx.pc)
+                          << " a0=" << toHex(getRegU32(&ctx, 4)) << " a1=" << toHex(getRegU32(&ctx, 5))
+                          << " a2=" << toHex(getRegU32(&ctx, 6)) << " a3=" << toHex(getRegU32(&ctx, 7))
+                          << " v0=" << toHex(getRegU32(&ctx, 2)) << " s2=0x" << std::hex << getRegU32(&ctx, 18)
+                          << " s3=0x" << getRegU32(&ctx, 19)
+                          << " [1218C]=" << rw(0x1218Cu) << " [120E8]=" << rw(0x120E8u)
+                          << " [8001218C]=" << rw(0x8001218Cu) << " [800120E8]=" << rw(0x800120E8u)
+                          << std::dec << std::endl;
+            }
+        }
         // ---- W108. THE TITLE BAR IS THE HUD, AND IT LIVES ON THE DISPLAY THREAD.
         //
         // This block used to run here, in the guest's own loop, updating the window title from

@@ -51,6 +51,60 @@ it should not have been dispatched — and if you think that is what happened, s
 **Platform order (captain's call):** x86-64 PC first → ARM64 (Odin 2) second → PSP only with a
 direction check.
 
+## ⚠️ BEFORE YOUR FIRST TOOL CALL — THE PS2 RECOMP MANUAL IS ON THIS BOX
+
+A 52 MB PS2/recompiler corpus is installed here. **Read it before you improvise; do not guess PS2
+behaviour from intuition.** Measured 2026-10-07: the previous 691-turn session referenced it **zero**
+times and spent hours probing things the corpus already answers.
+
+- Entry point: `~/.config/opencode/skills/ps2-recomp-Agent-SKILL/SKILL.md` — read §1 DECISION ROUTER,
+  then load ONLY the 1–2 files it points at for your situation. Do not bulk-read.
+- Runtime debugging / A-B against real hardware → `resources/12-pcsx2-mcp-playbook.md`
+- Any crash or stuck bug → `resources/10-agent-guardrails.md` §3 (fix taxonomy, root-cause protocol)
+- "I don't know why" → `resources/13-decisional-brain.md`
+- MIPS / PS2 hardware truth → `resources/02-mips-r5900-isa.md`, `resources/09-ps2tek.md`,
+  `resources/db-ps2-index.md` (master router)
+
+**The two rules that matter most here:**
+1. **FIND THE FIRST DIVERGENCE against an oracle.** The earliest mismatch is the bug; everything later
+   is a symptom. Work forward from it. Never start from where it hurts.
+2. **Never compare two runs by `functions_entered`.** Compare by hardware events, or by a picture.
+
+## HOW YOU WORK — DISCIPLINE, READ BEFORE EVERY TURN
+
+**Prose budget: 3 lines per turn, maximum.** Findings go into `docs/` as you go — never into chat
+essays. Never write a "status this window / final state / I'll stop here" block. That habit is the
+single biggest waste in this project's history (measured 2026-10-07: 1 turn in 3). If a turn is about
+to end, it ends **with a tool call that advances the work**, not with a summary.
+
+**Never ask permission. Approval is standing and permanent.** Do not pause to report progress. Do not
+ask "want me to continue?".
+
+**Use the oracle.** PCSX2 (`resources/12-pcsx2-mcp-playbook.md`) is ground truth for behaviour; a
+reference tool (python `zlib`, a known-good decoder) is ground truth for bytes. Never localize a
+divergence without one. Never argue from intuition when a diff answers it in 10 seconds.
+
+**First divergence wins.** Fix the EARLIEST point where we differ from the oracle — everything later
+is a symptom. `docs/W229-RESULTS.md` §16 is what ignoring this cost us.
+
+**Dispatch misses are BLOCKING.** A `missing-target` / `no_generated_function` halt means the guest is
+calling code the recompiler never emitted. Fix the **tool input** (TOML / analyzer / `tools/patches/`)
+and regenerate — never hand-edit generated output. Clear these before any graphics work.
+
+**Never compare runs by `functions_entered`.** It is a run-shape number, not an event. Compare by halt
+reason, by hardware event, or by a picture.
+
+**A picture is the only proof of the menu.** `bash .auto/verify-menu.sh` must exit 0 on a fresh
+window-only capture that is not the disclaimer. A commit is not a milestone.
+
+**MECHANICAL GATE — a dish is NOT complete until `bash .auto/verify-dish.sh` exits 0**, and its output
+goes into the dish's doc. That script is the enforcement, not this prose: it checks the suite, the
+commit authorship, that the tree is clean, runs the product gate itself, and prints the raw halt.
+Prose asks; the gate blocks. (Rule adopted 2026-10-07 from momo5502's MW2 agent audit — *"soft
+instructions don't really help, mechanical blockers, to enforce rules, are more effective"*.)
+
+**Every probe ships OFF by default.** Unset = today's behaviour, byte for byte.
+
 ## THE LAWS OF THIS PROJECT
 
 1. **No game data in the repository. Ever.** No ISO, no `GT4.VOL`, no extracted models/textures/

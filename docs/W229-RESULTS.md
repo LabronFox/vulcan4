@@ -454,5 +454,18 @@ on an output-buffer flush (`puVar9 == puVar12`), **reloading `puVar9 = *(param_1
 driver callback at vtable+0x1c. So a driver callback that resets the stream's output pointer would do
 exactly this. Next: instrument that flush/callback path and the `0x0` call-23 case.
 
+## 20. THE DECODER IS YIELDED AND RESUMED — the suspect is the resume state
+
+`FUN_0100F390` has a resume `switch` case for **every instruction** and 8 checkpoint sites, and the
+harness arrival probe (`VULCAN4_W229_DRES`) confirms it is resumed repeatedly at interior pcs —
+mostly `0x100f800` (the `sb` copy loop itself) and `0x100f418`, all with `ra=0x01010a70` (the
+`FUN_0100F8C8` return). So the decoder runs **across yields**, and its loop state (`t1`/`t4`/`s1`/`s3`
+— the copy destination, bound, source and offset) is saved and restored by the scheduler at each
+resume.
+
+That is the same class as §10/§11: a guest function suspended across a yield. The next probe is
+whether the resumed `t1`/`t4`/`s1`/`s3` at `0x100f800`/`0x100f418` match the values the MIPS would
+have had, i.e. whether the resume path re-materialises the copy state correctly.
+
 
 

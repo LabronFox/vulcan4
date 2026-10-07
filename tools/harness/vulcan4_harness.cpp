@@ -2325,6 +2325,24 @@ int main(int argc, char *argv[])
                           << " n=" << functionsEntered << std::endl;
             }
         }
+        // W229r. IS THE DECODER FUN_0100F390 RESUMED at an interior pc (a yield)? Log arrivals in
+        // [0x100f390,0x100f8c8) that are NOT the entry. OFF unless VULCAN4_W229_DRES.
+        {
+            static const bool s_w229dresOn = (std::getenv("VULCAN4_W229_DRES") != nullptr);
+            static int s_w229dresN = 0;
+            if (s_w229dresOn && s_w229dresN < 60 && ctx.pc >= 0x100f390u && ctx.pc < 0x100f8c8u
+                && ctx.pc != 0x100f390u)
+            {
+                ++s_w229dresN;
+                std::cout << "VULCAN4 W229 DRES pc=" << toHex(ctx.pc)
+                          << " ra=" << toHex(getRegU32(&ctx, 31))
+                          << " sp=" << toHex(getRegU32(&ctx, 29))
+                          << " s1=0x" << toHex(getRegU32(&ctx, 17))
+                          << " t1=0x" << toHex(getRegU32(&ctx, 9))
+                          << " prev=" << (lastResolvedPcValid ? toHex(lastResolvedPc) : std::string("NONE"))
+                          << std::endl;
+            }
+        }
         // W229. SHAPE-A DERail: the main thread resumes sub_01008C50 at label 0x1009004 (the merge
         // call's fallthrough) and its epilogue restores $ra from sp+0x40 = 0. Probe that slot.
         // OFF unless VULCAN4_W229_ARR.

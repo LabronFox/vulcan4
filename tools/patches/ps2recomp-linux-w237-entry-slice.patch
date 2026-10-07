@@ -1,0 +1,55 @@
+diff --git a/ps2xRecomp/src/lib/ps2_recompiler.cpp b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+index b4ee06f..98ce61f 100644
+--- a/ps2xRecomp/src/lib/ps2_recompiler.cpp
++++ b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+@@ -1250,14 +1250,48 @@ namespace ps2recomp
+                         }
+                     }
+                 }
++                std::vector<std::pair<uint32_t, uint32_t>> reachRanges;
++                for (uint32_t r : reach)
++                {
++                    auto b = bounds.find(r);
++                    if (b != bounds.end())
++                    {
++                        reachRanges.push_back({r, b->second});
++                    }
++                }
++                std::sort(reachRanges.begin(), reachRanges.end());
++                auto inReachableRange = [&](uint32_t a)
++                {
++                    auto it = std::upper_bound(reachRanges.begin(), reachRanges.end(),
++                                               std::make_pair(a, 0xFFFFFFFFu));
++                    if (it == reachRanges.begin())
++                    {
++                        return false;
++                    }
++                    --it;
++                    return a >= it->first && a < it->second;
++                };
+                 const size_t before = m_functions.size();
+                 m_functions.erase(
+                     std::remove_if(m_functions.begin(), m_functions.end(),
+                                    [&](const Function &f)
+                                    {
+                                        const bool codish = f.isRecompiled && !f.isStub && !f.isSkipped;
+-                                       return codish && !reach.contains(f.start)
+-                                              && !m_entryPointHintStarts.contains(f.start);
++                                       if (!codish)
++                                       {
++                                           return false;
++                                       }
++                                       if (reach.contains(f.start) || m_entryPointHintStarts.contains(f.start))
++                                       {
++                                           return false;
++                                       }
++                                       // Keep resume (entry_) functions that live INSIDE a reachable
++                                       // function; their slices are now bounded by the FULL boundary set.
++                                       if (isEntryFunctionName(f.name) && inReachableRange(f.start))
++                                       {
++                                           return false;
++                                       }
++                                       return true;
+                                    }),
+                     m_functions.end());
+                 std::ostringstream msg;

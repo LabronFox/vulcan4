@@ -1,13 +1,14 @@
 # VULCAN 4 — STATUS
 
-**As of 2026-10-07 (dish W252).** Rewritten, not amended. Every number below names the log, commit or
+**As of 2026-10-08 (dish W273).** Rewritten, not amended. Every number below names the log, commit or
 command that produced it. If a line has no evidence, it is not here.
 
 **TL;DR for a stranger:** GT4's own machine code is translated ahead of time (19,403/19,403 entry
-points), it **executes with no BIOS anywhere**, and the loader gets the disc's `CORE.GT4` payload all
-the way to a digest check. It fails that check by **one wrong byte in our own DEFLATE decoder**, and
-that is the whole remaining distance to the engine image. **G1 — first boot — is the wall.** No part
-of the game renders; no part of it plays.
+points) and **executes with no BIOS anywhere**, and the loader now places the disc's `CORE.GT4` engine
+image into RDRAM `0x00100000..0x00617A14` **byte-perfect** — verified whole-image against the disc's
+own zlib decoder, 0 mismatches in 5,339,668 bytes. The re-exec that would *enter* that image
+(`ExecPS2`) never fires: the loader parks on a semaphore nobody signals. **G1 — first boot — is the
+wall, and it is now one signal wide.** No part of the game renders; no part of it plays.
 
 ---
 
@@ -17,39 +18,41 @@ of the game renders; no part of it plays.
 |---|---|
 | **The recompiler emits every entry point** | W251: `check_engine_symbols.py` (independent of the recompiler's own report) → `csv=19403 emitted=19404 matched=19403`. The +1 is the ELF entry `0x00100008`, named LOUD. Commit `91e20a0`. |
 | **GT4's code executes, no BIOS** | `VULCAN4 BOOT REPORT functions_entered=3740 true_guest_entries=1529872 halt=stuck_in_syscall bios_files=0 frames_presented=1142` — `/mnt/ssd/vulcan4-build/run/w252-dump.log`. The harness has **no BIOS loading path at all**. |
-| **The engine image is entered ZERO times** | Every boot log to date: `[Dispatch] target_pc` inside `0x00100000..0x00617A14` = 0. The engine is not running; the loader is. |
+| **The engine image IS placed, byte-perfect** | W273 (`5774b00`): `VULCAN4_RDRAM_DUMP=00100000:517A14` vs `zlib.decompressobj(-15)` over `CORE.GT4[6:]` → **0 mismatches in 5,339,668 bytes** (the unpatched baseline was **all zeros**). Site: `W30BIGCOPY seq=27 op=memcpy src=0x12bf234 dst=0x100000 size=5339668 pc=0x10048c8`. |
+| **The engine is entered ZERO times** | The loader's generated code has **zero** `dispatchGuestBranch` targets in `0x00100000..0x00617A14`; the hand-off is `ExecPS2`, which never fires. Every boot log: 0 `[Dispatch]` targets in range. |
 | **The test suite is green** | 497/497, `bash .auto/verify-dish.sh` → exit 0. |
 | **The mechanical dish gate passes** | same run: `=== RESULT: MECHANICAL CLAIMS HOLD ===`. Picture gate (below) does not. |
-| **The picture is still the 2005 disclaimer** | `verify-menu.sh`: 3 colours, non-black fraction 0.1173 vs reference 14 / 0.1150 → structural match to the disclaimer. |
+| **The picture is still the 2005 disclaimer** | W273 `verify-menu.sh` on a **fresh** capture (`w273fix`, `frames_presented=350`): 14 colours / non-black 0.1173 vs the disclaimer's 14 / 0.1150 → structural match. |
 | **The GS rasterises primitives and samples textures** | G2.4; `bash tools/gs/build_gs_probe.sh` → 37,275 distinct colours, PSMCT32 + PSMT8/CLUT textures through real GIF REGLIST packets. *(Not re-run for this rewrite.)* |
 | **The project cross-compiles to ARM64** | commit `5509151`; `docs/ANDROID-FEASIBILITY.md`. *(Not re-run for this rewrite.)* |
 
 ---
 
-## The wall — G1, and it is now one byte wide
+## The wall — G1: the image is placed, and the hand-off never fires
 
-The loader reads `cdrom0:\CORE.GT4;1` (`fd=5`, 2,020,861 B), extracts the container
-(6-byte header + **raw DEFLATE**, `wbits=-15` — the reference `zlib.decompressobj(-15)` on
-`CORE.GT4[6:]` yields exactly the container's `u24@2`), and builds the engine image
-`0x00100000..0x00617A14` (size `0x517A14`). **The fio read and the container walk are correct —
-proven against hardware.** The decode is not.
+The loader reads `cdrom0:\CORE.GT4;1` (`fd=5`, 2,020,861 B), walks the container (6-byte header +
+**raw DEFLATE**, `wbits=-15`) and copies the engine image `0x00100000..0x00617A14` (size `0x517A14`).
+**The image is now placed byte-perfect, verified whole-image against the disc's own decoder** — and
+the loader still never hands off.
 
-| Measured | Value |
+| Measured (W273, `5774b00`) | Value |
 |---|---|
-| first differing byte | payload offset `0xD521C` = engine **`0x001D51EC`** |
-| hardware vs ours there | `0x7C` (`7c 00 45 8c`) vs `0x2D` |
-| extent | **11,365 of 6,118,856** bytes, 517 runs, span `0xD521C..0xD80B1` |
-| mechanism | hardware copies **12 B at distance `0x18`**; ours copies **21 B at `0x48`** — a DEFLATE match-copy error, writer `FUN_0100F390` (pc `0x100F800`) |
-| consequence | SHA-512 digest at `0x1004748` = ours `0x893d7a82` vs the game's `0x4bb5e6bf` → `FUN_01004500` false → guest spins in the fail-trap `0x01000638` (388/409 entries) instead of `ExecPS2` |
+| engine image vs the disc's zlib decode | **0 mismatches in 5,339,668 bytes** — `VULCAN4_RDRAM_DUMP=00100000:517A14` vs `zlib.decompressobj(-15)` over `CORE.GT4[6:]` |
+| the unpatched baseline | **all zeros — 0 of 5,339,668 bytes placed** (engine `0x00100008` reads `00`; the disc says `28`) |
+| placement site | `W30BIGCOPY seq=27 tid=2 op=memcpy src=0x12bf234 dst=0x100000 size=5339668 pc=0x10048c8` |
+| cause of the baseline zeroes | the **driver's frame selection** (a frozen shadow) — not the decode, not the copy; the harness `liveFrame` fix **alone** yields 0 mismatches |
+| the hand-off that never runs | `ExecPS2` (re-exec into the engine at entry `0x100008`; handler `vulcan4_harness.cpp:2706`) — **0 fires** |
+| why nothing else can enter the engine | the loader's generated code has **zero** `dispatchGuestBranch` targets in `0x00100000..0x00617A14`; `0x00100008` does not occur in it (static fact) |
+| where the loader parks instead | main thread on `sema#7`, `pc=0x0101f468`, `woken=0`; `sce_SignalSema` `a0` = 5, 6, 6, 2, 4, 5 — **never 7**; tid2 on `sleep#0` at `0x0101f348` |
+| best lead | `VULCAN 4 LIMITATION: syscall 0x5b override handler 0x80075000 has no generated function` — **6×** |
 
-**A/B control that closes the diagnosis:** inject the hardware blob (`VULCAN4_W229_ORACLE`) and the
-fail-trap is taken **0** times; `run/w252-orc.log` reaches
-`VULCAN4 EXECPS2 -> unified resolve entry=0x00100008 (engine 0x00100008,0x00617a14)` and halts
-`guest_blocked pc=0x005ad8c8`. **The engine does start when the blob is right — the decode is the sole
-loader blocker, and the fix is W253's work.**
+**The next dish is the wakeup, not the image:** find who should `SignalSema(7)` — a dropped signal, or
+an `intc`/interrupt delivery (`intr_queued=93 intr_run=97 irq_attach=0 irq_done=0 pending_hi=1`).
+The W252 blob-injection A/B survives on the record in [`docs/W252-RESULTS.md`](W252-RESULTS.md) as what
+was seen with the instruments of the day; its conclusion is retracted by the W273 banner there.
 
-Acceptance (architect, T2 FINAL): our dump vs `w229-oracle.bin` = 0 differing bytes → ≥1 `[Dispatch]`
-target in the engine range, `bios_files=0` → `verify-menu.sh` exit 0 → `verify-dish.sh` exit 0.
+**Success (unchanged):** `ExecPS2` reaches `0x00100008` → ≥1 `[Dispatch]` target inside
+`0x00100000..0x00617A14` with `bios_files=0` → `verify-menu.sh` exit 0 → `verify-dish.sh` exit 0.
 
 ---
 
@@ -69,7 +72,7 @@ target in the engine range, `bios_files=0` → `verify-menu.sh` exit 0 → `veri
 | Goal | State | What it is |
 |---|---|---|
 | G0 | ✅ | toolchain, disc map, function anatomy, complete recompiler output, clean-room reproduce |
-| **G1 — first boot** | ⏳ **the wall** | engine emitted 19,403/19,403 but entered 0 times; blocker named to one byte (above); fix = W253 |
+| **G1 — first boot** | ⏳ **the wall** | engine emitted 19,403/19,403 **and its image placed byte-perfect**; still entered 0 times — `ExecPS2` never fires, loader parked on `sema#7` (above) |
 | G2 — a picture | 🟡 | GS layer draws and rasterises (our own probe, not the game); the game's screen is still the disclaimer |
 | G3 — 3D (VU1) | ⬜ | plan in `docs/VU1-PLAN.md`; nothing driven by a guest |
 | G4 — playable | ⬜ | menus, a race you can drive, audio from the disc, saves |
@@ -109,6 +112,10 @@ proof that it is sound — not a game.
 - `verify-dish.sh` reads the newest `$B/run/*.log`, which is a **seat's** log when a seat is running;
   its `halt=` line is "newest boot on the box", not the gate's own boot.
 - The `[Dispatch]` printout is capped at **n=400**; absence past that is the cap, not evidence.
+- W252's headline ("the DEFLATE decode is the sole loader blocker") is **retracted**: W273's
+  whole-image A/B showed the baseline engine region is **all zeros** and that a *driver*
+  frame-selection fix alone makes it byte-perfect. The buffer W252's probes diffed was not the
+  finished image. [`docs/W273-RESULTS.md`](W273-RESULTS.md) supersedes it.
 - Earlier wrong claims stay on the record rather than being deleted: the `-0x01000000` memory-map bias
   that manufactured three goals' worth of decoy (removed in G1.8); the `FindAddress` scan-cost bug; and
   a gate that read the three *oldest* logs. A measurement that was itself broken is worth more written

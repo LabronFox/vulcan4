@@ -1,5 +1,13 @@
 # W252 — loader→engine handoff — acceptance criteria FINAL (T2) · Tracks A/B/C/D closed
 
+> **⚠ SUPERSEDED 2026-10-08 (W273).** This dish concluded the DEFLATE **decode** was the sole loader
+> blocker (a byte divergence at payload `0xD521C`). W273's whole-image A/B measured the finished RDRAM
+> and found the baseline engine region **all zeros** (`0 / 5,339,668` bytes placed), made byte-perfect
+> by a **driver frame-selection** fix alone (`0 mismatches` vs the disc's own zlib decode).
+> **The defect was the driver, not the decode.** The measurements below are kept because they are what
+> was seen with the instruments of the day; the conclusion is retracted. Current state:
+> [`docs/W273-RESULTS.md`](W273-RESULTS.md).
+
 Dish: make the loader's DEFLATE decode of CORE.GT4 byte-identical to hardware so GT4's engine code
 is actually entered. W251: emit 19,403/19,403 but the engine is entered **zero** times. Track A
 (measurer, oracle) pinned it: the loader reads CORE.GT4 (`fd=5`, 2,020,861 B) and extracts the

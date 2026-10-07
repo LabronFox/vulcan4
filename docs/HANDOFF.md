@@ -38,6 +38,17 @@ the thread stack. Runtime only (`EeScheduler.cpp`/`ps2_runtime.cpp`), no `.h`, n
 
 **Suite unchanged.** No fix landed. Menu not reached.
 
+**W229 UPDATE (§17–§22, latest):** the freeze root is now pinned to a **decompressed-blob corruption**.
+GT4 hashes its 6 MB decompressed blob (`0x12bf100`) and hangs when the hash is wrong. A full RAM dump
+(PCSX2 DebugServer socket, newline-JSON `read_memory`) proved the compressed input is **byte-identical**
+and ours' blob differs in **exactly one contiguous ~12 KB run** (`0xD521C..0xD80B2`). The writer is the
+DEFLATE Huffman decoder `FUN_0100F390`, and that word is written **twice** — once correct
+(`length 0xc, distance 0x18`, `v0=0x7c`) then overwritten (`length 0x15, distance 0x48`, `v0=0x2d`) at
+the **same destination** `t1=0x1394420`. A linear DEFLATE decoder never repeats a destination, so the
+decoder is **re-processing a position** — it is yielded/resumed at interior pcs (`0x100f800`,
+`0x100f418`, `VULCAN4_W229_DRES`). Next: dump the decoder's resume state at `0x100f800` and find why a
+position is decoded twice. Full details `docs/W229-RESULTS.md` §17–§22; probes all OFF by default.
+
 **RESULT OF THE FIX (W229 §9-§11):** the merge inputs now match hardware **byte-for-byte**
 (`count=0x20`, `w0=0x3bace481 w1=0x8259142d` / `0xc4531b7f 7da6ebd2`) and the 63M-iteration spin at
 `0x01005890` is **GONE**. Root of that family: our async-callback stacks were reserved from

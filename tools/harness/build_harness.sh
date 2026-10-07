@@ -147,7 +147,13 @@ if [ "$REBUILD" = "1" ]; then
 fi
 
 FFMPEG=$(pkg-config --libs libavcodec libavformat libavutil libswresample libswscale)
-nice -n 10 g++ -o vulcan4_harness harness.o register_functions.o ps2_recompiled_functions.o \
+# W240. The runtime-loaded ENGINE image (second recompilation target) links BESIDE the loader. Its
+# objects come from the bounded-TU emit (recomp_engine_small) and use DISTINCT table symbols.
+ENGINE_OBJS=""
+for o in "$B"/recomp_engine_small/ps2_recompiled_functions_*.o "$B"/recomp_engine_small/register_functions.o; do
+    [ -f "$o" ] && ENGINE_OBJS="$ENGINE_OBJS $o"
+done
+nice -n 10 g++ -o vulcan4_harness harness.o register_functions.o ps2_recompiled_functions.o $ENGINE_OBJS \
   "$B/ps2xRuntime/libps2_runtime.a" "$B/ps2xIOP/libps2_iop.a" \
   "$B/_deps/raylib-build/raylib/libraylib.a" $FFMPEG -lpthread -ldl -lm -lrt -lX11
 

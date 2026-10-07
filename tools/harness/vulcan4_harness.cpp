@@ -59,6 +59,13 @@ extern std::atomic<uint64_t> &guestFrameCounter() noexcept;
 
 #include <ps2_recompiled_functions.h>
 
+// W240. The runtime-loaded ENGINE image has its own function table with DISTINCT symbols
+// (emitted via PS2RECOMP_TABLE_SYMBOL). The driver switches to it on the ExecPS2 relaunch.
+extern const uint32_t g_ps2EngineFunctionTableBase;
+extern const uint32_t g_ps2EngineFunctionTableEnd;
+extern const uint32_t g_ps2EngineFunctionTableSlotCount;
+extern PS2Runtime::RecompiledFunction g_ps2EngineFunctionTable[];
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -1587,9 +1594,10 @@ int main(int argc, char *argv[])
     runtime.eeScheduler().setDriverAdvancesSchedulerContext(true);
 
     const uint32_t entryPoint = ctx.pc;
-    const uint32_t tableBase = g_ps2RecompiledFunctionTableBase;
-    const uint32_t tableEnd = g_ps2RecompiledFunctionTableEnd;
-    const uint32_t tableSlots = g_ps2RecompiledFunctionTableSlotCount;
+    uint32_t tableBase = g_ps2RecompiledFunctionTableBase;
+    uint32_t tableEnd = g_ps2RecompiledFunctionTableEnd;
+    uint32_t tableSlots = g_ps2RecompiledFunctionTableSlotCount;
+    PS2Runtime::RecompiledFunction *activeTable = g_ps2RecompiledFunctionTable;
 
     // The PS2 ABI hands the entry point $sp pointing near the top of RDRAM and $a0/$a1 zeroed.
     // The entry block reads *0x01041800 into a0, so $gp and the data segment are already in
@@ -2263,8 +2271,29 @@ int main(int argc, char *argv[])
             break;
         }
 
-        const uint32_t slot = (ctx.pc - tableBase) >> 2;
-        if (slot >= tableSlots || g_ps2RecompiledFunctionTable[slot] == nullptr)
+        uint32_t slot = (ctx.pc - tableBase) >> 2;
+        if (slot >= tableSlots || activeTable[slot] == nullptr)
+        {
+            // W240. CROSS-IMAGE JUMP: the pc may belong to the OTHER image's table (engine <->
+            // loader). Resolve it in both directions before declaring the guest lost.
+            PS2Runtime::RecompiledFunction *alt =
+                (activeTable == g_ps2RecompiledFunctionTable) ? g_ps2EngineFunctionTable
+                                                              : g_ps2RecompiledFunctionTable;
+            const bool altIsEngine = (alt == g_ps2EngineFunctionTable);
+            const uint32_t altBase = altIsEngine ? g_ps2EngineFunctionTableBase : g_ps2RecompiledFunctionTableBase;
+            const uint32_t altEnd = altIsEngine ? g_ps2EngineFunctionTableEnd : g_ps2RecompiledFunctionTableEnd;
+            const uint32_t altSlots = altIsEngine ? g_ps2EngineFunctionTableSlotCount : g_ps2RecompiledFunctionTableSlotCount;
+            if ((ctx.pc & 3u) == 0u && ctx.pc >= altBase && ctx.pc < altEnd)
+            {
+                const uint32_t altSlot = (ctx.pc - altBase) >> 2;
+                if (altSlot < altSlots && alt[altSlot] != nullptr)
+                {
+                    tableBase = altBase; tableEnd = altEnd; tableSlots = altSlots; activeTable = alt;
+                    slot = altSlot;
+                }
+            }
+        }
+        if (slot >= tableSlots || activeTable[slot] == nullptr)
         {
             // NAMED, NEVER SILENT. Record the address, the analyzer's name if it has one, and
             // stop here rather than jumping into nothing.
@@ -2557,7 +2586,7 @@ int main(int argc, char *argv[])
         // the run grind on a parked thread.
         try
         {
-            g_ps2RecompiledFunctionTable[slot](rdram, &ctx, &runtime);
+            activeTable[slot](rdram, &ctx, &runtime);
         }
         catch (const EeDispatcherTransfer &)
         {
@@ -2651,18 +2680,37 @@ int main(int argc, char *argv[])
                 // guest image. GT4's loader passes entry=0x100008 (low RDRAM, the 0x100000 page),
                 // which is NOT in the ELF's PT_LOAD .text (0x1000000). The recompiler emits guest
                 // code from the ELF only, so it cannot execute runtime-loaded/relocated code.
-                const uint32_t xSlot = (xEntry - tableBase) >> 2;
-                const bool xMapped = (xEntry & 3u) == 0u && xEntry >= tableBase && xEntry < tableEnd
-                                     && xSlot < tableSlots
-                                     && g_ps2RecompiledFunctionTable[xSlot] != nullptr;
+                auto entryMapped = [&](uint32_t b, uint32_t e, uint32_t n,
+                                        PS2Runtime::RecompiledFunction *t, uint32_t a)
+                {
+                    if ((a & 3u) != 0u || a < b || a >= e)
+                    {
+                        return false;
+                    }
+                    const uint32_t s = (a - b) >> 2;
+                    return s < n && t[s] != nullptr;
+                };
+                bool xMapped = entryMapped(tableBase, tableEnd, tableSlots, activeTable, xEntry);
+                if (!xMapped && entryMapped(g_ps2EngineFunctionTableBase, g_ps2EngineFunctionTableEnd,
+                                            g_ps2EngineFunctionTableSlotCount, g_ps2EngineFunctionTable,
+                                            xEntry))
+                {
+                    tableBase = g_ps2EngineFunctionTableBase;
+                    tableEnd = g_ps2EngineFunctionTableEnd;
+                    tableSlots = g_ps2EngineFunctionTableSlotCount;
+                    activeTable = g_ps2EngineFunctionTable;
+                    xMapped = true;
+                    std::cout << "VULCAN4 EXECPS2 -> engine table [" << toHex(tableBase) << ","
+                              << toHex(tableEnd) << ") entry=" << toHex(xEntry) << std::endl;
+                }
                 if (!xMapped)
                 {
                     std::cerr << "VULCAN 4 LIMITATION: ExecPS2 (EE syscall 0x07) entry "
                               << toHex(xEntry) << " is outside the recompiled guest image ["
                               << toHex(tableBase) << "," << toHex(tableEnd) << ") — GT4's loader "
                                  "re-executes into low RDRAM (the 0x100000 page), which is not part "
-                                 "of the ELF's PT_LOAD .text; the recompiler emits ELF code only, so "
-                                 "Stage 1 cannot execute runtime-loaded code." << std::endl;
+                                 "of the ELF's PT_LOAD .text and not in the engine table either; "
+                                 "the engine image was not recompiled for this entry." << std::endl;
                     runtime.clearStop();
                     haltReason = "execps2_unmapped_entry";
                     haltPc = xEntry;

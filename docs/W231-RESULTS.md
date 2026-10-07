@@ -70,3 +70,65 @@ breakpoints did not fire before the guest passed the loader). The low-RDRAM exec
 data-derived entry are both directly measured; the equivalence of hardware's `a0` is inferred from
 (the same game code) + (the oracle-verified blob bytes) and should be confirmed by a clean-breakpoint
 run before any second-image recompiler work is committed.
+
+## Container map (W231c) — MEASURED, not guessed
+
+`FUN_0101E81C` is a plain `memcpy(dest=param1, src=param2, len=param3)` (Ghidra decompile).
+`FUN_010047C0` walks the decoded blob as a member table:
+
+    u32 count = LE32(blob+0)        = 3
+    u32 entry = LE32(blob+4)        = 0x00100008
+    p = blob
+    repeat count times:
+        dest = LE32(p+8);  size = LE32(p+0xc);  src = p+0x10
+        memcpy(dest, src, size)
+        p = p + 8 + size
+
+Emulating that over `/mnt/ssd/vulcan4-build/w229-oracle.bin` (6,118,856 bytes) yields:
+
+| # | dest | src (blob off) | size | blob data range |
+|---|------|----------------|------|-----------------|
+| 0 | 0x006179FC | 0x10 | 0x18 | 0x10..0x28 |
+| 1 | **0x00100000** | **0x30** | **0x517A14** | **0x30..0x517A44** |
+| 2 | 0x00617A80 | 0x517A4C | 0xBE37C | 0x517A4C..0x5D5DC8 |
+
+`0x100000 + 0x517A14 = 0x617A14`, matching the header end field `0x006179FC` to within 0x18 (member 0
+is a 24-byte footer written at `0x6179FC..0x617A14`, i.e. the image's very end). Member 2 loads a
+second region at `0x617A80` (after the image). So the whole 6,118,856-byte blob is consumed exactly
+(final `p = 0x5D5DC0`, blob length `0x5D5DC8`).
+
+## Hardware verification — GATE PASSED, 100.0000%
+
+PCSX2 (same disc) via the DebugServer socket (`127.0.0.1:21512`, `{"cmd":"read_memory",...}`), with the
+guest paused **after** the loader had run. Dumped RDRAM `0x00100000` length `0x517A14` in 64 KB chunks
+(5,339,668 bytes) and compared byte-for-byte with `blob[0x30:0x30+0x517A14]`:
+
+```
+match 100.0000%   num diff bytes: 0   IDENTICAL
+```
+
+So **we hold the exact engine image**: `blob[0x30:0x517A44]` → `0x100000`, entry `0x100008`.
+
+## The image is CODE (measured on hardware)
+
+Disassembly at the entry and beyond (DebugServer, hardware memory):
+```
+0x00100008  padduw at,zero,zero      ; clear ALL GPRs (at..t8 ...), 16+ instructions
+0x00100080  mthi1 zero / mtlo zero / mtlo1 zero / mtsah / mtc1 f00..f31
+0x00100200  nop; lui v0,0x006D; addiu v0,0x6380; lw a0,(v0); jal 0x00107F08;
+            addiu a1,v0,4; j 0x005A3140; dmove a0,v0
+```
+i.e. a crt0 that zeroes registers/MDU/FPU then jumps into the engine (`j 0x005A3140`, and hardware's
+paused PC was `0x005A47B0` inside that region). The SCUS ELF `.text` at `0x01000000` is meanwhile all
+zeros — confirming the ELF is a loader and the engine runs from low RDRAM.
+
+## Step 3 (next, bounded) — the engine as a second recompilation target
+
+The gate is green, so the engine image qualifies as a second target: **base `0x00100000`, entry
+`0x00100008`**, disjoint from the loader ELF (`0x000100000..0x0617A14` vs `0x01000000..0x0102DC54`),
+so one function table can hold both. Work required (not done in this review): wrap
+`blob[0x30:0x517A44]` in a synthetic ELF (PT_LOAD vaddr 0x100000, `e_entry` 0x100008) on the SSD,
+recompile it with `ps2xRecomp` (symbol-less → scanner/discovery path), emit its functions into the
+same generated unit, and make the ExecPS2 driver relaunch dispatch into the recompiled engine instead
+of raising `execps2_unmapped_entry`. Until that lands, the **loud `VULCAN 4 LIMITATION` stays** —
+we hold the image but do not yet execute it. No code was changed in this review.

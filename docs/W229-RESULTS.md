@@ -491,5 +491,26 @@ The diagnostic knob `VULCAN4_W229_NOYIELD` (force no checkpoint yields **only** 
 **deadlocks the boot** (the decoder must yield for the rest of the system to run), so it cannot be used
 as-is without a scoped resume.
 
+## 22. TWO MATCHES AT THE SAME DESTINATION — the decoder re-processes one output position
+
+With `s1`/`s2`/`s3` now printed (`s2 = s1+s3` = the match source end, so `s1`=src, `s3`=length, `t1`=dst,
+`distance = t1 - s1`):
+
+```
+call 11: t1=0x1394420 s1=0x1394408 s3=0xc  -> length 12, distance 0x18,  v0=0x7c  (correct)
+call 49: t1=0x1394420 s1=0x13943d8 s3=0x15 -> length 21, distance 0x48,  v0=0x2d  (wrong)
+```
+
+**Both writes have the same destination `t1=0x1394420`** but different `(length, distance)`. A linear
+DEFLATE decoder never writes the same output position twice, so the decoder **re-processes one output
+position** — consistent with the §20 finding that `FUN_0100F390` is yielded and resumed at interior
+pcs. The first pass produces the hardware-correct bytes; a later pass, with different match
+parameters (wrong bit/decode state), overwrites a ~12 KB run.
+
+So the fix target is the **resume**: when `FUN_0100F390` is re-entered at an interior pc
+(`0x100f800`/`0x100f418`) the decode state (bit accumulator/position and Huffman window) must continue
+exactly, and it does not. Next: dump the stream's bit state (`param_1[0..2]`) at every decoder resume
+and compare to a straight-through run.
+
 
 

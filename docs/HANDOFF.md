@@ -49,6 +49,17 @@ decoder is **re-processing a position** — it is yielded/resumed at interior pc
 `0x100f418`, `VULCAN4_W229_DRES`). Next: dump the decoder's resume state at `0x100f800` and find why a
 position is decoded twice. Full details `docs/W229-RESULTS.md` §17–§22; probes all OFF by default.
 
+**W229 UPDATE (§23–§26, most recent):** the corruption is **byte-identical across runs** (two dumps,
+`cmp` → 0), so it is a **deterministic** defect — a recompiler/table/decode bug, NOT a yield race (the
+scheduler yields are nondeterministic). PCSX2 watchpoint on `0x1394420`: hardware writes it **once**
+(after the 16 MB memset); ours writes it **twice** — one extra decoder write, vs console. Emitted
+`sub_0100F390` was spot-checked against the live MIPS (`0x100f390..0x100f608`) and matches across the
+Huffman tree walk, the `lwu` refill (correctly zero-extended), `dsllv`/`dsrlv` (0x3F-masked), the
+literal/window `sb`s and both branch-likely loop edges — so the defect is not in those. Remaining
+candidates: the driver `FUN_0100F8C8`'s Huffman-table build (`0x1010900..0x1010a00`) or a deterministic
+runtime path. Also **`verify-menu.sh` is FALSE-PASSING**: a fresh 16-colour disclaimer capture exits 0
+(diff 13.3 vs a mismatched reference), so it must not be trusted as the sole decider.
+
 **RESULT OF THE FIX (W229 §9-§11):** the merge inputs now match hardware **byte-for-byte**
 (`count=0x20`, `w0=0x3bace481 w1=0x8259142d` / `0xc4531b7f 7da6ebd2`) and the 63M-iteration spin at
 `0x01005890` is **GONE**. Root of that family: our async-callback stacks were reserved from

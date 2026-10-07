@@ -554,5 +554,10 @@ stale snapshot; the reliable part is that the yields are real (`due=1`) and land
 why the copy-loop checkpoint is due every iteration (a perpetually-pending event / slice), and whether
 the resume at `0x100f800` actually re-executes the `sb`/`t1++`.
 
+**Hardware A/B (PCSX2 watchpoint on `0x1394420`, write):** the first hit is the big 16 MB memset
+(zeroing, `0x101ea1c`); after that the word is written **once more** — a single decoder write.
+Ours writes it **twice** (correct `0x7c`, then wrong `0x2d`). So our decoder makes one **extra** write
+that hardware does not: the re-process is confirmed against the console, not just inferred.
+
 
 

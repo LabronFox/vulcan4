@@ -1,0 +1,99 @@
+diff --git a/ps2xRecomp/src/lib/ps2_recompiler.cpp b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+index ab1ded9..f8565c3 100644
+--- a/ps2xRecomp/src/lib/ps2_recompiler.cpp
++++ b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+@@ -1167,6 +1167,94 @@ namespace ps2recomp
+ #endif
+             }
+ 
++            if (std::getenv("PS2RECOMP_REACHABLE_ONLY") != nullptr)
++            {
++                // W233. REACHABILITY SCOPING (tool change; OFF by default -> the loader is untouched).
++                // A symbol-less raw image makes the whole-image scan discover EVERY plausible prologue
++                // (GT4's engine: 18,903 functions / 527,553 resume points -> >200 MB TU that never
++                // finishes). Emit only the functions reachable from the ELF entry by direct J/JAL
++                // control flow; everything else stays out. Indirect-only targets must be re-added via
++                // entry_points if the guest needs them.
++                std::map<uint32_t, uint32_t> bounds; // recompilable start -> end
++                for (const auto &f : m_functions)
++                {
++                    if (f.isRecompiled && !f.isStub && !f.isSkipped)
++                    {
++                        bounds[f.start] = f.end;
++                    }
++                }
++                auto containing = [&](uint32_t a) -> std::optional<uint32_t>
++                {
++                    auto it = bounds.upper_bound(a);
++                    if (it == bounds.begin())
++                    {
++                        return std::nullopt;
++                    }
++                    --it;
++                    if (a < it->second)
++                    {
++                        return it->first;
++                    }
++                    return std::nullopt;
++                };
++                std::unordered_set<uint32_t> reach;
++                std::vector<uint32_t> work;
++                auto seedReach = [&](uint32_t a)
++                {
++                    if (const std::optional<uint32_t> c = containing(a))
++                    {
++                        if (reach.insert(*c).second)
++                        {
++                            work.push_back(*c);
++                        }
++                    }
++                };
++                seedReach(m_elfParser->getEntryPoint());
++                for (uint32_t seed : m_entryPointHintStarts)
++                {
++                    seedReach(seed);
++                }
++                while (!work.empty())
++                {
++                    const uint32_t s = work.back();
++                    work.pop_back();
++                    auto it = m_decodedFunctions.find(s);
++                    if (it == m_decodedFunctions.end())
++                    {
++                        continue;
++                    }
++                    for (const auto &ins : it->second)
++                    {
++                        if (ins.opcode != OPCODE_J && ins.opcode != OPCODE_JAL)
++                        {
++                            continue;
++                        }
++                        const uint32_t t = ((ins.address + 4u) & 0xF0000000u) | (ins.target << 2);
++                        if (const std::optional<uint32_t> c = containing(t))
++                        {
++                            if (reach.insert(*c).second)
++                            {
++                                work.push_back(*c);
++                            }
++                        }
++                    }
++                }
++                const size_t before = m_functions.size();
++                m_functions.erase(
++                    std::remove_if(m_functions.begin(), m_functions.end(),
++                                   [&](const Function &f)
++                                   {
++                                       const bool codish = f.isRecompiled && !f.isStub && !f.isSkipped;
++                                       return codish && !reach.contains(f.start)
++                                              && !m_entryPointHintStarts.contains(f.start);
++                                   }),
++                    m_functions.end());
++                std::ostringstream msg;
++                msg << "W233 reachable-only: kept " << m_functions.size() << " of " << before
++                    << " functions (entry=0x" << std::hex << m_elfParser->getEntryPoint() << std::dec << ")";
++                m_reporter.progress(msg.str());
++            }
++
+             discoverAdditionalEntryPoints();
+ 
+             if (failedCount > 0)

@@ -582,5 +582,57 @@ candidate is the **Huffman-table build in the driver `FUN_0100F8C8`** (`0x101090
 `0x120`-entry code-length tables at `sp+0x500`/`sp+0x574`): a single wrong table entry would deterministically
 mis-decode exactly the symbols that use it, which matches the single ~12 KB bad run.
 
+## 27. W230 — THE ORACLE PROVES THE HASH COMPARE IS THE BLOCKER (boot advances)
+
+MEASURED 2026-10-07. Caine built the exact console payload to `/mnt/ssd/vulcan4-build/w229-oracle.bin`
+(6,118,856 bytes = `0x5d5dc8`, sha256 `7728b0eb540bc690e415d10c44a0444cb9f4815be5fa7e536b43c4647ebe41a0`).
+
+The decoder driver's real call order inside `FUN_01004500` (measured from the recompiled table + the
+`VULCAN4_W229_FAIL` probe), which corrects an earlier assumption that `FUN_0100F8C8` runs *before*
+`FUN_01004500`:
+
+```
+0x100451c -> FUN_01004308 -> (0x10043a4) FUN_0100F8C8            [decode the 6 MB blob]
+0x1004688 -> FUN_01004448(auStack_60, 0x12bf204, 0x5d5dc8)        [SHA-512 of the blob]
+0x1004748 -> FUN_01005870(a0=expected 4bb5e6bf.., a1=ours)        [compare]
+```
+
+So the decode runs **inside** `FUN_01004500`; the LAST moment the digest can still change is the
+`FUN_01004448` call site `0x1004688` (`0x01004748` is the compare, already after hashing — injecting
+there would be too late).
+
+New probe `VULCAN4_W229_ORACLE=<path>` (OFF by default; unset is byte-for-byte today's behaviour)
+memcpy's the file over the decoded blob at `0x1004688`, then logs ONE line at the compare. With it set:
+
+```
+[w230:oracle] copy dst=0x12bf204 len=0x5d5dc8 injected=1 hashWord0=0x4bb5e6bf
+```
+
+`0x4bb5e6bf` is exactly the expected digest's first word (a0), i.e. the hash now **MATCHES**.
+
+RESULT: the boot **ADVANCES PAST the hash compare**. The loader fail-loop `0x1000638` is **not** taken
+(0 occurrences vs 1 in the no-oracle control) and the run reaches a **NEW wall**:
+
+```
+[guest-branch:missing-target] kind=DirectJump op=J source=0x1028bb0 target=0x101f040 pc=0x101f040
+VULCAN4 HARNESS detail=no generated function at this pc pc=0x0101f040
+```
+
+`0x101f040` is a table of 16-byte syscall-wrapper stubs (`addiu v1,N; syscall; jr ra; nop`, bytes
+`04 00 03 24 0C 00 00 00 08 00 E0 03 00 00 00 00` then N=5,6,7…) that the recompiler did **not** emit
+(0 hits in `register_functions.cpp` and `ps2_recompiled_functions.cpp`); it is not a recompiled
+function entry, so a direct `J` into it halts.
+
+CONTROL (no oracle): `halt=stuck_in_syscall`; the loader fail-loop `0x1000638` is taken once.
+
+CAPTURE: `/mnt/ssd/vulcan4-build/run/w229-oracle-capture.png`, window `0x2e00007` (640x448), **16
+colours** — still the 2005 Sony disclaimer. (An earlier capture grabbed the pre-present blank frame,
+solid magenta = `GenImageColor(...MAGENTA)` at `ps2_runtime.cpp:502`; the visible game window is the
+child titled `VULCAN 4 - …`, not the borderless 650x482 parent.)
+
+CONCLUSION: the hash compare is CONFIRMED as the sole loader blocker — a correct 6 MB blob makes the
+loader succeed and boot advances. The real fix remains the decoder's deterministic 12 KB corruption
+(§21–§26). The next wall *after* that fix is the unrecompiled syscall-stub table at `0x101f040`.
+
 
 

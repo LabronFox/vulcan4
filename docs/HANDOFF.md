@@ -1,3 +1,32 @@
+## 2026-10-07 · W230 (ORACLE injected) · the hash compare IS the loader blocker — boot ADVANCES · new wall named
+
+**GOAL:** past the disclaimer → menu. **Result:** boot now advances past the loader; screen still the
+disclaimer. Full write-up: `docs/W229-RESULTS.md` §27.
+
+**DID:** added `VULCAN4_W229_ORACLE=<path>` (runtime probe, OFF by default) that memcpy's the known-good
+payload `/mnt/ssd/vulcan4-build/w229-oracle.bin` (6,118,856 = `0x5d5dc8` bytes) over the decoded blob at
+`0x12bf204`, at the last moment the digest can change.
+
+**FOUND (measured):** the driver `FUN_01004500` runs the decoder *inside* itself, in this order —
+`0x100451c → FUN_01004308 → 0x10043a4 FUN_0100F8C8` (decode), `0x1004688 → FUN_01004448(auStack_60,
+0x12bf204, 0x5d5dc8)` (SHA-512), `0x1004748 → FUN_01005870(a0=expected, a1=ours)` (compare). So the
+injection point is `0x1004688`, not `0x01004748` (which is after hashing).
+
+- WITH oracle: `[w230:oracle] copy dst=0x12bf204 len=0x5d5dc8 injected=1 hashWord0=0x4bb5e6bf` — the
+  expected digest first word. The loader fail-loop `0x1000638` is NOT taken (0 vs 1) and boot reaches a
+  NEW wall: `[guest-branch:missing-target] kind=DirectJump op=J source=0x1028bb0 target=0x101f040`,
+  `detail=no generated function at this pc pc=0x0101f040` (functions_entered=3376, frames=307).
+- WITHOUT oracle (control): `halt=stuck_in_syscall`; fail-loop `0x1000638` taken once.
+- `0x101f040` is a table of 16-byte syscall-wrapper stubs (`addiu v1,N; syscall; jr ra; nop`) the
+  recompiler never emitted (0 hits in `register_functions.cpp`/`ps2_recompiled_functions.cpp`).
+- CAPTURE `/mnt/ssd/vulcan4-build/run/w229-oracle-capture.png` = window `0x2e00007` (640x448), 16
+  colours, the disclaimer. The earlier solid-magenta frame was the pre-present blank
+  (`GenImageColor(...MAGENTA)`, ps2_runtime.cpp:502); the real game window is the child titled `VULCAN 4 - …`.
+
+**NEXT:** (1) the real fix — the decoder's deterministic 12 KB corruption of the blob (§21–§26), so the
+hash passes without the oracle; (2) then the next wall is the unrecompiled syscall-stub table at `0x101f040`.
+**Suite unchanged.** No fix landed; menu not reached.
+
 ## 2026-10-06 · W229 (the filler is reached and correct; the INFLATE zeroes it) · no fix yet, culprit NAMED
 
 **GOAL:** past the disclaimer → menu. **Gate:** `.auto/verify-menu.sh`. **Result:** no picture change yet.

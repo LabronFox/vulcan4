@@ -1,0 +1,86 @@
+diff --git a/ps2xRecomp/src/lib/control_flow_analyzer.cpp b/ps2xRecomp/src/lib/control_flow_analyzer.cpp
+index ed7578d..e8f90e8 100644
+--- a/ps2xRecomp/src/lib/control_flow_analyzer.cpp
++++ b/ps2xRecomp/src/lib/control_flow_analyzer.cpp
+@@ -85,9 +85,24 @@ namespace ps2recomp
+             const Function *containingFn = findContainingExternalFunction(target);
+             if (!containingFn)
+             {
++                // W230. A direct J/JAL to executable code that is NOT inside any known
++                // function: an unclaimed gap that the symbol/analysis passes never
++                // covered (e.g. GT4's table of 16-byte syscall-wrapper stubs at
++                // 0x101F040, reached by `j func_101F040` at 0x1028BB0). Dropping it here
++                // left the target unregistered, so the emitted dispatch halted at runtime
++                // with `missing-target` / `no_generated_function`. Register it as an
++                // external entry so discoverAdditionalEntryPointsImpl() synthesizes a
++                // standalone guest function bounded by the next known function.
++                // Upstream: PS2Recomp silently ignored direct jumps into un-symbolised
++                // executable regions.
++                if (isExecutableAddress(target))
++                {
++                    result.externalEntryPoints.insert(target);
++                }
+                 return;
+             }
+ 
++
+             if (containingFn->start == function.start)
+             {
+                 return;
+diff --git a/ps2xRecomp/src/lib/ps2_recompiler.cpp b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+index 2438730..ab1ded9 100644
+--- a/ps2xRecomp/src/lib/ps2_recompiler.cpp
++++ b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+@@ -2042,6 +2042,12 @@ namespace ps2recomp
+             return best;
+         };
+ 
++        // W230. External jump targets that land in executable code NO known function decodes
++        // (e.g. GT4's 16-byte syscall-stub table at 0x101F040, reached by `j func_101F040`).
++        // They have no owning function to hang a resume point on and must be emitted as
++        // standalone guest functions, or the runtime halts at `missing-target`.
++        std::unordered_set<uint32_t> gapStandaloneTargets;
++
+         for (const auto &function : m_functions)
+         {
+             if (!function.isRecompiled || function.isStub || function.isSkipped)
+@@ -2077,6 +2083,10 @@ namespace ps2recomp
+                 const Function *owner = findContainingFunction(target);
+                 if (!owner)
+                 {
++                    // W230. No owner function decodes this target: an un-symbolised gap.
++                    // Synthesize it as a standalone guest function below. Upstream PS2Recomp
++                    // silently dropped it, which produced `missing-target` halts at runtime.
++                    gapStandaloneTargets.insert(target);
+                     continue;
+                 }
+ 
+@@ -2108,6 +2118,28 @@ namespace ps2recomp
+ 
+         m_codeGenerator->setResumeEntryTargets(m_resumeEntryTargetsByOwner);
+ 
++        // W230. Emit the un-owned gap targets as standalone guest functions (bounded by the
++        // next known function), using the real decoder.
++        if (!gapStandaloneTargets.empty())
++        {
++            const EntryDiscoveryStats gapStats = discoverAdditionalEntryPointsImpl(
++                m_functions,
++                m_decodedFunctions,
++                m_sections,
++                nullptr,
++                [this](Function &function)
++                { return decodeFunction(function); },
++                gapStandaloneTargets);
++            if (gapStats.discoveredCount > 0u)
++            {
++                m_reporter.recordAdditionalEntryPoints(gapStats.discoveredCount);
++                std::ostringstream msg;
++                msg << "synthesized " << gapStats.discoveredCount
++                    << " standalone gap entry point(s)";
++                m_reporter.progress(msg.str());
++            }
++        }
++
+         if (totalTargets > 0u)
+         {
+             m_reporter.recordAdditionalEntryPoints(totalTargets);

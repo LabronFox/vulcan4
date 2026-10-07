@@ -539,5 +539,20 @@ trusted as the sole decider — the menu is **not** reached (verified: fresh cap
 This is a gate/asset defect, not a product result: the real deliverable (a capture of GT4's own menu)
 is still absent.
 
+## 25. THE DECODER LIVELOCKS AT THE COPY LOOP — yields there with constant state
+
+`VULCAN4_W229_CK` now also logs when `eeCheckpointDue` returns **true** (a real yield) inside
+`FUN_0100F390`. The decoder yields **at `pc=0x100f800`** (the copy loop's `sb`) with `due=1` and a
+**constant** `(t1,s1,s3) = (0x12d400c, 0x12ce7dc, 0x1b)` across every one of the (first 200) yields.
+The checkpoint at the copy-loop back-edge (`0x100f864`) is therefore due on essentially every iteration,
+so the decoder suspends and is re-entered at `0x100f800` over and over without the copy advancing — a
+**livelock at the DEFLATE copy loop**. That is consistent with §22's finding that the same output
+position is written twice with different match parameters.
+
+Note: the CK/CKyield state is read from `runtime.cpu()` (a periodic copy), so the exact `t1` may be a
+stale snapshot; the reliable part is that the yields are real (`due=1`) and land on `0x100f800`. Next:
+why the copy-loop checkpoint is due every iteration (a perpetually-pending event / slice), and whether
+the resume at `0x100f800` actually re-executes the `sb`/`t1++`.
+
 
 

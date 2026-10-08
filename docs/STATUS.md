@@ -1,14 +1,17 @@
 # VULCAN 4 — STATUS
 
-**As of 2026-10-08 (dish W273).** Rewritten, not amended. Every number below names the log, commit or
-command that produced it. If a line has no evidence, it is not here.
+**As of 2026-10-08 (dish W275 / rungs R1–R3).** Rewritten, not amended. Every number below names the
+log, commit or command that produced it. If a line has no evidence, it is not here.
 
 **TL;DR for a stranger:** GT4's own machine code is translated ahead of time (19,403/19,403 entry
-points) and **executes with no BIOS anywhere**, and the loader now places the disc's `CORE.GT4` engine
+points) and **executes with no BIOS anywhere**, and the loader places the disc's `CORE.GT4` engine
 image into RDRAM `0x00100000..0x00617A14` **byte-perfect** — verified whole-image against the disc's
-own zlib decoder, 0 mismatches in 5,339,668 bytes. The re-exec that would *enter* that image
-(`ExecPS2`) never fires: the loader parks on a semaphore nobody signals. **G1 — first boot — is the
-wall, and it is now one signal wide.** No part of the game renders; no part of it plays.
+own zlib decoder, 0 mismatches in 5,339,668 bytes. The hand-off **now fires**: `ExecPS2` runs (rung
+R1), a dispatch miss inside the engine resolves through the engine's own table (rung R2), and the
+engine's SIF boot-ready poll — syscall `0x7A` `SifGetReg`, previously unwired and returning 0 forever —
+**exits** (rung R3). The engine now executes: **31 distinct engine-image code PCs**, `ee_cycle`
+**498 M** in a 15 s boot (`2,082 M` in 45 s). **G1 — first boot — is no longer "does anything run": it
+is the next unwired thing.** No part of the game renders; no part of it plays.
 
 ---
 
@@ -17,23 +20,26 @@ wall, and it is now one signal wide.** No part of the game renders; no part of i
 | Fact | Evidence (runnable / on disk) |
 |---|---|
 | **The recompiler emits every entry point** | W251: `check_engine_symbols.py` (independent of the recompiler's own report) → `csv=19403 emitted=19404 matched=19403`. The +1 is the ELF entry `0x00100008`, named LOUD. Commit `91e20a0`. |
-| **GT4's code executes, no BIOS** | `VULCAN4 BOOT REPORT functions_entered=3740 true_guest_entries=1529872 halt=stuck_in_syscall bios_files=0 frames_presented=1142` — `/mnt/ssd/vulcan4-build/run/w252-dump.log`. The harness has **no BIOS loading path at all**. |
+| **GT4's code executes, no BIOS** | `VULCAN4 BOOT REPORT functions_entered=10543 true_guest_entries=13252077 halt=stuck_in_syscall bios_files=0 frames_presented=848` — `/mnt/ssd/vulcan4-build/run/boot_w275r3.log` (15 s, probes off). 45 s: `functions_entered=10786 true_guest_entries=52847539 ee_cycle=2081907532` — `boot_w275r3long.log`. The harness has **no BIOS loading path at all**. |
 | **The engine image IS placed, byte-perfect** | W273 (`5774b00`): `VULCAN4_RDRAM_DUMP=00100000:517A14` vs `zlib.decompressobj(-15)` over `CORE.GT4[6:]` → **0 mismatches in 5,339,668 bytes** (the unpatched baseline was **all zeros**). Site: `W30BIGCOPY seq=27 op=memcpy src=0x12bf234 dst=0x100000 size=5339668 pc=0x10048c8`. |
-| **The engine is entered ZERO times** | The loader's generated code has **zero** `dispatchGuestBranch` targets in `0x00100000..0x00617A14`; the hand-off is `ExecPS2`, which never fires. Every boot log: 0 `[Dispatch]` targets in range. |
+| **The engine RUNS** | R1 `ExecPS2` fires (`ee_cycle=628916`, entry `0x00100008`); R2 lets `lookupFunction` fall through to `g_ps2EngineFunctionTable` → `No exact recompiled function` = **0**; R3 wires syscall `0x7A` → the SIF boot-ready poll **exits** (0x7A calls 195100 → **4**, `Unimplemented` 195117 → **17**). **31** distinct engine-image code PCs (`0x00100000..0x00617A14`), up from 27. |
+| **Two unwired syscalls remain, neither the wall** | `0x0B` — **16 calls**, `PC=0x101f0b8 RA=0x10183e0`, genuinely absent from the `Dispatcher.cpp` switch (v0 left 0). `0x07` — 1 call, is `ExecPS2`: implemented, special-cased in `System.cpp`, only *logs* as unimplemented. Both identical in the R2 baseline. |
 | **The test suite is green** | 497/497, `bash .auto/verify-dish.sh` → exit 0. |
 | **The mechanical dish gate passes** | same run: `=== RESULT: MECHANICAL CLAIMS HOLD ===`. Picture gate (below) does not. |
-| **The picture is still the 2005 disclaimer** | W273 `verify-menu.sh` on a **fresh** capture (`w273fix`, `frames_presented=350`): 14 colours / non-black 0.1173 vs the disclaimer's 14 / 0.1150 → structural match. |
+| **The picture is still the 2005 disclaimer** | R3 `verify-menu.sh` on a **fresh** capture (`w275r3long`, `frames_presented=2525`): 1 colour / non-black 0.1111 vs the disclaimer's 14 / 0.1150 → structural match, byte-identical to the R2 capture (md5 `ad5a5c50…`). R3 is a CPU/behaviour win, NOT a graphics one. |
 | **The GS rasterises primitives and samples textures** | G2.4; `bash tools/gs/build_gs_probe.sh` → 37,275 distinct colours, PSMCT32 + PSMT8/CLUT textures through real GIF REGLIST packets. *(Not re-run for this rewrite.)* |
 | **The project cross-compiles to ARM64** | commit `5509151`; `docs/ANDROID-FEASIBILITY.md`. *(Not re-run for this rewrite.)* |
 
 ---
 
-## The wall — G1: the image is placed, and the hand-off never fires
+## The wall — G1: the engine RUNS; the wall is now the next unwired call, not the hand-off
+
+*(This section's W273 framing — "the hand-off never fires / loader parked on `sema#7`" — is **superseded**:
+R1–R3 below. The placement facts still hold; the conclusion does not.)*
 
 The loader reads `cdrom0:\CORE.GT4;1` (`fd=5`, 2,020,861 B), walks the container (6-byte header +
 **raw DEFLATE**, `wbits=-15`) and copies the engine image `0x00100000..0x00617A14` (size `0x517A14`).
-**The image is now placed byte-perfect, verified whole-image against the disc's own decoder** — and
-the loader still never hands off.
+**The image is placed byte-perfect** — and the hand-off fires and the engine executes.
 
 | Measured (W273, `5774b00`) | Value |
 |---|---|
@@ -72,7 +78,7 @@ was seen with the instruments of the day; its conclusion is retracted by the W27
 | Goal | State | What it is |
 |---|---|---|
 | G0 | ✅ | toolchain, disc map, function anatomy, complete recompiler output, clean-room reproduce |
-| **G1 — first boot** | ⏳ **the wall** | engine emitted 19,403/19,403 **and its image placed byte-perfect**; still entered 0 times — `ExecPS2` never fires, loader parked on `sema#7` (above) |
+| **G1 — first boot** | 🟡 **running, not yet a screen** | engine emitted 19,403/19,403, image placed byte-perfect, `ExecPS2` fires (R1), 0 dispatch misses in the engine (R2), SIF boot poll exits (R3) → **31 engine code PCs**, `ee_cycle` 498 M/15 s. The wall moved to the **next unwired syscall (`0x0B`, 16 calls)**, not the hand-off |
 | G2 — a picture | 🟡 | GS layer draws and rasterises (our own probe, not the game); the game's screen is still the disclaimer |
 | G3 — 3D (VU1) | ⬜ | plan in `docs/VU1-PLAN.md`; nothing driven by a guest |
 | G4 — playable | ⬜ | menus, a race you can drive, audio from the disc, saves |

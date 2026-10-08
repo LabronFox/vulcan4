@@ -1090,3 +1090,421 @@ GATE_EXIT=0
 SEGFAULT to **497/497** via commit `097695a` (null-guard the weak engine-table symbols in
 `hasFunction`, the crash recorded earlier in this doc). The picture check is informational and still
 reports the disclaimer; that is expected — R2 is a dispatch fix and does not draw a menu.
+
+---
+
+## R3 — the "FindAddress" wall is actually syscall 0x7A (SifGetReg) unwired (architect, 2026-10-08)
+
+**The coordinator's premise (FindAddress returns wrong) is rejected by the log.** Measured in
+`boot_w275r2.log`:
+
+| syscall | calls | args | verdict |
+|---|---|---|---|
+| 0x83 FindAddress | **4** | a0=0x80000000 a1=0x80080000 (512KB window, all 4) | fast, not looping |
+| 0x7A (unwired) | **195100** | a0=4 (first call 0x80000000), a1=0x5b0e30, a3=0x20 | the wall |
+
+`[w119:unrouted] NEW syscall 0x7a ... pc=0x5ae0b8` + `Warning: Unimplemented PS2 syscall called
+... v0=0x0` repeated — syscall 0x7A falls through `dispatchNumericSyscall`'s default and returns 0.
+
+**The loop** (decompiled `sub_005b08c8`, engine `ps2_recompiled_functions_41.cpp:192864`):
+```
+0x5b0ac0: jal  0x5AE0B0        # thunk: addiu $v1,0x7A; syscall 0   (SifGetReg)
+          addiu $a0, $zero, 4  # a0 = 4
+0x5b0ac8: and  $v0, $v0, $s0   # s0 = 0x20000
+          beqz $v0, 0x5b0ac0   # while ((SifGetReg(4) & 0x20000) == 0)
+```
+A boot-ready poll: it spins until SIF register 4 has bit 0x20000 set. 0x7A returns 0, so the bit never
+sets — hence the 195100 calls and `halt=stuck_in_syscall`.
+
+**The runtime already knows the answer.** `SIF.cpp`:
+```cpp
+constexpr uint32_t kSifRegBootStatus = 0x4u;        // SIF register 4 = boot status
+constexpr uint32_t kSifBootReadyMask  = 0x00020000u; // bit 0x20000
+// seedDefaultSifRegsLocked(): g_sifRegs[kSifRegBootStatus] = kSifBootReadyMask;
+```
+`ps2_stubs::sceSifGetReg` (SIF.cpp:464) returns `g_sifRegs[reg]` = 0x20000 for reg 4. The ONLY missing
+link: `Dispatcher.cpp` had no `case 0x7A` (nor 0x79/0x7B). This is the concrete bug, not FindAddress.
+
+**Why the harness said "FindAddress"**: its stuck-detection reads a stale `m_activeSyscallId` (0x83)
+instead of the dominant syscall (0x7A) — the dominant-syscall branch requires `active == dominantId`,
+and the stale active value fails that test. The guest pc in the halt detail (0x005b0ac8) is the poll
+loop, not a FindAddress site, which is the giveaway.
+
+**Fix applied** (`ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp`, after case 0x78):
+```
+case 0x79: ps2_stubs::sceSifSetReg(rdram, ctx, runtime); return true;
+case 0x7A: ps2_stubs::sceSifGetReg(rdram, ctx, runtime); return true;
+case 0x7B: ps2_stubs::sceSifStopDma(rdram, ctx, runtime); return true;
+```
+- Patch: `/home/or/vulcan4/tools/patches/ps2recomp-linux-r3-sifgetreg-dispatch.patch` (reverse-apply OK).
+- Rebuild (driver directs): `cd /mnt/ssd/vulcan4-build && VULCAN4_ENGINE_DIR=/mnt/ssd/vulcan4-build/recomp_engine_w251 bash /home/or/vulcan4/tools/harness/build_harness.sh`
+- Note: FindAddress's return logic (KSEG1-canonical hit / `end` on miss) was already correct; no change.
+
+### R3 HLE comparison — syscall 0x83 (FindAddress) vs the PCSX2/BIOS oracle
+
+**1. PCSX2 does NOT HLE 0x83 — it falls through to the BIOS.**
+
+- `SYSCALL()` dispatcher: `/mnt/ssd/tools/pcsx2-src/pcsx2/R5900OpcodeImpl.cpp:908`.
+- The HLE table is `enum Syscall` at `/mnt/ssd/tools/pcsx2-src/pcsx2/R5900OpcodeTables.h:10-26`. It lists
+  exactly 14 ids: `SetGsCrt=2, ExecPS2=7, SetVTLBRefillHandler=13, StartThread=34, ChangeThreadPriority=41,
+  RFU060=60, SetOsdConfigParam=74, GetOsdConfigParam=75, SetOsdConfigParam2=110, GetOsdConfigParam2=111,
+  sysPrintOut=117, sceSifSetDma=119, Deci2Call=124, GetMemorySize=127`. `FindAddress` (0x83 = 131) is not among them.
+- Any id without a case hits `default: break;` (`R5900OpcodeImpl.cpp:1200-1201`) and then
+  `cpuRegs.pc -= 4; cpuException(0x20, cpuRegs.branch);` (`:1204-1205`). Exception 0x20 is the standard SYSCALL
+  vector, i.e. control transfers to the BIOS ROM kernel, which implements 0x83 itself. **Therefore PCSX2's
+  behaviour for 0x83 IS the BIOS behaviour** — there is no emulator-side shortcut to compare against; the oracle
+  is the BIOS ROM code.
+
+**2. The FindAddress contract (what the BIOS does).**
+
+- ps2sdk `ee/kernel/include/syscallnr.h`:
+  https://github.com/ps2dev/ps2sdk/blob/master/ee/kernel/include/syscallnr.h — defines
+  `#define __NR_FindAddress 0x83` with **no comment** (no signature, no return-value doc). ps2sdk does not
+  implement it (it is a BIOS/rom0 syscall, not a libkernel function).
+- Corpus: `~/.config/opencode/skills/ps2-recomp-Agent-SKILL/resources/09-ps2tek.md` has **no** FindAddress / 0x83
+  entry (grep returns nothing). The only corpus row is `db-syscalls.md:159`
+  (`| 0x83 | FindAddress | a0=id | $v0=addr | impl | |`) — the `a0=id` is wrong; a0 is the table start. Lines
+  `db-syscalls.md:188-189` group it under Memory/Cache.
+- The concrete reference implementation is upstream PS2Recomp PR #93 (Whoneon), which shipped with kernel tests:
+  https://github.com/ran-j/PS2Recomp/pull/93/files. It reads `a0`=table start (inclusive), `a1`=table end
+  (exclusive), `a2`=target; aligns the window to word boundaries; steps by `sizeof(uint32_t)` (**word scan**);
+  on a match returns the guest address of the first matching word (**preserving the segment it was found in**);
+  on a miss returns **0**. Its kernel test asserts exactly those three outcomes (first-word address, KSEG-alias
+  match preserving segment, 0 on miss).
+
+**3. Diff against OUR semantics (`System.cpp:956`).**
+
+| Aspect | PCSX2/BIOS + upstream PR #93 | Ours (`System.cpp:956`) | Divergence? |
+|---|---|---|---|
+| Scan unit | word (4-byte), window word-aligned | word (`start=(start+3)&~3; end&=~3; addr+=4`) | no — matches |
+| Alias fold in compare | KSEG fold `0x80000000–0xBFFFFFFF` | `normalizeKernelAlias` (`:791-798`, same range) | no — matches |
+| De-dup of aliased words | none | high-water mark (`:1040-1050`) | **yes — ours skips re-visited physical words** |
+| Match return | address of first matching word, **segment preserved** | forced to KSEG1: `0x80000000 | (resultAddr & PS2_RAM_MASK)` (`:1224-1228`) | **yes — ours canonicalises** |
+| Miss return | **0** (upstream PR #93 test) | **`end`** (aligned-down window end, `:1229`) | **yes** |
+
+Two structural notes:
+
+- `computeBuiltinFindAddressResult` (`System.cpp:800-830`) is a SECOND, unwired FindAddress that returns 0 on
+  miss, does no de-dup and no canonicalisation — closer to upstream than the live handler, but it has no callers
+  (dead code). The live path is `Dispatcher.cpp:314-315` → `FindAddress`.
+- Root cause of the de-dup: our host address map WRAPS physical modulo 32 MB
+  (`include/runtime/ps2_memory.h:137-140`, `if (phys >= PS2_RAM_SIZE) phys &= PS2_RAM_MASK;`). On real hardware
+  only 32 MB of RDRAM exists and the regions beyond it do not mirror; in our runtime every 0x02000000 guest block
+  re-reads the same 32 MB, which is what produced the historic 537M-word / 2 GB scan (comment at
+  `System.cpp:1026-1039`). The high-water mark exists only to make that converge.
+
+**4. Can the high-water mark skip the FIRST legitimate match? (the named risk)**
+
+- What it does: skips any guest address whose resolved physical offset `<= highestScannedPhysicalOffset`
+  (`System.cpp:1044-1047`). Because our map makes `phys(addr) == addr & 0x1FFFFFFF`, `phys` resets to 0 at every
+  0x02000000 boundary, so the mark scans the first 32 MB block of the window fully and then **skips every later
+  block**. It can therefore only produce a **false MISS** (return `end`) — never a wrong "later alias" — and only
+  when (a) the window spans a 32 MB boundary and (b) the matching word's lowest in-window alias lies in a block
+  after the one that set the high-water mark (its phys ≤ block-0 max).
+- For the calls GT4 actually makes in this boot: `a0=0x80000000`, `a1=0x80080000` (512 KB, entirely inside the
+  first KSEG0 32 MB block; phys monotonic 0x00000000→0x0007FFFF, no boundary). **The high-water mark is inert for
+  these 4 calls** — it never triggers. The builder's R2 measurement also recorded 0 misses across the 4 calls, so
+  the miss-return divergence is not exercised either. Conclusion: the 0x005b0ac8 loop is **not** caused by the
+  FindAddress de-aliasing or by the miss return; this is consistent with the board's "guest compute loop, not a
+  re-entry loop" reading. The high-water mark remains a latent false-miss bug for any future window that crosses a
+  32 MB alias boundary, but it is not the current wall.
+
+No fix written, per the R3 angle brief.
+
+## R3 — MEASURER / ORACLE: side-by-side at pc 0x005b0ac8, HARDWARE vs OURS (2026-10-08T07:56:36Z)
+
+Instrument: PCSX2 `-debugger` (DebugServer :21512), GT4 (USA) v2.00, temporary breakpoint, paused **exactly** at
+PC=0x005b0ac8 (first pass), engine verified loaded at that instant
+(`pcsx2_read_memory 0x005b0ac0` = `2c b8 16 0c 04 00 04 24 24 10 50 00 fc ff 40 10` = `jal 0x5ae0b0 / li a0,4 / and v0,s0 / beqz v0,-4`).
+
+| reg @ 0x005b0ac8 | HARDWARE | OURS (`/mnt/ssd/vulcan4-build/run/boot_w275r2.log`) |
+|---|---|---|
+| **v0** | **0x00070000** | **0x00000000** |
+| a0 | 0x00070000 | 0x00000004 |
+| a1 | 0x80018F58 | 0x005b0e30 |
+| a2 | 0x80019058 | 0x00000000 |
+| a3 | 0x00000020 | 0x00000020 |
+| s0 | 0x00020000 | 0x00020000 |
+| ra / pc | 0x005b0ac8 | 0x005b0ac8 |
+
+### The first divergence, named
+
+* **First diverging hardware event:** the **return of `jal 0x005AE0B0`** — the thunk for kernel syscall `v1=0x7A`
+  (syscall instruction at 0x005ae0b8). Hardware runs a real kernel handler and returns **v0=0x00070000**. Ours has no
+  handler for 0x7A (absent from `include/runtime/syscall_names.h`), takes the "Unimplemented PS2 syscall" path and returns
+  **v0=0**. Our own log, 195,099 times: `Warning: Unimplemented PS2 syscall called. PC=0x5ae0b8, RA=0x5b0ac8, Encoded=0x0, v0=0x0, v1=0x7a`.
+* **First instruction whose effect differs:** `and v0, s0` at **0x005b0ac8** → hardware 0x00020000, ours 0x00000000.
+* **First control-flow divergence:** `beqz v0` at **0x005b0acc** → hardware falls through to 0x005b0ad4; ours branches back
+  to 0x005b0ac0. Ours then spins **195,099 iterations** (our log: `a0=0x00000004 x195099`) until the harness deadline at
+  `ee_cycle=37262408`; hardware leaves the loop on the **first** pass.
+
+### The second call — never reached on ours
+
+`0x7A(a0=2)` after the loop: hardware v0 = **0x0001E640**, captured at PC=0x005b0adc with a0=0x00000002, s0=0x00886818
+(the delay slot `addiu s0,s2,0x6818` had executed). Ours never reaches 0x005b0adc — our log shows only
+`a0=0x00000004 x195099` and `a0=0x80000000 x1`; `a0=2` does not occur at all.
+
+### Macro state, same boot, after hardware left the loop
+
+Hardware: **20 EE threads**; EE idle at PC=0x00081FC0. 13 threads blocked in **SleepThread** (thunk 0x005adbc0 =
+`li v1,0x32; syscall`, PC=0x005adbc8, waitType=2) and 6 in **WaitSema** (thunk 0x005adce0 = `li v1,0x44; syscall`,
+PC=0x005adce8, waitType=1); 0x32/0x44 map to SleepThread/WaitSema in both our table and `db-syscalls.md:71,97`.
+Ours: **1 thread**, `runnable_threads=tid1@prio0:pc=0x005b0ac8(running)`, no other thread ever runs.
+
+### Caveats — measured, not assumed
+
+1. Post-call `a0/a1/a2` are kernel-clobbered on hardware (a1 in 0x5b0e30 → out 0x80018F58; a0 in 4 → out 0x70000, = v0).
+   Per O32 only v0 is meaningful after a call, and the deciding instruction `and v0,s0` consumes only v0 and s0. **v0 is the comparison.**
+2. Hardware RDRAM 0x00012180 / 0x0001218C is **all zero** (`pcsx2_disassemble 0x00012180` = undefined; `read_memory u32_array` = eight 0x00000000).
+   Our `VULCAN4 SYSTABLE ... slot=0x1218c handler=0x5b73c8` is **our own layout**, not hardware's. Hardware's own syscall-override
+   descriptor block sits at physical **0x658360**: `{0x80014f40, 0x00000000, 0x00000083, 0x005b73c8}` then `{0x0000005A, 0x005b7390}`
+   — GT4 overrides 0x83 and 0x5A itself, which our runtime already reproduces (`[SetSyscall] n=131 handler=0x5b73c8 slot=0x1218c`).
+3. PCSX2's debugger read of SIF MMIO `0x1000F200..0x1000F260` returns **all zero**, so this oracle confirms 0x7A's **return values**,
+   not its name. The mask claim is confirmed independently: hardware's `0x7A(a0=4)` return **does** carry bit 0x20000.
+4. `pcsx2_read_memory` with a plain address reads **RDRAM** (engine visible, real nops at 0x00081fc0); the `0x8000_0000+` form reads
+   **BIOS ROM** and cannot see the runtime-loaded engine — the two paths disagree by design, not by fault.
+
+### Bottom line
+
+The R3 wall is **not** FindAddress. It is the **unwired kernel syscall 0x7A**: hardware returns **0x00070000** (bit 0x20000 set,
+loop exits immediately) and ours returns **0x00000000** (loop never exits). Everything downstream — `stuck_in_syscall`, the
+195,099 iterations, `runnable_threads=tid1` — is a symptom of that one return value.
+
+No fix written. No repo file modified except this append and `.auto/crew/board.md`. PCSX2 left paused with all breakpoints cleared.
+
+---
+
+## R3 STATIC ANGLE — what the code around 0x005b0ac8 actually does with the return value
+
+Static-only decompile of the generated engine C++. No build, no commit, no fix written.
+
+### 1. Which function contains 0x005b0ac8
+
+`sub_005B08C8_0x5b08c8` — Address `0x5b08c8 - 0x5b0b48`.
+
+- **Not** in `/mnt/ssd/vulcan4-build/recomp/ps2_recompiled_functions.cpp`: that file is the main ELF
+  image (lowest function `0x1000008`), and `0x005b0ac8` is *below* the ELF load base `0x00100000`. It is
+  the engine module, loaded at `0x005b0000`.
+- Active engine source (the one `VULCAN4_ENGINE_DIR=recomp_engine_w251` rebuilds):
+  `ps2_recompiled_functions_41.cpp:192331` (`void sub_005b08c8_0x5b08c8(...)`; header `:192330`).
+  The single-file copy `/mnt/ssd/vulcan4-build/_orphan_recomp_engine_105MB/ps2_recompiled_functions.cpp:2226705`
+  is byte-identical for this function.
+
+### 2. The call site — and the correction to the premise
+
+The loop at `0x005b0ac8` does **not** call FindAddress (0x83). It calls `func_5AE0B0`, which is the
+syscall-0x7A trampoline: `addiu $v1, $zero, 0x7A; syscall 0` (`_orphan...:2212104-2212110`). The recompiled
+instruction is `syscall 0` (encoded id 0), so `handleSyscall` reads the real number from `$v1`
+(`ps2_runtime.cpp:4915`: `encodedSyscallId != 0 ? encodedSyscallId : getRegU32(ctx, 3)`). Dispatcher
+`case 0x7A -> ps2_stubs::sceSifGetReg` (`Dispatcher.cpp:298-300`).
+
+So the loop's syscall is **0x7A `sceSifGetReg`**, a SIF register read, and `$v0` receives the register
+value (`SIF.cpp:464-498`, `setReturnU32(ctx, value)`).
+
+Only `$a0` is set at this site — the FindAddress 3-arg signature (start/end/target) is absent:
+
+- first call (`label_5b0ac0`, `file_41:192868`): `jal func_5AE0B0`, delay slot `addiu $a0, $zero, 0x4`
+  (`file_41:192875`) → `sceSifGetReg(reg=4)`.
+- retry (delay of the `beqz`, `file_41:192895`): `addiu $a0, $zero, 0x2` → `sceSifGetReg(reg=2)`.
+
+`a1`/`a2` are not touched by this loop.
+
+### 3. What the caller does with $v0
+
+`file_41` (recomp_engine_w251/ps2_recompiled_functions_41.cpp):
+
+```
+:192864  label_5b0abc: lui  $s0, 0x2          → $s0 = 0x00020000
+:192868  label_5b0ac0: jal  func_5AE0B0       → syscall 0x7A (delay: a0 = 4)
+:192884  label_5b0ac8: and  $v0, $v0, $s0     → $v0 = $v0 & 0x00020000   (:192885)
+:192888  beqz $v0, 0x5b0ac0                   → loop if bit 17 clear     (:192888)
+          delay: addiu $a0, $zero, 0x2        → a0 = 2 on retry          (:192895)
+:192903  goto label_5b0ac0
+```
+
+- **v0 == 0 after the AND** (bit 0x20000 clear): branch taken, loops back to `label_5b0ac0` with `a0=2`.
+- **v0 != 0 after the AND** (bit 0x20000 set): branch not taken, falls through `:192907` to `0x5b0ad4`,
+  which reads `sceSifGetReg(reg=2)` into `0x886820` (`sw $v0, 0x8($s0)`), then tail-jumps to
+  `sub_005B0DB0` (the SIF DMA command handler).
+
+### 4. The loop EXIT condition
+
+Branch: `beqz $v0` at guest `0x5b0acc` (`file_41:192888`), backward target `0x5b0ac0`
+(`goto label_5b0ac0`, `file_41:192903`).
+
+Exit value: `($v0 & 0x00020000) != 0` — i.e. `sceSifGetReg(reg=4)` must return with bit 17 set. Reg 4 is
+`kSifRegBootStatus = 0x4` and the mask is `kSifBootReadyMask = 0x00020000` (`SIF.cpp:82-83`); the stub
+seeds `g_sifRegs[4] = 0x00020000` (`SIF.cpp:100`). So the guest is polling the **SIF boot-ready** flag.
+
+Boot log confirms this is the real wall, not FindAddress: syscall tally `0x7a ... calls=195100
+last_pc=0x005ae0b8 ra_count=0x005b0ac8x195099,0x005b0a74x1` (`boot_w275r2.log:651162`), and the w119 spin
+probe shows `0x7a ... v0Same=187971` — the register value never changes, so the AND never becomes
+nonzero. The harness's `"blocked inside SCE syscall 0x83 (FindAddress), guest pc 0x005b0ac8"` label pairs a
+live `m_activeSyscallId` sample with a stale `ctx.pc`; the dominant syscall is 0x7A (195100 of 287128 calls).
+
+### What the engine EXPECTS FindAddress (0x83) to return — the actual 0x83 caller
+
+The module's real FindAddress consumer is `sub_005B7450_0x5b7450`
+(`recomp_engine_w251/ps2_recompiled_functions_42.cpp:29857`, Address `0x5b7450 - 0x5b7560`):
+
+```
+:29954  0x5b74a4  jal func_5B7408    ; func_5B7408 = addiu v1,0x83; syscall 0  (the 0x83 wrapper)
+:29948  0x5b749c  lui $a0, 0x8000    ; a0 = 0x80000000  (table start)
+:29951  0x5b74a0  lui $a1, 0x8008    ; a1 = 0x80080000  (table end)
+:29960  0x5b74a8  addiu $a2, $s5, 0x73C8   ; a2 = 0x005B73C8  (target)
+:29970  0x5b74ac  daddu $s3, $v0, $zero    ; s3 = $v0  (result 1)
+:29979  0x5b74b8  jal func_5B7408          ; second scan
+:29973  0x5b74b0  lui $a0, 0x8000          ; a0 = 0x80000000
+:29976  0x5b74b4  lui $a1, 0x8008          ; a1 = 0x80080000
+:29985  0x5b74bc  addiu $a2, $s4, 0x7390   ; a2 = 0x005B7390  (target)
+:29995  0x5b74c0  addiu $s1, $s3, -0x20C   ; s1 = s3 - 0x20C   (0x20C = 0x83*4)
+:30001  0x5b74c8  addiu $s0, $s2, -0x168   ; s0 = s2 - 0x168   (0x168 = 0x5A*4)
+:30004  0x5b74cc  beq  $s1, $s0, 0x5b7520  ; converged → store s1 (0x658360), return
+:30024  0x5b74d8  beqz $v0, 0x5b74f8       ; (s1<s0) advance s3 side, else advance s2 side
+:30109  0x5b7510  bne  $s1, $s0, 0x5b74d8  ; LOOP back while s1 != s0
+```
+
+Contract: the two FindAddress calls must return addresses `0xA4` apart
+(`s3 - s2 == 0x20C - 0x168 == 0xA4 == (0x83 - 0x5A) * 4`), i.e. the module's `0x83` handler slot
+(`0x5b73c8`) and its `0x5A`-pair slot (`0x5b7390`) are 41 entries apart in the syscall table. This is the
+module's copy of the W10 convergence loop, and it is what `System.cpp:1205-1223` documents
+(`s1 = s3 - 0x20C`, `s0 = s2 - 0x168`, `loop until s1 == s0`, slots `0x8001218C` / `0x800120E8`).
+
+In this boot the 0x83 loop **already converged**: FindAddress was called exactly 4 times
+(`ra=0x010286dc, 0x010286f0, 0x005b74ac, 0x005b74c0`, each once — `boot_w275r2.log:651171`), with **zero**
+re-scan calls (`ra=0x5b74ec` / `0x5b7508` absent), so it never entered the `0x5b74d8/0x5b7510` loop.
+The stall is downstream, in the `0x5b0ac8` SIF boot-ready poll.
+
+---
+
+## SEGMENT F — R3 EXECUTION (builder): syscall 0x7A (SifGetReg) is wired; the SIF boot poll EXITS
+
+**Change (the whole of it).** `ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp`, 9 added lines, beside the
+existing `case static_cast<uint32_t>(-0x78): sceSifSetDChain`:
+
+```cpp
+        case 0x79:  ps2_stubs::sceSifSetReg(rdram, ctx, runtime);  return true;
+        case 0x7A:  ps2_stubs::sceSifGetReg(rdram, ctx, runtime);  return true;
+        case 0x7B:  ps2_stubs::sceSifStopDma(rdram, ctx, runtime); return true;
+```
+
+The runtime already had `sceSifGetReg` (`ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp:464`), and
+`seedDefaultSifRegsLocked()` seeds `g_sifRegs[kSifRegBootStatus=0x4] = 0x00020000u`. Nothing else was
+touched. `dd`/`dma` are unchanged; probes stayed OFF.
+
+### R2 → R3, 15 s plain boot, same binary path
+
+| metric | R2 `boot_w275r2.log` | R3 `boot_w275r3.log` | factor |
+|---|---|---|---|
+| `functions_entered` | 10446 | **10543** | +97 |
+| `true_guest_entries` | 1730333 | **13252077** | **7.7×** |
+| `ee_cycle` | 37262408 | **498121721** | **13.4×** |
+| `distinct_pcs` | 207 | **217** | +10 |
+| `vblanks_processed` | 57 | **151** | 2.6× |
+| `vsync_tick` | 7 | **101** | 14× |
+| `intr_run` | 61 | **108** | 1.8× |
+| `frames_presented` | 864 | 848 | — |
+| syscall `0x7a` calls | 195100 | **4** | **the poll EXITED** |
+| `Unimplemented PS2 syscall` | 195117 | **17** | 195100 removed |
+| halting pc | `0x005b0ac8` | **`0x005b0880`** | moved |
+| log size | 54,692,052 B | 6,422,434 B | shrank 8.5× |
+
+The removed 195100 calls are exactly the R2 `Chosen=0x7a` count (195099 of them), i.e. the
+`while ((SifGetReg(4) & 0x20000) == 0);` boot poll at `0x005b0ac8` — the wall named by the architect.
+
+### The 17 remaining `Unimplemented PS2 syscall` lines are PRE-EXISTING, not caused by R3
+
+Both are present identically in R2 (16 + 1 there too), and both are in the **main ELF image** (`0x01xxxxxx`),
+not the engine:
+
+```
+  16  PC=0x101f0b8  Encoded=0x0  v0=0x1, v1=0xb  Chosen=0xb   RA=0x10183e0
+   1  PC=0x101f078  Encoded=0x0  v0=0x1, v1=0x7  Chosen=0x7
+```
+
+- **syscall 0x0B — genuinely unmapped.** No `case 0x0B` anywhere in `Dispatcher.cpp`; falls to
+  `default: return false;` → the warning path, v0 left 0. 16 calls, all from the same site.
+- **syscall 0x07 — NOT unmapped, the log line is misleading.** ExecPS2 is special-cased in
+  `System.cpp` *after* the warning is printed (`if (syscallId == 0x07u) { ... requestExecPS2(...) }`),
+  and R1 proved it fires (count 1, entry `0x00100008`). So 0x07 logs as unimplemented while working.
+- Both are `Encoded=0x0` → the dispatcher took `$v1` (`System.cpp:350`), so the *logged* id is the
+  guest's `$v1`, not the encoded syscall field.
+
+### Engine PCs — strict metric (distinct CODE addresses at syscall sites)
+
+Distinct `last_pc=` / `from=Npc[...]` / `ra_count=0xNNNx` addresses inside the engine image
+`0x00100000..0x00617A14`: **R2 27 → R3 31**. Main image (`0x01xxxxxx`): unchanged at 62. Total distinct
+code addresses 90 → 94. (A looser count that also includes data-argument tokens gives 62 → 69.) Either
+way, far past R2's floor of ">19".
+
+Dispatch health: `No exact recompiled function` = **0**, `[guest-branch:` = **0**, `sce_ExitThread` = **0**.
+The 57 `missing-target|no generated function` hits are all the pre-existing
+`VULCAN 4 LIMITATION: syscall override handler has no generated function` line (the R2 trap) — never a
+dispatch miss.
+
+### The halt moved, but the halt LABEL is stale
+
+`halt=stuck_in_syscall`, `detail=blocked inside SCE syscall 0x83 (FindAddress), guest pc 0x005b0880`.
+`0x83 sce_FindAddress calls=4` — **unchanged from R2** (4 calls, 0 re-scans): FindAddress never entered
+its re-scan loop, so it is not the wall. The `0x83` in the detail line is the stale `m_activeSyscallId`
+artifact the measurer identified; the engine's R3 tally still names the halting pc correctly via `pc=`.
+
+### 45 s confirmation: pc=0x005b0880 is a DEADLINE, not a spin
+
+`boot_w275r3long.log` (6,821,122 B, exit 0, 2 frames):
+
+```
+functions_entered=10786  true_guest_entries=52847539  halt=stuck_in_syscall
+pc=0x005b1180  distinct_pcs=217  ee_cycle=2081907532  frames_presented=2525
+vblanks_processed=473  intr_run=249  ra_count ... 0x83 sce_FindAddress calls=4
+```
+
+The pc **moved** (`0x005b0880` → `0x005b1180`), `functions_entered` rose 10543 → 10786,
+`true_guest_entries` 13.25M → **52.85M** (4×), `ee_cycle` 498M → **2082M** (4.2×), `vblanks` 151 → 473.
+That is monotone progress with the deadline in sight — the run is not stuck at that pc.
+
+### The picture did NOT change
+
+`w275r3long-capture.png` md5 `ad5a5c503111d04bf67d34522cc31c0c` is **byte-identical to R2's
+`w275r2-capture.png`** and to `w275r2long-win-01.png`. Structural signature 1 colour / nonblack 0.1111
+vs the reference's 14 / 0.1150 → the v5 structural test calls it the disclaimer. R3 is a CPU/behaviour
+win, **not** a graphics win; nobody should read it as progress toward the picture.
+
+### Law 8 — the capture check, RAW
+
+```
+$ cd tools/PS2Recomp && git diff --numstat
+171	6	ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+9	0	ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp
+98	0	ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+28	7	ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+212	4	ps2xRuntime/src/lib/ps2_memory.cpp
+158	5	ps2xRuntime/src/lib/ps2_runtime.cpp
+
+$ ls -la tools/patches/ | grep r3
+-rw-rw-r-- 1 or or 848 Oct  8 10:49 ps2recomp-linux-r3-sifgetreg-dispatch.patch
+$ md5sum tools/patches/ps2recomp-linux-r3-sifgetreg-dispatch.patch
+776ccc9a6119e4d4274922ade6f3255d  .../ps2recomp-linux-r3-sifgetreg-dispatch.patch
+
+$ bash /mnt/ssd/tmp/law8check.sh
+PASS  live_added=171  distinct=136  MISSING_from_patches=0  .../EeScheduler.cpp
+PASS  live_added=9    distinct=7    MISSING_from_patches=0  .../Dispatcher.cpp
+PASS  live_added=98   distinct=74   MISSING_from_patches=0  .../System.cpp
+PASS  live_added=28   distinct=27   MISSING_from_patches=0  .../Thread.cpp
+PASS  live_added=212  distinct=150  MISSING_from_patches=0  .../ps2_memory.cpp
+PASS  live_added=158  distinct=111  MISSING_from_patches=0  .../ps2_runtime.cpp
+```
+
+Per-file, every one of the 9 live added `Dispatcher.cpp` lines is carried by the R3 patch (the patch's
+added lines are a superset: 9 case lines + the hunk header). `MISSING_from_patches=0` for all six files.
+
+### Handoffs (both are naming/telemetry, neither is a dispatch failure)
+
+1. **`syscall_names.h` is STALE and nothing regenerates it.** `tools/harness/gen_syscall_names.py` parses
+   `Dispatcher.cpp`'s cases into `ps2xRuntime/include/runtime/syscall_names.h` (gitignored, on disk dated
+   **Sep 30 22:45**), and **`build_harness.sh` never calls it**. So a syscall we just correctly wired prints
+   as `sce_unnamed_syscall` — which is what `0x7a` printed even while it was working. Fix: add the regen
+   step to `build_harness.sh`, or the mapping will keep lying about newly-wired ids.
+2. **The `Unimplemented PS2 syscall` line is misleading for 0x07.** ExecPS2 is handled in `System.cpp`
+   after the warning, so R1's working ExecPS2 (and every future syscall special-cased there) is counted as
+   an error. Anyone counting "unwired syscalls" from that grep over-counts by one per ExecPS2.

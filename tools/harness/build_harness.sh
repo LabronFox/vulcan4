@@ -10,6 +10,16 @@
 # -j2 + nice: a live Minecraft server shares this box (AGENTS.md law 11).
 set -euo pipefail
 
+# W276 R26. RESOLVE THIS SCRIPT'S OWN DIRECTORY BEFORE ANY `cd`.
+#
+# The gen_syscall_names.py call below used `dirname "$(readlink -f "$0")"`, but this script does
+# `cd "$B/run"` first -- so an invocation with a RELATIVE path (`bash tools/harness/build_harness.sh`)
+# resolved $0 against the NEW cwd, where `tools/harness/` does not exist, and `readlink -f` printed
+# nothing. dirname "" is ".", so the generator was looked for as $B/run/gen_syscall_names.py, was not
+# found, and the build stopped with "syscall names would be stale". MEASURED 2026-10-08 on exactly
+# that invocation. Absolute invocations never hit it, which is why it survived this long.
+SCRIPT_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)
+
 R=${VULCAN4_REPO:-/home/or/vulcan4}/tools/PS2Recomp
 B=${VULCAN4_BUILD:-/mnt/ssd/vulcan4-build}
 G=$B/recomp
@@ -86,7 +96,7 @@ cd "$B/run"
 # There is no timestamp check here on purpose: the script it writes is 140 lines of pure parse and
 # costs milliseconds, and a staleness check is the thing that failed. Run it, then the generated unit
 # is compiled from whatever it wrote. If the generator itself errors the build stops (set -e).
-if ! python3 -I "$(dirname "$(readlink -f "$0")")/gen_syscall_names.py"; then
+if ! python3 -I "$SCRIPT_DIR/gen_syscall_names.py"; then
     echo "build_harness: gen_syscall_names.py FAILED -- syscall names would be stale" >&2
     exit 1
 fi
@@ -188,4 +198,18 @@ nice -n 10 g++ -o vulcan4_harness harness.o register_functions.o ps2_recompiled_
   "$B/ps2xRuntime/libps2_runtime.a" "$B/ps2xIOP/libps2_iop.a" \
   "$B/_deps/raylib-build/raylib/libraylib.a" $FFMPEG -lpthread -ldl -lm -lrt -lX11
 
+# W276 R26. RECORD WHICH EMIT THE BINARY HOLDS, BESIDE THE BINARY.
+#
+# The `# generated=` line run_boot_named.sh writes describes the LOADER's emit
+# ($B/recomp/ps2_recompiled_functions.cpp). It says NOTHING about the engine objects linked in from
+# $ENGINE_DIR above -- but a reader, and a peer reviewer, takes it as the run's provenance. Measured
+# 2026-10-08: that exact misreading happened -- boot_w276r26c.log's header named the loader emit, was
+# read as naming the engine, and the r26 engine fix was reported as "booted and still failing" when
+# it had never been booted at all. The harness mtime already encodes this (it is linked from those
+# objects), but nothing spells it out, so put the truth where the run script can echo it.
+printf '%s\n' "dir=$ENGINE_DIR" \
+  "register_functions.cpp=$(stat -c %y "$ENGINE_DIR/register_functions.cpp" 2>/dev/null)" \
+  "objects=$(printf '%s\n' $ENGINE_OBJS | wc -l)" > "$B/run/.engine_stamp"
+
 echo "built $B/run/vulcan4_harness"
+echo "build_harness: engine stamp written -- $(head -1 "$B/run/.engine_stamp")"

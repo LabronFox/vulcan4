@@ -26,6 +26,15 @@ cd "$RUN" || exit 1
 {
   echo "# W251 CAPTURE RUN tag=$TAG entries=$ENTRIES budget=${SECS}s display=$DISP at $(date +%Y%m%d_%H%M%S)"
   echo "# harness=$(stat -c %y vulcan4_harness 2>/dev/null)"
+  # W276 R26. This script produces the PICTURE, which is the deliverable -- so the log that carries the
+  # capture must also name the ENGINE it came from. `harness=` alone does not say it out loud; a reader
+  # took another run's loader-emit line as the engine's provenance on 2026-10-08 and read a stale
+  # engine's picture as evidence about a new one. build_harness.sh stamps the truth; echo it here.
+  if [ -f .engine_stamp ]; then
+    echo "# engine=$(tr '\n' ' ' < .engine_stamp)"
+  else
+    echo "# engine=(unknown: no .engine_stamp; rebuild the harness to record it)"
+  fi
 } > "$OUT"
 
 # Refuse to reuse a display somebody else may be on: killing their X server to take a screenshot

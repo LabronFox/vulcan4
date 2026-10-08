@@ -4518,3 +4518,118 @@ $ diff w251/ps2_recompiled_functions_40.cpp r26/ps2_recompiled_functions_40.cpp
 
 No function count change (19,404 both), no table-line change other than the one slot, no other file
 touched. The dispatch miss was **one slot line**, and the sanctioned path produced exactly it.
+
+## R26.8 — Provenance: the R26 fix has NEVER been booted, and the log that said otherwise was misread
+
+R26.7 verified the fix "at the emit". That is not a boot, and the one log that looked like a boot of it
+(`run/boot_w276r26c.log`, 25 s) is **not** one. Verified independently here, because a peer relayed the
+conclusion and the conclusion has to be re-measured rather than taken:
+
+```
+$ head -5 /mnt/ssd/vulcan4-build/run/boot_w276r26c.log
+# W67 NAMED RUN tag=w276r26c entries=2000000 budget=25s at 20261008_192940
+# harness=2026-10-08 19:29:38.466604875 +0300
+# runtime=2026-10-08 19:27:56.177717161 +0300
+# generated=2026-10-07 22:20:57.562214835 +0300
+
+$ stat -c '%y %n' /mnt/ssd/vulcan4-build/recomp_engine_r26/register_functions.cpp
+2026-10-08 19:36:17.548970384 +0300 /mnt/ssd/vulcan4-build/recomp_engine_r26/register_functions.cpp
+```
+
+The harness was linked at **19:29:38**; the r26 emit was written at **19:36:17**, seven minutes later.
+A binary linked before the emit cannot contain it, so that log's `no generated function at pc=0x00577168`
+is the PRE-fix engine's halt and says nothing about R26.7. **The R26 fix is verified at the emit and
+nowhere else; its boot is still owed.**
+
+The relayed reason was `# generated=` naming the LOADER's emit. That line does point at the wrong tree
+for an engine run — but it is not the decisive evidence, because `run_boot_named.sh` also stamps
+`# harness=`, and the harness is linked FROM the engine objects, so its mtime already settles it. The
+decisive comparison is harness 19:29:38 vs emit 19:36:17. Recorded this way so the next reader does not
+have to trust a line whose meaning is ambiguous.
+
+### Fix applied to the record itself (so this cannot be misread twice)
+
+`run_boot_named.sh` wrote `# generated=` (loader) with nothing naming the ENGINE, and `build_harness.sh`
+took the engine from `VULCAN4_ENGINE_DIR` at LINK time — the fact a reader needs and no line stated.
+Both scripts changed:
+
+- `tools/harness/build_harness.sh`: after the link, writes `$B/run/.engine_stamp` holding `dir=`,
+  the engine `register_functions.cpp` mtime, and the object count; echoes the first line.
+- `tools/harness/run_boot_named.sh`: emits `# engine=<stamp>` (or `# engine=(unknown: no .engine_stamp…)`)
+  into every boot log header, with the `generated=` line explicitly labelled as the LOADER's emit.
+
+Both are host harness scripts, not shipped product; no generated file was hand-edited; `bash -n` passes
+on both. The next boot log will name its own engine, so a stale-engine log can no longer pass for a
+fresh one.
+
+## R26.9 — The R26 fix is BOOTED, and the A/B is the proof (first run of the fixed engine)
+
+Harness relinked 19:54:04 against `recomp_engine_r26` (47 objects, engine `register_functions.cpp`
+19:36:17) — the engine stamp now in the log header names exactly that. Boot, 25 s budget, twice;
+`run/run_boot_named.sh w276r26 …` then `run/run_capture.sh w276r26b …`. Both runs agree.
+
+### The A/B, on the halt itself (not on `functions_entered`)
+
+PRE-fix engine (`run/boot_w276r26c.log`, harness linked 19:29:38, i.e. before the emit existed):
+
+```
+[guest-branch:missing-target] kind=IndirectCall op=JALR source=0x5773e4 target=0x577168 pc=0x577168
+    ra=0x5773ec sp=0x1fffef0 … s0=0x617d98 s1=0x68be28 v0=0x577168
+    s0Readable=yes s0[0]=0x577168 s0[4]=0x0 s0[8]=0x101a70 s0[c]=0x0
+VULCAN4 HARNESS detail=no generated function at this pc pc=0x00577168 … elapsed_ms=6256
+```
+
+POST-fix engine (`run/boot_w276r26.log` and `boot_w276r26b.log`): that line does not exist. Both runs
+carry **zero** JALR missing-target halts and run to the wall clock:
+
+```
+VULCAN4 BOOT REPORT functions_entered=34223 true_guest_entries=1584637 true_guest_exits=0
+  halt=wallclock_deadline bios_files=0 … gs_packets=15 frames_presented=1392
+  gs_frame_reg_writes=2 (ctx0=2 ctx1=0) cop0_raised=INAPPLICABLE(0) pending_ip=0x0
+  … missing_functions=0
+```
+
+| | pre-fix (r26c) | post-fix (r26) | post-fix (r26b) |
+|---|---|---|---|
+| halt | `no generated function at pc=0x00577168` | `wallclock_deadline` | `wallclock_deadline` |
+| elapsed_ms | 6,256 | ~25,004 | ~25,004 |
+| `missing_functions` | — (halted in the miss) | **0** | **0** |
+| `gs_packets` | 15 | 15 | 15 |
+| `[DBCMAN]` lines | 0 | **0** | **0** |
+| picture | disclaimer | disclaimer (gate exit 1) | disclaimer (gate exit 1) |
+
+The 9 lines in the post-fix logs that match `no generated function` are ALL the
+`syscall 0x5a/0x5b override handler … has no generated function in either image` LIMITATION class
+(0x5b79f8, 0x5b98d0, 0x80076000) — the known, already-refused override backlog, not a dispatch miss.
+
+The fix moved the run's death from 6.3 s to the budget. That is the whole claim: **one slot line
+converted a hard dispatch miss into a run that survives the window.** It is not a picture change and
+was never expected to be one.
+
+### The two predicted next misses did NOT fire
+
+`0x101b18` and `0x577180` (the two hook-table targets with no slot, from the 13-target enumeration)
+appear **0 times** in either post-fix log. Prediction unproven; no `entry_points` line added for them,
+because there is no measurement that they are reached (Law 3 — refused, not guessed at).
+
+### The picture, on the fixed engine, measured
+
+`bash .auto/verify-menu.sh` on the fresh capture `run/w276r26b-capture.png` (19:56, 12,143 bytes):
+
+```
+newest capture : /mnt/ssd/vulcan4-build/run/w276r26b-capture.png
+structural sig  : capture 1 colours / nonblack 0.1111   vs reference 14 / 0.1150
+GATE FAIL: STRUCTURAL MATCH to the disclaimer … the disclaimer is STILL on screen
+GATE EXIT=1
+```
+
+**STILL THE 2005 DISCLAIMER. R5 (picture no longer the disclaimer) is NOT reached.** Correct and
+expected: R26 closed a dispatch miss, not the file-I/O wall. The dish's real work is untouched.
+
+### What the run is doing instead of loading
+
+`[DBCMAN]` is **0** in every post-fix run — dbcman is still never reached. The guest spends the window
+at `pc=0x00580dd8` with `distinct_pcs=752`, `checkpoint_serviced=60`, `dispatcher_transfers=62`,
+`serviced_invocations=122`, `blocked_on_servicing=0`, `vsync_tick=296`, `intr_queued=181`,
+`syscalls=37` / `total_syscall_calls=93244`, `missing_functions=0`. The next gap is still the one the
+dish named: nothing parses the raw SIF RPC call, so no read of GT4.VOL is ever issued.

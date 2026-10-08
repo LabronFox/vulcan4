@@ -1,0 +1,51 @@
+W276 R26 -- the ONLY change to the recompiler's INPUT that closes the 0x00577168 dispatch miss.
+The authoritative engine TOML lives on the SSD (it names generated output paths), so this patch is
+what keeps the fix from surviving only on one disk. Addresses and config only -- no game bytes.
+
+Apply to w251-engine_authoritative.toml (the engine recompilation config):
+  1. add the "hook_577168@0x00577168" entry_points line + its comment (hunk 1)
+  2. point output at the r26 emit directory (hunk 2) -- for the run that produced
+     /mnt/ssd/vulcan4-build/recomp_engine_r26/, 47 objects, harness relinked 2026-10-08 19:54:04
+
+Verified at the emit: register_functions.cpp slot 1170520 =
+  g_ps2EngineFunctionTable[1170520] = sub_00577100_0x577100; // 0x577168
+and ps2_recompiled_functions_40.cpp carries `case 0x577168u: goto label_577168;` + `label_577168:`.
+Verified at the boot: run/boot_w276r26.log and boot_w276r26b.log, halt=wallclock_deadline,
+missing_functions=0, no JALR missing-target line (pre-fix boot_w276r26c.log halted at elapsed_ms=6256
+with `no generated function at this pc pc=0x00577168`).
+
+=== hunk 1: bak-r26 -> authoritative (the fix)
+--- w251-engine_authoritative.toml.bak-r26	2026-10-08 19:34:29.789269732 +0300
++++ w251-engine_authoritative.toml	2026-10-08 19:35:57.926376251 +0300
+@@ -166,6 +166,19 @@
+ # Guest functions without runtime handlers that may be referenced by address.
+ # PS2Recomp keeps their guest implementation and exposes exact callable entries.
+ entry_points = [
++  # R26: Ghidra's function list (engine-symbols.csv) has a HOLE at 0x577168. It is a real
++  # 8-byte guest function -- 0x577168 jr $ra / 0x57716c addiu v0,$zero,1 -- reached only
++  # through a RUNTIME-BUILT pointer table (s0=0x617d98, s0[0]=0x577168), so no static call
++  # reference exists, so it is neither a known function start nor an interior of any
++  # function that itself holds an unresolved indirect jump -- and the W236 fallback only
++  # promotes interiors of the function that CONTAINS the unresolved jump
++  # (control_flow_analyzer.cpp:442, addr >= function.start && addr < function.end), never
++  # the jump's target in a different function. NOT the NO_FALLBACKS knob: it is measurably
++  # unset here (register_functions.cpp has the caller's own interior 0x5773e4 at slot
++  # 1170679). Measured halt in run/boot_w276r26c.log: no generated function at pc=0x00577168.
++  # discoverAdditionalEntryPoints() turns this into a resume entry under its owner
++  # (0x577100) -- the same shape as the already-registered neighbour 0x577170.
++  "hook_577168@0x00577168",
+   "handler_5B73C8@0x005B73C8",
+   "handler_5B7390@0x005B7390",
+   "handler_5B7408@0x005B7408",
+=== hunk 2: authoritative -> w276-engine_r26 (the emit dir for the verified run)
+--- w251-engine_authoritative.toml	2026-10-08 19:35:57.926376251 +0300
++++ w276-engine_r26.toml	2026-10-08 19:36:08.947147641 +0300
+@@ -9,7 +9,7 @@
+ ghidra_output = ""
+ 
+ # Path to output directory
+-output = "/mnt/ssd/vulcan4-build/recomp_engine_w251/"
++output = "/mnt/ssd/vulcan4-build/recomp_engine_r26/"
+ 
+ # Single file output mode (recommended for large games)
+ single_file_output = true

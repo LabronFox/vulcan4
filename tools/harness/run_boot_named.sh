@@ -13,6 +13,15 @@ STAMP=$(date +%Y%m%d_%H%M%S)
   echo "# harness=$(stat -c %y /mnt/ssd/vulcan4-build/run/vulcan4_harness 2>/dev/null)"
   echo "# runtime=$(stat -c %y /mnt/ssd/vulcan4-build/ps2xRuntime/libps2_runtime.a 2>/dev/null)"
   echo "# generated=$(stat -c %y /mnt/ssd/vulcan4-build/recomp/ps2_recompiled_functions.cpp 2>/dev/null)"
+  # W276 R26. `# generated=` above is the LOADER emit. The ENGINE this binary actually holds is what
+  # VULCAN4_ENGINE_DIR named at LINK time, and build_harness.sh now stamps it beside the binary.
+  # Without this line a reader takes `generated=` for the run's whole provenance and reads a stale
+  # engine's log as evidence about a new one -- which happened on 2026-10-08 (boot_w276r26c.log).
+  if [ -f /mnt/ssd/vulcan4-build/run/.engine_stamp ]; then
+    echo "# engine=$(tr '\n' ' ' < /mnt/ssd/vulcan4-build/run/.engine_stamp)"
+  else
+    echo "# engine=(unknown: no .engine_stamp; rebuild the harness to record it)"
+  fi
   echo "# argv: $0 $TAG $ENTRIES $SECONDS_BUDGET"
 } > "$OUT"
 nice -n 10 ionice -c3 timeout "$((SECONDS_BUDGET + 60))" xvfb-run -a \

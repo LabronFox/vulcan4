@@ -4006,3 +4006,19 @@ already measured that delivering the `0x80000001` BIND reply did **not** change 
 `tools/patches/ps2recomp-linux-w275r20-cdvdfsv-provider.patch`; `git apply --numstat` == live
 `git diff --numstat` per file (`cdvd.cpp` 183 == 183). No source sits only in the working tree for
 this deliverable.
+
+### R23 addendum — FileIoService is dormant: `0x80000001` can never bind (code-derived)
+
+`IopModuleManager::isLoaded(aliases)` (src/iop_module_manager.cpp L171) returns true if ANY alias key
+has a non-zero reference count. `observePhysicalLoad` (L129) records the **path leaf** of what was
+loaded — so loading GT4's `cdrom0:\IOPRP300.IMG;1` registers the key `IOPRP300.IMG`, **not** `fileio`.
+fileio is only ever an image resident (R22: GT4 never `sceSifLoadModule`s it by name). Therefore
+`FileIoService.moduleAliases() = {"fileio","xfileio"}` is never satisfied → `serviceActive()` false →
+FileIoService is not in `routes` → `canBindRpc(0x80000001)` is **false** for the guest's *first* RPC
+client (`0x008899C0`). This is the identical dormant-forever bug R20 fixed for cdvdfsv by emptying its
+aliases; the fix is the same one-line change (empty `moduleAliases()` for an image-resident service).
+
+Derived from code reading, not a runtime counter — but the inputs are measured (R22 image residency;
+R23 fileio owns the sid). Handed to the fileio builder; `fileio.cpp` was not edited here to avoid
+racing its in-flight work on that exact file. A boot that prints FileIoService active/dormant would
+turn this into a runtime measurement.

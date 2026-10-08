@@ -106,3 +106,27 @@ functions are closed at the tool input. The picture has NOT advanced to a human-
 What remains is a mechanical grind: each `missing-target` (0x5477c8 next) is an 8-byte or small
 `jr ra`/leaf Ghidra missed, closed by one TOML entry + emit + rebuild. The DVD streamer RPCs
 themselves are not yet decoded — that is the real protocol work after the grind.
+
+## R30c/d/e — the missing-function grind is DONE, the wall is now the DVD streamer
+
+Each cycle closed one Ghidra-missed leaf (all real function starts, oracle-disasm'd), then revealed
+the next. Closed in `w276-engine_r30.toml` entry_points (884→889):
+
+| addr | shape | reached by |
+|---|---|---|
+| 0x58dfe0 | func (lui v0,0x88) | JALR 0x5b1394 |
+| 0x578288 | `jr ra;nop` | JALR 0x578118 |
+| 0x5477c8 | func (addiu sp,-0x10) | JALR 0x578714 |
+| 0x566df8 | func (addiu sp,-0x20) | JALR 0x565a58 |
+| 0x55ab90 | `jr ra;nop` | JALR 0x55aca8 |
+
+`boot_w277r30e.log`: **missing_functions=0**, halt=**stuck_in_syscall** (WaitSema 0x44, pc 0x5aedb0),
+functions_entered=17406, gs_packets=45, gs_frame_reg_writes=29, frames=1029, **9 threads**.
+
+The game now boots every driver, binds every service, and issues exactly ONE DVD RPC —
+`[PCDV:stub] rpc=0x0 send=0x86ccc0 sendSize=0x40 recv=0` — then blocks in a WaitSema loop
+(`ra=0x5aedc0`, 10177 calls). The stub answers nothing, so the DVD streamer's completion semaphores
+(sema#95918/95919/95920, three parked threads) never fire. The caption: the missing-function grind
+is finished; what remains is the mission's step-2 in full — implement the PCDV rpc=0 init so the
+streamer signals completion. The picture is unchanged (w277r30e-capture.png `a1a674fa…`, 18924 B —
+the disclaimer, not blank, not a new screen).

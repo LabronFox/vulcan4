@@ -4022,3 +4022,127 @@ Derived from code reading, not a runtime counter — but the inputs are measured
 R23 fileio owns the sid). Handed to the fileio builder; `fileio.cpp` was not edited here to avoid
 racing its in-flight work on that exact file. A boot that prints FileIoService active/dormant would
 turn this into a runtime measurement.
+
+---
+
+## R24 — the raw SIF RPC CALL path is wired end to end; payload located by descriptor, providers moved to the EE address space (builder, 2026-10-08)
+
+Goal: the engine posts raw SIF RPC via `sceSifSetDma` from ring `0x20886a40` and never calls the
+`sceSifBindRpc`/`sceSifCallRpc` wrappers, so the whole RPC call path had to be reconstructed. Three
+defects were found and fixed; a fourth was an accessor bug that silently voided every reply.
+
+### R24.1 The payload descriptor (the CALL's send buffer)
+
+`SIF.cpp` derived the CALL payload from the packet header's `dest` field:
+
+```cpp
+sendBuf = (dsize != 0u) ? rawRpcReadWord(packet, 0x04u) : 0u;   // WRONG
+```
+
+`dest` is `0x0` on **every** GT4 transfer (R19 dump), so the payload always resolved to EE address
+`0` — i.e. never. The payload travels as a **separate SIF1 descriptor posted immediately before the
+packet in the same DMA list**. MEASURED, `run/boot_sifpkt.log` L65594-65601 (count=2):
+
+```
+[DESC i=0 src=0x00888280 dst=0x0 size=0x00000008 attr=0x00]   <- the send payload
+[DESC i=1 src=0x20886a40 dst=0x0 size=0x00000040 attr=0x44]   <- the packet
+```
+
+and the packet's header word is `0x840` → `psize=0x40`, `dsize=8` — exactly the preceding
+descriptor's size. That is how a payload is located without the header carrying it. `rawRpcDeliverBatch`
+now matches `pending[i-1].size == headerWord >> 8` and passes that `src`/size to `rawRpcDeliverReply`.
+When a CALL declares `dsize != 0` and **no** matching descriptor accompanied it, the call is refused
+with a printed limitation rather than issued against a null buffer (law 2/3).
+
+### R24.2 Providers were reading the wrong address space
+
+`RpcRequest::send.address` / `receive.address` are **EE/RDRAM** addresses, not IOP ones. Proof, all
+in-tree: the syscall path sets `request.receive = {receiveBuffer, receiveSize}` on the guest's own
+register, `SifRpcRawCall` copies with `rpcCopyToRdram(rdram, receiveBuffer, iopResult.resultAddress,
+receiveSize)` — guest-RDRAM to guest-RDRAM — and `mcserv.cpp`, the provider known to run, uses
+`readGuest`. `IopEmulator::isMemoryRange` accepts only physical < 2 MB, `[0x80000000,0x80200000)` and
+`[0xA0000000,0xA0200000)`, so an EE address like `0x00888F00` read through `readIopMemory` **always
+failed**. Both providers were still on `readIopMemory`/`writeIopMemory`, so every read returned false
+and every reply was dropped: `fileio.cpp` (5 call sites, incl. the `readIopString` rename to
+`readGuestString`) and `cdvd.cpp` (2 call sites). All seven now use `readGuest`/`writeGuest`.
+
+### R24.3 Measured — equal-duration A/B, probe ON vs OFF (both 2,000,000 entries, 30 s)
+
+| | probe OFF (`boot_w276r24_off.log`) | probe ON (`boot_w276r24_on.log`) |
+|---|---|---|
+| `functions_entered` | 40482 | 12891 |
+| `true_guest_entries` | 1590944 | **3743024** |
+| `halt` | `wallclock_deadline` | `stuck_in_syscall` |
+| `gs_packets` | 15 | 15 |
+| `frames_presented` | 1683 | 1752 |
+| `bios_files` | 0 | 0 |
+| `[SIFRPC]` lines | **0** | 7 (all success) |
+| FileIO / CDVDFSV lines | **0** | 1 / 2 |
+
+Law 12 (unset reproduces today's behaviour byte for byte): the OFF log contains **zero** new
+provider/trace lines — `grep -cE "FileIO|CDVDFSV|SIFRPC|DBCMAN"` = 0. The raw path stays behind
+`rawRpcProbeEnabled()`.
+
+**The bind loops are gone.** Probe ON, all seven SIF transactions are successes — no retried BIND, no
+"has no server" limitation:
+
+```
+recvbuf a=0x80000002 b=0x886800 c=0x886740
+bind a=0x8899c0 b=0x80000001 c=0x1f10000
+call a=0x8899c0 b=0xff       c=0x80000001 d=0x1
+bind a=0x874fa8 b=0x80000592 c=0x1f10080
+call a=0x874fa8 b=0x0        c=0x80000592 d=0x1
+bind a=0x657a40 b=0x80000593 c=0x1f10100
+call a=0x657a40 b=0x22       c=0x80000593 d=0x1
+```
+
+The FileIO provider now receives the request and refuses it honestly, exactly once:
+
+```
+VULCAN 4 LIMITATION: FileIO command 255 is not implemented — the guest asked for a filesystem
+operation this provider does not decode yet, and answering success would be a lie
+```
+
+`rpc_number = 0xFF` is **out of range** for FILEIO's 17-entry `enum _fio_functions` (0..16) and is
+**not explained**. Do not guess it: it is the next file-I/O unknown.
+
+### R24.4 THE PICTURE IS UNCHANGED — R5 NOT REACHED
+
+`gs_packets = 15` in both arms, and the picture gate fails on the disclaimer:
+
+```
+$ bash .auto/verify-menu.sh        # exit=1
+GATE FAIL: STRUCTURAL MATCH to the disclaimer: only 1 colours and a non-black fraction (0.1085)
+within 0.05 of the reference (0.1150). That is dark-grey-text-on-black at some fade level - the
+disclaimer is STILL on screen, whatever the perceptual diff says.
+```
+
+`[DBCMAN]` lines: **0** in both arms. The next wall is not the RPC plumbing — the guest still spins
+under `stuck_in_syscall`: `sceSifGetReg` (0x7A) 187,366 hits with a **negative v0 184,928 times**,
+`CreateSema` (0x40) / `DeleteSema` (0x41) ~187 k hits each, `pc=0x005aedb0`. The spin profile is
+`[w119:spin] totalSyscalls=660000`. `[EVDUE] type=1 deadline_cy=63898887 now_cy=60308466
+guest_short=3590421cy pending=1`.
+
+### R24.5 Capture (Law 8)
+
+All 20 modified files are carried by `tools/patches/ps2recomp-linux-w276-r24-live-complete.patch`
+(2943 lines), verified per file against the live `git diff HEAD --numstat` with
+`tools/check-patch-capture.sh` — the new durable script for this check:
+
+```
+FILE                                                 LIVE_ADD PATCH_ADD VERDICT
+ps2xIOP/src/modules/cdvd.cpp                              191      191 OK
+ps2xIOP/src/modules/fileio.cpp                            104      104 OK
+ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp                  507      507 OK
+ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp               152      152 OK
+ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h                  35       35 OK
+ps2xRuntime/src/lib/ps2_memory.cpp                        212      212 OK
+ps2xRuntime/src/lib/ps2_runtime.cpp                       169      169 OK
+(... 20/20 rows all OK, no SHORT row)
+----
+CAPTURE CHECK: PASS (every file's added lines are carried)
+```
+
+**Not claimed:** nothing here says the picture will move once 0xFF is decoded. The measured fact is
+that the RPC plumbing is now honest end-to-end and the guest's throughput roughly doubled — and that
+the picture did **not** change.

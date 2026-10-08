@@ -1,0 +1,1508 @@
+diff --git a/ps2xRecomp/src/lib/control_flow_emitter.cpp b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+index 4b62414..7746782 100644
+--- a/ps2xRecomp/src/lib/control_flow_emitter.cpp
++++ b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+@@ -510,6 +510,28 @@ namespace ps2recomp
+         m_ss << "    {\n";
+         m_ss << "        const bool " << branchTakenVar << " = (" << conditionalBranchExpression() << ");\n";
+ 
++        // W253 probe (2). THE REWIND LOG.
++        //
++        // The bug is a livelock in which the core writer's out pointer walks BACKWARDS and one
++        // 11,461-byte band is rewritten forever. Every other observation of that event is indirect; this
++        // emits the log AT the backward edge, where the registers are still live and no dispatcher can
++        // perturb the timing. Two guards, both compile-time on this branch's own operands:
++        //   * target < pc        -- a BACKWARD edge, which excludes the forward ~2000 branches in the
++        //                           image and the whole engine;
++        //   * pc in [0x0100F390, 0x01011000) -- the core writer + its driver, so nothing outside the
++        //                           DEFLATE path pays.
++        // Registers logged: r9 (t1) = [job+0x20] out ptr, r8 (t0) = [job+0x0C] in ptr, r7 (a3) =
++        // [job+0x00], r6 (a2) = [job+0x08]. Same four as the core-entry probe, so the pair reads as
++        // "<retry #N> pc -> target, out ptr now X".
++        if (target < m_branchInst.address && m_branchInst.address >= 0x0100F390u &&
++            m_branchInst.address < 0x01011000u)
++        {
++            m_ss << fmt::format(
++                "        ::vulcan4W253Jump(0x{:08x}u, 0x{:08x}u, {}, "
++                "GPR_U32(ctx, 9), GPR_U32(ctx, 8), GPR_U32(ctx, 7), GPR_U32(ctx, 6));\n",
++                m_branchInst.address, target, branchTakenVar);
++        }
++
+         // W129. A PROBE EMITTED BY THE TRANSLATOR, not pasted into the generated file (which is
+         // regenerated every build). It is guarded by a runtime env knob so it costs one getenv-free
+         // branch on an inline-visible flag when off, and nothing at all when the knob is unset.
+diff --git a/ps2xRecomp/src/lib/instruction_translator.cpp b/ps2xRecomp/src/lib/instruction_translator.cpp
+index 9376635..2698e26 100644
+--- a/ps2xRecomp/src/lib/instruction_translator.cpp
++++ b/ps2xRecomp/src/lib/instruction_translator.cpp
+@@ -139,6 +139,23 @@ namespace ps2recomp
+             return translateMemoryWrite(inst, effectiveMemoryHint, width, addr, val);
+         };
+ 
++        // W253 probe (1). THE CORE WRITER'S RETRY HEAD.
++        //
++        // 0x0100F418 (`dsll32 v0,a3,0`) is NOT a function entry -- Ghidra reports it as part of
++        // FUN_0100F390 -- it is the re-entry point of the core writer's bit loop, and FIVE of that
++        // function's eight backward edges land on it. It IS a resume case in the generated switch, but
++        // the back edges reach it by direct `goto`, which the per-entry dispatcher cannot observe, so
++        // the counter has to live at the instruction. Emitted here, before the opcode switch, so it
++        // precedes the `dsll32` no matter which sub-translator handles it (it is OPCODE_SPECIAL).
++        // The four registers are the job-struct fields the core consumes: t1 = [s0+0x20] (out ptr),
++        // t0 = [s0+0x0C] (in ptr), a3 = [s0+0x00] (hold), a2 = [s0+0x08] (bits).
++        if (inst.address == 0x0100F418u)
++        {
++            return "::vulcan4W253CoreEnter(0x0100f418u, ctx->pc, GPR_U32(ctx, 9), GPR_U32(ctx, 8), "
++                   "GPR_U32(ctx, 7), GPR_U32(ctx, 6)); " +
++                   m_codeGenerator.translateSpecialInstruction(inst);
++        }
++
+         switch (inst.opcode)
+         {
+         case OPCODE_SPECIAL:
+@@ -194,6 +211,21 @@ namespace ps2recomp
+         case OPCODE_LWU:
+             return fmt::format("SET_GPR_ZE32(ctx, {}, {});", inst.rt, genRead(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+         case OPCODE_SB:
++            // W253 probe (4). THE INVISIBLE BYTE STORE.
++            //
++            // 0x0100F800 (`sb v0,0(t1)`) is the FIRST DIVERGING INSTRUCTION of the whole loader arc:
++            // hardware writes 0x7C, we write 0x2D, at blob offset 0xD521C. Unlike every neighbouring `sw`
++            // it has NO store-watch guard, so the write is unobserved today. The address is a compile-time
++            // constant, so the emit is scoped to that one store and no other `sb` in either image pays for
++            // it; the runtime knob (VULCAN4_W253) then decides whether anything prints.
++            if (inst.address == 0x0100F800u)
++            {
++                return "::vulcan4W253ByteStore(ADD32(GPR_U32(ctx, " + std::to_string(inst.rs) + "), " +
++                       std::to_string(static_cast<int32_t>(inst.immediate)) + "), (uint8_t)GPR_U32(ctx, " +
++                       std::to_string(inst.rt) + "), 0x0100f800u); " +
++                       genWrite(8, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate),
++                                fmt::format("(uint8_t)GPR_U32(ctx, {})", inst.rt)) + ";";
++            }
+             return genWrite(8, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("(uint8_t)GPR_U32(ctx, {})", inst.rt)) + ";";
+         case OPCODE_SH:
+             return genWrite(16, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("(uint16_t)GPR_U32(ctx, {})", inst.rt)) + ";";
+diff --git a/ps2xRuntime/include/ps2_call_list.h b/ps2xRuntime/include/ps2_call_list.h
+index 94a6fa1..1dca1a5 100644
+--- a/ps2xRuntime/include/ps2_call_list.h
++++ b/ps2xRuntime/include/ps2_call_list.h
+@@ -66,6 +66,7 @@
+                                \
+     X(AddIntcHandler)          \
+     X(AddIntcHandler2)         \
++    X(AddSbusIntcHandler)      \
+     X(RemoveIntcHandler)       \
+     X(AddDmacHandler)          \
+     X(AddDmacHandler2)         \
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index 498bbe9..9b6b456 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -905,6 +905,96 @@ inline void vulcan4W129CopyProbePrint(const char *where,
+ }
+ 
+ 
++// W253. THE CORE-ENTRY ORDINAL, THE REWIND LOG, AND THE INVISIBLE BYTE STORE.
++//
++// WHY: the loader's DEFLATE decode is CORRECT end to end (0 wrong bytes through w = 6,120,817) and then,
++// 816 bytes before the end, the core writer's OUT POINTER rewinds to blob off 0xD521C and the driver
++// livelocks, rewriting one 11,461-byte band [0xD52CC, 0xD7F91] forever. The writer is FUN_0100F390
++// (guest 0x0100F390), whose retry head is 0x0100F418 -- FIVE of that function's eight backward edges
++// land on it -- and the driver that re-enters it is FUN_0100F8C8 (guest 0x0100F8C8).
++//
++// Neither the retry head nor the byte store at 0x100F800 is visible to the per-entry dispatcher: both
++// run inside one generated function body (the documented reason vulcan4W129CopyProbe lives here too).
++// So all three pieces are emitted BY THE TRANSLATOR, from inline helpers defined here:
++//   (1) vulcan4W253CoreEnter -- prefixed to the instruction at 0x0100F418; counts entries to the retry
++//                              head and prints the four job-struct registers the core consumes.
++//   (2) vulcan4W253Jump      -- emitted at every BACKWARD conditional branch inside
++//                              [0x0100F390, 0x01011000); prints the current ordinal and the same four
++//                              registers, so a rewind reads as "<retry #N> pc -> target".
++//   (4) vulcan4W253ByteStore -- emitted at the byte store 0x100F800, which has NO W130 store-watch
++//                              guard (every neighbouring `sw` does), so today that write is invisible.
++//
++// The knob is read ONCE into a function-local static, so when VULCAN4_W253 is unset every call is a load
++// and a test on an inline-visible variable and nothing is printed: unset = today's behaviour.
++inline bool vulcan4W253On() noexcept
++{
++    static const bool on = std::getenv("VULCAN4_W253") != nullptr;
++    return on;
++}
++
++// The ordinal is shared by the enter counter and the jump log, so a rewind can be read as
++// "retry #N moved the out pointer to X" instead of as an isolated print with no history.
++inline uint64_t &vulcan4W253Ordinal() noexcept
++{
++    static uint64_t ordinal = 0;
++    return ordinal;
++}
++
++inline void vulcan4W253CoreEnter(uint32_t insnAddr, uint32_t ctxPc, uint32_t t1, uint32_t t0,
++                                 uint32_t a3, uint32_t a2) noexcept
++{
++    if (!vulcan4W253On())
++    {
++        return;
++    }
++    const uint64_t n = ++vulcan4W253Ordinal();
++    if (n <= 16u || (n % 100000u) == 0u)
++    {
++        std::fprintf(stderr,
++                     "[w253:core] entry n=%llu insn=0x%08x ctxpc=0x%08x t1=0x%08x t0=0x%08x "
++                     "a3=0x%08x a2=0x%08x\n",
++                     static_cast<unsigned long long>(n), insnAddr, ctxPc, t1, t0, a3, a2);
++    }
++}
++
++inline void vulcan4W253Jump(uint32_t pc, uint32_t target, bool taken, uint32_t t1, uint32_t t0,
++                            uint32_t a3, uint32_t a2) noexcept
++{
++    if (!vulcan4W253On())
++    {
++        return;
++    }
++    static uint64_t jumpHits = 0;
++    ++jumpHits;
++    // BOUNDED ON PURPOSE: the whole bug is a livelock, so an unbounded log is a many-GB file, not a
++    // measurement. The first 64 edges name the shape; the %100000 hits prove it is still going.
++    if (jumpHits <= 64u || (jumpHits % 100000u) == 0u)
++    {
++        std::fprintf(stderr,
++                     "[w253:jump] n=%llu ordinal=%llu pc=0x%08x -> 0x%08x taken=%d t1=0x%08x "
++                     "t0=0x%08x a3=0x%08x a2=0x%08x\n",
++                     static_cast<unsigned long long>(jumpHits),
++                     static_cast<unsigned long long>(vulcan4W253Ordinal()), pc, target, taken ? 1 : 0,
++                     t1, t0, a3, a2);
++    }
++}
++
++inline void vulcan4W253ByteStore(uint32_t addr, uint32_t value, uint32_t writerPc) noexcept
++{
++    if (!vulcan4W253On())
++    {
++        return;
++    }
++    static uint64_t storeHits = 0;
++    ++storeHits;
++    if (storeHits <= 64u || (storeHits % 1000000u) == 0u)
++    {
++        std::fprintf(stderr, "[w253:sb] n=%llu pc=0x%08x addr=0x%08x value=0x%02x\n",
++                     static_cast<unsigned long long>(storeHits), writerPc, addr, value & 0xFFu);
++    }
++}
++
++
+ // W130. THE WRITER-WATCH FILTER AND THE READ PROBE THAT TEACHES IT THE ADDRESSES.
+ //
+ // The watch set holds up to four 32-bit guest addresses. The read probe (emitted by the translator at
+diff --git a/ps2xRuntime/include/runtime/syscall_names.h b/ps2xRuntime/include/runtime/syscall_names.h
+index 4636c5e..7ca6193 100644
+--- a/ps2xRuntime/include/runtime/syscall_names.h
++++ b/ps2xRuntime/include/runtime/syscall_names.h
+@@ -11,6 +11,8 @@ static const SyscallName kSyscallNames[] = {
+     { 0x01, "ResetEE" },
+     { 0x02, "GsSetCrt" },
+     { 0x04, "ExitThread" },
++    { 0x07, "ExecPS2" },
++    { 0x0B, "AddSbusIntcHandler" },
+     { 0x10, "AddIntcHandler" },
+     { 0x11, "RemoveIntcHandler" },
+     { 0x12, "AddDmacHandler" },
+@@ -19,18 +21,24 @@ static const SyscallName kSyscallNames[] = {
+     { 0x15, "DisableIntc" },
+     { 0x16, "EnableDmac" },
+     { 0x17, "DisableDmac" },
++    { 0x18, "SetAlarm" },
++    { 0x19, "CancelAlarm" },
+     { 0x20, "CreateThread" },
+     { 0x21, "DeleteThread" },
+     { 0x22, "StartThread" },
+     { 0x23, "ExitThread" },
+     { 0x24, "ExitDeleteThread" },
++    { 0x25, "TerminateThread" },
+     { 0x29, "ChangeThreadPriority" },
+     { 0x2B, "RotateThreadReadyQueue" },
+     { 0x2D, "ReleaseWaitThread" },
++    { 0x2F, "GetThreadId" },
+     { 0x30, "ReferThreadStatus" },
+     { 0x32, "SleepThread" },
+     { 0x33, "WakeupThread" },
+     { 0x35, "CancelWakeupThread" },
++    { 0x37, "SuspendThread" },
++    { 0x39, "ResumeThread" },
+     { 0x3C, "SetupThread" },
+     { 0x3D, "SetupHeap" },
+     { 0x3E, "EndOfHeap" },
+@@ -51,6 +59,10 @@ static const SyscallName kSyscallNames[] = {
+     { 0x59, "ReferEventFlagStatus" },
+     { 0x5A, "Copy" },
+     { 0x5B, "GetEntryAddress" },
++    { 0x5C, "EnableIntcHandler" },
++    { 0x5D, "DisableIntcHandler" },
++    { 0x5E, "EnableDmacHandler" },
++    { 0x5F, "DisableDmacHandler" },
+     { 0x61, "EnableCache" },
+     { 0x62, "DisableCache" },
+     { 0x64, "FlushCache" },
+@@ -60,12 +72,56 @@ static const SyscallName kSyscallNames[] = {
+     { 0x71, "GsPutIMR" },
+     { 0x73, "SetVSyncFlag" },
+     { 0x74, "SetSyscall" },
++    { 0x76, "sceSifDmaStat" },
++    { 0x77, "sceSifSetDma" },
++    { 0x78, "sceSifSetDChain" },
++    { 0x79, "sceSifSetReg" },
++    { 0x7A, "sceSifGetReg" },
++    { 0x7B, "sceSifStopDma" },
++    { 0x7C, "Deci2Call" },
+     { 0x7F, "GetMemorySize" },
+     { 0x82, "InitTLB" },
+     { 0x83, "FindAddress" },
+     { 0x85, "SetMemoryMode" },
+     { 0xFC, "SetAlarm" },
+     { 0xFE, "CancelAlarm" },
++    { 0xFFFFFF01, "iCancelAlarm" },
++    { 0xFFFFFF03, "iSetAlarm" },
++    { 0xFFFFFF84, "Deci2Call" },
++    { 0xFFFFFF88, "sceSifSetDChain" },
++    { 0xFFFFFF89, "sceSifSetDma" },
++    { 0xFFFFFF8A, "sceSifDmaStat" },
++    { 0xFFFFFF8F, "iGsPutIMR" },
++    { 0xFFFFFF90, "iGsGetIMR" },
++    { 0xFFFFFF98, "iFlushCache" },
++    { 0xFFFFFFA1, "DisableDmacHandler" },
++    { 0xFFFFFFA2, "EnableDmacHandler" },
++    { 0xFFFFFFA3, "DisableIntcHandler" },
++    { 0xFFFFFFA4, "EnableIntcHandler" },
++    { 0xFFFFFFA6, "iReferEventFlagStatus" },
++    { 0xFFFFFFA8, "iPollEventFlag" },
++    { 0xFFFFFFAB, "iClearEventFlag" },
++    { 0xFFFFFFAD, "iSetEventFlag" },
++    { 0xFFFFFFB7, "iDeleteSema" },
++    { 0xFFFFFFB8, "iReferSemaStatus" },
++    { 0xFFFFFFBA, "iPollSema" },
++    { 0xFFFFFFBD, "iSignalSema" },
++    { 0xFFFFFFC6, "ResumeThread" },
++    { 0xFFFFFFC8, "SuspendThread" },
++    { 0xFFFFFFCA, "iCancelWakeupThread" },
++    { 0xFFFFFFCC, "iWakeupThread" },
++    { 0xFFFFFFCF, "iReferThreadStatus" },
++    { 0xFFFFFFD1, "GetThreadId" },
++    { 0xFFFFFFD2, "iReleaseWaitThread" },
++    { 0xFFFFFFD4, "iRotateThreadReadyQueue" },
++    { 0xFFFFFFD6, "iChangeThreadPriority" },
++    { 0xFFFFFFDA, "TerminateThread" },
++    { 0xFFFFFFE1, "iCancelAlarm" },
++    { 0xFFFFFFE2, "iSetAlarm" },
++    { 0xFFFFFFE3, "iDisableDmac" },
++    { 0xFFFFFFE4, "iEnableDmac" },
++    { 0xFFFFFFE5, "iDisableIntc" },
++    { 0xFFFFFFE6, "iEnableIntc" },
+ };
+ 
+-static const unsigned kSyscallNameCount = 58;
++static const unsigned kSyscallNameCount = 114;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 4a6e44b..4fd5250 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -54,6 +54,34 @@ namespace
+     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
+     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
+ 
++    // W275 Angle A. INVOCATION-QUEUE TRACE. OFF unless VULCAN4_W275_INV is set, so an unset
++    // environment reproduces today's behaviour byte for byte (AGENTS.md law 12). This exists to
++    // answer ONE question with an address rather than an adjective: the DMAC interrupt invocation
++    // queued by dispatchIrq() is enqueued exactly the way an INTC Interrupt invocation is, so if
++    // INTC ones are serviced and the DMAC one is not, the log below shows the enqueue and the
++    // missing service -- and the pc on each line names which handler was dropped.
++    inline const char *w275InvKindName(GuestInvocationKind kind)
++    {
++        switch (kind)
++        {
++        case GuestInvocationKind::Interrupt: return "Interrupt";
++        case GuestInvocationKind::Alarm: return "Alarm";
++        case GuestInvocationKind::GsCallback: return "GsCallback";
++        case GuestInvocationKind::RpcCallback: return "RpcCallback";
++        case GuestInvocationKind::SyscallOverride: return "SyscallOverride";
++        case GuestInvocationKind::ExitHandler: return "ExitHandler";
++        case GuestInvocationKind::HleCall: return "HleCall";
++        case GuestInvocationKind::SifCommand: return "SifCommand";
++        }
++        return "?";
++    }
++
++    inline bool w275InvTrace()
++    {
++        static const bool on = (std::getenv("VULCAN4_W275_INV") != nullptr);
++        return on;
++    }
++
+     template <typename Map>
+     int allocatePositiveId(int &nextId, const Map &objects)
+     {
+@@ -753,13 +781,43 @@ void EeScheduler::sleepCurrent(uint32_t microseconds)
+         return;
+     }
+ 
+-    // W88. sce_SleepThread(n) IS TIMED. Measured on GT4: 23 of 24 calls pass a0 = 8, and the boot
+-    // stops dead on the 24th. The old body dropped the argument on the floor and blocked with
+-    // std::monostate, so "sleep 8 microseconds" became "sleep until somebody calls sce_WakeupThread",
+-    // and with CreateThread calls=1 and nothing else pending that is forever.
++    // W88 assumed sce_SleepThread(n) IS TIMED and read $a0 as microseconds. W275 Segment D SETTLES
++    // that the other way: ps2tek.md:5065 / 09-ps2tek.md give "32h SleepThread: void", the guest
++    // trampoline func_101F340 never writes $a0, so $a0 was never a duration. SleepThread.cpp now
++    // passes 0 here by default, i.e. the untimed branch, and only reaches the timed branch behind the
++    // OFF-by-default VULCAN4_W161_SLEEP_TIMED / VULCAN4_W161_SLEEP_US A/B knobs.
++    //
++    // microseconds == 0 therefore IS the production path: block with std::monostate and let
++    // sce_WakeupThread makeReady() it. That is what FUN_0100D838's waiter-walk needs to find.
+     //
+-    // n == 0 keeps the old untimed behaviour deliberately: a plain sleep with no duration is a
+-    // genuine wait for a wakeup, and turning it into a zero-length timed sleep would spin.
++    // W275 T1-followup #2 probe (OFF unless VULCAN4_W275_SLEEP is set). W88 measured "23 of 24 calls
++    // pass a0 = 8"; this prints the argument and the guest PC of every call so the 24th is a number
++    // instead of a guess. It matters because the guest SleepThread trampoline func_101F340 sets only
++    // $v1 = 0x32 and issues syscall 0 -- it never touches $a0. Its caller at pc=0x100afa0 is the GIF
++    // busy-poll loop, whose prologue ran 0x100af30 `sll $a0,$s5,2`, i.e. $a0 = the DMAC slot index
++    // times 4. If the parked call shows us=0 here, the untimed branch below is what parks it, and
++    // nothing in the run ever wakes it (measured: sema 7 is never signalled).
++    static const bool s_w275SleepOn = (std::getenv("VULCAN4_W275_SLEEP") != nullptr);
++    if (s_w275SleepOn)
++    {
++        static uint64_t s_n = 0ull;
++        // Cap raised from 128 to 20000 on the second measurement: the first run's 128-line cap hid the
++        // TAIL of the run, which is exactly where the decisive call lives (sleepCurrentCalls = 15576).
++        if (s_n < 20000ull)
++        {
++            ++s_n;
++            std::cerr << "[w275:sleep] #" << s_n << " tid=" << self->id << " us=" << microseconds
++                      << " guestpc=0x" << std::hex << m_runtime.cpu().pc
++                      << " sp=0x" << getRegU32(&self->activeContext(), 29)
++                      << " a0=0x" << getRegU32(&self->activeContext(), 4)
++                      << " ra=0x" << getRegU32(&self->activeContext(), 31)
++                      // $s0/$s3 belong to the caller (the DMAC busy-poll loop at 0x100af50): $s0 is the
++                      // byte it re-reads at 0x100afa8, $s3 its remaining retry budget.
++                      << " s0=0x" << getRegU32(&self->activeContext(), 16)
++                      << " s3=" << (int32_t)getRegU32(&self->activeContext(), 19)
++                      << std::dec << std::endl;
++        }
++    }
+     constexpr uint64_t kCyclesPerMicrosecond = 295ull; // kEeClockHz is 294912000, i.e. 294.912/us
+     const uint64_t deadline = m_eeCycle + (static_cast<uint64_t>(microseconds) * kCyclesPerMicrosecond);
+     if (microseconds != 0u)
+@@ -1232,6 +1290,23 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+     {
+         m_pendingInvocationsHighWater = m_pendingInvocations.size();
+     }
++    // W275 Angle A: every ENQUEUE, with the kind, the pc it will run at, and where the queue stood.
++    if (w275InvTrace())
++    {
++        static uint64_t s_w275Enq = 0;
++        ++s_w275Enq;
++        GuestThread *owner = currentThread();
++        std::cerr << "[w275:enq] n=" << s_w275Enq
++                  << " kind=" << w275InvKindName(invocation.kind)
++                  << " pc=0x" << std::hex << invocation.context.pc << std::dec
++                  << " seq=" << invocation.sequence
++                  << " pending=" << (m_pendingInvocations.size() + 1u)
++                  << " curTid=" << m_currentThreadId
++                  << " ownerTid=" << (owner != nullptr ? owner->id : -1)
++                  << " ownerInvDepth=" << (owner != nullptr ? owner->invocations.size() : 0u)
++                  << " guestExecuting=" << (m_guestExecuting.load(std::memory_order_acquire) ? 1 : 0)
++                  << std::endl;
++    }
+     m_pendingInvocations.push_back(std::move(invocation));
+     m_checkpointPending.store(true, std::memory_order_release);
+ }
+@@ -1370,6 +1445,19 @@ EeServiceResult EeScheduler::serviceInvocations(int stepBudget)
+         {
+             GuestInvocation invocation = std::move(m_pendingInvocations.front());
+             m_pendingInvocations.pop_front();
++            if (w275InvTrace())
++            {
++                static uint64_t s_w275Pop = 0;
++                ++s_w275Pop;
++                std::cerr << "[w275:svc-pop] n=" << s_w275Pop
++                          << " kind=" << w275InvKindName(invocation.kind)
++                          << " pc=0x" << std::hex << invocation.context.pc << std::dec
++                          << " seq=" << invocation.sequence
++                          << " tid=" << running->id
++                          << " pendingLeft=" << m_pendingInvocations.size()
++                          << " step=" << step
++                          << std::endl;
++            }
+             if (getRegU32(&invocation.context, 29) == 0u)
+             {
+                 SET_GPR_U32(&invocation.context, 29, invocationStackTop());
+@@ -1378,6 +1466,29 @@ EeServiceResult EeScheduler::serviceInvocations(int stepBudget)
+             ranAnything = true;
+             continue;
+         }
++        // W275 Angle A. THE DROP CANDIDATE. A pending invocation can only be attached when the
++        // running thread is on its BASE frame (invocations empty). While the thread is INSIDE an
++        // invocation, a newly queued one waits here. If the DMAC invocation is queued while some
++        // other Interrupt invocation never returns, this line is where it starves -- and the
++        // pc on the front of the queue names it.
++        if (w275InvTrace() && !m_pendingInvocations.empty() && !running->invocations.empty())
++        {
++            static uint64_t s_w275Stuck = 0;
++            ++s_w275Stuck;
++            if (s_w275Stuck <= 40u || (s_w275Stuck % 1000u) == 0u)
++            {
++                std::cerr << "[w275:svc-stuck] n=" << s_w275Stuck
++                          << " front.kind=" << w275InvKindName(m_pendingInvocations.front().kind)
++                          << " front.pc=0x" << std::hex << m_pendingInvocations.front().context.pc << std::dec
++                          << " queued=" << m_pendingInvocations.size()
++                          << " tid=" << running->id
++                          << " inProgressKind=" << w275InvKindName(running->invocations.back().kind)
++                          << " inProgressPc=0x" << std::hex << running->invocations.back().context.pc << std::dec
++                          << " depth=" << running->invocations.size()
++                          << " step=" << step
++                          << std::endl;
++            }
++        }
+ 
+         R5900Context &context = running->activeContext();
+ 
+@@ -1462,6 +1573,25 @@ EeServiceResult EeScheduler::serviceInvocations(int stepBudget)
+                     ++m_stepIntrRun;
+                 }
+             }
++            // W275 Angle A: every SERVICE (the run site the driver actually uses). The pc is the
++            // discriminator -- an INTC Interrupt invocation and the DMAC one are both kind=Interrupt,
++            // and only the pc says which handler this is. FUN_0100DAE0 is 0x100dae0.
++            if (w275InvTrace())
++            {
++                static uint64_t s_w275Run = 0;
++                ++s_w275Run;
++                const uint32_t runPc = running->invocations.empty() ? context.pc
++                                                                    : running->invocations.back().context.pc;
++                std::cerr << "[w275:svc-run] n=" << s_w275Run
++                          << " kind=" << (running->invocations.empty()
++                                              ? "BaseFrame"
++                                              : w275InvKindName(running->invocations.back().kind))
++                          << " pc=0x" << std::hex << runPc << std::dec
++                          << " tid=" << running->id
++                          << " depth=" << running->invocations.size()
++                          << " step=" << step
++                          << std::endl;
++            }
+             ++m_schedulerSteps;
+             function(m_rdram, &context, &m_runtime);
+             m_insideInterrupt = false;
+@@ -1699,6 +1829,27 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
+     assertExecutor();
+     const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
+ 
++    // W275 Angle A: dispatchIrq ENTRY. dmac=1 is the DMAC path (drainCompletedDmacHandlers ->
++    // dispatchDmacHandlersForCause); dmac=0 is INTC. Log the mask and its cause bit so a reject at
++    // the mask gate below is distinguishable from an empty `matching` set.
++    if (w275InvTrace())
++    {
++        static uint64_t s_w275Dispatch = 0;
++        ++s_w275Dispatch;
++        const char *gate = (cause < 32u && (mask & (1u << cause)) == 0u) ? "REJECT" : "pass";
++        std::cerr << "[w275:dispatch] n=" << s_w275Dispatch
++                  << " dmac=" << (dmac ? 1 : 0)
++                  << " cause=" << cause
++                  << " mask=0x" << std::hex << mask << std::dec
++                  << " causeBit=" << ((cause < 32u) ? ((mask >> cause) & 1u) : 0u)
++                  << " gate=" << gate
++                  << " dmacHandlers=" << m_dmacHandlers.size()
++                  << " intcHandlers=" << m_intcHandlers.size()
++                  << " curTid=" << m_currentThreadId
++                  << " pending=" << m_pendingInvocations.size()
++                  << std::endl;
++    }
++
+     // W105. SEPARATE (A) FROM (B). ONE RUN, ONE ANSWER.
+     //
+     // vblanks_processed=224 with interrupts_raised=0 means 224 VBlankStart events each called
+@@ -1789,6 +1940,20 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
+     }
+     std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
+               { return left.order < right.order; });
++    if (w275InvTrace())
++    {
++        std::cerr << "[w275:dispatch-match] dmac=" << (dmac ? 1 : 0)
++                  << " cause=" << cause
++                  << " matching=" << matching.size();
++        for (const EeIrqHandler &handler : matching)
++        {
++            std::cerr << " [" << (handler.enabled ? "en" : "dis")
++                      << " h=0x" << std::hex << handler.handler << std::dec
++                      << " arg=0x" << std::hex << handler.argument << std::dec
++                      << " hasFn=" << (m_runtime.hasFunction(handler.handler) ? 1 : 0) << "]";
++        }
++        std::cerr << std::endl;
++    }
+     for (const EeIrqHandler &handler : matching)
+     {
+         GuestInvocation invocation{};
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp
+index 3b2be31..141fb59 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp
+@@ -22,6 +22,9 @@ namespace ps2_syscalls
+         case 0x04:
+             ExitThread(rdram, ctx, runtime);
+             return true;
++        case 0x0B:
++            AddSbusIntcHandler(rdram, ctx, runtime);
++            return true;
+         case 0x10:
+             AddIntcHandler(rdram, ctx, runtime);
+             return true;
+@@ -292,6 +295,15 @@ namespace ps2_syscalls
+         case static_cast<uint32_t>(-0x78):
+             ps2_stubs::sceSifSetDChain(rdram, ctx, runtime);
+             return true;
++        case 0x79:
++            ps2_stubs::sceSifSetReg(rdram, ctx, runtime);
++            return true;
++        case 0x7A:
++            ps2_stubs::sceSifGetReg(rdram, ctx, runtime);
++            return true;
++        case 0x7B:
++            ps2_stubs::sceSifStopDma(rdram, ctx, runtime);
++            return true;
+         case 0x7F:
+             GetMemorySize(rdram, ctx, runtime);
+             return true;
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
+index 2c98016..a5c30ea 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
+@@ -125,6 +125,39 @@ namespace ps2_syscalls
+         AddIntcHandler(rdram, ctx, runtime);
+     }
+ 
++    void AddSbusIntcHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        // 0x0B AddSbusIntcHandler(cause=$a0, handler=$a1) -> $v0=handler id.
++        //
++        // SBUS interrupts are raised by the IOP for the sub-bus devices and delivered to the EE
++        // over SIF. A recompiled EE has no IOP to raise them, so no SBUS cause can ever be
++        // dispatched here -- the registered handler is recorded only so the id has the shape the
++        // kernel gives it. The guest's caller confirms this is safe to do without dispatch: GT4's
++        // only 0x0B call site, sub_010183B0 @ 0x10183b0, is a 16-iteration loop over causes 0..15
++        // that NEVER reads the returned id (0x10183e4 `slti $v0,$s0,0x10` overwrites $v0 two
++        // instructions later). One stable, non-negative id per cause, first registration wins --
++        // the kernel's own "fresh id per handler" shape, without a handler table we would never
++        // walk.
++        (void)rdram;
++        (void)runtime;
++        const uint32_t cause = getRegU32(ctx, 4);
++
++        static std::mutex s_sbusIdMutex;
++        static std::unordered_map<uint32_t, int32_t> s_sbusHandlerIds;
++        std::lock_guard<std::mutex> lock(s_sbusIdMutex);
++        auto it = s_sbusHandlerIds.find(cause);
++        if (it == s_sbusHandlerIds.end())
++        {
++            it = s_sbusHandlerIds.emplace(cause, static_cast<int32_t>(s_sbusHandlerIds.size())).first;
++            std::cout << "VULCAN 4 LIMITATION: EE syscall 0x0B AddSbusIntcHandler(cause=" << cause
++                      << ") registered with id " << it->second
++                      << " -- SBUS interrupts are IOP-side and are never delivered to a recompiled"
++                         " EE; the handler will not run and the cause will not be dispatched."
++                      << std::endl;
++        }
++        setReturnS32(ctx, it->second);
++    }
++
+     void RemoveIntcHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         removeHandler(rdram, ctx, runtime, false);
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index a9866db..248d57e 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -331,6 +331,46 @@ namespace ps2_syscalls
+ 
+     void TODO(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t encodedSyscallId)
+     {
++        // WHICH syscall is this? The dispatcher passes the encoded id, but an SDK wrapper that
++        // sets $v1 and emits a bare `syscall 0` arrives as 0, so fall back to $v1 -- the same rule
++        // the "Unimplemented" report below has always used.
++        uint32_t syscallId = encodedSyscallId;
++        if (syscallId == 0u)
++        {
++            syscallId = getRegU32(ctx, 3);
++        }
++
++        // 0x07 ExecPS2 is DELIBERATELY not in Dispatcher.cpp's switch, but it IS implemented -- it
++        // is handled here, below-by-return, because it cannot reset the machine in place (see the
++        // note in the body). Dispatching it HERE, before any reporting, is the fix for a warning
++        // that used to announce "Unimplemented" for a syscall that works.
++        if (syscallId == 0x07u)
++        {
++            // ExecPS2(entry, gp, argc, argv): the guest loader re-execs the game. On hardware the
++            // kernel clears all internal state and starts a fresh priority-0 main thread at
++            // `entry` (09-ps2tek 07h). A recompiled syscall stub cannot reset the machine in place
++            // -- its emitted `jr $ra` would resume the OLD frame and the driver holds a reference
++            // to the current thread's context -- so record the relaunch and stop the guest; the
++            // driver performs it at a safe point. This function must not return on hardware; here
++            // it returns only far enough to yield.
++            const uint32_t entry = getRegU32(ctx, 4);
++            const uint32_t gp = getRegU32(ctx, 5);
++            const uint32_t argc = getRegU32(ctx, 6);
++            const uint32_t argv = getRegU32(ctx, 7);
++            if (runtime == nullptr)
++            {
++                std::cerr << "VULCAN 4 LIMITATION: ExecPS2 (EE syscall 0x07) with no runtime — "
++                             "cannot relaunch the guest; returning 0 instead." << std::endl;
++                setReturnS32(ctx, 0);
++                return;
++            }
++            std::cerr << "[execps2] entry=0x" << std::hex << entry << " gp=0x" << gp
++                      << std::dec << " argc=" << argc
++                      << " argv=0x" << std::hex << argv << std::dec << std::endl;
++            runtime->requestExecPS2(entry, gp, argc, argv);
++            return;
++        }
++
+         // a bit more detail mayber reomve old logic, lets get it more raw
+         std::cerr << "[Syscall TODO]"
+                   << " encoded=0x" << std::hex << encodedSyscallId
+@@ -346,11 +386,6 @@ namespace ps2_syscalls
+         const uint32_t v0 = getRegU32(ctx, 2);
+         const uint32_t v1 = getRegU32(ctx, 3);
+         const uint32_t caller_ra = getRegU32(ctx, 31);
+-        uint32_t syscallId = encodedSyscallId;
+-        if (syscallId == 0u)
+-        {
+-            syscallId = v1;
+-        }
+ 
+         std::cerr << "Warning: Unimplemented PS2 syscall called. PC=0x" << std::hex << ctx->pc
+                   << ", RA=0x" << caller_ra
+@@ -365,10 +400,10 @@ namespace ps2_syscalls
+                   << ", $a2=0x" << getRegU32(ctx, 6)
+                   << ", $a3=0x" << getRegU32(ctx, 7) << std::dec << std::endl;
+ 
+-        // Common syscalls:
+-        // 0x04: Exit
++        // Common syscalls still reachable here:
++        // 0x04: Exit (also in the dispatcher's switch; kept for the bare-`syscall 0` encoding)
+         // 0x06: LoadExecPS2
+-        // 0x07: ExecPS2
++        // (0x07: ExecPS2 is handled at the top of this function, before any reporting.)
+         if (syscallId == 0x04u)
+         {
+             std::cerr << "  -> Syscall is Exit(), calling ExitThread stub." << std::endl;
+@@ -376,33 +411,6 @@ namespace ps2_syscalls
+             return;
+         }
+ 
+-        if (syscallId == 0x07u)
+-        {
+-            // ExecPS2(entry, gp, argc, argv): the guest loader re-execs the game. On hardware the
+-            // kernel clears all internal state and starts a fresh priority-0 main thread at
+-            // `entry` (09-ps2tek 07h). A recompiled syscall stub cannot reset the machine in place
+-            // -- its emitted `jr $ra` would resume the OLD frame and the driver holds a reference
+-            // to the current thread's context -- so record the relaunch and stop the guest; the
+-            // driver performs it at a safe point. This function must not return on hardware; here
+-            // it returns only far enough to yield.
+-            const uint32_t entry = getRegU32(ctx, 4);
+-            const uint32_t gp = getRegU32(ctx, 5);
+-            const uint32_t argc = getRegU32(ctx, 6);
+-            const uint32_t argv = getRegU32(ctx, 7);
+-            if (runtime == nullptr)
+-            {
+-                std::cerr << "VULCAN 4 LIMITATION: ExecPS2 (EE syscall 0x07) with no runtime — "
+-                             "cannot relaunch the guest; returning 0 instead." << std::endl;
+-                setReturnS32(ctx, 0);
+-                return;
+-            }
+-            std::cerr << "[execps2] entry=0x" << std::hex << entry << " gp=0x" << gp
+-                      << std::dec << " argc=" << argc
+-                      << " argv=0x" << std::hex << argv << std::dec << std::endl;
+-            runtime->requestExecPS2(entry, gp, argc, argv);
+-            return;
+-        }
+-
+         static std::mutex s_unknownMutex;
+         static std::unordered_map<uint32_t, uint64_t> s_unknownCounts;
+         {
+@@ -436,6 +444,96 @@ namespace ps2_syscalls
+     // the guest loses its frame: that is G1.8's measured wall, where GT4's convergence-loop
+     // $s2/$s3 were reset every third iteration and hasInvocation() latched so every later 0x83
+     // silently fell through to our builtin instead of the guest's own code.
++    // ---------------------------------------------------------------------
++    // W274: GT4's OWN GetEntryAddress, installed over kernel syscall 0x5B.
++    //
++    // GT4's loader (SCUS_973.28, sub_0102AA90) copies a 0x330-byte blob with its
++    // own Copy syscall and patches the table:
++    //   Copy(dest=0x80075000, src=0x01036300, size=0x330)  @ 0x0102AAD0
++    //   SetSyscall(0x5B, 0x80075000)                       @ 0x0102AAE8
++    //   for n in {0x55..0x59}: SetSyscall(n, GetEntryAddress(n))  @ 0x0102AB00
++    //
++    // The blob's 0x5B handler (RDRAM 0x00075000) is a pure table LOOKUP: it scans a
++    // 6-entry {number,handler} table at RDRAM 0x00075300 and returns the paired word
++    // (0 when the number is absent). That is NOT the kernel primitive, which returns
++    // the ADDRESS of the writable syscall-table slot 0x80011F80+n*4 for the caller to
++    // write through. Returning the slot address here would make the loader install a
++    // table slot as a syscall handler. So the builtin case 0x5B cannot be reused; this
++    // is a different primitive and the guest must keep its own.
++    //
++    // The table is read LIVE out of rdram, never baked in (law 1). If it is not there,
++    // refuse loudly instead of inventing an address.
++    // ---------------------------------------------------------------------
++    static bool emulateGuestGetEntryAddress(uint8_t *rdram, R5900Context *ctx,
++                                           uint32_t syscallNumber, uint32_t handler)
++    {
++        constexpr uint32_t kGt4Syscall = 0x5Bu;
++        constexpr uint32_t kGt4HandlerPhys = 0x00075000u; // 0x80075000 & 0x1FFFFFFF
++        constexpr uint32_t kGt4TableAddr = 0x80075300u;   // blob+0x300
++        constexpr uint32_t kGt4TableCount = 6u;           // blob scans exactly 6 entries
++
++        // Strictly scoped: ONLY GT4's blob, ONLY on 0x5B. Anything else falls through
++        // untouched to the LOUD W250 limitation in the caller.
++        if (syscallNumber != kGt4Syscall || (handler & 0x1FFFFFFFu) != kGt4HandlerPhys)
++        {
++            return false;
++        }
++
++        static bool announced = false;
++        if (!announced)
++        {
++            announced = true;
++            std::cerr
++                << "VULCAN 4 LIMITATION: syscall 0x5B is emulated as GT4's OWN GetEntryAddress "
++                   "(guest blob installed by SetSyscall(0x5B,0x80075000), Copy source 0x01036300), NOT "
++                   "the kernel primitive that returns the writable syscall-table slot 0x80011F80+n*4. "
++                   "Emulated: scan GT4's 6-entry {number,handler} table at RDRAM 0x00075300, return the "
++                   "paired handler, 0 when the number is absent. Table read live from rdram."
++                << std::endl;
++        }
++
++        const uint8_t *table = getConstMemPtr(rdram, kGt4TableAddr);
++        if (!table)
++        {
++            std::cerr << "VULCAN 4 LIMITATION: syscall 0x5B (GT4 GetEntryAddress) — RDRAM 0x"
++                      << std::hex << kGt4HandlerPhys << std::dec
++                      << " region is not mapped; cannot look up an entry. Returning KE_ERROR."
++                      << std::endl;
++            setReturnS32(ctx, KE_ERROR);
++            return true;
++        }
++
++        uint32_t firstNumber = 0u;
++        std::memcpy(&firstNumber, table, sizeof(firstNumber));
++        if (firstNumber == 0u)
++        {
++            // Asked before GT4's own Copy(0x80075000, 0x01036300, 0x330) ran, or that Copy never ran.
++            std::cerr << "VULCAN 4 LIMITATION: syscall 0x5B (GT4 GetEntryAddress) — GT4's entry table at "
++                         "RDRAM 0x00075300 is empty, so GT4's own blob was never copied there. Returning "
++                         "KE_ERROR exactly as before this stub (was the W250 line)."
++                      << std::endl;
++            setReturnS32(ctx, KE_ERROR);
++            return true;
++        }
++
++        const uint32_t wanted = getRegU32(ctx, 4); // $a0 = syscall number to resolve
++        for (uint32_t i = 0u; i < kGt4TableCount; ++i)
++        {
++            uint32_t number = 0u;
++            uint32_t entry = 0u;
++            std::memcpy(&number, table + (i * 8u), sizeof(number));
++            std::memcpy(&entry, table + (i * 8u) + 4u, sizeof(entry));
++            if (number == wanted)
++            {
++                setReturnU32(ctx, entry);
++                return true;
++            }
++        }
++
++        setReturnU32(ctx, 0u); // GT4's blob returns 0 for "no such entry"
++        return true;
++    }
++
+     bool dispatchSyscallOverride(uint32_t syscallNumber, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         uint32_t handler = 0u;
+@@ -453,6 +551,14 @@ namespace ps2_syscalls
+             return false;
+         }
+ 
++        // W274: an override target can legitimately have no generated function when the guest
++        // installed its OWN blob below both images (GT4 does exactly this for 0x5B). Emulate the
++        // ones we have read out of the guest; everything else keeps hitting the W250 line below.
++        if (emulateGuestGetEntryAddress(rdram, ctx, syscallNumber, handler))
++        {
++            return true;
++        }
++
+         if (!runtime->hasFunction(handler))
+         {
+             // W250. NEVER silent: an override target with no generated function is a LOUD limitation
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+index 512ca97..641ffbb 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+@@ -644,18 +644,39 @@ namespace ps2_syscalls
+     void SleepThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         EeScheduler &ee = scheduler(rdram, ctx, runtime);
+-        // W88. a0 is the duration in microseconds and it was being thrown away. On GT4 23 of 24 calls
+-        // pass 8; the 24th is the last thing the boot does.
++        // W275 Segment D. sce_SleepThread (0x32) IS UNTIMED. SETTLED, NOT ARGUED.
+         //
+-        // W161 (Sanji). Test knob, OFF by default. ps2sdk says `SleepThread(void)` takes NO argument,
+-        // so reading a0 as a duration is a deviation. VULCAN4_W161_SLEEP_US overrides the value we
+-        // treat as the duration, so one binary can A/B the timed and untimed (SDK/upstream) behaviour
+-        // without a rebuild. Delete with the dish that settles which is correct.
+-        uint32_t microseconds = ctx != nullptr ? getRegU32(ctx, 4) : 0u;
++        // W88 read $a0 as a microsecond duration and parked the thread in a TIMED sleep. That was a
++        // deviation from the platform and it is the W161 divergence: ps2tek.md:5065 and
++        // 09-ps2tek.md give "32h SleepThread: void", and ps2sdk's `SleepThread(void)` takes no
++        // argument at all -- the trampoline func_101F340 sets only $v1 = 0x32 and never touches $a0,
++        // so whatever we read out of $a0 is the CALLER's leftover register, not a duration.
++        //
++        // Measured cost of getting it wrong (W275 R1): tid2 at guest 0x100b628 spins on the 8-byte
++        // counter at 0x70002050, which the VBlank/GS handler FUN_0100D838 (INTC cause 2) increments at
++        // 0x100d8b4 (`sd v1,0(s1)`) before its waiter-walk calls WakeupThread on the parked sleepers.
++        // With $a0 read as 1us, tid2 became a TIMED sleeper, and completeTimedSleeps() only runs from
++        // accountCycles() i.e. only while a guest thread executes. tid1 blocked on sema 7 and tid2 in
++        // a timed sleep left nothing runnable, the clock stopped, VBlank delivery stopped at 50 and
++        // the run halted guest_blocked with tid2 still "asleep" after 16,075 calls. On hardware
++        // SleepThread PARKS the thread until WakeupThread: the handler's walk is what wakes it, and
++        // that walk needs the thread to actually be in an untimed wait to find it.
++        //
++        // So $a0 is ignored. wokeup_count is consumed first (unchanged); the wait is untimed
++        // (EeWaitPayload monostate), and sce_WakeupThread (EeScheduler::wakeupThread) already
++        // makeReady()s a thread parked with reason Sleep.
++        uint32_t microseconds = 0u;
++        // A/B knobs, BOTH OFF by default, so one binary can still measure the old behaviour:
++        //   VULCAN4_W161_SLEEP_TIMED=1  -> restore the W88 timed read of $a0 (the divergence)
++        //   VULCAN4_W161_SLEEP_US=<n>   -> timed sleep with a fixed n (overrides the above)
+         if (const char *env = std::getenv("VULCAN4_W161_SLEEP_US"))
+         {
+             microseconds = static_cast<uint32_t>(std::atoi(env));
+         }
++        else if (std::getenv("VULCAN4_W161_SLEEP_TIMED") != nullptr)
++        {
++            microseconds = ctx != nullptr ? getRegU32(ctx, 4) : 0u;
++        }
+         ee.sleepCurrent(microseconds);
+         setReturnS32(ctx, KE_OK);
+     }
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 514db2a..5a6b449 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -10,9 +10,63 @@
+ #include <algorithm>
+ #include <string>
+ #include <vector>
++#include <cstdio>
++#include <cstdlib>
++
++// W275 T1-followup. The guest's own reads/writes of the DMAC busy byte are traced WITH the guest PC
++// by PS2Runtime::Load8/Store8 (ps2_runtime.cpp), and that path also lands here. This flag is raised
++// for the duration of that inner memory call so the memory-layer backstop below does not double-log
++// the same event (a guest poll of this byte can run very hot). OFF by default, like the whole probe.
++thread_local bool g_w275GuestBusyHandled = false;
+ 
+ namespace
+ {
++    // W275 T1-followup. Targeted DMAC busy-byte watch, gated on VULCAN4_W275_BUSY (OFF by default:
++    // unset reproduces today's behaviour byte for byte). The EE DMAC channel-busy byte lives in
++    // scratchpad at 0x7000206D + channel*12 for channels 0/1/2. This prints the raw scratchpad
++    // traffic on those bytes (and the 32-bit words that contain them) plus the three CHCR registers,
++    // so the write/read ordering can be read off a single boot.
++    inline bool w275BusyEnabled()
++    {
++        static const bool on = (std::getenv("VULCAN4_W275_BUSY") != nullptr);
++        return on;
++    }
++    inline bool w275BusyByte(uint32_t addr)
++    {
++        return addr == 0x7000206Du || addr == 0x7000207Du || addr == 0x70002089u;
++    }
++    inline bool w275BusyWord(uint32_t addr)
++    {
++        return addr == 0x7000206Cu || addr == 0x7000207Cu || addr == 0x70002088u;
++    }
++    inline bool w275ChcrAddr(uint32_t addr)
++    {
++        return addr == 0x10008000u || addr == 0x10009000u || addr == 0x1000A000u;
++    }
++
++    // W275 T1-followup #2. GIF chain-walk trace, gated on VULCAN4_W275_GIFTAG (OFF by default).
++    // The boot halts with a live-locking tid2 waiting on the ch2 (GIF, 0x1000A000) chain transfer:
++    // the CHCR kick (0x10000185 = DIR|MOD=1|TIE) enters the mode==1 walker and no completion ever
++    // follows. This prints TADR, every tag the walker actually reads (raw 16 bytes) and what became
++    // of chainBuf, so the drop point is readable instead of inferred.
++    inline bool w275GifTagEnabled()
++    {
++        static const bool on = (std::getenv("VULCAN4_W275_GIFTAG") != nullptr);
++        return on;
++    }
++    inline const char *w275ChName(uint32_t channelBase)
++    {
++        switch (channelBase)
++        {
++        case 0x10008000u: return "VIF0";
++        case 0x10009000u: return "VIF1";
++        case 0x1000A000u: return "GIF";
++        case 0x1000D000u: return "SPR_FROM";
++        case 0x1000D400u: return "SPR_TO";
++        default: return "?";
++        }
++    }
++
+     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
+     {
+         if (static_cast<uint64_t>(offset) + static_cast<uint64_t>(bytes) > static_cast<uint64_t>(regionSize))
+@@ -740,7 +794,13 @@ uint8_t PS2Memory::read8(uint32_t address)
+ 
+     if (scratch)
+     {
+-        return m_scratchpad[physAddr];
++        const uint8_t _v = m_scratchpad[physAddr];
++        if (w275BusyEnabled() && !g_w275GuestBusyHandled && w275BusyByte(address))
++        {
++            std::fprintf(stderr, "[w275:busy] op=READ8 addr=0x%08X value=0x%02X pc=na src=read8.scratch\n",
++                         address, static_cast<unsigned>(_v));
++        }
++        return _v;
+     }
+     if (physAddr < PS2_RAM_SIZE)
+     {
+@@ -827,7 +887,13 @@ uint32_t PS2Memory::read32(uint32_t address)
+ 
+     if (scratch)
+     {
+-        return loadScalar<uint32_t>(m_scratchpad, physAddr, PS2_SCRATCHPAD_SIZE, "read32 scratchpad", address);
++        const uint32_t _v = loadScalar<uint32_t>(m_scratchpad, physAddr, PS2_SCRATCHPAD_SIZE, "read32 scratchpad", address);
++        if (w275BusyEnabled() && !g_w275GuestBusyHandled && w275BusyWord(address))
++        {
++            std::fprintf(stderr, "[w275:busy] op=READ32 addr=0x%08X value=0x%08X pc=na src=read32.scratch\n",
++                         address, _v);
++        }
++        return _v;
+     }
+     if (physAddr < PS2_RAM_SIZE)
+     {
+@@ -938,6 +1004,11 @@ void PS2Memory::write8(uint32_t address, uint8_t value)
+ 
+     if (scratch)
+     {
++        if (w275BusyEnabled() && !g_w275GuestBusyHandled && w275BusyByte(address))
++        {
++            std::fprintf(stderr, "[w275:busy] op=WRITE8 addr=0x%08X value=0x%02X pc=na src=write8.scratch\n",
++                         address, static_cast<unsigned>(value));
++        }
+         m_scratchpad[physAddr] = value;
+     }
+     else if (physAddr < PS2_RAM_SIZE)
+@@ -1051,6 +1122,11 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
+ 
+     if (scratch)
+     {
++        if (w275BusyEnabled() && !g_w275GuestBusyHandled && w275BusyWord(address))
++        {
++            std::fprintf(stderr, "[w275:busy] op=WRITE32 addr=0x%08X value=0x%08X pc=na src=write32.scratch\n",
++                         address, value);
++        }
+         storeScalar<uint32_t>(m_scratchpad, physAddr, PS2_SCRATCHPAD_SIZE, value, "write32 scratchpad", address);
+     }
+     else if (physAddr < PS2_RAM_SIZE)
+@@ -1172,6 +1248,20 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+     if (scratch)
+     {
+         inRange(physAddr, sizeof(__m128i), PS2_SCRATCHPAD_SIZE, "write128 scratchpad", address);
++        if (w275BusyEnabled())
++        {
++            alignas(16) uint8_t _row[16];
++            _mm_storeu_si128(reinterpret_cast<__m128i *>(_row), value);
++            for (uint32_t _i = 0; _i < 16u; ++_i)
++            {
++                const uint32_t _a = address + _i;
++                if (w275BusyByte(_a))
++                {
++                    std::fprintf(stderr, "[w275:busy] op=WRITE128 addr=0x%08X byte=0x%08X value=0x%02X pc=na src=write128.scratch\n",
++                                 address, _a, static_cast<unsigned>(_row[_i]));
++                }
++            }
++        }
+         _mm_storeu_si128(reinterpret_cast<__m128i *>(&m_scratchpad[physAddr]), value);
+     }
+     else if (physAddr < PS2_RAM_SIZE)
+@@ -1208,6 +1298,11 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+ 
+ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ {
++    if (w275BusyEnabled() && !g_w275GuestBusyHandled && w275ChcrAddr(address))
++    {
++        std::fprintf(stderr, "[w275:busy] op=WRITE_CHCR addr=0x%08X value=0x%08X pc=na src=writeIORegister\n",
++                     address, value);
++    }
+     size_t timerIndex = 0u;
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+@@ -1380,6 +1475,15 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+         {
+             const auto dctrlIt = m_ioRegisters.find(0x1000E000u);
+             const bool dmacEnabled = (dctrlIt == m_ioRegisters.end()) || ((dctrlIt->second & 0x1u) != 0u);
++            if (w275GifTagEnabled())
++            {
++                std::fprintf(stderr,
++                             "[w275:giftag] KICK ch=%s addr=0x%08X value=0x%08X dctrl=0x%08X dmacEnabled=%d "
++                             "gsVRAM=%d\n",
++                             w275ChName(address & 0xFFFFFF00u), address, value,
++                             dctrlIt == m_ioRegisters.end() ? 0u : dctrlIt->second, dmacEnabled ? 1 : 0,
++                             m_gsVRAM ? 1 : 0);
++            }
+             if (!dmacEnabled)
+             {
+                 return true;
+@@ -1395,7 +1499,14 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 return true;
+             }
+ 
+-            if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) && (m_gsVRAM || channelBase == 0x10008000u))
++            const bool w275EnterGs =
++                (channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) &&
++                (m_gsVRAM || channelBase == 0x10008000u);
++            if (w275GifTagEnabled() && channelBase == 0x1000A000u && !w275EnterGs)
++            {
++                std::fprintf(stderr, "[w275:giftag] DROP ch=GIF reason=gsVRAM-guard (m_gsVRAM=0)\n");
++            }
++            if (w275EnterGs)
+             {
+                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
+                 {
+@@ -1431,6 +1542,16 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     const int kMaxChainTags = 4096;
+                     std::vector<uint8_t> chainBuf;
+ 
++                    const bool w275gt = w275GifTagEnabled() && channelBase == 0x1000A000u;
++                    if (w275gt)
++                    {
++                        std::fprintf(stderr,
++                                     "[w275:giftag] WALK ch=%s chcr=0x%08X mode=%u tie=%d asp=%u "
++                                     "tadr=0x%08X madr=0x%08X qwc=%u asr0=0x%08X asr1=0x%08X\n",
++                                     w275ChName(channelBase), value, mode, tieEnabled ? 1 : 0, asp,
++                                     tagAddr, madr, qwc, asr0, asr1);
++                    }
++
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+                     {
+                         const uint64_t bytes64 = static_cast<uint64_t>(qwCount) * 16ull;
+@@ -1488,6 +1609,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ 
+                     int tagsProcessed = 0;
+                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
++                    // W275. A chain of zero total QWC (e.g. NEXT -> END with QWC=0) is a LEGAL,
++                    // COMPLETED transfer: the DMAC clears STR and raises the channel's interrupt
++                    // exactly as if data had moved. The walker below only records data, so an
++                    // empty chainBuf must still mark the channel complete or the guest's wait
++                    // (FUN_0100AE78 polls the busy byte the handler clears) never terminates.
++                    bool chainWalkedToEnd = false;
+ 
+                     while (tagsProcessed < kMaxChainTags)
+                     {
+@@ -1500,6 +1627,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                         }
+                         catch (...)
+                         {
++                            if (w275gt)
++                                std::fprintf(stderr,
++                                             "[w275:giftag]   BREAK tag#%d tagAddr=0x%08X reason=translateAddress-threw\n",
++                                             tagsProcessed, currentTagAddr);
+                             break;
+                         }
+                         const uint8_t *tagBase;
+@@ -1515,7 +1646,14 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             tagMax = PS2_RAM_SIZE;
+                         }
+                         if (physTag + 16 > tagMax)
++                        {
++                            if (w275gt)
++                                std::fprintf(stderr,
++                                             "[w275:giftag]   BREAK tag#%d tagAddr=0x%08X reason=tag-out-of-range "
++                                             "phys=0x%08X tagMax=0x%08X spr=%d\n",
++                                             tagsProcessed, currentTagAddr, physTag, tagMax, tagInSPR ? 1 : 0);
+                             break;
++                        }
+ 
+                         const uint8_t *tp = tagBase + physTag;
+                         uint64_t tag = loadScalar<uint64_t>(tp, 0, 16, "dma chain tag", tagAddr);
+@@ -1601,8 +1739,24 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             appendData(dataAddr, tagQwc);
+                         if (irq && tieEnabled)
+                             endChain = true;
++
++                        if (w275gt)
++                        {
++                            std::fprintf(stderr,
++                                         "[w275:giftag]   tag#%d addr=0x%08X raw=%02X%02X%02X%02X%02X%02X%02X%02X"
++                                         "%02X%02X%02X%02X%02X%02X%02X%02X id=%u qwc=%u dw=%u irq=%d "
++                                         "end=%d payload=%d dataAddr=0x%08X nextTagAddr=0x%08X chainBuf=%zu\n",
++                                         tagsProcessed - 1, currentTagAddr,
++                                         tp[0], tp[1], tp[2], tp[3], tp[4], tp[5], tp[6], tp[7],
++                                         tp[8], tp[9], tp[10], tp[11], tp[12], tp[13], tp[14], tp[15],
++                                         id, tagQwc, addr, irq ? 1 : 0, endChain ? 1 : 0,
++                                         hasPayload ? 1 : 0, dataAddr, tagAddr, chainBuf.size());
++                        }
+                         if (endChain)
++                        {
++                            chainWalkedToEnd = true;
+                             break;
++                        }
+                     }
+ 
+                     m_ioRegisters[channelBase + 0x30] = tagAddr;
+@@ -1612,7 +1766,16 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     chcr = (chcr & 0x0000FFFFu) | (lastTagUpper << 16);
+                     m_ioRegisters[channelBase + 0x00] = chcr;
+ 
+-                    if (!chainBuf.empty())
++                    if (w275gt)
++                    {
++                        std::fprintf(stderr,
++                                     "[w275:giftag] END ch=%s tagsProcessed=%d chainBuf=%zu tagAddr=0x%08X "
++                                     "asr0=0x%08X asr1=0x%08X asp=%u chcrFinal=0x%08X enqueue=%s\n",
++                                     w275ChName(channelBase), tagsProcessed, chainBuf.size(), tagAddr,
++                                     asr0, asr1, asp, chcr, chainBuf.empty() ? "NO(chainBuf empty)" : "YES");
++                    }
++
++                    if (!chainBuf.empty() || chainWalkedToEnd)
+                     {
+                         PendingTransfer pt;
+                         pt.fromScratchpad = false;
+@@ -1644,6 +1807,15 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ 
+                 const bool autoProcessTransfers =
+                     (channelBase == 0x1000A000u) ? (m_gifPacketCallback || m_gifArbiter != nullptr) : true;
++                if (w275GifTagEnabled() && channelBase == 0x1000A000u)
++                {
++                    std::fprintf(stderr,
++                                 "[w275:giftag] PROCESS ch=GIF auto=%d cb=%d arbiter=%d pendingGif=%zu "
++                                 "pendingVif1=%zu pendingVif0=%zu\n",
++                                 autoProcessTransfers ? 1 : 0, m_gifPacketCallback ? 1 : 0,
++                                 m_gifArbiter ? 1 : 0, m_pendingGifTransfers.size(),
++                                 m_pendingVif1Transfers.size(), m_pendingVif0Transfers.size());
++                }
+                 if (autoProcessTransfers)
+                 {
+                     processPendingTransfers();
+@@ -1712,6 +1884,18 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
+         }
+         else
+         {
++            if (w275BusyEnabled())
++            {
++                for (uint32_t _i = 0; _i < chunk; ++_i)
++                {
++                    const uint32_t _a = PS2_SCRATCHPAD_BASE + scratchOffset + _i;
++                    if (w275BusyByte(_a))
++                    {
++                        std::fprintf(stderr, "[w275:busy] op=WRITE8 addr=0x%08X value=0x%02X pc=na src=spr_dma\n",
++                                     _a, static_cast<unsigned>(m_rdram[mainOffset + copied + _i]));
++                    }
++                }
++            }
+             std::memcpy(m_scratchpad + scratchOffset, m_rdram + mainOffset + copied, chunk);
+         }
+ 
+@@ -1747,6 +1931,20 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
+ void PS2Memory::processPendingTransfers()
+ {
+     const bool hadGif = !m_pendingGifTransfers.empty();
++    if (w275GifTagEnabled())
++    {
++        std::fprintf(stderr,
++                     "[w275:giftag]   SERVICED gif=%zu vif1=%zu vif0=%zu\n",
++                     m_pendingGifTransfers.size(), m_pendingVif1Transfers.size(),
++                     m_pendingVif0Transfers.size());
++        for (size_t di = 0; di < m_pendingGifTransfers.size(); ++di)
++        {
++            const auto &d = m_pendingGifTransfers[di];
++            std::fprintf(stderr,
++                         "[w275:giftag]     gifXfer[%zu] chainData=%zu qwc=%u spr=%d src=0x%08X\n",
++                         di, d.chainData.size(), d.qwc, d.fromScratchpad ? 1 : 0, d.srcAddr);
++        }
++    }
+     uint32_t observedGifQwc = 0u;
+     for (const auto &transfer : m_pendingGifTransfers)
+     {
+@@ -1966,6 +2164,11 @@ void PS2Memory::processPendingTransfers()
+         m_ioRegisters[D_STAT] = dstat;
+     };
+ 
++    if (w275GifTagEnabled())
++    {
++        std::fprintf(stderr, "[w275:giftag]   COMPLETE hadGif=%d hadVif0=%d hadVif1=%d\n",
++                     hadGif ? 1 : 0, hadVif0 ? 1 : 0, hadVif1 ? 1 : 0);
++    }
+     if (hadGif)
+     {
+         raiseDStatChannel(2u); // GIF channel
+@@ -2493,6 +2696,11 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+             {
+                 uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
+                 m_ioRegisters[address] = channelStatus;
++                if (w275BusyEnabled() && !g_w275GuestBusyHandled && w275ChcrAddr(address))
++                {
++                    std::fprintf(stderr, "[w275:busy] op=READ_CHCR addr=0x%08X value=0x%08X pc=na src=readIORegister\n",
++                                 address, channelStatus);
++                }
+                 return channelStatus;
+             }
+         }
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 3d8160f..7d87df8 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1811,8 +1811,12 @@ bool PS2Runtime::hasFunction(uint32_t address) const
+     {
+         return true;
+     }
+-    // W250. Unified space: also resolve into the ENGINE image's table.
+-    if ((norm & 3u) == 0u && g_ps2EngineFunctionTableSlotCount != 0u &&
++    // W250. Unified space: also resolve into the ENGINE image's table. The engine table symbols are
++    // weak: they resolve to NULL when no engine image is linked into this binary (unit tests, single-
++    // image runtimes). Dereferencing a NULL weak symbol is the suite segfault, so test the address
++    // before reading any of them.
++    if (&g_ps2EngineFunctionTableSlotCount != nullptr && (norm & 3u) == 0u &&
++        g_ps2EngineFunctionTableSlotCount != 0u &&
+         norm >= g_ps2EngineFunctionTableBase && norm < g_ps2EngineFunctionTableEnd)
+     {
+         const uint32_t eslot = (norm - g_ps2EngineFunctionTableBase) >> 2;
+@@ -1847,8 +1851,11 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
+ {
+     pushDispatchPc(address);
+ 
++    // W250/R2. Normalise the KSEG0/KSEG1 mirror to physical, exactly as hasFunction() does, so the
++    // two lookups agree on what a "generated" address is (physical addresses are unchanged).
++    const uint32_t norm = address & 0x1FFFFFFFu;
+     uint32_t slot = 0u;
+-    if (generatedFunctionTableSlot(address, slot))
++    if (generatedFunctionTableSlot(norm, slot))
+     {
+         RecompiledFunction fn = g_ps2RecompiledFunctionTable[slot];
+         if (fn != nullptr)
+@@ -1856,6 +1863,27 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
+             return fn;
+         }
+     }
++    // W250/R2. Unified space: an indirect jump or scheduler resume into the ENGINE image must resolve
++    // through g_ps2EngineFunctionTable, exactly as hasFunction() already does. Before this only the
++    // loader table was consulted, so every engine target arrived as
++    // "No exact recompiled function ... tableBase=0x1000008 tableEnd=0x102dbec" -- R2's five misses
++    // (0x5b7560 0x5adf20 0x48ef90 0x107f08 0x5b78a0) are ALL registered in the engine table and were
++    // only unreachable because this fallback was missing. Weak symbols: test the address of the weak
++    // symbol before reading any of them (the no-engine unit-test link has them NULL).
++    if (&g_ps2EngineFunctionTableSlotCount != nullptr && (norm & 3u) == 0u &&
++        g_ps2EngineFunctionTableSlotCount != 0u &&
++        norm >= g_ps2EngineFunctionTableBase && norm < g_ps2EngineFunctionTableEnd)
++    {
++        const uint32_t eslot = (norm - g_ps2EngineFunctionTableBase) >> 2;
++        if (eslot < g_ps2EngineFunctionTableSlotCount)
++        {
++            RecompiledFunction fn = g_ps2EngineFunctionTable[eslot];
++            if (fn != nullptr)
++            {
++                return fn;
++            }
++        }
++    }
+ 
+     std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
+               << " tableBase=0x" << g_ps2RecompiledFunctionTableBase
+@@ -5159,8 +5187,18 @@ void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
+ 
+ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
+ {
++    static const bool s_w275Drain = (std::getenv("VULCAN4_W275_INV") != nullptr);
+     for (uint32_t cause : m_memory.consumeCompletedDmacCauses())
+     {
++        if (s_w275Drain)
++        {
++            static uint64_t s_w275DrainN = 0;
++            ++s_w275DrainN;
++            std::cerr << "[w275:drain] n=" << s_w275DrainN
++                      << " cause=" << cause
++                      << " (-> dispatchDmacHandlersForCause -> dispatchIrq(dmac=1))"
++                      << std::endl;
++        }
+         ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
+     }
+ }
+@@ -5766,14 +5804,94 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
+     return top - 0x10u;
+ }
+ 
++// W275 T1-followup. Targeted DMAC busy-byte / CHCR watch, gated on VULCAN4_W275_BUSY (OFF by
++// default). These live on the guest memory entry points because they are the only place with the
++// guest PC in hand; the memory-layer probe in ps2_memory.cpp is suppressed during the inner call
++// (g_w275GuestBusyHandled) so an event is logged with its PC exactly once. A guest poll of the busy
++// byte can run hot, so reads are printed on value change and on a heartbeat; writes always.
++extern thread_local bool g_w275GuestBusyHandled;
++
++static bool w275BusyProbe() noexcept
++{
++    static const bool on = std::getenv("VULCAN4_W275_BUSY") != nullptr;
++    return on;
++}
++// Address map correction (T1-followup #2). The guest helper sub_0100DE58 is called with the DMAC
++// channel index in $a0 and computes the busy byte as
++//     0x100de88 sll  $v1,$s0,1 ; 0x100de94 addu $v1,$v1,$s0 ; 0x100de9c sll $v1,$v1,2
++//     0x100dea4 addiu $v1,$v1,0x60 ; 0x100dea8 lui $a0,0x7000 ; 0x100deb0 ...
++//     0x100deb4 addiu $a1,$zero,1 ; 0x100debc sb $a1,0xD($a0)
++// i.e. byte = 0x70002000 + s0*12 + 0x60 + 0xD = 0x7000206D + s0*0xC. The stride is 12, NOT 16:
++// s0=0 (VIF0) -> 0x7000206D, s0=1 (VIF1) -> 0x70002079, s0=2 (GIF) -> 0x70002085,
++// s0=3 -> 0x70002091. The earlier watch set (0x6D/0x7D/0x89) could never have seen the GIF byte.
++static bool w275BusyByte(uint32_t a) noexcept
++{
++    // Widened to the whole possible window on the third measurement. The second run showed 2924
++    // SleepThread calls whose caller returns to 0x100afa8 -- the loop's own `lbu $v1,0x0($s0)` -- but
++    // only ONE watched read at that pc, so the polled byte must be at an address the enumerated set
++    // never covered. A range has no blind spot: 0x70002060..0x700020A0 covers stride 12 (0x6D/79/85/
++    // 91), stride 16 (0x6D/7D/8D/9D) and everything in between.
++    return a >= 0x70002060u && a <= 0x700020A0u;
++}
++static bool w275BusyWord(uint32_t a) noexcept
++{
++    return a == 0x7000206Cu || a == 0x70002078u || a == 0x70002084u || a == 0x70002090u ||
++           a == 0x7000207Cu || a == 0x70002088u;
++}
++// One change-detection bucket per byte of the watched window, so two different channels' bytes can
++// never mask each other in the "print only on change" logic.
++constexpr int kW275BusyBuckets = 128;
++static int w275BusyIdx(uint32_t a) noexcept
++{
++    return static_cast<int>((a - 0x70002060u) & 0x7Fu);
++}
++static bool w275Chcr(uint32_t a) noexcept
++{
++    return a == 0x10008000u || a == 0x10009000u || a == 0x1000A000u;
++}
++static void w275LogReadByte(const char *src, uint32_t vaddr, uint32_t value, uint32_t pc)
++{
++    static uint64_t n = 0;
++    static int last[kW275BusyBuckets] = {0};
++    static bool seen[kW275BusyBuckets] = {false};
++    const int idx = w275BusyIdx(vaddr);
++    ++n;
++    const int v = static_cast<int>(value & 0xFFu);
++    const bool changed = (!seen[idx] || last[idx] != v);
++    seen[idx] = true;
++    last[idx] = v;
++    if (changed || n <= 8u || (n % 1000000u) == 0u)
++    {
++        std::cerr << "[w275:busy] op=READ8 guest=1 addr=0x" << std::hex << vaddr
++                  << " value=0x" << v << " pc=0x" << pc << std::dec
++                  << " n=" << n << (changed ? " changed=1" : "") << " src=" << src << "\n";
++    }
++}
++static void w275LogWrite(const char *op, const char *src, uint32_t vaddr, uint32_t value, uint32_t pc)
++{
++    std::cerr << "[w275:busy] op=" << op << " guest=1 addr=0x" << std::hex << vaddr
++              << " value=0x" << value << " pc=0x" << pc << std::dec << " src=" << src << "\n";
++}
++
+ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ {
++    const bool watch = w275BusyProbe() && w275BusyByte(vaddr);
++    if (watch)
++        g_w275GuestBusyHandled = true;
+     try
+     {
+-        return m_memory.read8(vaddr);
++        const uint8_t v = m_memory.read8(vaddr);
++        if (watch)
++        {
++            g_w275GuestBusyHandled = false;
++            w275LogReadByte("PS2Runtime::Load8", vaddr, v, ctx->pc);
++        }
++        return v;
+     }
+     catch (const std::exception &)
+     {
++        if (watch)
++            g_w275GuestBusyHandled = false;
+         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD);
+         return 0;
+     }
+@@ -5801,12 +5919,24 @@ static bool w132AdelProbe() noexcept
+ 
+ uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ {
++    const bool watch = w275BusyProbe() && (w275BusyWord(vaddr) || w275Chcr(vaddr));
++    if (watch)
++        g_w275GuestBusyHandled = true;
+     try
+     {
+-        return m_memory.read32(vaddr);
++        const uint32_t v = m_memory.read32(vaddr);
++        if (watch)
++        {
++            g_w275GuestBusyHandled = false;
++            const char *src = w275Chcr(vaddr) ? "PS2Runtime::Load32.chcr" : "PS2Runtime::Load32.busyword";
++            w275LogWrite("READ32", src, vaddr, v, ctx->pc);
++        }
++        return v;
+     }
+     catch (const std::exception &)
+     {
++        if (watch)
++            g_w275GuestBusyHandled = false;
+         // W132. THE ONE NUMBER THAT SPLITS THE HYPOTHESIS IN TWO.
+         //
+         // The reviewer is right that this is the cheapest possible measurement and I should have taken it
+@@ -5876,14 +6006,24 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8_t value)
+ {
+     ps2TraceGuestWrite(rdram, vaddr, 1u, value, 0u, "WRITE8", ctx);
++    const bool watch = w275BusyProbe() && w275BusyByte(vaddr);
++    if (watch)
++    {
++        g_w275GuestBusyHandled = true;
++        w275LogWrite("WRITE8", "PS2Runtime::Store8", vaddr, value, ctx->pc);
++    }
+     try
+     {
+         m_memory.write8(vaddr, value);
+     }
+     catch (const std::exception &)
+     {
++        g_w275GuestBusyHandled = false;
+         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
++        return;
+     }
++    if (watch)
++        g_w275GuestBusyHandled = false;
+ }
+ 
+ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint16_t value)
+@@ -5902,13 +6042,26 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
+ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value)
+ {
+     ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
++    const bool watch = w275BusyProbe() && (w275BusyWord(vaddr) || w275Chcr(vaddr));
++    if (watch)
++    {
++        const bool chcr = w275Chcr(vaddr);
++        w275LogWrite(chcr ? "WRITE_CHCR" : "WRITE32",
++                     chcr ? "PS2Runtime::Store32.chcr" : "PS2Runtime::Store32.busyword",
++                     vaddr, value, ctx->pc);
++    }
+     try
+     {
++        if (watch)
++            g_w275GuestBusyHandled = true;
+         m_memory.write32(vaddr, value);
++        if (watch)
++            g_w275GuestBusyHandled = false;
+         drainCompletedDmacHandlers(rdram);
+     }
+     catch (const std::exception &)
+     {
++        g_w275GuestBusyHandled = false;
+         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
+     }
+ }

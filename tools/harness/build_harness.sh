@@ -72,6 +72,25 @@ fi
 mkdir -p "$B/run"
 cd "$B/run"
 
+# W275-R3. REGENERATE syscall_names.h -- IT WAS A GENERATED ARTIFACT WITH NO GENERATOR IN THE BUILD.
+#
+# vulcan4_harness.cpp:50 includes runtime/syscall_names.h to NAME the syscalls in the no-BIOS
+# backlog. The header lives in the (gitignored) upstream tree, so it is a build artifact -- but
+# nothing here ever regenerated it, and the copy on disk had been frozen since Sep 30 with 58
+# entries while the dispatcher had grown to 114. Measured cost: every syscall wired after that date
+# printed as `sce_unnamed_syscall`, so a *wiring gap* and a *genuinely unknown syscall* looked
+# identical in the log. That is the most expensive kind of wrong a log can be -- it is how 0x79,
+# 0x7A, 0x78, 0x77, 0x2F (45,894 calls) and 0x07 read as unnamed in /mnt/ssd/vulcan4-build/run/
+# boot_w275r3.log.
+#
+# There is no timestamp check here on purpose: the script it writes is 140 lines of pure parse and
+# costs milliseconds, and a staleness check is the thing that failed. Run it, then the generated unit
+# is compiled from whatever it wrote. If the generator itself errors the build stops (set -e).
+if ! python3 -I "$(dirname "$(readlink -f "$0")")/gen_syscall_names.py"; then
+    echo "build_harness: gen_syscall_names.py FAILED -- syscall names would be stale" >&2
+    exit 1
+fi
+
 # The runtime archive is a CMake target; rebuild it so a runtime change is never
 # hidden behind a stale .a.
 nice -n 10 cmake --build "$B" --target ps2_runtime -j2 >/dev/null

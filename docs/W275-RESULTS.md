@@ -1066,3 +1066,27 @@ is called **4 times in both runs** — the guest is not stuck inside it. The wal
 `functions_entered` climbs only +12 over 3× the time, which is the signature of a **guest loop inside
 the already-recompiled set** — reach is saturated; the growth is in cycles executed, not functions
 reached. That is the next thing to name (what is at `0x005b0ac8`), not a dispatch miss.
+
+### Mechanical gate — RAW (`bash .auto/verify-dish.sh`, run on commit 2900615, tree clean)
+
+```
+=== VULCAN 4 dish gate — 2026-10-08 10:38 ===
+PASS  suite 497 tests, 0 failed
+PASS  newest commit authored as the captain
+PASS  working tree clean
+INFO  verify-menu.sh: not passed (last lines below) — screen is not the menu yet
+      newest capture : /mnt/ssd/vulcan4-build/run/w275r2long-capture.png
+      structural sig  : capture 1 colours / nonblack 0.1085   vs reference 14 / 0.1150
+      GATE FAIL: STRUCTURAL MATCH to the disclaimer: only 1 colours and a non-black fraction (0.1085) within 0.05 of the reference (0.1150). That is dark-grey-text-on-black at some fade level - the disclaimer is STILL on screen, whatever the perceptual diff says.
+INFO  newest capture: /mnt/ssd/vulcan4-build/run/w275r2long-capture.png
+INFO  newest log: /mnt/ssd/vulcan4-build/run/boot_w275r2long.log
+      halt=stuck_in_syscall
+INFO  missing-function hits in that log: 57
+=== RESULT: MECHANICAL CLAIMS HOLD ===
+GATE_EXIT=0
+```
+
+`GATE_EXIT=0` — the first exit-0 gate in this dish. Check 1 (suite) flipped from the pre-existing
+SEGFAULT to **497/497** via commit `097695a` (null-guard the weak engine-table symbols in
+`hasFunction`, the crash recorded earlier in this doc). The picture check is informational and still
+reports the disclaimer; that is expected — R2 is a dispatch fix and does not draw a menu.

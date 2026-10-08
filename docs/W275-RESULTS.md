@@ -1508,3 +1508,42 @@ added lines are a superset: 9 case lines + the hunk header). `MISSING_from_patch
 2. **The `Unimplemented PS2 syscall` line is misleading for 0x07.** ExecPS2 is handled in `System.cpp`
    after the warning, so R1's working ExecPS2 (and every future syscall special-cased there) is counted as
    an error. Anyone counting "unwired syscalls" from that grep over-counts by one per ExecPS2.
+
+### The mechanical gate — RAW output (2026-10-08 11:01, `bash .auto/verify-dish.sh`)
+
+```
+=== VULCAN 4 dish gate — 2026-10-08 11:01 ===
+PASS  suite 497 tests, 0 failed
+PASS  newest commit authored as the captain
+PASS  working tree clean
+INFO  verify-menu.sh: not passed (last lines below) — screen is not the menu yet
+      newest capture : /mnt/ssd/vulcan4-build/run/w275r3long-capture.png
+      structural sig  : capture 1 colours / nonblack 0.1111   vs reference 14 / 0.1150
+      GATE FAIL: STRUCTURAL MATCH to the disclaimer: only 1 colours and a non-black fraction (0.1111) within 0.05 of the reference (0.1150). That is dark-grey-text-on-black at some fade level - the disclaimer is STILL on screen, whatever the perceptual diff says.
+INFO  newest capture: /mnt/ssd/vulcan4-build/run/w275r3long-capture.png
+INFO  newest log: /mnt/ssd/vulcan4-build/run/boot_w275r3long.log
+      halt=stuck_in_syscall
+INFO  missing-function hits in that log: 57
+=== RESULT: MECHANICAL CLAIMS HOLD ===
+GATE_EXIT=0
+```
+
+Law-8 capture check re-run at the same moment (the union of `tools/patches/*.patch` covers every live
+added line of all six dirty files; the R3 patch carries the 9 `Dispatcher.cpp` lines):
+
+```
+PASS  live_added=171  distinct=136  MISSING_from_patches=0  ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+PASS  live_added=9    distinct=7    MISSING_from_patches=0  ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp
+PASS  live_added=98   distinct=74   MISSING_from_patches=0  ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+PASS  live_added=28   distinct=27   MISSING_from_patches=0  ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+PASS  live_added=212  distinct=150  MISSING_from_patches=0  ps2xRuntime/src/lib/ps2_memory.cpp
+PASS  live_added=158  distinct=111  MISSING_from_patches=0  ps2xRuntime/src/lib/ps2_runtime.cpp
+```
+
+One note for the next seat: on arrival this window the R2 patch
+(`ps2recomp-linux-r2-lookup-engine-table.patch`) had been trimmed in the working tree to the
+`lookupFunction` hunk only, dropping its `hasFunction` weak-symbol guard hunk (209 lines). That guard is
+carried by `ps2recomp-linux-w275-suite-fix.patch`, so coverage held either way; the committed R2 patch
+was restored rather than the trim committed, because the trim deletes committed content without adding
+anything. Nobody should trim one patch because another already carries the line — duplicate coverage is
+free, and a patch that silently loses its own hunk is how 1,065 lines went missing on 2026-10-08.

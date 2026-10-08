@@ -2778,3 +2778,29 @@ Ghidra holds only the main ELF (`.text 0x01000000-0x0102DC0F`), so `0x00551728`,
 section was taken from the live oracle, not from Ghidra.
 
 **No fix written.** Emulator left running (PID 858872); no relaunch was needed this session.
+
+---
+
+## R7 — CP0 Status EIE→IEc copy applied; sema5 still deadlocked (fix necessary, not sufficient) (architect, 2026-10-08)
+
+**Fix:** `EeScheduler::dispatchIrq` now copies the live context's Status.EIE (bit 16) to the Interrupt
+invocation's Status.IEc (bit 0), clearing EIE:
+```cpp
+const uint32_t liveStatus = m_runtime.cpu().cop0_status;
+invocation.context.cop0_status = (liveStatus & 0x10000u) ? 0x1u : 0u;
+```
+
+**Boot result** (15s `boot_w275r7.log`): functions_entered=10451, distinct_pcs=214, halt=`guest_blocked`
+(tid1 parked WaitSema(sema5) @0x005adce8) — **byte-identical to R5/R6**. No `iSignalSema` (the interrupt-safe
+variant) appears; only `0x42 SignalSema` 13× from loader PCs. The engine's cause-11 INTC handler
+`0x005b8158` is registered (AddIntcHandler ra=0x005b7c68, a0=0x0b) but not observed as invoked, and the
+oracle's sema-signalling handler `0x00557AF0` (reached via the 0x81FE0 trampoline, ra=0x81FEC, sp=0x81FC0)
+never runs in our boot.
+
+**Verdict:** the EIE→IEc copy is a necessary step (the handler's `andi v0,1` gate needs it), but it does not
+unblock sema5 — the interrupt that would invoke the sema-signalling handler (0x00557AF0 / 0x005b8158) is
+either not firing or not matching after ExecPS2. That is the next wall: trace the post-ExecPS2 interrupt
+dispatch for the cause that reaches 0x00557AF0 and delivers `iSignalSema(a0=0x29 → sema 41)`.
+
+Patch: `/home/or/vulcan4/tools/patches/ps2recomp-linux-r7-cp0-iec.patch` (EeScheduler.cpp, +10/-0 on the R7
+hunk; full file diff reverse-apply OK).

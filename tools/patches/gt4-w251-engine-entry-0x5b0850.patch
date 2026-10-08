@@ -1,0 +1,14 @@
+Add 0x005b0850 (func_5B0850, interior entry of sub_005b07d0) as an engine entry_point so the
+recompiler emits it as a switch-case label. It is reached only by the runtime-computed
+`jalr a2` in sub_005B0E30 (a2 = record-array entry 0x0088684C), so the control-flow analyzer
+cannot statically discover it. Without it the SIF0 dispatch lands on "no generated function".
+
+--- a/w251-engine_authoritative.toml
++++ b/w251-engine_authoritative.toml
+@@ entry_points = [
+   "handler_5B73C8@0x005B73C8",
+   "handler_5B7390@0x005B7390",
+   "handler_5B7408@0x005B7408",
+   "handler_5B74E0@0x005B74E0",
++  "func_5B0850@0x005B0850",
+   "_sceCd_cd_read_intr@0x01014078",

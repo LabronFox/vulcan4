@@ -2489,3 +2489,28 @@ recompiler could not statically discover it as a jump target.
 `sub_005b07d0`) in the engine recompilation — TOML `entry_points` / analyzer function list — and regenerate
 `recomp_engine_w251`. The TLB blob wall (`0x56 WaitEventFlag` 48×, 0x55-0x59 → 0x80075000) is still BEHIND
 this new wall; the boot does not reach it yet.
+
+---
+
+## R5 — 0x005b0850 dispatched (entry_point fix); next wall = `guest_blocked` sema5 (TLB blob dependency) (architect, 2026-10-08)
+
+**Fix:** added `"func_5B0850@0x005B0850"` to the engine `entry_points` in
+`/mnt/ssd/gt4/work/w251-engine_authoritative.toml`, regenerated
+(`PS2RECOMP_ENTRY_ADDR_CSV=/mnt/ssd/vulcan4-build/engine-symbols.csv
+PS2RECOMP_TABLE_SYMBOL=g_ps2EngineFunctionTable ps2_recomp w251-engine_authoritative.toml`), recompiled
+(build_engine.sh, 47 units), relinked. Verified: `case 0x5b0850u: goto label_5b0850;` in sub_005b07d0 and
+`g_ps2EngineFunctionTable[1229330] = sub_005b07d0_0x5b07d0; // 0x5b0850`.
+
+**Boot result** (15s `boot_w275r5.log`, 45s `boot_w275r5long.log`):
+- 0x005b0850 now dispatches (the `missing_function` wall is gone).
+- functions_entered=10451 (was 10443), distinct_pcs=214, frames 337/350.
+- halt=`guest_blocked`: tid1 parked in `WaitSema(sema5)` @0x005adce8 ra=0x005b18b4 —
+  "no other thread is runnable ... wakeup we do not yet deliver".
+- `0x56 WaitEventFlag` LIMITATION is **still 48×** (`0x55-0x59 → 0x80075000` unrecompiled).
+
+**Next wall (the one the coordinator flagged):** the unrecompiled TLB blob. The engine's event-flag
+syscalls (0x55 iClearEventFlag, 0x56 WaitEventFlag, 0x57 PollEventFlag, 0x58 iPollEventFlag,
+0x59 ReferEventFlagStatus) are blob-implemented (`mtc0/sync/mfc0` COP0 mailbox, blob copied
+0x01036300 → 0x80075000) and have no generated function. The engine's event-flag/semaphore signal that
+would wake `sema5` depends on that machinery, so the main thread deadlocks. Requires a TLB/COP0-mailbox
+model for 0x55-0x59 (W274 T2 §5), not a stub.

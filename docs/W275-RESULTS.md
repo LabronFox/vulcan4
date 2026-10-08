@@ -1547,3 +1547,245 @@ carried by `ps2recomp-linux-w275-suite-fix.patch`, so coverage held either way; 
 was restored rather than the trim committed, because the trim deletes committed content without adding
 anything. Nobody should trim one patch because another already carries the line — duplicate coverage is
 free, and a patch that silently loses its own hunk is how 1,065 lines went missing on 2026-10-08.
+
+## SEGMENT G — R4 (builder, 2026-10-08): syscall 0x0B wired, 0x07 un-logged, syscall_names.h regenerated — and the wall is NOT FindAddress
+
+Handed: (1) wire EE syscall 0x0B, (2) stop 0x07 ExecPS2 logging as "unimplemented", (3) regenerate the
+stale `syscall_names.h`. All three are in. Commit `035387f`. Raw gate `GATE_EXIT=0` and the raw law-8
+capture check are pasted at the end of this segment.
+
+### G.1 — Item 1: syscall 0x0B (AddSbusIntcHandler), decided from the caller, not from taste
+
+Ground truth first (`/mnt/ssd/vulcan4-build/recomp/ps2_recompiled_functions.cpp`, `sub_010183B0`
+@0x10183b0 — the only caller):
+
+```
+label_10183d8:
+    // 0x10183d8: 0xc407c2c  jal func_101F0B0
+    SET_GPR_U32(ctx, 31, 0x10183E0u);
+    // 0x10183dc: daddu $a0, $s0, $zero (Delay Slot)
+label_10183e0:
+    // 0x10183e0: addiu $s0, $s0, 0x1
+    // 0x10183e4: slti  $v0, $s0, 0x10      <-- OVERWRITES $v0 from the call
+    // 0x10183e8: bnez  $v0, label_10183d8
+```
+
+A 16-iteration loop over `$a0` = 0..15 whose `$v0` is clobbered by `slti` two instructions after the
+call. **The returned id is never read**, so `0` vs. a stable nonzero id is not observable by this
+caller — the id is safe either way. Wired as `AddSbusIntcHandler` returning a stable per-cause id, and
+it emits a law-2 `VULCAN 4 LIMITATION:` line on first registration of each cause:
+
+```
+VULCAN 4 LIMITATION: EE syscall 0x0B AddSbusIntcHandler(cause=N) registered with id N -- SBUS
+interrupts are IOP-side and are never delivered to a recompiled EE; the handler will not run and
+the cause will not be dispatched.
+```
+
+Files: `Dispatcher.cpp` `case 0x0B:` (+12/0 with the R3 block), `ps2_call_list.h` `X(AddSbusIntcHandler)`
+(+1), `Interrupt.cpp` body (+33).
+
+MEASURED, 45 s (new callkind line vs. R3 which had no such line):
+
+```
+  0x0b sce_AddSbusIntcHandler calls=16 last_pc=0x0101f0b8 from=1pc[0x0101f0b8] ra_count=0x010183e0x16 \
+  arg=... a0=0x010183e0/a0=0x00000000x1,...,0x00000005x1,+10 a1=0x010183e0/a1=0x00000002x16
+```
+
+16 calls, one per cause 0..15, matching the static loop exactly. 16 LIMITATION lines on disk.
+
+### G.2 — Item 2: 0x07 ExecPS2 no longer logs as unimplemented
+
+0x07 is handled upstream (the harness calls `runtime->requestExecPS2()` and stops the guest), so its
+presence in `TODO()` was producing a false "Unimplemented PS2 syscall" warning for a syscall that is
+in fact implemented. `TODO()` now dispatches 0x07 before any reporting.
+
+MEASURED, 45 s: `Unimplemented PS2 syscall` **17 → 0**; `[Syscall TODO]` **17 → 0**.
+The ExecPS2 request still fires: `[execps2] entry=0x100008 gp=0x0 argc=2 argv=0x80075334`.
+
+### G.3 — Item 3: `syscall_names.h` regenerated AND hooked into the build
+
+The header was a generated artifact with no generator in the build: frozen at Sep 30 with 58 entries
+while the dispatcher had grown to 114. Every syscall wired after Sep 30 therefore printed as
+`sce_unnamed_syscall`, so **a wiring gap and a genuinely unknown syscall looked identical in the log** —
+which is how 0x79/0x7A/0x78/0x77/0x2F (45,894 calls) and 0x07 read as unnamed in R3.
+
+- `gen_syscall_names.py` rewritten as a line-based switch parser (handles `ps2_stubs::name(...)`,
+  fall-through label groups, and `case static_cast<uint32_t>(-0xNN):`), plus an `EXTRA_NAMES` entry for
+  0x07. It warns on stderr for any numbered label it cannot name.
+- `build_harness.sh` now runs it unconditionally before compiling the generated unit, and **fails the
+  build** (`exit 1`) if it errors. No timestamp check on purpose: a staleness check is the thing that
+  failed here.
+
+MEASURED, 45 s: `sce_unnamed_syscall` **7 → 0**; header 58 → **114** names; 0x79/0x7A/0x0B/0x07 all
+print by name. Cosmetic residue: the harness prints `sce_` + the header name, so names already carrying
+the prefix print doubled (`sce_sceSifSetReg`). The wiring is right; only the label prefix doubles.
+
+### G.4 — 45 s vs 45 s, R3 → R4 (both 2,000,000 entry budget, 45 s deadline)
+
+| metric | R3 (`boot_w275r3long.log`) | R4 (`boot_w275r4long.log`) |
+|---|---|---|
+| functions_entered | 10786 | 10790 |
+| true_guest_entries | 52,847,539 | 53,510,043 |
+| halt | `stuck_in_syscall` | `stuck_in_syscall` |
+| halt pc | 0x005b1180 | 0x005b1188 |
+| distinct_pcs | 217 | 217 |
+| total_syscall_calls | 92036 | 92036 |
+| syscalls (distinct) | 35 | 35 |
+| missing_functions | 0 | 0 |
+| frames_presented | 2525 | 2515 |
+| vsync_tick | 423 | 428 |
+| ee_cycle | 2,081,907,532 | 2,108,407,112 |
+| intr_run | 249 | 252 |
+| mmio_accesses | 2002 | 2012 |
+| `Unimplemented PS2 syscall` | 17 | **0** |
+| `sce_unnamed_syscall` | 7 | **0** |
+| `[Syscall TODO]` | 17 | **0** |
+
+**The unwired-syscall count is 0 new.** Every syscall the guest issues in this window now resolves to a
+named handler. That did NOT move the halt.
+
+### G.5 — Engine PCs: the recorded "31" is NOT reproducible, and the 8-byte halt move is a SAMPLER ARTIFACT
+
+Two separate honesty items, both measured.
+
+(a) **"engine PCs 27 → 31" could not be reproduced.** Counting distinct code addresses at syscall sites,
+split by image (engine = 0x00100000..0x00617A14, main = everything else), from the `last_pc=`/`from=`
+/`ra_count=` tokens: three token subsets give **21 / 25 / 59** engine PCs, none of them 31. On my own
+reproducible metric (union of `from=` pcs, engine-vs-main by address) the figure is **engine=59,
+main=124, total=183 — byte-identical between R3 and R4, and between the 15 s and 45 s logs.**
+`0x0B` is issued from 0x0101f0b8, which is > 0x00617A14, i.e. the main image, so it is not an engine PC
+by construction. **Treat 31 as unreproduced.** The lesson is the project's own rule, one more time:
+a `functions_entered`-class number is a run-shape number, not an event.
+
+(b) **The halt pc moving 0x005b1180 → 0x005b1188 is the checkpoint sampler landing on a different
+instruction of the SAME 3-instruction loop.** Both addresses are inside one spin:
+
+```
+label_5b1180:
+    // 0x5b1180: jal  func_5B0880
+    // 0x5b1184: daddu $a0, $zero, $zero   (Delay Slot)
+label_5b1188:
+    // 0x5b1188: beqz $v0, 0x5b1180        <-- loops back
+    // 0x5b118c: ld   $ra, 0x30($sp)       (Delay Slot)
+```
+
+and every one of the 301 `[Yield]` events is identical:
+
+```
+[Yield] n=12d source_pc=0x5b1180 target_pc=0x5b0880 fallthrough_pc=0x5b1188 kind=DirectCall ra=0x5b1188
+```
+
+298 in R3, 301 in R4. Nothing progressed.
+
+### G.6 — THE WALL, NAMED: a busy-wait on one RDRAM word, `while (*(u32*)0x008869C0 == 0);`
+
+The harness reports `blocked inside SCE syscall 0x83 (FindAddress), guest pc 0x005b1188 -- this syscall
+is the wall`, and that label is **one level too coarse**. Chasing FindAddress's return value is the
+wrong chase; here is what the guest is actually doing:
+
+`func_5B0880` (`ps2_recompiled_functions_41.cpp`, engine image) is a 5-instruction table lookup:
+
+```
+0x5b0880: lui   $v0, 0x0088
+0x5b0884: sll   $a0, $a0, 2
+0x5b0888: addiu $v0, $v0, 0x69C0        => $v0 = 0x008869C0
+0x5b088c: addu  $a0, $a0, $v0
+0x5b0890: jr    $ra
+0x5b0894: lw    $v0, 0x0($a0)           (Delay Slot)
+```
+
+so `func_5B0880(0)` is `*(uint32_t *)0x008869C0`, and the loop at G.5(b) is:
+
+```
+while (*(uint32_t *)0x008869C0 == 0) { }
+```
+
+**The guest is waiting for a word at 0x008869C0 that nothing in this run ever writes.** That is the
+wall, and it is a scheduling/producer wall, not a dispatch wall and not a return-value wall.
+
+Supporting measurements:
+- `0x83 sce_FindAddress calls=4` in the whole 45 s — four calls, not a livelock. Its last entry pc is
+  0x005b7410, and two of the four calls return to 0x005b74ac / 0x005b74c0 — i.e. from inside the
+  guest's OWN installed 0x83 override: `VULCAN4 SYSTABLE n=0x83 slot=0x1218c handler=0x5b73c8`,
+  installed by `sce_SetSyscall` at 0x005b749c with `a1=0x5b7390`. The harness's `activeSyscallId()` is
+  0x83 at the deadline because `handleSyscall(0x83)` has not returned — the guest is executing guest
+  code inside that override, which is why the label is *correct but not specific*.
+- `sub_005b0e30` (the function containing the spin) has **no static JAL caller** anywhere in either
+  generated image — it is reached indirectly, consistent with a callback/override path. Not proven
+  which; do not assume.
+- The thread is not blocked: `thread_state=tid1:status=0:wait=none#0 ... pc=0x005b1188(running)`,
+  `blocked_on_servicing=0`, `sleepCurrentCalls=14`, and the machine is alive — 2515 frames presented,
+  428 vsyncs, 252 interrupt runs.
+
+**Next seat: do not re-derive the wall from `halt=`. Start at `0x008869C0`.** Whoever is supposed to
+produce that word is the missing piece — find the writer (it is a guest store, so the W253 byte-store
+probe or a PCSX2 oracle watchpoint on 0x008869C0 answers it in one run).
+
+### G.7 — the gate's "missing-function hits: 57" is NOT a regression
+
+All 57 are pre-existing `VULCAN 4 LIMITATION: syscall 0xXX override handler 0xYYY has no generated
+function in either image -- not invoking (was silent KE_ERROR)` lines: 48x (0x56, handler 0x800750c8),
+6x (0x5b, 0x80076000), 2x (0x5a, 0x5b79f8), 1x (0x5a, 0x5b98d0). **Identical 57 in
+`boot_w275r3long.log`.** No change, no new miss.
+
+### G.8 — LAW 8 RAW (per-file, against the live `git diff --numstat`)
+
+`tools/patches/ps2recomp-linux-w275r3-sbus-intc-and-syscall-names.patch`, 1508 lines, all 12 dirty files:
+
+```
+PASS  live_added=22   distinct=22   MISSING_from_patches=0  ps2xRecomp/src/lib/control_flow_emitter.cpp
+PASS  live_added=32   distinct=32   MISSING_from_patches=0  ps2xRecomp/src/lib/instruction_translator.cpp
+PASS  live_added=1    distinct=1    MISSING_from_patches=0  ps2xRuntime/include/ps2_call_list.h
+PASS  live_added=90   distinct=60   MISSING_from_patches=0  ps2xRuntime/include/ps2_runtime_macros.h
+PASS  live_added=57   distinct=57   MISSING_from_patches=0  ps2xRuntime/include/runtime/syscall_names.h
+PASS  live_added=171  distinct=136  MISSING_from_patches=0  ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+PASS  live_added=12   distinct=9    MISSING_from_patches=0  ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp
+PASS  live_added=33   distinct=32   MISSING_from_patches=0  ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
+PASS  live_added=141  distinct=109  MISSING_from_patches=0  ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+PASS  live_added=28   distinct=27   MISSING_from_patches=0  ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+PASS  live_added=212  distinct=150  MISSING_from_patches=0  ps2xRuntime/src/lib/ps2_memory.cpp
+PASS  live_added=158  distinct=111  MISSING_from_patches=0  ps2xRuntime/src/lib/ps2_runtime.cpp
+LAW8_EXIT=0
+```
+
+`cd tools/PS2Recomp && git diff --numstat` for the same 12 files — every live added-line count is <=
+the count the patch set carries:
+
+```
+22      0       ps2xRecomp/src/lib/control_flow_emitter.cpp
+32      0       ps2xRecomp/src/lib/instruction_translator.cpp
+1       0       ps2xRuntime/include/ps2_call_list.h
+90      0       ps2xRuntime/include/ps2_runtime_macros.h
+57      1       ps2xRuntime/include/runtime/syscall_names.h
+171     6       ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+12      0       ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp
+33      0       ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
+141     35      ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+28      7       ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+212     4       ps2xRuntime/src/lib/ps2_memory.cpp
+158     5       ps2xRuntime/src/lib/ps2_runtime.cpp
+```
+
+### G.9 — MECHANICAL GATE RAW
+
+`bash .auto/verify-dish.sh`, run on the committed tree at `035387f`:
+
+```
+=== VULCAN 4 dish gate — 2026-10-08 11:26 ===
+PASS  suite 497 tests, 0 failed
+PASS  newest commit authored as the captain
+PASS  working tree clean
+INFO  verify-menu.sh: not passed (last lines below) — screen is not the menu yet
+      newest capture : /mnt/ssd/vulcan4-build/run/w275r4long-win-14.png
+      structural sig  : capture 1 colours / nonblack 0.1085   vs reference 14 / 0.1150
+      GATE FAIL: STRUCTURAL MATCH to the disclaimer: only 1 colours and a non-black fraction (0.1085) within 0.05 of the reference (0.1150). That is dark-grey-text-on-black at some fade level - the disclaimer is STILL on screen, whatever the perceptual diff says.
+INFO  newest capture: /mnt/ssd/vulcan4-build/run/w275r4long-win-14.png
+INFO  newest log: /mnt/ssd/vulcan4-build/run/boot_w275r4long.log
+      halt=stuck_in_syscall
+INFO  missing-function hits in that log: 57
+=== RESULT: MECHANICAL CLAIMS HOLD ===
+GATE_EXIT=0
+```
+
+The screen is still the disclaimer — this segment claims no picture. Everything it claims is a wiring
+and a measurement.

@@ -1001,10 +1001,10 @@ index 0000000..5f5d68c
 +}
 diff --git a/ps2xIOP/src/modules/pdiperiph.cpp b/ps2xIOP/src/modules/pdiperiph.cpp
 new file mode 100644
-index 0000000..60359d2
+index 0000000..bb54ad0
 --- /dev/null
 +++ b/ps2xIOP/src/modules/pdiperiph.cpp
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,170 @@
 +#include "module_factories.h"
 +#include "rpc_reply.h"
 +
@@ -1038,7 +1038,10 @@ index 0000000..60359d2
 +        constexpr uint32_t kPdiusbExtSid = 0x45535550u; // "ESUP"
 +        constexpr uint32_t kPdiusbKbSid = 0x424b5550u; // "BKUP"
 +        constexpr uint32_t kPbgmSid = 0x5042474du; // "PBGM" (bound after PDIUSB/USTORAGE; LGDEV/POWOFF/RTINETB era)
-+        constexpr uint32_t kNumericSid = 0x046d046du; // numeric sid, bound alongside PBGM
++        constexpr uint32_t kNumericSid = 0x046d046du; // Logitech USB vendor id 0x046d twice = LGDEV.IRX
++        constexpr uint32_t kMpg1Sid = 0x4d504731u; // "MPG1" = MPEG-1 video decoder
++        constexpr uint32_t kMpg2Sid = 0x4d504732u; // "MPG2" = MPEG-2 video decoder
++        constexpr uint32_t kVoiceSid = 0x564f4943u; // "VOIC" = voice/ADPCM decoder
 +        constexpr uint32_t kMaxUnknownRpcLogs = 64u;
 +
 +        const char *sidName(uint32_t sid)
@@ -1051,7 +1054,10 @@ index 0000000..60359d2
 +            case kPdiusbExtSid: return "pdiusb-ext";
 +            case kPdiusbKbSid: return "pdiusb-kb";
 +            case kPbgmSid: return "pbgm";
-+            case kNumericSid: return "numeric-46d";
++            case kNumericSid: return "lgdev";
++            case kMpg1Sid: return "mpg1";
++            case kMpg2Sid: return "mpg2";
++            case kVoiceSid: return "voice";
 +            default: return "pdi?";
 +            }
 +        }
@@ -1085,17 +1091,20 @@ index 0000000..60359d2
 +                if (request.sid != kPdistrSid && request.sid != kPdispu2Sid &&
 +                    request.sid != kPdiusbHostSid && request.sid != kPdiusbExtSid &&
 +                    request.sid != kPdiusbKbSid && request.sid != kPbgmSid &&
-+                    request.sid != kNumericSid)
++                    request.sid != kNumericSid && request.sid != kMpg1Sid &&
++                    request.sid != kMpg2Sid && request.sid != kVoiceSid)
 +                {
 +                    return result;
 +                }
 +
 +                result.handled = true;
 +                result.resultAddress = request.receive.address;
-+                if (request.function == 0u)
-+                {
-+                    result.signalCompletion = true;
-+                }
++                // These PDI peripheral rpcs are all NOWAIT fire-and-forget (mode=0x1, endFn=0). The
++                // guest parks in WaitSema until the completion semaphore fires, so every one must be
++                // signalled. The reply buffer is left as the (zeroed) send buffer; for the observed
++                // init/probe calls an empty buffer means "no device", which is the honest default
++                // until the oracle measures a real reply.
++                result.signalCompletion = true;
 +
 +                bool shouldLog = false;
 +                {
@@ -1148,10 +1157,11 @@ index 0000000..60359d2
 +            }
 +
 +        private:
-+            inline static constexpr std::array<uint32_t, 7> kSids{kPdistrSid, kPdispu2Sid,
-+                                                                  kPdiusbHostSid, kPdiusbExtSid,
-+                                                                  kPdiusbKbSid, kPbgmSid,
-+                                                                  kNumericSid};
++            inline static constexpr std::array<uint32_t, 10> kSids{kPdistrSid, kPdispu2Sid,
++                                                                   kPdiusbHostSid, kPdiusbExtSid,
++                                                                   kPdiusbKbSid, kPbgmSid,
++                                                                   kNumericSid, kMpg1Sid,
++                                                                   kMpg2Sid, kVoiceSid};
 +            inline static constexpr std::array<std::string_view, 3> kModuleAliases{"pdistr", "pdispu2", "pdiusb"};
 +
 +            IopHost &m_host;

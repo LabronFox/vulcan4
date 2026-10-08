@@ -2804,3 +2804,67 @@ dispatch for the cause that reaches 0x00557AF0 and delivers `iSignalSema(a0=0x29
 
 Patch: `/home/or/vulcan4/tools/patches/ps2recomp-linux-r7-cp0-iec.patch` (EeScheduler.cpp, +10/-0 on the R7
 hunk; full file diff reverse-apply OK).
+
+---
+
+## R8 — EE timer model ALREADY exists; the real wall is the scheduler never idling to the timer deadline (architect, 2026-10-08)
+
+**Premise refuted.** The coordinator's "the runtime doesn't model the EE timers" is wrong. The model is
+complete and wired:
+- `ps2_memory.cpp`: `EeTimer[4]`, `advanceEeTimers()` (advances COUNT from the EE-cycle clock, sets
+  EQUF/OVFF, returns an interrupt mask), `cyclesUntilNextEeTimerInterrupt()`, MMIO read/write handlers
+  (`writeIORegister` → `decodeEeTimerRegister`).
+- `EeScheduler.cpp`: `accountCycles()` ORs `advanceEeTimers` into `m_pendingEeTimerInterrupts`;
+  `processPendingEvents()` drains it and calls `dispatchIrq(false, 9+timer)`; `waitForEvent()` advances
+  `accountCycles` to `cyclesUntilNextEeTimerInterrupt()`.
+
+**Measured (diagnostic traces, then reverted):** Timer2 IS armed —
+`MODE=0x382` (clock=2 → 576 kHz, CUE=1, CMPE=1), `COMPARE=0xFFFF` (65535). EQUF would fire at
+65535 ticks = 33.5M EE cycles (113.8 ms). But the guest parks in `WaitSema(sema5)` at 29.4M EE cycles
+(100 ms) — *before* the timer fires — and `cyclesUntilNextEeTimerInterrupt` is **never called** (zero
+DEADLINE trace lines), so the scheduler never idles `m_eeCycle` forward to 33.5M. The timer stalls at
+57536 ticks, EQUF never sets, `dispatchIrq(false,11)` never runs, and `sub_005b8158` is never invoked.
+
+**Real fix (not "model the timers"):** when the guest blocks and no thread is runnable, the scheduler /
+harness drive loop must advance `m_eeCycle` to the next timer deadline — i.e. call `waitForEvent()` /
+`accountCycles(cyclesUntilNextEeTimerInterrupt())` — so Timer2 EQUF fires and `dispatchIrq(false, 11)`
+invokes `sub_005b8158`. That is the idle-advance gap, not a missing timer model.
+
+Diagnostic traces were reverted (`ps2_memory.cpp` back to +212/−4). No source change committed this round.
+
+---
+
+## R9 — idle-advance wired: sema5 cleared, guest runs deep into the engine (architect, 2026-10-08)
+
+**Fix:** `EeScheduler::serviceInvocations`' block path (nothing runnable) now advances `m_eeCycle` to the
+nearest EE-timer deadline before reporting `Blocked`:
+```cpp
+const uint64_t timerCycles = m_runtime.memory().cyclesUntilNextEeTimerInterrupt();
+if (timerCycles != max && timerCycles > 0) { accountCycles(timerCycles); continue; }
+```
+This mirrors what `run()` does via `waitForEvent()` but on the driver's `serviceInvocations` path, which the
+harness actually uses. After the fire EQUF is set, so the next probe is "no pending timer" → no spin.
+
+**Boot result** (15s `boot_w275r9.log`, 45s `boot_w275r9long.log`):
+
+| | R7 (before) | R9 (after) |
+|---|---|---|
+| functions_entered | 10451 | **27730** (45s) |
+| distinct_pcs | 214 | **282** |
+| ee_cycle | 29.4M | **1.11B** |
+| intr_run | 64 | **191** |
+| frames | 350 | 1144 |
+| halt | guest_blocked sema5 | **missing_function @0x0060b548** |
+
+Timer2 EQUF fired, `dispatchIrq(false,11)` reached `sub_005b8158`, sema was signalled, and tid1 woke
+(`tid1 RUNNING`, no longer parked). `0x56` LIMITATION is now 0.
+
+**Next wall:** dispatch miss @ `0x0060b548` ("no generated function") — the same class as R5's `0x005b0850`
+(an interior entry reached only by a runtime-computed branch, absent from the switch cases). Fix: add
+`0x0060b548` to the engine `entry_points`, regenerate `recomp_engine_w251`.
+
+**Still latent:** (a) the sema id-allocation divergence (hardware signals id 41, ours dense id 5) is behind
+this wall; (b) remaining `0x5a`/`0x5b` LIMITATIONs (`0x5b79f8`, `0x5b98d0`, `0x80076000`).
+
+Patch: `/home/or/vulcan4/tools/patches/ps2recomp-linux-r9-timer-idle-advance.patch` (EeScheduler.cpp full
+diff, reverse-apply OK).

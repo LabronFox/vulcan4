@@ -3278,3 +3278,193 @@ guest's GIF/GS packets into a changed framebuffer. Stop chasing the SIF ack.
 
 Patch: `/home/or/vulcan4/tools/patches/ps2recomp-linux-r15-pool-entry-intercept.patch` (SIF.cpp +
 ps2_runtime.cpp).
+
+---
+
+## E3/GS static angle — the main loop waits on a memory flag [pool+0x24], not a GS register (architect, 2026-10-08)
+
+Decompiled the render loop from `/mnt/ssd/vulcan4-build/recomp_engine_w251/` (the recompiled guest is the
+ground truth, not a guess).
+
+### 1. What the main loop waits on
+
+The "main loop at 0x005b2980" is **not** the gate. It is a pure CPU-count busy-delay:
+
+```
+0x5b2980: addiu $v0,$v0,-1 ; bne $v0,$v1,-1 -> 0x5b2980     // spin until $v0 == -1
+```
+`ps2_recompiled_functions_42.cpp:4629-4654`. It waits on **nothing external** — it is a software delay of
+$v0 iterations (a count, not a register or flag).
+
+The **real gate** is the poll immediately above it, at `0x5b29bc`:
+
+```
+0x5b29bc: lw  $v0, 0x24($s0)      // s0 = 0x008899C0  -> reads 0x008899E4
+0x5b29c0: beqz $v0, -> spin
+```
+`ps2_recompiled_functions_42.cpp:4703-4723`. The loop waits on the **32-bit completion flag at
+0x008899E4** (offset +0x24 of the pool descriptor at 0x008899C0).
+
+The **outer** render loop `sub_00580cd8` (the 48.6% hot loop) has the identical gate one level up:
+
+```
+0x580db4: lw  $v0, 0x24($s1)      // s1 = 0x00874FA8  -> reads 0x00874FCC
+0x580dfc: beqz $v0, -> spin
+```
+`ps2_recompiled_functions_40.cpp:67543`, with its own pure-delay spin at `0x580dd8` (`:67595-67634`).
+
+So: **two spin loops (0x5b2980, 0x580dd8) wait on nothing; the actual gate is the frame-done memory flag
+[pool+0x24] — 0x008899E4 (frame function) and 0x00874FCC (outer loop).** It is not a VSync flag in a
+register, not CSR/SIGNAL/FINISH, not a DMA register.
+
+### 2. Who sets the flag, and why it never fires
+
+- The poster `func_5B17D0` **clears** the flag when it posts a render command:
+  `sw $zero, 0x24($s1)` at `0x5b1804` (`ps2_recompiled_functions_41.cpp:198159`).
+- It allocates the command node from the free-list at **0x00888240** (`func_5B11F0`); when the list is
+  empty it returns -1, which is why the outer loop spins at 0x580dd8.
+- The flag becomes non-zero only when a posted command **completes** and its node is returned to the free
+  list. In GT4 the frame function synchronises through EE kernel **semaphores**:
+  `func_5ADCE0` = **WaitSema** (syscall 0x44), `func_5ADCC0` = **SignalSema** (syscall 0x42)
+  (`tools/PS2Recomp/ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp:168-176`).
+- **The guest never reads the GS CSR** — 0 reads of `0x12001000` anywhere in `boot_w275r17.log`. So the
+  SIGNAL/FINISH/VSINT CSR bits are *not* what it is waiting on; it waits on the VSync **interrupt** driving
+  its completion semaphore.
+
+### 3. What the GS frontend must deliver
+
+The runtime already delivers a VSync IRQ — `dispatchIrq(false, 2)` at VBlankStart
+(`tools/PS2Recomp/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:2934`; boot report `intr_run=151,
+intr_run_by_kind=139`) — but it lands on the **boot loader's** handler `0x100d838` (`[W105IRQ]` log). The
+VBlankStart handler only toggles **CSR bit 0x2000 (bit 13, FIELD)**
+(`EeScheduler.cpp:2905-2910`); it never raises the **VSINT (0x8)** or **FINISH (0x2)** bits, and it never
+drives the game's own per-frame render-completion semaphore (the `SignalSema` that writes 0x008899E4).
+
+**Missing signal:** a real **frame-done/VSync into the game's completion path** — i.e. the callback that
+ends in `SignalSema` and sets the pool flag `0x008899E4`. Until that fires, the guest spins on the flag,
+`gs_packets` stays 15, DISPFB is never re-pointed (`gs_frame_reg_writes=2`), and the frontend just
+re-presents the same disclaimer framebuffer 2499 times.
+
+### Correction to R15
+
+R15 claimed `func_5B17D0` (0x005B17D0) "has zero occurrences — the guest never calls it." That is wrong.
+The PC histogram in the same `boot_w275r17.log` shows `0x005b29b4=32` (the return address after
+`jal func_5B17D0` at `0x5b29ac` inside the frame function) and `0x005b18b4=32` / `0x005b188c=32`
+(addresses *inside* `func_5B17D0`). The function IS called (32 sampled entries); R15's intercept log line
+never fired — a logging bug, not a call-site absence. This matters: the SIF ack is not the blocker, but the
+allocator is live and returning -1 (empty free list), which is the direct cause of the 0x580dd8 spin.
+
+---
+
+## R16 — ORACLE: the SIF BIND reply writes 0x008899E4 (measurer, 2026-10-08)
+
+Measurement only. No fix written. Fresh `-debugger` boot of the real disc; every number below is a live
+DebugServer read, not an inference.
+
+Relaunch used (owning it cleanly — this is the only launch this dish performed):
+
+```
+cd /mnt/ssd/tools/pcsx2-src/build-pcsx2/bin && DISPLAY=:0 setsid nohup ./pcsx2-qt -debugger -fastboot \
+  "/mnt/ssd/gt4/Gran Turismo 4 (USA) (v2.00).iso" > /mnt/ssd/tmp/pcsx2-w275e3b.log 2>&1 < /dev/null &
+```
+
+### 1. THE TWO VALUES
+
+| | `[0x008899E4]` at the poll | `v0` at the branch `0x005b29c0` | `beqz` result |
+|---|---|---|---|
+| **hardware (PCSX2 oracle)** | `0x00047E88` | `0x00047E88` | **not taken** — falls through to `0x005b29c4`/`0x005b29c8`/`0x005b29d0` |
+| **our recomp** | `0x00000000` | `0x00000000` | taken — `->0x005b2978`, 1,048,577-iteration backoff, retry forever |
+
+**Hardware is the `0x00047E88`.** Ours is the zero.
+
+Hardware's poll context (BP hit at `0x005b29c0`), register-identical to the recomp's stuck path:
+
+```
+v0 =0x00047E88  s0 =0x008899C0  s1 =0x00889A40  s3 =0x00890000
+gp =0x006DDDF0  sp =0x01FFFA70  ra =0x005B29B4  pc =0x005B29C0
+[0x008899E4] = 0x00047E88   (read back while paused)
+```
+
+### 2. THE INSTRUCTION THEY FIRST DISAGREE AT
+
+**`sw v0, 0x24(s1)` @ `0x005b13b0`** — never executed by the recomp.
+
+Observed at the load **`lw v0, 0x24(s0)` @ `0x005b29bc`** and the branch **`beqz v0, ->0x005B2978` @ `0x005b29c0`**.
+
+Proven live by a single step (this is the whole proof, two reads one instruction apart):
+
+```
+pause @ PC=0x005b13b0  ->  [0x008899E4] = 0x00000000
+pcsx2_step(count=1)    ->  PC=0x005b13b4   (0x8e430028  lw v1, 0x28(s2))
+read 0x008899E0        ->  0x00000000, 0x00047E88, 0x00000000      <-- 0x008899E4 became 0x00047E88
+```
+
+### 3. WHAT 0x005b13b0 IS — the SIF BIND reply handler, NOT a VSync/frame-done path
+
+`0x005b1328` is the SIF reply handler for command **`0x80000009` (SIF_CMD_BIND)**:
+
+```
+0x005b1328: addiu sp,-0x40
+0x005b133c: dmove s2,a0                 ; a0 = dispatcher's stack frame
+0x005b1348: lw   v1,0x20(s2)            ; cmd  -- measured v1 = 0x80000009
+0x005b134c: beq  v1,v0,->0x5B1374       ; v0 = 0x8000000A (SIF_CMD_CALL)
+0x005b1354: bnez v0,->0x5B13BC          ; cmd < 0x8000000A -> out
+0x005b1358: lw   s1,0x1C(s2)            ; delay slot: s1 = client struct = 0x008899C0
+0x005b1360: ori  v0,0x9                 ; v0 = 0x80000009
+0x005b1364: beq  v1,v0,->0x5B13AC       ; <-- TAKEN on hardware
+0x005b13ac: lw   v0,0x24(s2)            ; v0 = payload = 0x00047E88
+0x005b13b0: sw   v0,0x24(s1)            ; *** WRITES 0x008899E4 ***  dest = 0x008899C0+0x24
+0x005b13b4: lw   v1,0x28(s2)            ; 2nd payload word = 0x00047ED0
+0x005b13b8: sw   v1,0x14(s1)
+```
+
+Entered through the generic callback dispatcher at `0x005b0f20`:
+
+```
+0x005b0f38: dmove gp,v1
+0x005b0f40: dmove a0,sp                 ; frame handed to the callback
+0x005b0f48: jalr  ->a2                  ; a2 = 0x005B1328 (measured)
+0x005b0f4c: lw    a1,0x4(v0)            ; delay slot
+0x005b0f58: SYNC ; 0x005b0f5c ei ; jr ra
+```
+
+The stack frame the callback receives (read at the pause, `a0 = sp`):
+
+```
+0x00081F20 +0x00=0x00000000 +0x04=0x00000000 +0x08=0x80000008 +0x0C=0x00000000
+           +0x10=0x00000000 +0x14=0x20886A40 +0x18=0x00000000 +0x1C=0x008899C0   <- client ptr
+           +0x20=0x80000009  <- SIF cmd      +0x24=0x00047E88 <- payload      +0x28=0x00047ED0
+```
+
+So the word the whole SIF-init retry loop waits on is the **SIF BIND reply payload** — the RPC's server-data
+pointer — and the loop `0x005b28f0` (alloc at `0x005b17d0` -> poll `0x005b29bc` -> backoff `0x005b2980` -> retry)
+cannot exit until the IOP's BIND reply is dispatched to the callback `0x005b1328` with the client at `0x008899C0`.
+
+### 4. RECOMP SIDE — same shape, wrong effect
+
+- `tools` engine table **does** carry the handler: `register_functions.cpp:500836
+  g_ps2EngineFunctionTable[1230024..] = sub_005b1328_0x5b1328` (index = `(addr-0x100000)>>2`), and
+  `ps2_recompiled_functions_41.cpp:196476` has the `0x5b1364 -> label_5b13ac` -> `0x5b13b0` path. **The code exists.**
+- What the recomp actually delivers (`boot_w275r17.log:65564`): a SIF0 response record that dispatches to
+  **`func_5B0850`** and writes **`0x008869C0=1`** — a *different* client record (`0x00886740`, type `0x18`), not
+  `0x008899C0` / `0x005b1328`. Wrong record, wrong effect, `0x008899E4` never leaves 0.
+- `boot_w275r17.log` histogram: `0x005b2980` = 29.31% of PCs, caller `fn=0x005b2980 entries=16831 from=1ra[0x005b29b4]`
+  — `ra 0x005b29b4` is the return of `jal 0x005B17D0` at `0x005b29ac`, reachable only when the poll reads 0.
+
+### 5. ANSWER-SHAPE CORRECTION (must be recorded honestly)
+
+The dish asked for "the missing GS signal (SIGNAL id / FINISH / CSR bit / VSync)". **It is none of those.**
+The first divergence between our recomp and the hardware is an **EE-side SIF RPC BIND reply** (SIF command
+`0x80000009`, payload `0x00047E88`) delivered to the SIF-init client at `0x008899C0`. The guest never reads
+GS CSR during this boot (0 reads of `0x12001000`), so a GS SIGNAL/FINISH/CSR/VSync cannot be the unblock.
+
+**Open, not measured:** whether this SIF-init retry is *the* render blocker or a stall parallel to the render
+loop — the same log also shows `0x00580dd8` at 48.63% (the architect's flag word `0x00874FCC`, a second,
+distinct `+0x24` gate). Recording both so the next seat does not conflate them.
+
+### 6. ORACLE STATE LEFT BEHIND
+
+PCSX2 left running and paused at `0x005b29c0` (DebugServer 21512 reachable); three non-temporary BPs
+(`0x005b28f0`, `0x005b17d0`, `0x005b29c0`) and one watchpoint (`0x008899e4-0x008899e8`, 3 hits) still armed.
+The watchpoint's `last_PC` always reads `0x00000000` — do not trust it to name the writer; use it only to stop,
+then single-step and re-read the address (that is how the writer above was identified).

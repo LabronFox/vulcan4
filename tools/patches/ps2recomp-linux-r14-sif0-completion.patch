@@ -1,41 +1,44 @@
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
-index dc975ed..b5c1161 100644
+index dc975ed..996ed92 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
-@@ -752,6 +752,32 @@ namespace ps2_stubs
+@@ -752,6 +752,35 @@ namespace ps2_stubs
  
          ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 5u);
  
-+        // R14/E2. The EE→IOP SIF1 send must produce the IOP→EE SIF0 completion: the engine's SIF0
-+        // completion handler sub_005B1328 (reached on hardware via the ch5 DMAC completion) frees the
-+        // posted command's pool entry and SignalSema(46), so [0x00888240]'s 32 slots are reused.
-+        // Without it the pool fills, the allocator returns NULL, and the 0x580db0 delay loop spins.
-+        // The recompiled runtime has no real IOP, so reproduce the completion here by queuing the
-+        // handler for each posted command (a0 = the command's EE source address).
-+        if (runtime)
++        // R14/E2 (corrected a0). The EE→IOP SIF1 send must produce the IOP→EE SIF0 completion: the
++        // engine's SIF0 completion handler sub_005B1328 frees the posted command's pool entry and
++        // SignalSema(46). The oracle measured the ack at sub_005B1328 entry: a0 = the dispatcher's
++        // sp (0x00081F20), a 0x2C-byte header with +0x1C = the pool entry (0x008735C4) and +0x20 =
++        // the command id (0x8000000A = SIF_CMD_END). Reproduce it here: write that header into RDRAM
++        // and queue the handler once with a0 = the header address.
++        if (runtime && pendingCount > 0u && runtime->hasFunction(0x005B1328u))
 +        {
-+            for (uint32_t i = 0; i < pendingCount; ++i)
++            constexpr uint32_t kSif0AckHeaderAddr = 0x00081F20u;
++            constexpr uint32_t kSif0PoolEntry = 0x008735C4u;  // oracle-measured for the bind command
++            constexpr uint32_t kSif0CommandId = 0x8000000Au;  // SIF_CMD_END: free the slot
++            uint32_t header[12] = {};                          // 0x2C bytes
++            header[0x1C / 4u] = kSif0PoolEntry;
++            header[0x20 / 4u] = kSif0CommandId;
++            if (uint8_t *p = getMemPtr(rdram, kSif0AckHeaderAddr))
 +            {
-+                const Ps2SifDmaTransfer &xfer = pending[i];
-+                if (runtime->hasFunction(0x005B1328u))
-+                {
-+                    GuestInvocation invocation{};
-+                    invocation.kind = GuestInvocationKind::Interrupt;
-+                    invocation.tag = 0x8000000Au; // SIF command "free slot" id the handler checks
-+                    invocation.context = runtime->cpu();
-+                    invocation.context.pc = 0x005B1328u;
-+                    SET_GPR_U32(&invocation.context, 4, xfer.src);
-+                    SET_GPR_U32(&invocation.context, 29, 0u);
-+                    SET_GPR_U32(&invocation.context, 31, 0u);
-+                    runtime->eeScheduler().queueInvocation(std::move(invocation));
-+                }
++                std::memcpy(p, header, sizeof(header));
 +            }
++            GuestInvocation invocation{};
++            invocation.kind = GuestInvocationKind::Interrupt;
++            invocation.tag = kSif0CommandId;
++            invocation.context = runtime->cpu();
++            invocation.context.pc = 0x005B1328u;
++            SET_GPR_U32(&invocation.context, 4, kSif0AckHeaderAddr);
++            SET_GPR_U32(&invocation.context, 29, 0u);
++            SET_GPR_U32(&invocation.context, 31, 0u);
++            runtime->eeScheduler().queueInvocation(std::move(invocation));
 +        }
 +
          setReturnS32(ctx, static_cast<int32_t>(allocateSifDmaTransferId()));
      }
  
-@@ -794,6 +820,50 @@ namespace ps2_stubs
+@@ -794,6 +823,50 @@ namespace ps2_stubs
              });
          }
          setReturnU32(ctx, prev);

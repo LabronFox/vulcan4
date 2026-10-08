@@ -3127,3 +3127,115 @@ frames yet. That is the R5 enabler E3/GS work, not a boot blocker.
 Net: the R14 `maxCycleRepeats` raise is the definite half (spin cleared, full-45s boot); the SIF0
 completion `a0` still needs the oracle-correct buffer before `SignalSema ra=0x5b13c8` fires and the pool
 reuses.
+
+---
+
+## R5/E3 — GS static + runtime: the wall is (a) the game never reaches per-frame draw (architect, 2026-10-08)
+
+**Question:** why is `verify-menu.sh` still the 2005 disclaimer (1 colour, non-black 0.1085) when the
+guest runs the full 45s (functions_entered=56119, 0x005b2980 main loop, frames_presented=2495)?
+
+**Evidence (boot_w275r14.log, /mnt/ssd/vulcan4-build/run/):**
+
+1. **`gs_packets=15` is byte-identical across r10/r11/r12/r13/r14.** The game's GS work has not advanced
+   at all since the disclaimer era — nothing new is being drawn.
+2. **All 15 GIF packets are the one-time reset-graph init**, all at `guestPc=0x100a434` (log lines
+   ~54400-54577): `PRIM=0x8005` + `RGBAQ`, four BITBLTBUF/TRXPOS/TRXREG/TRXDIR IMAGE texture uploads
+   (114688 / 2048 / 1024 / 256 bytes), two nloop=23 context dumps (SCISSOR `0x1bf0..0x27f0`,
+   XYOFFSET `0x7208..`), and one single-vertex textured triangle-fan (`packet#10` PRIM=`0x11e` +
+   XYZ2=`0x89709250`). **Zero sustained per-frame draw** — no XYZ2/XYZ3/SPRITE/TRIANGLE vertex streams.
+3. **Last `[gs:gif]` at line 54577; first `[frame:upload]` at line 60331.** ~5700 further log lines with
+   **zero** GS/GIF activity across the whole 45s (2495 host present ticks). `halt=wallclock_deadline`,
+   top PC `0x005b2980` = the guest is spinning in a wait, not drawing.
+4. **`gs_frame_reg_writes=2`** — `DISPFB1=DISPFB2=0x1400` (fbp=0, fbw=10) and
+   `DISPLAY1=0x1bf27f00000000` (640x448), written twice and **never updated again**. The first-frame
+   draw-and-swap cycle never completed: after 45s DISPFB still points at VRAM page 0, the "front" buffer.
+5. **The present path is NOT the wall.** `GSCpuBackend::PresentFromLocalMemory`
+   (tools/PS2Recomp/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp:2274) decodes DISPFB (line 2281), finds page 0
+   all-black, and falls back to the draw context's framebuffer (`ctx0.fbp=160`) via the
+   `displayFrame.fbp==0 && all-black` candidate loop (gs_cpu_backend.cpp:2316-2331). Hence every
+   `[frame:upload]` line reads `displayFbp=0 sourceFbp=160`. It faithfully re-decodes the SAME stale VRAM
+   content every tick; the game has drawn nothing new into ANY buffer.
+
+**Named wall — (a) blocked upstream of the render routine.** The game configures the GS once and then
+issues no draw commands. The suspect (already on the board): the SIF0 completion invocation still passes
+the wrong `a0` (`xfer.src` instead of the SIF command header — pool entry @+0x1C, command id @+0x20),
+so `SignalSema ra=0x5b13c8` never fires and the main loop at `0x005b2980` never proceeds into the render
+path. Fixing the GS present/decode (hypotheses b and c) cannot change the picture until the guest emits
+per-frame GIF draw packets.
+
+**What must happen for GT4 to draw:** correct the SIF0 completion `a0` (SIF command header, not
+`xfer.src`), so `SignalSema(46)` fires and the loop past `0x005b2980` reaches the render routine — at
+which point `gs_packets` should jump from 15 to thousands and DISPFB should be re-pointed at the drawn
+buffer.
+
+No fix written (static read-only pass).
+
+## R4.8 follow-up — oracle measurement of sub_005B1328's a0
+
+Oracle: real GT4 USA v2.00 (SCUS-97328) on PCSX2 `-debugger -fastboot`, disc
+`/mnt/ssd/gt4/Gran Turismo 4 (USA) (v2.00).iso`. The handler entry (PC=0x005b1328) was caught twice;
+a0 and the header were identical on both hits.
+
+### The exact a0
+**a0 = 0x00081F20 — the caller's stack pointer (sp), not a pool/heap allocation.**
+Set by `0x005b0f40: daddu a0, sp, zero`, immediately before `0x005b0f48: jalr a2`
+(a2 = 0x005b1328, loaded from the dispatch table record at 0x008868A0).
+
+### Command-header layout at a0 (0x2C bytes, u32)
+| off | value | meaning |
+|---|---|---|
+| +0x00 | 0x00008000 | |
+| +0x04 | 0x00873dc0 | -> [0x00873dc0] = 0x00FFFFFF |
+| +0x08 | 0x80000008 | SIF cmd id (other/stale) |
+| +0x0C | 0x00000000 | |
+| +0x10 | 0x00000000 | |
+| +0x14 | 0x00000000 | |
+| +0x18 | 0x00000000 | |
+| +0x1C | **0x008735C4** | pool entry pointer -> s1 |
+| +0x20 | **0x8000000A** | command id (0x80000009 also seen in the driver) |
+| +0x24 | 0x00000000 | |
+| +0x28 | 0x00000000 | |
+
+Pool entry s1 = 0x008735C4: +0x08 = 0xFFFFFFFF (negative, so the handler tail's `bltz` skips
+func_5ADCD0 on this path); +0x18 = 0x006DDDF0 (gp); +0x1C = **0x005780F8** (callback, jalr'd at
+ra=0x5b13c8 — the SignalSema frame the wall report names); +0x20 = 0x008735C0 (= 0x00000106).
+
+### Divergences from the R14 premise
+1. a0 is the dispatcher's own stack buffer (0x00081F20 == sp) — not a `jal 0x005B17D0` return value.
+2. The 0x00888240 region the premise attributed to a0 is actually in **a1** at entry.
+3. The pool entry is 0x008735C4, outside the 0x00888240 region.
+
+### Effect
+With a0 = header, `a0[0x20] == 0x8000000A` matches and the handler reaches `jalr s1[0x1C]` =
+0x005780F8 with ra = 0x5b13c8 — the exact SignalSema site the wall names. So `a0 = xfer.src` is the
+reason the handler bails. The runtime must synthesize a 0x2C-byte header on its stack with
++0x1C = a pool entry and +0x20 = 0x8000000A (or 0x80000009). No fix written (measurement only).
+
+---
+
+## R14 corrected a0 — sub_005B1328 RUNS (iSignalSema 31× ra=0x5b13d0); sema id 0 not 46 (architect, 2026-10-08)
+
+**Fix:** synthesized the SIF0 ack header (oracle layout) and passed it as the handler's a0 instead of
+`xfer.src`:
+```cpp
+// RDRAM 0x00081F20, 0x2C bytes: +0x1C = 0x008735C4 (pool entry), +0x20 = 0x8000000A (SIF_CMD_END)
+// a0 = 0x00081F20 in the queued sub_005B1328 Interrupt invocation
+```
+
+**Boot result** (45s `boot_w275r15.log`):
+- `sub_005B1328` **runs**: `0xffffffbd sce_iSignalSema calls=31 ra=0x005b13d0` — the `SignalSema` site inside
+  the handler fires (31 completions).
+- functions_entered=56954 (was 56119), distinct_pcs=**748** (was 222) — the pool reuses and the guest
+  progresses through the 0x580dd8 delay loop (halt=`wallclock_deadline`, full 45s).
+- **But** `iSignalSema a0=0` (not 46): the hard-coded pool entry `0x008735C4` has `[0x8]=0` in this boot —
+  it is the wrong/empty entry for the current command. The real per-command pool entry is the guest
+  allocator's return (`jal 0x005B17D0`), which needs tracing.
+- `gs_packets` still 15 (no per-frame draw); `verify-menu.sh` still STRUCTURAL MATCH to the disclaimer
+  (1 colour, non-black 0.1085) — the GS has not drawn GT4's frames (E3/GS work).
+
+**Verdict:** the a0-header mechanism is correct (the handler reaches its SignalSema site); the remaining gap
+is deriving the actual pool-entry pointer per command instead of the hard-coded 0x008735C4, so
+`SignalSema(46)` (not 0) fires. The GS/E3 is the separate picture blocker.
+
+Patch: `/home/or/vulcan4/tools/patches/ps2recomp-linux-r14-sif0-completion.patch` (updated SIF.cpp).

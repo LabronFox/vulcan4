@@ -3587,3 +3587,18 @@ EE posts via `SifCallRpc`) that makes `client[0x008899C0][0]` non-zero. That rep
 return the requested file data to the EE's `SifCallRpc`), and/or make the MC/cdvd open of `core.gt4` succeed.
 The exact RPC fno / command id needs either a recovered oracle (`pcsx2-qt -debugger`) or tracing the
 `SifCallRpc` payload at `0x20886a40`.
+
+---
+
+## E2 unblock — the loading blocker is FILE I/O (cdvd/GT4.VOL), not the SIF RPC (architect, 2026-10-08)
+
+**boot_w275r18.log:** no `SifCallRpc` / `RpcDebug` / `sifClientAttach` activity — the game's loading does not
+go through the EE SIF RPC call path. The only file-I/O is `[MC] Open '/BASCUS-97328GAMEDATA/core.gt4'
+result=-4` (LOADER phase, early boot): the runtime maps the game's open onto an empty `mc0` host path and
+returns `-4`; the loader falls back to the disc. So the "not found" reply is already delivered (`-4`), and
+the real blocker is deeper — the engine's data load of `GT4.VOL` / track-car data, not `core.gt4`.
+
+**E2 next sub-task:** model file I/O over the disc's `GT4.VOL` — trace what the ENGINE reads (the cdvd/IOP
+file open+read of `GT4.VOL`) and provide the volume's file data so the engine finishes loading, `client[0]`
+goes non-zero and `func_5AF850` dispatches to the draw. The exact file/read call needs the recovered oracle
+(`pcsx2-qt -debugger`) or a cdvd-read trace. Do not stall on the `core.gt4` MC open.

@@ -257,17 +257,21 @@ Every wall so far is the same class (a service with no HLE route). The next two 
 
 Neither is a guess; both are measured against the oracle before any reply is invented.
 
-## R30k/l/m — every service is now claimed; the wall is the LGDEV rpc=0xc reply
+## R30k/l/m — every service is now claimed; the wall is StartThread + pending interrupts
 
 Claiming the codec sids (MPG1 `0x4d504731`, MPG2 `0x4d504732`, VOIC `0x564f4943`) and signalling
-completion for every pdiperiph rpc (not just rpc=0) leaves **zero "no server" sids** in r30m — the
-boot binds every one of the 10 PDI/peripheral/codec services and issues their inits. The run still
-parks in `halt=stuck_in_syscall` (functions_entered≈13700) and the picture is still the disclaimer.
+completion for every pdiperiph rpc leaves **zero "no server" sids** in r30m — the boot binds every one
+of the 10 PDI/peripheral/codec services and issues their inits. The LGDEV `rpc=0xc` (zero-filled reply)
+now lets the game PAST the Logitech probe.
 
-The single remaining wall is **LGDEV `rpc=0xc`**: `send=recv=0x873f40` (0x240 B, all-zero send). It is
-NOWAIT with no callback, so the guest waits on the completion semaphore; the stub now signals that
-semaphore but writes no reply, and the game stays parked — so the zero-filled reply is NOT "no wheel".
-Decoding the real `0x240`-byte reply (device-present/absent status) is the oracle's job, and it is the
-exact next action: re-arm PCSX2, break on the LGDEV `rpc=0xc` server, and A/B the reply against the
-live IOP. Everything after it (MPG1/MPG2/VOIC inits, then the first PCDV read) is behind that one
-reply.
+The wall then moves to a NEW class, not a service bind. r30m halts in
+**`sce_StartThread` (0x22) at pc=0x005608e0 on tid10 (prio 13)**, with
+**`pending_now=903 pending_hi=902`** and **`irq_attach=0 irq_runsite=0 irq_done=0`** — ~900 interrupts
+are pending and none were ever attached/delivered. The game has finished driver/media init and is now
+starting its threads; the wall is the EE interrupt/thread machinery, not the IOP services. The picture
+is still the disclaimer (`w277r30m-capture.png`, 18924 B).
+
+This is the boundary the captain's OpenAdhoc note predicted: the driver layer is done, and the next
+divergence is engine-side (interrupt delivery to the freshly-started media/script threads). Next action:
+root-cause the StartThread block + 903 undelivered interrupts against the PCSX2 oracle and
+`10-agent-guardrails.md` §3 (fix taxonomy) — this is an interrupt/thread wall, not a missing RPC.

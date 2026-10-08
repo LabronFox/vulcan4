@@ -835,3 +835,74 @@ Segment D's own files are carried whole by
 `ps2recomp-linux-g18c-baselineframe.patch` shows `best+176` added lines for `EeScheduler.cpp` while the
 live diff is 171 — a bigger number that does not prove it carries today's lines. The check above
 compares line *content*, not counts.
+
+### Mechanical gate — RAW (Segment D, `bash .auto/verify-dish.sh`)
+
+```
+=== VULCAN 4 dish gate — 2026-10-08 10:21 ===
+FAIL  suite failed=unknown (ran /mnt/ssd/vulcan4-build/ps2xTest/ps2x_tests)
+PASS  newest commit authored as the captain
+PASS  working tree clean
+INFO  verify-menu.sh: not passed (last lines below) — screen is not the menu yet
+      newest capture : /mnt/ssd/vulcan4-build/run/w275sleept-capture.png
+      structural sig  : capture 1 colours / nonblack 0.1085   vs reference 14 / 0.1150
+      GATE FAIL: STRUCTURAL MATCH to the disclaimer: only 1 colours and a non-black fraction (0.1085) within 0.05 of the reference (0.1150). That is dark-grey-text-on-black at some fade level - the disclaimer is STILL on screen, whatever the perceptual diff says.
+INFO  newest capture: /mnt/ssd/vulcan4-build/run/w275sleept-capture.png
+INFO  newest log: /mnt/ssd/vulcan4-build/run/boot_w275sleept.log
+      halt=guest_blocked
+INFO  missing-function hits in that log: 49
+=== RESULT: CLAIM NOT SUPPORTED ===
+GATE_EXIT=1
+```
+
+**The gate does NOT exit 0. The one failing check is the suite, and the suite failure is
+pre-existing — it is not Segment D's.** Note the gate prints `failed=unknown` rather than a count
+because the test binary dies before printing its `Failed:` line.
+
+### The suite SEGFAULT — proven pre-existing, RAW at pure nested HEAD
+
+`ps2x_tests` exits **139** inside `[Suite]: PS2RuntimeExpansion`, after 240 `[Passed]` lines.
+
+Proof it is not this segment's: the pre-existing test binary predated the Segment D source edits and
+carried none of its strings —
+
+```
+$ stat -c '%y %n' ps2xRuntime/src/lib/ps2_runtime.cpp ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+2026-10-08 10:17:58 ps2xRuntime/src/lib/ps2_runtime.cpp
+2026-10-08 10:17:58 ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+$ stat -c '%y %n' /mnt/ssd/vulcan4-build/ps2xTest/ps2x_tests
+2026-10-08 10:16:34 /mnt/ssd/vulcan4-build/ps2xTest/ps2x_tests
+$ strings -a /mnt/ssd/vulcan4-build/ps2xTest/ps2x_tests | grep -c 'W161_SLEEP_TIMED\|Segment D'
+0
+```
+
+and, decisively, ALL W275 nested edits stashed at pure HEAD, binary rebuilt from scratch:
+
+```
+$ cd tools/PS2Recomp && git stash push -m w275-segD-law8verify && git rev-parse --short HEAD
+76c4290
+$ cd /mnt/ssd/vulcan4-build && cmake --build . --target ps2x_tests -j4   # tail
+[100%] Linking CXX executable ps2x_tests
+[100%] Built target ps2x_tests
+$ stat -c '%y' ps2xTest/ps2x_tests
+2026-10-08 10:21:40
+$ ./ps2xTest/ps2x_tests ; echo $?
+Segmentation fault
+139
+[Suite]: PS2RuntimeExpansion
+```
+
+Then the stash was popped; `git diff --numstat` came back byte-identical (171/6, 98/0, 28/7, 212/4,
+127/2) and the binary rebuilt. Final run with the edits restored: `exit 139`, 240 `[Passed]`, dies at
+`[Suite]: PS2RuntimeExpansion`. **Same crash, same place, with and without every W275 edit.**
+
+Site (from the pre-compaction backtrace): `PS2Runtime::hasFunction` (`ps2_runtime.cpp:1803`, which
+normalises and calls `generatedFunctionTableSlot` at `:1750` and reads
+`g_ps2RecompiledFunctionTable[slot]`) ← `PS2Runtime::dispatchGuestBranch` ← test lambda #11 ← `main`.
+The test side defines that table in `ps2xTest/src/test_function_table.cpp`:
+`Base = 0`, `End = PS2_RAM_SIZE`, `SlotCount = (End - Base) >> 2`. `hasFunction`'s bounds check passes
+a slot the table was never sized for. **Not fixed here** — out of Segment D's scope, and it must be
+owned: it is the only reason this dish's gate is not green.
+
+**Segment D is therefore a FAILED-GATE dish by law 4, with the gate output above.** What it proves
+is the measurement: ExecPS2 fires. The suite SEGFAULT is the handoff.

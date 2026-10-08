@@ -3541,3 +3541,28 @@ inside `func_5AF850` / the render logic.
 **Verdict:** the per-frame pace is the software delay + the allocator (not a hardware VSync/VSINT/SIGNAL).
 The remaining gap is the **GIF path3 upload trigger**: trace what state inside `func_5AF850` makes the game
 emit XYZ2/XYZ3/SPRITE on hardware, and drive that in the GS frontend. Named, not written.
+
+---
+
+## R5 draw trigger — the game waits for the SIF RPC reply to set client[0x008899C0][0] != 0 (E2) (architect, 2026-10-08)
+
+**Oracle note:** PCSX2 DebugServer went `ECONNREFUSED` after `continue`-to-`func_5AF850` (the emulator
+died); the static picture below is recovered without further oracle reads.
+
+**Static** (`func_5AF850` → callback `sub_005b05c0`):
+```
+func_5AF850:  lbu a1,0(s6)        ; s6 = client 0x008899C0, a1 = client[0] (command byte)
+              beqz v0, 0x5b0514   ; byte==0 -> "empty" path
+0x5b0514:     ... jalr v1         ; v1 = callback (a0 arg = 0x005B05C0), a2=0
+sub_005b05c0: daddu a0,a2,zero    ; a0 = a2 = 0
+              beqz a0, ret1       ; skip func_5AF500, return 1 (no-op)
+```
+So with an empty packet the game does **nothing** and just paces (`0x580dd8`). The game reaches the real
+draw (XYZ2/XYZ3/SPRITE) only when `client[0x008899C0][0]` is non-zero — i.e. when the IOP's SIF RPC reply
+arrives with the next command. The oracle also showed `client[0]=0` at the frame-done check, so waiting is
+normal on hardware too.
+
+**Verdict — E2 (missing IOP/SIF RPC reply), not a state word we set.** The game is still loading: it waits
+for the IOP to return the next SIF RPC command (file / track / car data) that makes `client[0]` non-zero and
+`func_5AF850` dispatch to the draw. The exact SIF cmd id needs either a recovered oracle or tracing the
+guest's `sceSifSetDma`/`SifCallRpc` posts (which command id the EE sends and the reply it expects).

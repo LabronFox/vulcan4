@@ -64,6 +64,11 @@ times and spent hours probing things the corpus already answers.
 - "I don't know why" → `resources/13-decisional-brain.md`
 - MIPS / PS2 hardware truth → `resources/02-mips-r5900-isa.md`, `resources/09-ps2tek.md`,
   `resources/db-ps2-index.md` (master router)
+- **GT4 boot / menus / "the game does nothing" / disc streaming → `resources/14-adhoc-gt4-scripting.md`**.
+  GT4's own scripting language (**Adhoc**) owns **~99 % of non-race logic** — boot, every menu, event logic.
+  The readable source of GT4's scripts is cloned at **`/mnt/ssd/vulcan4-ref/OpenAdhoc`** (GT4 = 100 %
+  re-created, all 29 projects). Read `docs/REFERENCES-OPENADHOC.md`. The executable is mostly *the engine
+  the scripts drive* — so a stall while the guest waits on data is very likely the script loader.
 
 **The two rules that matter most here:**
 1. **FIND THE FIRST DIVERGENCE against an oracle.** The earliest mismatch is the bug; everything later

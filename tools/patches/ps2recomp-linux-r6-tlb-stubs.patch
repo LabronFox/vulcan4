@@ -1,0 +1,367 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index a9866db..b3b144f 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -331,6 +331,46 @@ namespace ps2_syscalls
+ 
+     void TODO(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t encodedSyscallId)
+     {
++        // WHICH syscall is this? The dispatcher passes the encoded id, but an SDK wrapper that
++        // sets $v1 and emits a bare `syscall 0` arrives as 0, so fall back to $v1 -- the same rule
++        // the "Unimplemented" report below has always used.
++        uint32_t syscallId = encodedSyscallId;
++        if (syscallId == 0u)
++        {
++            syscallId = getRegU32(ctx, 3);
++        }
++
++        // 0x07 ExecPS2 is DELIBERATELY not in Dispatcher.cpp's switch, but it IS implemented -- it
++        // is handled here, below-by-return, because it cannot reset the machine in place (see the
++        // note in the body). Dispatching it HERE, before any reporting, is the fix for a warning
++        // that used to announce "Unimplemented" for a syscall that works.
++        if (syscallId == 0x07u)
++        {
++            // ExecPS2(entry, gp, argc, argv): the guest loader re-execs the game. On hardware the
++            // kernel clears all internal state and starts a fresh priority-0 main thread at
++            // `entry` (09-ps2tek 07h). A recompiled syscall stub cannot reset the machine in place
++            // -- its emitted `jr $ra` would resume the OLD frame and the driver holds a reference
++            // to the current thread's context -- so record the relaunch and stop the guest; the
++            // driver performs it at a safe point. This function must not return on hardware; here
++            // it returns only far enough to yield.
++            const uint32_t entry = getRegU32(ctx, 4);
++            const uint32_t gp = getRegU32(ctx, 5);
++            const uint32_t argc = getRegU32(ctx, 6);
++            const uint32_t argv = getRegU32(ctx, 7);
++            if (runtime == nullptr)
++            {
++                std::cerr << "VULCAN 4 LIMITATION: ExecPS2 (EE syscall 0x07) with no runtime — "
++                             "cannot relaunch the guest; returning 0 instead." << std::endl;
++                setReturnS32(ctx, 0);
++                return;
++            }
++            std::cerr << "[execps2] entry=0x" << std::hex << entry << " gp=0x" << gp
++                      << std::dec << " argc=" << argc
++                      << " argv=0x" << std::hex << argv << std::dec << std::endl;
++            runtime->requestExecPS2(entry, gp, argc, argv);
++            return;
++        }
++
+         // a bit more detail mayber reomve old logic, lets get it more raw
+         std::cerr << "[Syscall TODO]"
+                   << " encoded=0x" << std::hex << encodedSyscallId
+@@ -346,11 +386,6 @@ namespace ps2_syscalls
+         const uint32_t v0 = getRegU32(ctx, 2);
+         const uint32_t v1 = getRegU32(ctx, 3);
+         const uint32_t caller_ra = getRegU32(ctx, 31);
+-        uint32_t syscallId = encodedSyscallId;
+-        if (syscallId == 0u)
+-        {
+-            syscallId = v1;
+-        }
+ 
+         std::cerr << "Warning: Unimplemented PS2 syscall called. PC=0x" << std::hex << ctx->pc
+                   << ", RA=0x" << caller_ra
+@@ -365,10 +400,10 @@ namespace ps2_syscalls
+                   << ", $a2=0x" << getRegU32(ctx, 6)
+                   << ", $a3=0x" << getRegU32(ctx, 7) << std::dec << std::endl;
+ 
+-        // Common syscalls:
+-        // 0x04: Exit
++        // Common syscalls still reachable here:
++        // 0x04: Exit (also in the dispatcher's switch; kept for the bare-`syscall 0` encoding)
+         // 0x06: LoadExecPS2
+-        // 0x07: ExecPS2
++        // (0x07: ExecPS2 is handled at the top of this function, before any reporting.)
+         if (syscallId == 0x04u)
+         {
+             std::cerr << "  -> Syscall is Exit(), calling ExitThread stub." << std::endl;
+@@ -376,33 +411,6 @@ namespace ps2_syscalls
+             return;
+         }
+ 
+-        if (syscallId == 0x07u)
+-        {
+-            // ExecPS2(entry, gp, argc, argv): the guest loader re-execs the game. On hardware the
+-            // kernel clears all internal state and starts a fresh priority-0 main thread at
+-            // `entry` (09-ps2tek 07h). A recompiled syscall stub cannot reset the machine in place
+-            // -- its emitted `jr $ra` would resume the OLD frame and the driver holds a reference
+-            // to the current thread's context -- so record the relaunch and stop the guest; the
+-            // driver performs it at a safe point. This function must not return on hardware; here
+-            // it returns only far enough to yield.
+-            const uint32_t entry = getRegU32(ctx, 4);
+-            const uint32_t gp = getRegU32(ctx, 5);
+-            const uint32_t argc = getRegU32(ctx, 6);
+-            const uint32_t argv = getRegU32(ctx, 7);
+-            if (runtime == nullptr)
+-            {
+-                std::cerr << "VULCAN 4 LIMITATION: ExecPS2 (EE syscall 0x07) with no runtime — "
+-                             "cannot relaunch the guest; returning 0 instead." << std::endl;
+-                setReturnS32(ctx, 0);
+-                return;
+-            }
+-            std::cerr << "[execps2] entry=0x" << std::hex << entry << " gp=0x" << gp
+-                      << std::dec << " argc=" << argc
+-                      << " argv=0x" << std::hex << argv << std::dec << std::endl;
+-            runtime->requestExecPS2(entry, gp, argc, argv);
+-            return;
+-        }
+-
+         static std::mutex s_unknownMutex;
+         static std::unordered_map<uint32_t, uint64_t> s_unknownCounts;
+         {
+@@ -436,6 +444,233 @@ namespace ps2_syscalls
+     // the guest loses its frame: that is G1.8's measured wall, where GT4's convergence-loop
+     // $s2/$s3 were reset every third iteration and hasInvocation() latched so every later 0x83
+     // silently fell through to our builtin instead of the guest's own code.
++    // ---------------------------------------------------------------------
++    // W274: GT4's OWN GetEntryAddress, installed over kernel syscall 0x5B.
++    //
++    // GT4's loader (SCUS_973.28, sub_0102AA90) copies a 0x330-byte blob with its
++    // own Copy syscall and patches the table:
++    //   Copy(dest=0x80075000, src=0x01036300, size=0x330)  @ 0x0102AAD0
++    //   SetSyscall(0x5B, 0x80075000)                       @ 0x0102AAE8
++    //   for n in {0x55..0x59}: SetSyscall(n, GetEntryAddress(n))  @ 0x0102AB00
++    //
++    // The blob's 0x5B handler (RDRAM 0x00075000) is a pure table LOOKUP: it scans a
++    // 6-entry {number,handler} table at RDRAM 0x00075300 and returns the paired word
++    // (0 when the number is absent). That is NOT the kernel primitive, which returns
++    // the ADDRESS of the writable syscall-table slot 0x80011F80+n*4 for the caller to
++    // write through. Returning the slot address here would make the loader install a
++    // table slot as a syscall handler. So the builtin case 0x5B cannot be reused; this
++    // is a different primitive and the guest must keep its own.
++    //
++    // The table is read LIVE out of rdram, never baked in (law 1). If it is not there,
++    // refuse loudly instead of inventing an address.
++    // ---------------------------------------------------------------------
++    static bool emulateGuestGetEntryAddress(uint8_t *rdram, R5900Context *ctx,
++                                           uint32_t syscallNumber, uint32_t handler)
++    {
++        constexpr uint32_t kGt4Syscall = 0x5Bu;
++        constexpr uint32_t kGt4HandlerPhys = 0x00075000u; // 0x80075000 & 0x1FFFFFFF
++        constexpr uint32_t kGt4TableAddr = 0x80075300u;   // blob+0x300
++        constexpr uint32_t kGt4TableCount = 6u;           // blob scans exactly 6 entries
++
++        // Strictly scoped: ONLY GT4's blob, ONLY on 0x5B. Anything else falls through
++        // untouched to the LOUD W250 limitation in the caller.
++        if (syscallNumber != kGt4Syscall || (handler & 0x1FFFFFFFu) != kGt4HandlerPhys)
++        {
++            return false;
++        }
++
++        static bool announced = false;
++        if (!announced)
++        {
++            announced = true;
++            std::cerr
++                << "VULCAN 4 LIMITATION: syscall 0x5B is emulated as GT4's OWN GetEntryAddress "
++                   "(guest blob installed by SetSyscall(0x5B,0x80075000), Copy source 0x01036300), NOT "
++                   "the kernel primitive that returns the writable syscall-table slot 0x80011F80+n*4. "
++                   "Emulated: scan GT4's 6-entry {number,handler} table at RDRAM 0x00075300, return the "
++                   "paired handler, 0 when the number is absent. Table read live from rdram."
++                << std::endl;
++        }
++
++        const uint8_t *table = getConstMemPtr(rdram, kGt4TableAddr);
++        if (!table)
++        {
++            std::cerr << "VULCAN 4 LIMITATION: syscall 0x5B (GT4 GetEntryAddress) — RDRAM 0x"
++                      << std::hex << kGt4HandlerPhys << std::dec
++                      << " region is not mapped; cannot look up an entry. Returning KE_ERROR."
++                      << std::endl;
++            setReturnS32(ctx, KE_ERROR);
++            return true;
++        }
++
++        uint32_t firstNumber = 0u;
++        std::memcpy(&firstNumber, table, sizeof(firstNumber));
++        if (firstNumber == 0u)
++        {
++            // Asked before GT4's own Copy(0x80075000, 0x01036300, 0x330) ran, or that Copy never ran.
++            std::cerr << "VULCAN 4 LIMITATION: syscall 0x5B (GT4 GetEntryAddress) — GT4's entry table at "
++                         "RDRAM 0x00075300 is empty, so GT4's own blob was never copied there. Returning "
++                         "KE_ERROR exactly as before this stub (was the W250 line)."
++                      << std::endl;
++            setReturnS32(ctx, KE_ERROR);
++            return true;
++        }
++
++        const uint32_t wanted = getRegU32(ctx, 4); // $a0 = syscall number to resolve
++        for (uint32_t i = 0u; i < kGt4TableCount; ++i)
++        {
++            uint32_t number = 0u;
++            uint32_t entry = 0u;
++            std::memcpy(&number, table + (i * 8u), sizeof(number));
++            std::memcpy(&entry, table + (i * 8u) + 4u, sizeof(entry));
++            if (number == wanted)
++            {
++                setReturnU32(ctx, entry);
++                return true;
++            }
++        }
++
++        setReturnU32(ctx, 0u); // GT4's blob returns 0 for "no such entry"
++        return true;
++    }
++
++    // W274/R6. The engine's 0x55-0x59 syscall overrides are TLB primitives living in the low-RAM blob
++    // (0x80075038..0x800751A8, copied 0x01036300 -> 0x80075000). The blob does mtc0/tlbwr/tlbwi/tlbr/
++    // tlbp/mfc0 round-trips; the recompiled runtime has no COP0 TLB hardware, so emulate the register
++    // round-trip with a 48-entry shadow TLB (the R5900's TLB size). GT4 probes its own TLB through these,
++    // so TLBR/TLBP must read back exactly what TLBWR/TLBWI stored.
++    struct ShadowTlbEntry
++    {
++        uint32_t pageMask = 0u;
++        uint32_t entryHi = 0u;
++        uint32_t entryLo0 = 0u;
++        uint32_t entryLo1 = 0u;
++    };
++    static ShadowTlbEntry g_shadowTlb[48];
++    static uint32_t g_tlbWrSlot = 0u;
++
++    static void writeGuestU32Live(uint8_t *rdram, uint32_t addr, uint32_t value)
++    {
++        if (uint8_t *p = getMemPtr(rdram, addr))
++        {
++            std::memcpy(p, &value, sizeof(value));
++        }
++    }
++
++    static bool tlbSegmentValid(uint32_t entryHi)
++    {
++        const uint32_t seg = (entryHi >> 24) & 0xF0u;
++        return seg == 0x10u || seg == 0x20u || seg == 0x30u || seg == 0x40u || seg == 0x50u;
++    }
++
++    // Strictly scoped to GT4's blob handler range; anything else falls through to the caller's loud
++    // limitation.
++    static bool emulateGuestTlbOp(uint8_t *rdram, R5900Context *ctx,
++                                  uint32_t syscallNumber, uint32_t handler)
++    {
++        const uint32_t phys = handler & 0x1FFFFFFFu;
++        if (phys < 0x00075038u || phys > 0x000751A8u)
++        {
++            return false;
++        }
++
++        switch (syscallNumber)
++        {
++        case 0x55: // TLBWR(PageMask=a0, EntryHi=a1, EntryLo0=a2, EntryLo1=a3) -> v0 = Index | -1
++        {
++            const uint32_t pageMask = getRegU32(ctx, 4);
++            const uint32_t entryHi = getRegU32(ctx, 5);
++            const uint32_t entryLo0 = getRegU32(ctx, 6);
++            const uint32_t entryLo1 = getRegU32(ctx, 7);
++            if (!tlbSegmentValid(entryHi))
++            {
++                setReturnS32(ctx, -1);
++                return true;
++            }
++            const uint32_t slot = (g_tlbWrSlot++ % 48u);
++            g_shadowTlb[slot] = {pageMask, entryHi, entryLo0, entryLo1};
++            setReturnS32(ctx, static_cast<int32_t>(slot));
++            return true;
++        }
++        case 0x56: // TLBWI(Index=a0<0x30, PageMask=a1, EntryHi=a2, EntryLo0=a3, EntryLo1=t0) -> v0 = a0 | -1
++        {
++            const uint32_t index = getRegU32(ctx, 4);
++            if (index >= 0x30u)
++            {
++                setReturnS32(ctx, -1);
++                return true;
++            }
++            g_shadowTlb[index] = {getRegU32(ctx, 5), getRegU32(ctx, 6),
++                                  getRegU32(ctx, 7), getRegU32(ctx, 8)};
++            setReturnU32(ctx, index);
++            return true;
++        }
++        case 0x57: // TLBR(Index=a0) -> PageMask->(a1), EntryHi->(a2), EntryLo0->(a3), EntryLo1->(t0)
++        {
++            const uint32_t index = getRegU32(ctx, 4);
++            ShadowTlbEntry e{};
++            if (index < 48u)
++            {
++                e = g_shadowTlb[index];
++            }
++            writeGuestU32Live(rdram, getRegU32(ctx, 5), e.pageMask);
++            writeGuestU32Live(rdram, getRegU32(ctx, 6), e.entryHi);
++            writeGuestU32Live(rdram, getRegU32(ctx, 7), e.entryLo0);
++            writeGuestU32Live(rdram, getRegU32(ctx, 8), e.entryLo1);
++            setReturnU32(ctx, index);
++            return true;
++        }
++        case 0x58: // TLBP(EntryHi=a0) -> v0 = Index | -1; hit -> PageMask->(a1), EntryLo0->(a2), EntryLo1->(a3)
++        {
++            const uint32_t entryHi = getRegU32(ctx, 4);
++            int32_t found = -1;
++            for (uint32_t i = 0u; i < 48u; ++i)
++            {
++                if (g_shadowTlb[i].entryHi == entryHi)
++                {
++                    found = static_cast<int32_t>(i);
++                    break;
++                }
++            }
++            if (found >= 0)
++            {
++                const ShadowTlbEntry &e = g_shadowTlb[found];
++                writeGuestU32Live(rdram, getRegU32(ctx, 5), e.pageMask);
++                writeGuestU32Live(rdram, getRegU32(ctx, 6), e.entryLo0);
++                writeGuestU32Live(rdram, getRegU32(ctx, 7), e.entryLo1);
++                setReturnS32(ctx, found);
++            }
++            else
++            {
++                setReturnS32(ctx, -1);
++            }
++            return true;
++        }
++        case 0x59: // composite TLB helper: probe the shadow TLB for the virtual address in a0
++        {
++            const uint32_t vaddr = getRegU32(ctx, 4);
++            if (!tlbSegmentValid(vaddr))
++            {
++                setReturnS32(ctx, -1);
++                return true;
++            }
++            int32_t found = -1;
++            for (uint32_t i = 0u; i < 48u; ++i)
++            {
++                if (g_shadowTlb[i].entryHi == vaddr)
++                {
++                    found = static_cast<int32_t>(i);
++                    break;
++                }
++            }
++            setReturnS32(ctx, found);
++            return true;
++        }
++        default:
++            return false;
++        }
++    }
++
+     bool dispatchSyscallOverride(uint32_t syscallNumber, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         uint32_t handler = 0u;
+@@ -453,6 +688,21 @@ namespace ps2_syscalls
+             return false;
+         }
+ 
++        // W274: an override target can legitimately have no generated function when the guest
++        // installed its OWN blob below both images (GT4 does exactly this for 0x5B). Emulate the
++        // ones we have read out of the guest; everything else keeps hitting the W250 line below.
++        if (emulateGuestGetEntryAddress(rdram, ctx, syscallNumber, handler))
++        {
++            return true;
++        }
++
++        // W274/R6. The engine's own 0x55-0x59 TLB primitives also live in the unrecompiled blob.
++        // Emulate the COP0 register round-trip (shadow TLB) instead of invoking the blob.
++        if (emulateGuestTlbOp(rdram, ctx, syscallNumber, handler))
++        {
++            return true;
++        }
++
+         if (!runtime->hasFunction(handler))
+         {
+             // W250. NEVER silent: an override target with no generated function is a LOUD limitation

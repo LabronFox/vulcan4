@@ -2514,3 +2514,30 @@ syscalls (0x55 iClearEventFlag, 0x56 WaitEventFlag, 0x57 PollEventFlag, 0x58 iPo
 0x01036300 → 0x80075000) and have no generated function. The engine's event-flag/semaphore signal that
 would wake `sema5` depends on that machinery, so the main thread deadlocks. Requires a TLB/COP0-mailbox
 model for 0x55-0x59 (W274 T2 §5), not a stub.
+
+---
+
+## R6 — TLB stubs (0x55-0x59) implemented; 0x56 LIMITATION gone, but sema5 STILL deadlocked (architect, 2026-10-08)
+
+**Fix:** `ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp` — added a 48-entry shadow TLB and
+`emulateGuestTlbOp` (called from `dispatchSyscallOverride` before the `hasFunction` gate) emulating the
+blob's 0x55-0x59 COP0 round-trip:
+- 0x55 TLBWR(PageMask,EntryHi,EntryLo0,EntryLo1) → v0 = slot | -1 (segment guard `(EntryHi>>24)&0xF0 ∈ {0x10,0x20,0x30,0x40,0x50}`).
+- 0x56 TLBWI(Index<0x30,PageMask,EntryHi,EntryLo0,EntryLo1) → v0 = Index | -1.
+- 0x57 TLBR(Index) → PageMask→(a1), EntryHi→(a2), EntryLo0→(a3), EntryLo1→(t0).
+- 0x58 TLBP(EntryHi) → v0 = Index | -1; hit → PageMask→(a1), EntryLo0→(a2), EntryLo1→(a3).
+- 0x59 composite probe (approximate: EntryHi == vaddr).
+
+**Boot result** (15s `boot_w275r6.log`):
+- `0x56` "no generated function" LIMITATION count: **48 → 0** — the stubs intercept.
+- But halt is **unchanged**: `guest_blocked`, tid1 parked `WaitSema(sema5)` @0x005adce8, ra=0x005b18b4,
+  functions_entered=10451 (same as R5), distinct_pcs=214, intr_run=64.
+
+**Conclusion:** the TLBWI return-value change (KE_ERROR −1 → index) did not alter the guest flow, so the
+TLB blob was **not** the sema5 blocker. The wall is the sema5 wakeup itself — "an interrupt or a wakeup we
+do not yet deliver": `intr_run=64` but the interrupt handler that should signal sema5 is not doing so.
+The TLB stubs are a necessary step (0x55-0x59 is now emulated, not a LIMITATION) but the sema5 deadlock is
+a separate, still-open wall.
+
+Patch: `/home/or/vulcan4/tools/patches/ps2recomp-linux-r6-tlb-stubs.patch` (+285/−35 full System.cpp diff,
+reverse-apply OK — carries the R6 TLB stubs on top of the pre-existing W275 probes in that file).

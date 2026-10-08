@@ -3830,3 +3830,69 @@ reads back are coherent — there is no second copy to fall out of sync.
 `IopSubsystem::handleRpc` directly; whether `SifRpcRawCall` gets there from the guest still requires the boot,
 because it depends on the SIF.cpp path owned by the E2 agent. Everything on this side of that seam is now
 measured rather than assumed.
+
+---
+
+## R21 — CORRECTION to R20 §"the exact edit SIF.cpp still needs": `0x00047E88` is oracle-grounded and must NOT be deleted (architect, 2026-10-08)
+
+**The claim being corrected.** R20 (above, "Consequence, and the exact edit SIF.cpp still needs") says the
+fabricated bind block is "an **invented** `sd = 0x00047E88`", that "the measured CALL's `sd` is provably
+**self-referential** … echoing the invented bind value back", and therefore that "those constants carry no
+information and must be deleted." The first two clauses are correct; **the conclusion is wrong**, and acting
+on it would regress the picture. Retracted here, on disk, so no future seat deletes a working value.
+
+**Authoritative source for the mechanism** (the EE side GT4 actually links — ps2sdk
+`ee_kernel_src_sifrpc.c`, read this session):
+
+```
+L120  sceSifBindRpc:  cd->command = 0; cd->server = NULL; cd->hdr.pkt_addr = bind; ...
+L173-186 sceSifCallRpc: call->rpc_number/send_size/recvbuf/recv_size/rmode=1/pkt_addr/cd,
+                        and                 call->sd = cd->server;      <-- CALL +0x34
+L293-311 _request_end(SifRpcRendPkt_t *request):   // the REND handler
+        if (request->cid == SIF_CMD_RPC_CALL) { if (cd->end_function) cd->end_function(cd->end_param); }
+        else if (request->cid == SIF_CMD_RPC_BIND) {
+            cd->server = request->sd;   // REND +0x24  -> client +0x24
+            cd->buf    = request->buf;  // REND +0x28  -> client +0x14
+            cd->cbuf   = request->cbuf; // REND +0x2C  -> client +0x18
+        }
+        if (cd->hdr.sema_id >= 0) iSignalSema(cd->hdr.sema_id);
+        rpc_packet_free(cd->hdr.pkt_addr); cd->hdr.pkt_addr = NULL;
+```
+
+So the derivation in R20 is right: `call->sd` (CALL +0x34) is *by construction* whatever a completed BIND
+put into `cd->server`. **But the value it echoes is not ours.** R16's oracle (this file, L3375-3385) measured
+hardware's own `sw v0,0x24(s1)` at `0x005b13b0` writing **`0x00047E88`** into `0x008899E4` (= client
+`0x008899C0` + 0x24), proven by a single step (`0x00000000 -> 0x00047E88`), with the paired REND word
+`+0x28 = 0x00047ED0` sitting right beside it. `0x00047E88` (< 0x200000) is **IOP RAM**, and `0x00047ED0` is
+that server struct's `cbuf` — a coherent `t_SifRpcServerData`, not a number anyone invented. The recomp's
+constant equals the hardware value **because it was copied from the oracle**, which is what reproducing
+hardware means.
+
+**Corrected instruction.** Keep whatever delivers `0x008899E4 = 0x00047E88` (the R16 architect fix's second
+`sub_005B1328` invocation), and label it *oracle-matched*, not *invented*. What genuinely may go is the
+**hardcoded `cd = 0x008899C0`** hypothesis only to the extent it can be replaced by reading the client out of
+the posted packet (BindPkt +0x1C) — but only if the replacement reproduces the same oracle byte.
+
+**What still stands from R20, unchanged:** classification of a posted packet must use the **header cid at
++0x08**, because `+0x20` is the RPC-family *inner* field (cid in a RendPkt, sid in a BindPkt, rpc_number in a
+CallPkt) — that is why two earlier readings of the wire layout each looked right for their own field. And the
+fileio-sid argument (R20 below) is unaffected.
+
+**New evidence for R20's fileio conclusion — the absence of a host server is structural, not incidental.**
+`ps2xIOP/src/emulator/services/iop_rpc.cpp`: `IopRpcBridge::m_servers` is populated **only** by a guest
+`sceSifRegisterRpc` (L213-230, from IOP-side `cpu.gpr[4..7]` + stack), and `hasServer(sid)` (L344-347) tests
+exactly that map. There is **no** built-in host RPC server for any sid. So `canBindRpc(0x80000001) = false`
+cannot be fixed by an emulator default — the sid needs an active `IopService` owner, the same
+`moduleAliases() = {}` change R20 made for cdvdfsv, once a bind to it is shown to need one.
+
+**Wall order, restated on the corrected reading:** in execution order the two clients are
+(1) **`0x008899C0`, sid `0x80000001`** (fileio — the client R16's oracle watches), then
+(2) **`0x00874FA8`, sid `0x80000592`** (CDVD, 13 bind retries). R20's provider owns (2); (1) is still
+unowned and is gated behind the fileio alias question. **Picture status unchanged: R16 delivered (1)'s bind
+reply and the picture stayed the disclaimer** — so (1) alone is not the render unblock, and neither result
+should be reported as a picture change until a fresh boot says so.
+
+**One open item routed to the SIF.cpp owner (E2 agent), not fixed here:** `rawRpcProbeEnabled()`
+(SIF.cpp L665-676) tests `std::getenv("VULCAN4_SIFRPC") != nullptr`, so `VULCAN4_SIFRPC=0`/`=OFF` still
+**enables** the probe — Law 12 forbids that; the value must be parsed. Sent to the owner; not edited here
+(the file is owned by a running agent).

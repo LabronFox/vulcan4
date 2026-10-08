@@ -2006,3 +2006,58 @@ run that lands somewhere new may be the probe, not the guest — bisect the inst
 **6. Law-8 capture check (RAW, this session):** `cd tools/PS2Recomp && git diff --numstat` lists 13
 files. Per-file patch-added-line comparison vs the live numstat printed **OK for all 13**
 (`SIF.cpp live=11 patchAdded=11 ps2recomp-linux-r4-sif0-dmac-dispatch.patch`), final line `ALL-COVERED`.
+
+**Segment J — mechanical gate RAW output (`bash .auto/verify-dish.sh`, commit 73dc33f):**
+```
+=== VULCAN 4 dish gate — 2026-10-08 12:30 ===
+PASS  suite 497 tests, 0 failed
+PASS  newest commit authored as the captain
+PASS  working tree clean
+INFO  verify-menu.sh: not passed (last lines below) — screen is not the menu yet
+      newest capture : /mnt/ssd/vulcan4-build/run/w276tab9b-capture.png
+      structural sig  : capture 1 colours / nonblack 0.1085   vs reference 14 / 0.1150
+      GATE FAIL: STRUCTURAL MATCH to the disclaimer: only 1 colours and a non-black fraction (0.1085) within 0.05 of the reference (0.1150). That is dark-grey-text-on-black at some fade level - the disclaimer is STILL on screen, whatever the perceptual diff says.
+INFO  newest capture: /mnt/ssd/vulcan4-build/run/w276tab9b-capture.png
+INFO  newest log: /mnt/ssd/vulcan4-build/run/boot_w276tab9b.log
+      halt=stuck_in_syscall
+INFO  missing-function hits in that log: 57
+=== RESULT: MECHANICAL CLAIMS HOLD ===
+GATE_EXIT=0
+```
+The `verify-menu.sh` INFO is expected and correct: R4 is not the menu yet — the guest is blocked at
+the 0x5b1180 spin, so the frame is GT4's own startup text, not a menu. This dish claims no picture.
+
+**Segment J — law-8 capture check RAW output:**
+```
+$ cd tools/PS2Recomp && git diff --numstat     # 13 files, unchanged from the w275 capture
+22     0   ps2xRecomp/src/lib/control_flow_emitter.cpp
+32     0   ps2xRecomp/src/lib/instruction_translator.cpp
+1      0   ps2xRuntime/include/ps2_call_list.h
+90     0   ps2xRuntime/include/ps2_runtime_macros.h
+57     1   ps2xRuntime/include/runtime/syscall_names.h
+171    6   ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+11     0   ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+12     0   ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp
+33     0   ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
+141   35   ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+28     7   ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+212    4   ps2xRuntime/src/lib/ps2_memory.cpp
+158    5   ps2xRuntime/src/lib/ps2_runtime.cpp
+$ python3 -I <per-file adder over tools/patches/*.patch>
+OK  ps2xRecomp/src/lib/control_flow_emitter.cpp live=22 patchAdded=88
+OK  ps2xRecomp/src/lib/instruction_translator.cpp live=32 patchAdded=128
+OK  ps2xRuntime/include/ps2_call_list.h live=1 patchAdded=1
+OK  ps2xRuntime/include/ps2_runtime_macros.h live=90 patchAdded=432
+OK  ps2xRuntime/include/runtime/syscall_names.h live=57 patchAdded=128
+OK  ps2xRuntime/src/lib/Kernel/EeScheduler.cpp live=171 patchAdded=1132
+OK  ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp live=11 patchAdded=11
+OK  ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp live=12 patchAdded=21
+OK  ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp live=33 patchAdded=33
+OK  ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp live=141 patchAdded=924
+OK  ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp live=28 patchAdded=56
+OK  ps2xRuntime/src/lib/ps2_memory.cpp live=212 patchAdded=924
+OK  ps2xRuntime/src/lib/ps2_runtime.cpp live=158 patchAdded=3274
+ALL-COVERED
+$ ls -la tools/patches/ | tail -3
+-rw-rw-r--r-- 1 or or 1143 Oct  8 12:0X ps2recomp-linux-r4-sif0-dmac-dispatch.patch   <- SIF.cpp, 11 added lines
+```

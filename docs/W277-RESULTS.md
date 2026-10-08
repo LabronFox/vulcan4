@@ -228,3 +228,31 @@ Watch for the first PCDV `rpc != 0` (a DVD read). It has not happened; the remai
 (0x5042474d = likely LGDEV/POWOFF service, 0x046d046d = numeric) should be claimed first with log-only
 stubs so the boot finishes driver init. Then the PCDV read rpcs reveal the GT4.VOL streaming protocol,
 which is decoded against the oracle + OpenAdhoc's boot/scripts file list.
+
+---
+
+## R30j — the boot reaches the media codecs (MPG1 / VOIC) and the Logitech device
+
+Claiming the last two sids (r30j) moved the wall again, and it names the next layer:
+
+- `0x046d046d` = **Logitech USB vendor id `0x046d` repeated** → the LGDEV.IRX service. Bound, then
+  `rpc=0xc` with `send=recv=0x873f40` (0x240 B, all-zero send). It is NOWAIT, no callback, so the game
+  parks in WaitSema waiting for a reply my stub never writes → `halt=stuck_in_syscall`
+  (functions_entered=13727 — lower than r30i, because the run now parks on this reply instead of
+  running). The reply is the wheel's "device present/absent" status; decoding it is the oracle's job.
+- Two NEW no-server sids appear at the same point, the **media codecs**:
+  `0x4d504731` = "MPG1" (MPEG-1 video decoder) and `0x564f4943` = "VOIC" (voice/ADPCM decoder). These
+  are what the intro movie needs.
+
+So the boot is now DEEP past driver init: it has bound every PDI service and is reaching for the
+video/audio codecs and the Logitech device — the media layer, not the driver layer. PCDV `rpc=0`
+was issued twice but still no DVD read. The picture remains the disclaimer (`w277r30j-capture.png`).
+
+### Honest verdict (r30j)
+
+The boot order is now mapped end-to-end: 23 drivers → PDI services → Logitech device → media codecs.
+Every wall so far is the same class (a service with no HLE route). The next two actions, in order:
+1. decode LGDEV `rpc=0xc` reply ("no wheel") against the live PCSX2 oracle;
+2. claim MPG1/VOIC with log-only stubs, then decode their rpcs the same way.
+
+Neither is a guess; both are measured against the oracle before any reply is invented.

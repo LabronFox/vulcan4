@@ -1001,10 +1001,10 @@ index 0000000..5f5d68c
 +}
 diff --git a/ps2xIOP/src/modules/pdiperiph.cpp b/ps2xIOP/src/modules/pdiperiph.cpp
 new file mode 100644
-index 0000000..bcf965f
+index 0000000..60359d2
 --- /dev/null
 +++ b/ps2xIOP/src/modules/pdiperiph.cpp
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,160 @@
 +#include "module_factories.h"
 +#include "rpc_reply.h"
 +
@@ -1037,6 +1037,8 @@ index 0000000..bcf965f
 +        constexpr uint32_t kPdiusbHostSid = 0x54485550u; // "THUP"
 +        constexpr uint32_t kPdiusbExtSid = 0x45535550u; // "ESUP"
 +        constexpr uint32_t kPdiusbKbSid = 0x424b5550u; // "BKUP"
++        constexpr uint32_t kPbgmSid = 0x5042474du; // "PBGM" (bound after PDIUSB/USTORAGE; LGDEV/POWOFF/RTINETB era)
++        constexpr uint32_t kNumericSid = 0x046d046du; // numeric sid, bound alongside PBGM
 +        constexpr uint32_t kMaxUnknownRpcLogs = 64u;
 +
 +        const char *sidName(uint32_t sid)
@@ -1048,6 +1050,8 @@ index 0000000..bcf965f
 +            case kPdiusbHostSid: return "pdiusb-host";
 +            case kPdiusbExtSid: return "pdiusb-ext";
 +            case kPdiusbKbSid: return "pdiusb-kb";
++            case kPbgmSid: return "pbgm";
++            case kNumericSid: return "numeric-46d";
 +            default: return "pdi?";
 +            }
 +        }
@@ -1080,7 +1084,8 @@ index 0000000..bcf965f
 +                RpcResult result;
 +                if (request.sid != kPdistrSid && request.sid != kPdispu2Sid &&
 +                    request.sid != kPdiusbHostSid && request.sid != kPdiusbExtSid &&
-+                    request.sid != kPdiusbKbSid)
++                    request.sid != kPdiusbKbSid && request.sid != kPbgmSid &&
++                    request.sid != kNumericSid)
 +                {
 +                    return result;
 +                }
@@ -1143,9 +1148,10 @@ index 0000000..bcf965f
 +            }
 +
 +        private:
-+            inline static constexpr std::array<uint32_t, 5> kSids{kPdistrSid, kPdispu2Sid,
++            inline static constexpr std::array<uint32_t, 7> kSids{kPdistrSid, kPdispu2Sid,
 +                                                                  kPdiusbHostSid, kPdiusbExtSid,
-+                                                                  kPdiusbKbSid};
++                                                                  kPdiusbKbSid, kPbgmSid,
++                                                                  kNumericSid};
 +            inline static constexpr std::array<std::string_view, 3> kModuleAliases{"pdistr", "pdispu2", "pdiusb"};
 +
 +            IopHost &m_host;

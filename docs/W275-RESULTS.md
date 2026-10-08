@@ -3486,3 +3486,31 @@ not advance.
 framebuffer. Stop chasing SIF.
 
 Patch: `/home/or/vulcan4/tools/patches/ps2recomp-linux-r16-sif0-bind-reply.patch` (SIF.cpp).
+
+---
+
+## E3/GS investigation — per-frame signal is the SIF BIND reply; next blocker is the GIF path3 upload (architect, 2026-10-08)
+
+**Oracle** (PCSX2 paused at `0x005b29c0`, DebugServer 21512): `v0=0x00047E88` (frame-done),
+`s0=0x008899C0` (client), `ra=0x005b29b4`, `pc=0x005b29c0`.
+
+**Static** (`sub_005b28f0`, the render loop):
+```
+0x5b29ac: jal  func_5B17D0        ; allocator
+0x5b29b4: bltz v0, 0x5b2a00      ; alloc fail -> skip
+0x5b29bc: lw   v0, 0x24(s0)      ; v0 = client[0x24] = 0x008899E4  (frame-done flag)
+0x5b29c0: beqz v0, 0x5b2978      ; flag==0 -> spin
+0x5b29c8: jal  func_5B20E0        ; render
+```
+So the **per-frame pace is the SIF RPC BIND reply** (cmd `0x80000009`) writing `0x008899E4 = 0x00047E88`
+via `sub_005B1328`'s `sw v0,0x24(s1)` — option (d), not VSync/VSINT/GS-SIGNAL.
+
+**After the flag**: `func_5B20E0` → `sub_00580cd8` → `func_5B0750` → `func_5AF850` (the GIF packet
+send/parse). Our guest sits in `sub_00580cd8`'s 1,048,576-iteration delay loop (`0x580dd8`, the R18 top PC)
+— `func_5AF850`'s path fails, so the game retries and never emits XYZ2/XYZ3/SPRITE streams
+(`gs_packets` stays 15).
+
+**Fix (named, not written):** drive the **GIF path3 upload** — the GS frontend must accept and process the
+game's GIF path3 draw packets so `func_5AF850` completes and the frame reaches the screen. The frame-done
+flag + BIND reply are now correct; the remaining gap is the GIF/GS frontend upload path, not a per-frame
+signal.

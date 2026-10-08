@@ -442,10 +442,16 @@ DOWNSTREAM of the byte. The surviving number in the boot report is `pending_hi=1
 `irq_attach=0 irq_runsite=0 irq_done=0 thread_attached=0` — a high-priority interrupt is pending and
 never attached/delivered; tid1 sits on `sema#7`, tid2 on `sleep#0`, `ExecPS2` 0.
 
-Two corrections to the mission brief's address map: the stride is 0x10, not 12 — the byte for ch2 is
+> **SUPERSEDED (W275 T1-follow-up #2, see Segment B below).** The stride claim below is WRONG.
+> The correct formula, read straight off the guest at 0x100dcf0 (`sb zero,13(a0)` with
+> `a0 = a2 + 16 + 12*ch`, `a2 = 0x70002050`), is **byte = 0x7000206D + 12·channel** → VIF0
+> 0x7000206D, VIF1 0x70002079, **GIF 0x70002085**, ch3 0x70002091. The 0x7000208D / stride-0x10
+> text below is retained only as the record of a retracted claim; do not build on it.
+
+~~Two corrections to the mission brief's address map: the stride is 0x10, not 12 — the byte for ch2 is
 0x7000208D, not 0x70002089; and 0x7000207C / 0x70002088 are NOT busy flags — the guest uses them as
 saved-sp slots (`sw $sp,0x0($v1)` at 0x100af18 stores 0x1ffcda0 / 0x1045970, pointers). The only byte
-flag is 0x7000206D for channel 0; byte accesses at 0x7000207D / 0x70002089 are ZERO in the whole boot.
+flag is 0x7000206D for channel 0; byte accesses at 0x7000207D / 0x70002089 are ZERO in the whole boot.~~
 
 ### Law-8 capture check — RAW
 
@@ -462,3 +468,178 @@ System.cpp       live=+98  patch=+98
 ps2_memory.cpp   live=+91  patch=+91
 ps2_runtime.cpp  live=+104 patch=+104
 ```
+
+---
+
+## Segment B — W275 T1 follow-up #2: the GIF chain walker, named drop
+
+*2026-10-08 · builder · probe `VULCAN4_W275_GIFTAG=1` (OFF by default) + `VULCAN4_W275_BUSY=1`.*
+
+**Decisive run:** `/mnt/ssd/vulcan4-build/run/boot_w275tag4.log` (6,461,080 bytes, EXIT=0,
+`frames_presented=0` — "NO CAPTURE was taken, no 640x448 window ever appeared on :105").
+Command:
+```
+VULCAN4_W275_GIFTAG=1 VULCAN4_W275_BUSY=1 VULCAN4_DISPLAY=:105 \
+  bash tools/harness/run_capture.sh <name> 2000000 15 30
+```
+
+### B.1 The named drop — candidate **(a) CONFIRMED**: an empty, legal, zero-QWC source chain
+
+The GIF source-chain kick the boot repeats is a **valid chain that transfers zero quadwords and
+terminates with `tag_end`**. Raw walker output (25 WALKs in the run, all byte-identical):
+
+```
+[w275:giftag] KICK ch=GIF addr=0x1000A000 value=0x10000185 dctrl=0x00000001 dmacEnabled=1 gsVRAM=1
+[w275:giftag] WALK ch=GIF chcr=0x10000185 mode=1 tie=1 asp=0 tadr=0x01045A90 madr=0x0106E6D0 qwc=0 \
+                       asr0=0x00000000 asr1=0x00000000
+[w275:giftag]   tag#0 addr=0x01045A90 raw=00000020805E04010000000000000000 id=2 qwc=0 dw=17063552 irq=0 end=0 payload=0 dataAddr=0x01045AA0 nextTagAddr=0x01045E80 chainBuf=0
+[w275:giftag]   tag#1 addr=0x01045E80 raw=00000070000000000000000000000000 id=7 qwc=0 dw=0 irq=0 end=1 payload=0 dataAddr=0x01045E90 nextTagAddr=0x01045E80 chainBuf=0
+[w275:giftag] END ch=GIF tagsProcessed=2 chainBuf=0 tagAddr=0x01045E80 asr0=0x00000000 asr1=0x00000000 asp=0 chcrFinal=0x70000185 enqueue=NO(chainBuf empty)
+[w275:giftag] PROCESS ch=GIF auto=1 cb=0 arbiter=1 pendingGif=0 pendingVif1=0 pendingVif0=0
+[w275:giftag]   SERVICED gif=0 vif1=0 vif0=0
+[w275:giftag]   COMPLETE hadGif=0 hadVif0=0 hadVif1=0
+```
+
+**Tag decode (memory order → DMAtag qword).** The 32-hex-char `raw=` dump is the 16 tag bytes **in
+memory order**; the DMAtag is the **first 8 bytes read little-endian**. Decode (QWC = bits 0-15,
+id = bits 28-31, ADDR = bits 32-63):
+
+| tag | address | raw (memory order) | DMAtag qword | id | QWC | ADDR |
+|---|---|---|---|---|---|---|
+| #0 | 0x01045A90 | `00000020805E04010000000000000000` | `0x01045E8020000000` | **2 `next`** | **0** | 0x01045E80 |
+| #1 | 0x01045E80 | `00000070000000000000000000000000` | `0x0000000070000000` | **7 `end`** | **0** | — |
+
+Cross-check: tag#0's `dw=17063552` = `0x01045E80`, which the walker's own parse puts equal to tag#1's
+address — consistent only with tag#0's first 8 bytes being little-endian `01 04 5E 80 20 00 00 00`.
+
+**Why this is a *completed* transfer, per the mandated corpus** (`resources/09-ps2tek.md`, not
+intuition):
+- `id=2 next` — "MADR = TADR+16; TADR = DMAtag.ADDR" (ps2tek.md:1784) → next tag at 0x01045E80. ✔ walked.
+- `id=7 end` — sets `tag_end` (ps2tek.md:1782).
+- **"When tag_end=true, the transfer ends after QWC has been transferred."** (ps2tek.md:1725.)
+  QWC here is 0, so **zero quadwords is the whole transfer — and it is complete.**
+
+On real hardware this clears CHCR.STR, sets D_STAT channel 2, and fires the TIE interrupt. The
+runtime instead gates the entire GIF enqueue on a non-empty chain buffer:
+
+- `enqueueTransfer` early-returns on `qwCount == 0` (ps2_memory.cpp:1513-1514).
+- `if (mode == 0 && qwc > 0) enqueueTransfer(...)` (1531) — source-chain (mode 1) is not this path.
+- **`if (!chainBuf.empty())` (ps2_memory.cpp:1769)** — the gate that drops the transfer.
+
+So `chainBuf` stays size 0, `m_pendingGifTransfers` is never pushed, `hadGif=0` (~1924), and the
+completion stanza (2163-2168: `raiseDStatChannel(2u); queueCompletedDmacCause(2u);
+m_ioRegisters[GIF_CHANNEL+0x00] &= ~0x100u; m_ioRegisters[GIF_CHANNEL+0x20] = 0;`) never runs.
+Measured end state: `chcrFinal=0x70000185` — **STR (bit 0x100) is still set after the walk**, which is
+exactly the "transfer never completed" signature.
+
+**Census over the whole run (not a sample):** KICK total 61; GIF CHCR write `0x10000185` = 25;
+WALK 25; `END enqueue=NO(chainBuf empty)` = 25; **enqueue=YES = 0**; COMPLETE `hadGif=1` = 9 (those are
+the *other* GIF kicks, CHCR `0x181` with real payloads), `hadGif=0` = 53. **25 of 25 source-chain GIF
+kicks are this same empty chain; 0 of 25 enqueue.**
+
+Kicker pc: the empty-chain kick is `pc=0x100dee8` inside `sub_0100DE58` (23 of 25 CHCR writes to
+0x1000A000); the payload kicks come from `pc=0x100b0e4` (8×, value 0x181) and `pc=0x100ac54` (1×,
+0x80). Both tags sit in segment-2 `.bss` (file-backed vaddr ends 0x01041724; 0x01045A90 and
+0x01045E80 are past it), so these bytes are **runtime-written** — this captured dump is the only
+ground truth, the ELF cannot supply them offline.
+
+### B.2 Candidates (b) and (c) — both REFUTED by the same dump
+
+- **(b) ID parse / `mode==1` rejection: REFUTED.** The walker decoded `next`→ADDR and terminated on
+  `end` exactly as ps2tek specifies; the id parse is correct, it is the *payload gate after* the parse
+  that drops it.
+- **(c) DIR=1 GIF path not enqueued: REFUTED.** The DIR=1 GIF path is entered and walked —
+  `PROCESS ch=GIF auto=1 cb=0 arbiter=1` appears for every one of the 25 kicks.
+
+The drop is therefore **candidate (a): empty `chainBuf` because both tags carry QWC=0** — and a
+zero-QWC `end`-terminated chain is legal and complete, so the runtime must not treat "empty payload"
+as "nothing happened".
+
+### B.3 The coordinator's premise is FALSIFIED by measurement
+
+The handed premise — *"tid2 LIVE-LOCKS on a GIF chain transfer … the ch2 busy byte never clears"* — is
+wrong on both halves:
+
+1. **The GIF busy byte clears.** Measured: `0x70002085` (GIF; formula corrected in B.4) is **set 25×**
+   (pc=0x100debc) and **cleared 32×** — 24× at guest `pc=0x100af5c` and 8× at `pc=0x100dcf0` (the DMAC
+   handler). It is not stuck.
+2. **The loop is bounded, not a live-lock.** Guest `0x100af50`/`0x100afa0`/`0x100afa8` is a bounded
+   retry: `bgez $s3` guard with `addiu $s3,$s3,-1` in the taken delay slot. A live-lock cannot decrement
+   and exit; this does.
+3. **There is no `$a0 == 0` untimed park.** 15,576 `SleepThread` calls, **zero with us=0**:
+   12,652× us=1 (carrying `s0=0x70002050`), 2,924× us=8 (`s0=0x70002085, ra=0x100afa8`). Every park
+   is timed.
+
+So the boot does **not** halt on a stuck GIF busy byte. The GIF busy byte is one symptom; the measured
+halt is B.5.
+
+### B.4 Busy-byte address map — CORRECTED (supersedes the top-of-file note)
+
+Read straight off the guest disassembly of the DMAC serve at `0x100dcf0`:
+```
+100dce4:  00021080  sll v0,v0,0x2
+100dce8:  24420010  addiu v0,v0,16
+100dcec:  00c22021  addu a0,a2,v0
+100dcf0:  a080000d  sb zero,13(a0)     ; a2 = 0x70002050 → byte = 0x70002050 + 16 + 12*ch + 13
+```
+`a2 = 0x70002050` (confirmed by the run's own `flag@0x70002050=2`), so the **stride is 0xC, not 0x10**,
+and the byte is **`0x7000206D + 12*channel`**:
+
+| channel | busy byte |
+|---|---|
+| ch0 VIF0 | 0x7000206D |
+| ch1 VIF1 | 0x70002079 |
+| **ch2 GIF** | **0x70002085** |
+| ch3 | 0x70002091 |
+
+The per-channel completion callbacks run at `0x100dcf8-0x100dd18` (`lw s0,0(v1)` then
+`jal 0x10202e8`), i.e. right after the clear.
+
+### B.5 The measured halt state (what actually stops the boot)
+
+```
+halt=guest_blocked
+thread_state=tid1:status=2:wait=sema#7:woken=0:pc=0x0101f468:ra=0x01000de8:invocations=0
+             tid2:status=2:wait=sleep#0:woken=0:pc=0x0101f348:ra=0x0100afa8:invocations=0
+SEM id=7 count=0 waiters=1   (SEM 1..6 count=1 waiters=0)
+elapsed_ms=6497 ee_cycle=248373842 next_event_cycle=250680249
+sleepCurrentCalls=15576 intr_run_by_kind=[intr=94,dmac=0,override=0,other=0]
+```
+`wait=sleep#0` is **waitReason=sleep with waitId 0**, NOT "microseconds 0" (harness
+`vulcan4_harness.cpp:3197-3200`). tid2 is in a *timed* 8 µs sleep (ra=0x0100afa8, s0=0x70002085).
+
+### B.6 Open leads — HYPOTHESES, not measurements (flagged as such)
+
+1. **A scheduler gap may be what actually halts the boot.** `completeTimedSleeps()` runs only from
+   `accountCycles()`, i.e. only when guest code executes; `EeScheduler::canDispatchGuest()`
+   (EeScheduler.cpp:1629) returns false when every ready queue is empty and no invocation is pending.
+   With `m_nextDeadlineCycle`/`processDueDeadlines()` handling only `m_deadlines` (VBlank/timers) and
+   not timed sleeps, a timed sleeper whose deadline is nearer than the next scheduled event
+   (tid2's wake ≈ `ee_cycle + 8*295`, well under the +2,306,407 cycle gap to `next_event_cycle`) has
+   nothing to advance it. If so, the run is being stopped early and masking the true consequence of
+   the empty-chain drop. **Not yet measured** — one env-gated print of the sleeper's `wakeCycle`
+   versus `next_event_cycle` would settle it.
+2. **Whether the GIF completion IRQ is what signals sema#7.** The DMAC handler walks per-channel
+   callbacks at `0x100dcf8-0x100dd18`; there are 64 `jal SignalSema` sites in the ELF
+   (`SignalSema` trampoline @0x101f440, `trampoline(n)=0x101f2f0+16*(n-45)`), one at 0x1000de8 —
+   numerically adjacent to tid1's `ra=0x01000de8`. **Not conclusive.**
+
+### B.7 Law-8 capture check — RAW (this segment's probe tree)
+
+```
+$ cd tools/PS2Recomp && git diff --numstat
+164	0	ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+98	0	ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+202	3	ps2xRuntime/src/lib/ps2_memory.cpp
+127	2	ps2xRuntime/src/lib/ps2_runtime.cpp
+
+$ per-file added lines vs tools/patches/ps2recomp-linux-w275-t1b-giftag-empty-chain.patch
+EeScheduler.cpp                   live+164   patch+164   PASS
+System.cpp                        live+98    patch+98    PASS
+ps2_memory.cpp                    live+202   patch+202   PASS
+ps2_runtime.cpp                   live+127   patch+127   PASS
+patch total added lines: 595   ( = 591 real + 4 '+++' header lines )
+```
+All four modified files are carried by the patch. `System.cpp`'s +98 is the already-captured 0x5b
+GetEntryAddress fix (`ps2recomp-linux-w274-0x5b-getentryaddress.patch`); the other three are the
+W275 probes.

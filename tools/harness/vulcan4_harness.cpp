@@ -1369,6 +1369,80 @@ static void w229ArrStoreObserver(uint32_t addr, uint32_t size, uint64_t val,
     }
 }
 
+// W276. WHO WRITES THE ENGINE'S SIF0 RECORD TABLE?
+//
+// label_5b1180 spins on tab[0]: `while (*(uint32_t*)0x008869C0 == 0) { }` (func_5B0880 reads
+// *(u32*)(0x008869C0 + 4*a0)). The channel-5 handler sub_5b0e30 IS dispatched (measured: W275 INV
+// prints `dmac=1 cause=5 matching=1 [en h=0x5b0e30 arg=0x20 hasFn=1]`) and the spin still never
+// clears, so either the handler does not store there, or the store goes through a path the write
+// macro never sees. The `op` string is the discriminator: a generated `"WRITE32"`/`"Ps2FastWrite32"`
+// is a guest CPU store, while `"SIF IOP-to-EE DMA"` / a range write is a host-side copy. Watch the
+// table AND the descriptor it lives in (0x00886818 holds the pointer the handler dereferences).
+// OFF unless VULCAN4_W276_TABWATCH.
+// The window is settable (VULCAN4_W276_LO / VULCAN4_W276_HI, hex) so the watch can be narrowed to
+// the 8-word record table alone when the wide window overflows the print cap. The cap is far above
+// any plausible count for a narrow window, so a narrowed run has NO gap in the write history.
+// NOTE, and it matters: this observer runs on EVERY guest store, so the bounds are resolved ONCE into
+// static consts. Calling getenv() per store here was measured to change the boot path outright (the
+// diverted run never reached GT4's own code at all), which is the standard probe hazard.
+static uint32_t w276WinLo()
+{
+    static const uint32_t v = [] {
+        const char *s = std::getenv("VULCAN4_W276_LO");
+        return s != nullptr ? static_cast<uint32_t>(std::strtoul(s, nullptr, 16)) : 0x00886800u;
+    }();
+    return v;
+}
+static uint32_t w276WinHi()
+{
+    static const uint32_t v = [] {
+        const char *s = std::getenv("VULCAN4_W276_HI");
+        return s != nullptr ? static_cast<uint32_t>(std::strtoul(s, nullptr, 16)) : 0x00886A40u;
+    }();
+    return v;
+}
+static uint64_t &w276Hits()
+{
+    static uint64_t n = 0;
+    return n;
+}
+
+static void w276TabStoreObserver(uint32_t addr, uint32_t size, uint64_t val,
+                                 const R5900Context *c, const char *op, uint32_t srcAddr)
+{
+    // Always (any window) tally writes that land inside the 8-word table itself, so the halt dump can
+    // state the definitive writer set for 0x008869C0..0x008869DF no matter how the window was set.
+    if (addr >= 0x008869C0u && addr < 0x008869E0u)
+    {
+        static uint32_t s_tabN = 0;
+        static uint32_t s_tabPc[16] = {0};
+        if (s_tabN < 16u) s_tabPc[s_tabN] = (c != nullptr ? c->pc : 0u);
+        ++s_tabN;
+        std::cout << "VULCAN4 W276 TAB8 n=" << s_tabN
+                  << " addr=" << toHex(addr)
+                  << " val=" << toHex(static_cast<uint32_t>(val))
+                  << " writerPc=" << toHex(c != nullptr ? c->pc : 0u)
+                  << " op=" << (op != nullptr ? op : "?") << std::endl;
+    }
+    if (addr < w276WinLo() || addr >= w276WinHi()) return;
+    static const uint64_t kCap = 20000u;
+    uint64_t &n = w276Hits();
+    ++n;
+    if (n <= kCap)
+    {
+        std::cout << "VULCAN4 W276 TABW addr=" << toHex(addr) << " size=" << size
+                  << " val=" << toHex(static_cast<uint32_t>(val))
+                  << " writerPc=" << toHex(c != nullptr ? c->pc : 0u)
+                  << " op=" << (op != nullptr ? op : "?")
+                  << " src=" << toHex(srcAddr) << std::endl;
+    }
+    else if (n == kCap + 1u)
+    {
+        std::cout << "VULCAN4 W276 TABW ... cap " << kCap << " reached, further writes suppressed"
+                  << std::endl;
+    }
+}
+
 int main(int argc, char *argv[])
 {
     const std::string usage =
@@ -1454,6 +1528,15 @@ int main(int argc, char *argv[])
         // could only ever report zero. Arm it here, at the harness's own guest start, and it chains
         // to whatever observer is installed below so nothing is silenced.
         ps2ArmSpStreamWatch();
+
+        // W276. OFF unless VULCAN4_W276_TABWATCH. Arm the SIF0 record-table store watch before the
+        // first guest instruction so an early writer is not missed. See w276TabStoreObserver.
+        if (std::getenv("VULCAN4_W276_TABWATCH") != nullptr)
+        {
+            ps2AddStoreSubscriber(&w276TabStoreObserver);
+            std::cout << "VULCAN4 W276 TABW armed lo=" << toHex(w276WinLo()) << " hi=" << toHex(w276WinHi())
+                      << std::endl;
+        }
 
         if (diagnosticsRequested)
         {
@@ -3222,6 +3305,27 @@ int main(int argc, char *argv[])
     std::cout << "VULCAN4 MISSING-BOUNDARIES n=" << missingBoundaryAddresses.size() << " :";
     for (uint32_t a : missingBoundaryAddresses) std::cout << " 0x" << toHex(a);
     std::cout << std::endl;
+    // W276. Dump the SIF0 record table the engine is parked on. label_5b1180 spins on tab[0] and the
+    // whole point of the dish is whether anything ever made it non-zero. OFF unless the watch knob is
+    // set, so the default run is byte-for-byte unchanged.
+    if (std::getenv("VULCAN4_W276_TABWATCH") != nullptr)
+    {
+        std::cout << "VULCAN4 W276 TABDUMP";
+        for (uint32_t i = 0u; i < 8u; ++i)
+        {
+            const uint32_t off = 0x008869C0u + 4u * i;
+            uint32_t v = 0u;
+            if (off + 4u <= 0x02000000u)
+            {
+                std::memcpy(&v, rdram + off, 4);
+            }
+            std::cout << " [" << i << "]=" << toHex(v);
+        }
+        uint32_t descriptorPtr = 0u;
+        std::memcpy(&descriptorPtr, rdram + 0x00886818u, 4);
+        std::cout << " descPtr@0x00886818=" << toHex(descriptorPtr) << std::endl;
+    }
+
     std::cout << "VULCAN4 BOOT REPORT functions_entered=" << functionsEntered
               << " true_guest_entries=" << ps2_log::entryCounter().load()
               << " true_guest_exits=" << ps2_log::exitCounter().load()

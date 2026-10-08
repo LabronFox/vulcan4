@@ -1789,3 +1789,220 @@ GATE_EXIT=0
 
 The screen is still the disclaimer — this segment claims no picture. Everything it claims is a wiring
 and a measurement.
+
+## SEGMENT H — R4 STATIC ANGLE (architect): every writer of 0x008869C0, and why none runs
+
+The spin is `while (*(u32*)0x008869C0 == 0);` (loop 0x5b1180/0x5b1188, engine
+`ps2_recompiled_functions_41.cpp:195611-195659`). `func_5B0880` reads `[0x008869C0 + idx*4]`
+(`41.cpp:192227-192258`, read at `:192248`). Exhaustive search of the whole build tree
+(`grep -rni 0x8869c0 /mnt/ssd/vulcan4-build/` → zero hits; `grep -rn 27072` on the engine → the
+sites below) gives exactly **two EE stores** that can touch the word, and **neither writes non-zero
+to slot 0**:
+
+### H.1 — the two EE writers
+
+| # | pc (store) | function | what it writes |
+|---|---|---|---|
+| 1 | **0x5b08b0** `sw $a1,0($a0)` | `func_5B0898` (inside `sub_005b07d0`) | `[0x008869C0 + idx*4] = a1` — the generic setter (`41.cpp:192284`; `lui 0x88`/`addiu 0x69C0` at `:192261-192272`) |
+| 2 | **0x5b09b0** `sw $zero,0($v0)` | `sub_005b08c8` init loop | zeroes `0x008869C0..0x00886A3C` (32 words, descending) — reset only (`41.cpp:192570`) |
+
+`func_5B0898` has **one** static caller in either image: `40.cpp:166636-166646`, the `J func_5B0898`
+at **0x590a74**, with `a0=1, a1=0` → clears **slot 1** (`0x008869C4`), never slot 0. There is no
+`lui 0x88`+`sw ..,0x69C0` immediate store anywhere (the two immediate siblings write *different*
+bases: `07.cpp:21232` @0x1b2624 → `0x008269C0 = 3`, `15.cpp:170416` @0x2a0894 → `0x008369C0 = 0x1D` —
+those are the 0x82/0x83 instances of the same table, status codes, NOT 0x88).
+
+### H.2 — what 0x008869C0 is
+
+Slot 0 of a **32-entry status/result table** in the 0x5B module's IOP-communication layer
+(SIF RPC). Evidence: (a) `sub_005b08c8` builds a 32-byte DMA/SIF descriptor at 0x00886818 whose
+field `[0x886834] = 0x8869C0` is a pointer **at** the table (`41.cpp:192481-192495`); the src/dst
+pointers are `|0x20000000` (uncached KSEG1), classic DMA addressing; (b) the send primitive
+`func_5B0DB0`/`sub_005b0c78` builds a SIF command header (`lbu` cmd id, `sll 8` size, `or`) and reads
+the SIF flag `0x886820` (`41.cpp:193623-193628`), i.e. `sceSifSendCmd`; (c) the module's syscall
+surface is SIF: 0x79 SifSetReg / 0x7A SifGetReg / 0x0B AddSbusIntcHandler (R3/R4 work), and the
+guest's own 0x83 override (`SetSyscall a1=0x5b7390`; `0x5b7390` = word-copy, `0x5b73c8` = word-scan,
+`42.cpp:29551`, `42.cpp:29627`).
+
+Loop EXIT: `beqz $v0` at 0x5b1188 branches back while `v0==0`; **any non-zero** value of `0x008869C0`
+ends it. That non-zero is the SIF RPC result/status for slot 0.
+
+### H.3 — why none of the writers set it in our boot
+
+- Writer 2 (init zero-loop) only ever writes 0 — it keeps the slot "pending".
+- Writer 1 (`func_5B0898`) is the only EE setter and is never invoked with idx=0 (its sole caller uses
+  idx=1, value 0).
+- Therefore the non-zero value the spin waits on is written by the **IOP side** — the SIF0 (IOP→EE)
+  DMA response to the `sceSifSendCmd` issued immediately before the spin at 0x5b1174
+  (`41.cpp:195581`, `jal func_5B0DB0` with `a0=0x80000002`, packet at 0x886A80, size 0x10).
+- Our boot runs **no IOP** (no BIOS, IOP modules not loaded, SIF RPC never answered), so the response
+  never lands and `0x008869C0` stays 0 → the EE spins at 0x5b1180 forever.
+
+### H.4 — confidence + the one check that settles it
+
+High confidence on the writer inventory (exhaustive literal+offset grep of the tree). "IOP writes the
+result" is an inference from the SIF structure; it is NOT a hand-waved claim — confirm it in one run:
+PCSX2 oracle watchpoint on **0x008869C0** during GT4's own boot will show the store (IOP-side SIF0
+DMA, not an EE instruction). That is the next seat's job. No fix written (per instruction).
+
+---
+
+## SEGMENT I — ORACLE VERDICT on the wall (the measurer's run, 2026-10-08T08:44:51Z)
+
+One clean run: fresh `pcsx2-qt -debugger -fastboot "Gran Turismo 4 (USA) (v2.00).iso"` (pid 612359,
+DebugServer 21512, DebugServer-verified). Section H's closing question — *"PCSX2 oracle watchpoint on
+0x008869C0 will show the store (IOP-side SIF0 DMA, not an EE instruction)"* — is answered, and the
+`not an EE instruction` half of it is **refuted**.
+
+### I.1 — hardware: it IS written, by an EE instruction
+
+| | hardware (measured) | ours |
+|---|---|---|
+| 0x008869C0 | `0x00000001` (slot 0 set) | never written |
+| writing instruction | `sw v1,(v0)` @ **0x005b0868**, delay slot of `jr ra` @0x005b0864 | — |
+| enclosing leaf | **func_5B0850** (0x005b0850-0x005b0868) | present, never invoked with idx=0 |
+| caller | **ra = 0x005B0F50**, inside record-table dispatcher **sub_005B0E30** | — |
+| value | **0x00000001** (idx=0, val=1 from frame 0x00081F20: +0x10=0, +0x14=1) | — |
+| context | sp=**0x00081F20** = 0x81FC0-0xA0, GT4 kernel trampoline @**0x00081FE0**, gp=0, IRQs disabled | n/a |
+| where the spin goes | exits at 0x005b1190 → `j 0x005AE0A0` (syscall 0x79, a0=0x80000002) | never reached |
+
+- Spin entry (bp 0x005b1180) hit @cycle **1,787,808,870**, only **3 threads**: TID0 PC=0x00081fc0 st=2
+  (idle) / TID1 PC=0x005adcb8 **st=1 RUNNING** — the spinner, sp=0x01FFFC60, ra=0x005B117C / TID4
+  st=4 waitType=1. The write lands **+25,809 cycles later** @cycle **1,787,834,679**.
+- The store computes `*((u32*)(*(u32*)(a1+0x1C) + *(u32*)(a0+0x10)*4)) = *(u32*)(a0+0x14)`; at the
+  write a1=**0x00886818** (ctx), a1+0x1C=0x008869C0 (base), a2=0x008869C0, a0+0x10=**0** (idx),
+  so dest v0 = base + idx*4 = **0x008869C0** (the flag word itself), value v1 = **1**.
+- Proof the loop exits: 0x008869C0 read `0,0,0,0` pre-store; after single-stepping the delay slot it
+  read **0x00000001**, so `beqz v0,0x005B1180` @0x005b1188 falls through.
+- Proof hardware finishes init: end state **18 threads** (TID 0,1,4..16,18,19,20) @cycle
+  2,550,854,656; **TID 1 left the loop** and now sits at 0x005adbc8 st=4 waitType=2 (a syscall wait).
+  0x008869C0 = slot0 **1**, slot1 **1**, rest 0.
+
+### I.2 — why ours spins (the named diff)
+
+The flag is set from GT4's **asynchronous kernel handler dispatch**: trampoline **0x00081FE0**
+(`lui sp,0x8 / jalr v1 / addiu sp,sp,0x1FC0 / li v1,0xFFFB / syscall`) → dispatcher **sub_005B0E30**
+→ record table **0x00886840** (ctx+0x0C, count 0x20 at ctx+0x10) → leaf **func_5B0850** with frame
+idx=0/val=1. **Nothing on the spin thread's own call chain writes it**, so no amount of scheduling
+that thread alone can clear the loop: our runtime must *drive the dispatch* (deliver the event and run
+the handler). The dispatcher has no static JAL caller in the image — it is reached only through the
+trampoline, which is exactly why a static pass could not see it.
+
+### I.3 — correction to SEGMENT H
+
+- H's "the non-zero value ... is written by the IOP side — the SIF0 (IOP→EE) DMA response ... not an EE
+  instruction" is **disproved**: the observed store is a plain EE `sw` in func_5B0850. What survives is
+  only the *trigger* half — our boot runs no IOP, so the dispatch never fires.
+- H's writer inventory was **incomplete**: it missed func_5B0850 (0x5b0868) as a writer of the table,
+  and func_5B0870 (0x5b0878) writes **ctx+0x08**, not the table. Adding them makes the inventory
+  exhaustive: init zero-loop (0) + func_5B0898 (idx/val setter) + **func_5B0850 (frame setter)**.
+
+### I.4 — caveats (instrument, not game)
+
+- The temp bp at 0x005b1190 (spin exit) **never fired** although TID 1 demonstrably reached the exit
+  syscall (it now waits at 0x005adbc8). Instrument order — armed/resumed race — not a game fact.
+- A pre-compaction note of mine said the destination was `0x008869C4`; the clean re-measure is
+  **v0 = 0x008869C0** (idx 0, the flag word itself).
+- `pcsx2_get_backtrace` **SIGSEGVs** this build — never call it.
+- Oracle left **UP and clean** (pid 612359, all breakpoints/watchpoints cleared), settled at the
+  18-thread state.
+
+---
+
+## R4 — the wall is DMAC channel-5 (SIF0) handler dispatch, not a syscall-override ordering bug (architect, 2026-10-08)
+
+**The coordinator's hypothesis (point 2: "my case 0x79 builtin bypasses the engine's override") is REJECTED.**
+- `[SetSyscall]` dump (boot_w275r4.log) shows NO override for 0x79 (or anything pointing at 0x5b0e30):
+  `0x54->0x5b9e40, 0x55-0x59->0x80075038..0x800751a8 (blob), 0x5A->0x5b98d0, 0x5B->0x80075000 (blob),
+  0x83->0x5b73c8`. 0x79 correctly reaches the builtin sceSifSetReg.
+- `dispatchSyscallOverride` already runs BEFORE the builtin switch (`Dispatcher.cpp::dispatchNumericSyscall`).
+
+**What the oracle's `sub_005B0E30 via trampoline 0x81FE0` actually is:** sub_005B0E30 is the engine's
+**DMAC channel-5 (SIF0) handler**, registered at boot:
+```
+0x12 sce_AddDmacHandler  a0=5 a1=0x005b0e30  (ra=0x005b0a58)     [log 66948]
+0x16 sce_EnableDmac      a0=5                 (ra=0x005ae8f0)     [log 66951]
+```
+The trampoline `0x00081FE0` is the EE-kernel interrupt/DMAC dispatch (the R1 DMAC gap, W275), NOT the
+syscall SYSTABLE. On hardware the SIF0 (IOP->EE) transfer completes -> trampoline JALRs sub_005B0E30 ->
+it calls func_5B0850@0x5b0850 (ra=0x5b0f50) -> `sw v1,0(v0)` @0x5b0868 writes 0x008869C0=1 -> the
+`beqz v0,0x5b1180` loop exits.
+
+**The concrete bug:** the SIF0 (IOP->EE) completion path `writeEeRange` (SIF.cpp:206, sole call site
+`:425` inside `sceSifGetOtherData`) writes the payload into EE RAM but never dispatches the channel-5
+DMAC handler. `dispatchDmacHandlersForCause(...,5u)` exists only in `sceSifSetDma` (SIF.cpp:753, the
+EE->IOP/SIF1 direction). So sub_005B0E30 never fires, 0x008869C0 stays 0, the 0x5b1180 loop spins.
+
+**Fix applied** (SIF.cpp, after the `writeEeRange` success in `sceSifGetOtherData`):
+```cpp
+if (runtime) { ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 5u); }
+```
+- Patch: `/home/or/vulcan4/tools/patches/ps2recomp-linux-r4-sif0-dmac-dispatch.patch` (reverse-apply OK).
+- Rebuild: `cd /mnt/ssd/vulcan4-build && VULCAN4_ENGINE_DIR=/mnt/ssd/vulcan4-build/recomp_engine_w251 bash /home/or/vulcan4/tools/harness/build_harness.sh`
+
+**Separate unfixed wall (do not conflate):** `0x56 WaitEventFlag` hits
+`override handler 0x800750c8 has no generated function` (48x). The engine's 0x55-0x59 event-flag syscalls
+are implemented in a 0x330-byte blob (Copy 0x01036300 -> 0x80075000) whose handlers use `mtc0/sync/mfc0`
+(the R5900 COP0 mailbox to GT4's own kernel). That is a second, independent wall (unrecompiled guest
+kernel blob), not the R4 DMAC-dispatch one.
+
+**Caveat:** `writeEeRange` emits no log without a store observer, so I could not statically confirm it
+fires before the 15s halt. If the rebuild shows no change, the SIF0 trigger is a different path
+(`IopHost::writeGuest` / ps2xIOP), and the next measurement is a `VULCAN4` store-watch on 0x8869c0's
+writer.
+
+## SEGMENT J — R4 RESULT (builder, 2026-10-08): the SIF fix is INERT, the spin is REAL, and the writer set is EMPTY
+
+**Run shape (reproducible, two identical back-to-back 15 s runs `w276tab9a` / `w276tab9b`):**
+```
+functions_entered=10539 / 10538   true_guest_entries=12316818 / 12222919   true_guest_exits=0
+halt=stuck_in_syscall   intr_queued=66  intr_run=43  intr_run_by_kind=40  gs_packets=15  frames_presented=859
+detail=blocked inside SCE syscall 0x83 (FindAddress), guest pc 0x005b0880 ra=0x005b1188
+```
+(The SCE-syscall label is the harness's *classifier*, not the mechanism — see below. Mechanism is the spin.)
+
+**1. THE SIF0 FIX IS INERT (R4 premise REJECTED).**
+`sceSifGetOtherData` is never called in the boot: `writeEeRange` never runs, so the new
+`dispatchDmacHandlersForCause(...,5u)` at `Stubs/SIF.cpp:450` never fires. The only `dmac=1 cause=5`
+dispatches come from the pre-existing call at `SIF.cpp:764` inside `sceSifSetDma` (2 calls, ra=0x5b0d8c).
+Patch kept (it is correct for when that path does run) but it does **not** unblock R4.
+
+**2. THE SPIN, read from the generated engine code (not inferred).**
+- `func_5B0880` (`ps2_recompiled_functions_41.cpp:192228`, VA 0x5b0880, an interior entry of
+  `sub_005b07d0_0x5b07d0` — `case 0x5b0880u: goto label_5b0880;`) is a 3-instruction leaf:
+  `return *(uint32_t*)(0x008869C0 + (a0 << 2));`
+- Its only caller is `label_5b1180` in `sub_005b0e30_0x5b0e30`, called with `a0 = 0` (delay slot
+  0x5b1184 `daddu $a0,$zero,$zero`) → it polls **tab[0] at 0x008869C0** forever.
+- `sub_005b0e30` spans **0x5b0e30 - 0x5b11c8** — i.e. the spin is INSIDE the DMAC channel-5 (SIF0)
+  handler itself. The handler IS entered, not missing.
+
+**3. DEFINITIVE WRITER SET FOR 0x008869C0..0x008869DF — 20 writes, ALL ZERO.**
+A store subscriber (`VULCAN4_W276_TABWATCH=1`) that fires on **every** guest store *and* every host-side
+range copy (`ps2TraceGuestRangeWrite` → `IopHost::writeGuest`/`zeroGuest`/RPC), printing the writer pc
+and the `op` discriminator. Full list:
+```
+n=1..4    addr=0x008869c0/0x008869d0 val=0x00000000 writerPc=0x00100160 op=WRITE128   (guest boot clear)
+n=5..20   addr=0x008869c0..0x008869dc val=0x00000000 writerPc=0x005b09b0 op=WRITE32   (engine table init, 8 words)
+(+ a Ps2FastWrite* twin at writerPc=0 for each — same store via the fast path)
+```
+**Not one write carries a non-zero value.** No `SIF IOP-to-EE DMA` op, no `memcpy`/`memset` range copy,
+ever lands in the region. At halt `tab[0..7]` is all `0x00000000`.
+
+**4. THE PREDICTED WRITER IS NEVER REACHED.** The R4 doc predicted `func_5B0850@0x5b0850 -> sw v1,0(v0)
+@0x5b0868 writes 0x008869C0=1` with `ra=0x5b0f50`. Measured: `0x5b0868` appears **0** times in the log
+and `0x5b0f50` appears **0** times. So the branch of the handler that would publish the record is never
+taken. Also note `func_5B0850` is address-computed, not constant: it writes
+`*(uint32_t*)(a1->[0x1C] + (a0->[0x10] << 2)) = a0->[0x14]` — it only lands on 0x8869C0 if `a1->[0x1C]`
+is `0x8869C0`, which is exactly the descriptor the engine built at 0x886834.
+
+**5. PROBE HAZARD, MEASURED — do not call `getenv()` in a per-store hook.** The first narrowed-watch
+build resolved its window bounds with a per-store `std::getenv()`; that single change moved the boot to
+a *different path entirely* in 15 s (`functions_entered=10374`, `halt=stuck_in_syscall` at
+**guest pc 0x01002218**, syscall 0x32 SleepThread, a second thread tid2, `descPtr@0x00886818=0`, and
+**zero** in-region writes because the guest never reached GT4's SIF code). Caching the bounds into
+`static const` restored byte-identical reproducibility across two runs. **Corollary for the crew: a
+run that lands somewhere new may be the probe, not the guest — bisect the instrument before the guest.**
+
+**6. Law-8 capture check (RAW, this session):** `cd tools/PS2Recomp && git diff --numstat` lists 13
+files. Per-file patch-added-line comparison vs the live numstat printed **OK for all 13**
+(`SIF.cpp live=11 patchAdded=11 ps2recomp-linux-r4-sif0-dmac-dispatch.patch`), final line `ALL-COVERED`.

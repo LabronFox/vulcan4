@@ -1,9 +1,9 @@
 === W277: PDI CDVD service stubs (sids 0x50434456 "PCDV" + 0x50636476 "Pcdv") ===
 # The engine loads PDICDVD.IRX + LIBPDI.IRX (LOADFILE rpc=0) then binds both sids; no route
 # existed so the binds retried forever. This adds a stub service (like dbcman) that claims both
-# sids, gated on pdicdvd/libpdi module aliases, logs every RPC, and invents no replies.
-# Verified: both binds resolve (boot_w277pcdv2.log), game proceeds to PCDV rpc=0 then a
-# Ghidra-missed fn (0x578288) closed at the tool input (w276-engine_r30.toml).
+# sids, gated on pdicdvd/libpdi module aliases, logs every RPC (and dumps the send buffer), and
+# invents no replies. Verified: both binds resolve; game proceeds to PCDV rpc=0 (the DVD init,
+# 0x40-byte send buffer) then blocks on the streamer semaphores (sema#95918/95919/95920).
 
 diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
 index e35218d..cf7b90a 100644
@@ -60,10 +60,10 @@ index d8f583f..40fe326 100644
 
 --- new file ps2xIOP/src/modules/pdicdvd.cpp ---
 new file mode 100644
-index 0000000..abef47b
+index 0000000..12d5252
 --- /dev/null
 +++ b/ps2xIOP/src/modules/pdicdvd.cpp
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,127 @@
 +#include "module_factories.h"
 +#include "rpc_reply.h"
 +
@@ -147,6 +147,25 @@ index 0000000..abef47b
 +                            << " recv=0x" << request.receive.address
 +                            << " recvSize=0x" << request.receive.size;
 +                    m_host.log(LogLevel::Info, message.str());
++                }
++                // W277: dump the send buffer as 32-bit words so the init packet (rpc=0, 0x40 bytes)
++                // is legible without another run. The DVD init params live here.
++                if (request.send.address != 0u && request.send.size >= 4u)
++                {
++                    const uint32_t count =
++                        (request.send.size > 64u ? 64u : request.send.size) / 4u;
++                    std::ostringstream dump;
++                    dump << "[PCDV:send] rpc=0x" << std::hex << request.function << " words=" << std::dec
++                         << count << ":";
++                    for (uint32_t i = 0u; i < count; ++i)
++                    {
++                        uint32_t w = 0u;
++                        if (m_host.readGuest(request.send.address + i * 4u, &w, 4u))
++                        {
++                            dump << ' ' << std::hex << w;
++                        }
++                    }
++                    m_host.log(LogLevel::Info, dump.str());
 +                }
 +                return result;
 +            }

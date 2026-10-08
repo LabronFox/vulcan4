@@ -130,3 +130,44 @@ The game now boots every driver, binds every service, and issues exactly ONE DVD
 is finished; what remains is the mission's step-2 in full — implement the PCDV rpc=0 init so the
 streamer signals completion. The picture is unchanged (w277r30e-capture.png `a1a674fa…`, 18924 B —
 the disclaimer, not blank, not a new screen).
+
+---
+
+## RESUME FROM HERE (captain's stop, 2026-10-08 23:38)
+
+**Verified state, not inferred:**
+- `boot_w277r30e.log`: `missing_functions=0`, `halt=stuck_in_syscall`, `functions_entered=17406`,
+  `frames_presented=1029`, `gs_packets=45`, `gs_frame_reg_writes=29`, 9 threads, `bios_files=0`.
+- Picture: `w277r30e-capture.png` = sha256 `a1a674fa…`, 18924 B — STILL the ©2005 disclaimer
+  (not blank, not a new screen).
+
+**What is done (all committed, all patched):**
+- LOADFILE `rpc=0` (SifLoadModule) loads 16 IRX drivers — patch `ps2recomp-linux-w277-loadfile-sifloadmodule.patch`.
+- 5 Ghidra-missed leaves closed at the tool input in `/mnt/ssd/gt4/work/w276-engine_r30.toml`
+  entry_points (884→889): 0x58dfe0, 0x578288, 0x5477c8, 0x566df8, 0x55ab90.
+- PCDV/Pcdv service stub (sids 0x50434456 + 0x50636476) — patch `ps2recomp-linux-w277-pdicdvd-service.patch`.
+
+**The wall, named:** the DVD streamer. The game issues ONE RPC — `[PCDV:stub] rpc=0x0
+send=0x86ccc0 sendSize=0x40 recv=0` — then blocks in `WaitSema` (pc 0x5aedb0, ra 0x5aedc0) while
+three threads wait on sema#95918/95919/95920. The stub answers nothing, so the streamer's
+completion semaphores never fire.
+
+**Exact next step (one action):** dump the 0x40-byte init packet (the stub now logs
+`[PCDV:send] ... words=16: …` — read it from any fresh boot log), then oracle-trace what the real
+PDICDVD `rpc=0` init does — specifically which of sema#95918/95919/95920 it signals, and with what
+value — using the live PCSX2 (`pcsx2_connect`, paused at 0x005c1004, GT4 SCUS-97328 v2.00). Then
+implement that signal in `ps2xIOP/src/modules/pdicdvd.cpp` `handleRpc`, rebuild
+(`VULCAN4_ENGINE_DIR=/mnt/ssd/vulcan4-build/recomp_engine_r30 bash tools/harness/build_harness.sh`),
+boot + capture (`VULCAN4_SIFRPC=1 VULCAN4_DISPLAY=:107 bash tools/harness/run_capture.sh …`), and
+look at the picture. Blank or disclaimer = the streamer still isn't signalling; iterate.
+
+**Build/run loop (probe ON is still required — the raw RPC delivery is gated behind
+`VULCAN4_SIFRPC=1`; flipping that default is an open question):**
+```
+cd /mnt/ssd/gt4/work && PS2RECOMP_ENTRY_ADDR_CSV=/mnt/ssd/vulcan4-build/engine-symbols.csv \
+  PS2RECOMP_TABLE_SYMBOL=g_ps2EngineFunctionTable TMPDIR=/mnt/ssd/tmp \
+  nice -n 10 ionice -c3 /mnt/ssd/vulcan4-build/ps2xRecomp/ps2_recomp w276-engine_r30.toml
+VULCAN4_ENGINE_DIR=/mnt/ssd/vulcan4-build/recomp_engine_r30 bash tools/harness/build_engine.sh
+VULCAN4_ENGINE_DIR=/mnt/ssd/vulcan4-build/recomp_engine_r30 bash tools/harness/build_harness.sh
+VULCAN4_SIFRPC=1 VULCAN4_DISPLAY=:107 bash tools/harness/run_capture.sh w277 2000000 20 4
+```

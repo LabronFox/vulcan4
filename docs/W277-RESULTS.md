@@ -171,3 +171,60 @@ VULCAN4_ENGINE_DIR=/mnt/ssd/vulcan4-build/recomp_engine_r30 bash tools/harness/b
 VULCAN4_ENGINE_DIR=/mnt/ssd/vulcan4-build/recomp_engine_r30 bash tools/harness/build_harness.sh
 VULCAN4_SIFRPC=1 VULCAN4_DISPLAY=:107 bash tools/harness/run_capture.sh w277 2000000 20 4
 ```
+
+---
+
+## R30g/h/i — the PCDV-init wall answered; boot now RUNS to the deadline (captain re-open)
+
+### The wall, restated (r30f)
+
+`halt=stuck_in_syscall`, ONE PCDV rpc — `rpc=0x0 send=0x86ccc0 sendSize=0x40 recv=0` — then a
+WaitSema loop that never fires. The stub answered the rpc but never **signalled completion**.
+
+### Root cause (measured in code, not inferred)
+
+The PCDV `rpc=0` is a **NOWAIT** call (`mode=0x1`) with an endFunction callback (`endFn=0x5780f8`,
+`endParam=0x86cc80`). `SifCallRpc` (RPC.cpp:784-792) signals the client's completion semaphore ONLY
+when the HLE result sets `signalCompletion` / `signalNowaitCompletion`. `pdicdvd.cpp` set
+`handled=true` but left both false — so `signalRpcCompletionSema()` never ran and the semaphore the
+guest parks on never fired. Fix: set `result.signalCompletion = true` for rpc=0 (one flag, one signal).
+
+### What it unlocked, in order (r30g → r30h → r30i)
+
+The boot is a driver-load + service-bind grind. Each "no server" bind is a wall. Three HLE services
+closed them (all in `ps2xIOP/src/modules/`, patched as `ps2recomp-linux-w277-r30-pdi-peripherals.patch`):
+
+| sid | name | module | wall in | fixed by |
+|---|---|---|---|---|
+| 0x50434456 | PCDV | PDICDVD | r30e/f | `pdicdvd.cpp` signalCompletion |
+| 0x50555354 | PUST | USTORAGE | r30g | `ustorage.cpp` |
+| 0x53545250 | STRP | PDISTR | r30h (retried 4x) | `pdiperiph.cpp` |
+| 0x534d5550 | SMUP | PDISPU2 | r30h | `pdiperiph.cpp` |
+| 0x54485550/0x45535550/0x424b5550 | THUP/ESUP/BKUP | PDIUSB | r30h | `pdiperiph.cpp` |
+
+### Numbers (raw, same engine r30, 20 s budget)
+
+| run | halt | functions_entered | gs_packets | modules |
+|---|---|---|---|---|
+| r30f | stuck_in_syscall | 16640 | 39 | 16 |
+| r30g | stuck_in_syscall | 18329 | 53 | 17 (USTORAGE) |
+| r30h | **wallclock_deadline** | 21347 | 53 | 23 |
+| r30i | wallclock_deadline | 21298 | 15 | 23 |
+
+**halt flipped from `stuck_in_syscall` to `wallclock_deadline`** — the game is no longer parked in a
+syscall; it loads all 23 IOP drivers, binds every PDI service, and runs to the 20 s deadline.
+
+### Honest verdict (not a false win)
+
+The picture is **STILL the ©2005 disclaimer** (`w277r30i-capture.png`, 18924 B). The boot is RUNNING
+but has not reached the movie/menu. Two remaining "no server" sids are bound but not walls (game is at
+deadline, not stuck on them): `0x5042474d` ("PBGM") and `0x046d046d` (numeric). The PCDV streamer has
+still issued only `rpc=0` (init) — **no DVD read/seek/stream rpc yet**, so the game has not begun
+loading the Adhoc scripts/movie. That is the next wall, and it is where OpenAdhoc names the files.
+
+### Next step (one action)
+
+Watch for the first PCDV `rpc != 0` (a DVD read). It has not happened; the remaining two sids
+(0x5042474d = likely LGDEV/POWOFF service, 0x046d046d = numeric) should be claimed first with log-only
+stubs so the boot finishes driver init. Then the PCDV read rpcs reveal the GT4.VOL streaming protocol,
+which is decoded against the oracle + OpenAdhoc's boot/scripts file list.

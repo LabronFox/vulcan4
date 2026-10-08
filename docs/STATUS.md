@@ -78,7 +78,7 @@ was seen with the instruments of the day; its conclusion is retracted by the W27
 | Goal | State | What it is |
 |---|---|---|
 | G0 | ✅ | toolchain, disc map, function anatomy, complete recompiler output, clean-room reproduce |
-| **G1 — first boot** | 🟡 **running, not yet a screen** | engine emitted 19,403/19,403, image placed byte-perfect, `ExecPS2` fires (R1), 0 dispatch misses in the engine (R2), SIF boot poll exits (R3) → **31 engine code PCs**, `ee_cycle` 498 M/15 s. The wall moved to the **next unwired syscall (`0x0B`, 16 calls)**, not the hand-off |
+| **G1 — first boot** | 🟡 **running, not yet a screen** | engine emitted 19,403/19,403, image placed byte-perfect, `ExecPS2` fires (R1), 0 dispatch misses in the engine (R2), SIF boot poll exits (R3). W277 r30: **23 IOP drivers load, every PDI service binds, `halt=wallclock_deadline`** (`functions_entered=21347`, 20 s) — the boot RUNS to the deadline instead of parking in a syscall. The next wall is the **first DVD read rpc** (the streamer has only init'd), then the Adhoc script loader |
 | G2 — a picture | 🟡 | GS layer draws and rasterises (our own probe, not the game); the game's screen is still the disclaimer |
 | G3 — 3D (VU1) | ⬜ | plan in `docs/VU1-PLAN.md`; nothing driven by a guest |
 | G4 — playable | ⬜ | menus, a race you can drive, audio from the disc, saves |

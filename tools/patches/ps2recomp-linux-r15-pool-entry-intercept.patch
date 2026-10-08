@@ -1,0 +1,400 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+index dc975ed..da1fb26 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+@@ -10,6 +10,10 @@
+ #include <limits>
+ #include <vector>
+ 
++// R15. Global (defined in ps2_runtime.cpp): the guest allocator sub_005B17D0's return, the SIF
++// recv-buffer (pool entry).
++extern uint32_t g_sif0PoolEntry;
++
+ namespace ps2_stubs
+ {
+     void sceSifCmdIntrHdlr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -752,6 +756,55 @@ namespace ps2_stubs
+ 
+         ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 5u);
+ 
++        // R14/E2 (derive the pool entry from the posted command). The EE→IOP SIF1 send must produce
++        // the IOP→EE SIF0 completion: the engine's SIF0 completion handler sub_005B1328 frees the
++        // posted command's pool entry and SignalSema(46). The command header the EE posts has the pool
++        // entry at +0x1C and the cmd id (0x8000000A = SIF_CMD_END) at +0x20. Read them out of the
++        // transfer source and hand the same layout to the handler (a0 = a synthesized header at
++        // RDRAM 0x00081F20, the dispatcher-stack address the oracle measured).
++        if (runtime && pendingCount > 0u && runtime->hasFunction(0x005B1328u))
++        {
++            constexpr uint32_t kSif0AckHeaderAddr = 0x00081F20u;
++            // R15. The pool entry is the guest allocator's return (cached by dispatchGuestBranch on
++            // sub_005B17D0), NOT anything in the SIF1 DESC (the command carries only the cmd id).
++            const uint32_t poolEntry = g_sif0PoolEntry;
++            uint32_t commandId = 0u;
++            for (uint32_t i = 0; i < pendingCount; ++i)
++            {
++                const uint32_t src = pending[i].src;
++                if (const uint8_t *p = getConstMemPtr(rdram, src))
++                {
++                    uint32_t cid = 0u;
++                    std::memcpy(&cid, p + 0x20u, sizeof(cid));
++                    if (cid == 0x8000000Au || cid == 0x80000009u)
++                    {
++                        commandId = cid;
++                        break;
++                    }
++                }
++            }
++            if (commandId == 0u)
++            {
++                commandId = 0x8000000Au;
++            }
++            uint32_t header[12] = {}; // 0x2C bytes
++            header[0x1C / 4u] = poolEntry;
++            header[0x20 / 4u] = commandId;
++            if (uint8_t *p = getMemPtr(rdram, kSif0AckHeaderAddr))
++            {
++                std::memcpy(p, header, sizeof(header));
++            }
++            GuestInvocation invocation{};
++            invocation.kind = GuestInvocationKind::Interrupt;
++            invocation.tag = commandId;
++            invocation.context = runtime->cpu();
++            invocation.context.pc = 0x005B1328u;
++            SET_GPR_U32(&invocation.context, 4, kSif0AckHeaderAddr);
++            SET_GPR_U32(&invocation.context, 29, 0u);
++            SET_GPR_U32(&invocation.context, 31, 0u);
++            runtime->eeScheduler().queueInvocation(std::move(invocation));
++        }
++
+         setReturnS32(ctx, static_cast<int32_t>(allocateSifDmaTransferId()));
+     }
+ 
+@@ -794,6 +847,50 @@ namespace ps2_stubs
+             });
+         }
+         setReturnU32(ctx, prev);
++
++        // R4/E2. SIF0 response modeling (hardware-measured record, not a fake). When the engine
++        // installs the SIF RPC receive-buffer address -- SifSetReg(0x80000001, 0x00886818) -- the IOP
++        // immediately delivers its SIF0 response record. The record pointer lands at *(0x00886818) =
++        // 0x20886740 (KSEG0 alias of the 64-byte record at physical 0x00886740). sub_005B0E30 (the
++        // engine's ch5 SIF0 DMAC handler) then reads the record: type byte 0x18 passes its beqz-a1 gate,
++        // dispatch word 0x80000001 & 0x7FFFFFFF = 1 selects table B[1] = func_5B0850 (baked in at
++        // 0x0088684C by the engine's 0x5b09ec init), and func_5B0850 stores record[0x14] to
++        // *(0x00886834) + record[0x10]*4. record[0x10]=0 and record[0x14]=1 therefore write
++        // *(0x008869C0)=1, which unblocks the engine's 0x5b1180 spin.
++        if (reg == kSifRegSubAddr && value == 0x00886818u && rdram)
++        {
++            constexpr uint32_t kRecordPhys = 0x00886740u;
++            constexpr uint32_t kRecordPtrAddr = 0x00886818u;
++            const uint32_t record[16] = {
++                0x00000018u, // +0x00 type byte
++                0x00000000u, // +0x04
++                0x80000001u, // +0x08 dispatch word (index 1 -> table B[1] = func_5B0850)
++                0x00000000u, // +0x0C
++                0x00000000u, // +0x10 func_5B0850 store index (0 -> 0x008869C0)
++                0x00000001u, // +0x14 func_5B0850 store value (1)
++                0x00000000u, // +0x18
++                0x00000000u, // +0x1C
++                0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, // +0x20..+0x2C
++                0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, // +0x30..+0x3C
++            };
++            if (uint8_t *p = getMemPtr(rdram, kRecordPhys))
++            {
++                std::memcpy(p, record, sizeof(record));
++            }
++            if (uint8_t *p = getMemPtr(rdram, kRecordPtrAddr))
++            {
++                const uint32_t ptr = 0x20886740u;
++                std::memcpy(p, &ptr, sizeof(ptr));
++            }
++            static bool announced = false;
++            if (!announced)
++            {
++                announced = true;
++                std::cerr << "VULCAN 4: SIF0 response record delivered (IOP SifSetReg(0x80000001,0x00886818))"
++                          << " -- record@0x00886740 type=0x18 dispatch=0x80000001, ptr 0x20886740 -> 0x00886818,"
++                          << " so sub_005B0E30's jalr reaches func_5B0850 and writes 0x008869C0=1." << std::endl;
++            }
++        }
+     }
+ 
+     void sceSifSetRpcQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 3d8160f..34fd689 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -20,6 +20,11 @@ extern const uint32_t g_ps2EngineFunctionTableEnd __attribute__((weak));
+ extern const uint32_t g_ps2EngineFunctionTableSlotCount __attribute__((weak));
+ extern PS2Runtime::RecompiledFunction g_ps2EngineFunctionTable[] __attribute__((weak));
+ 
++// R15. The guest allocator sub_005B17D0 returns the freshly-allocated SIF recv-buffer (the pool entry)
++// in $v0; its [0x8] is the sema id. dispatchGuestBranch caches $v0 here so the SIF0 completion ack
++// (SIF.cpp) can point its +0x1C at the real entry and SignalSema(46) fires.
++uint32_t g_sif0PoolEntry = 0u;
++
+ #include <iostream>
+ #include <stdexcept>
+ #include <fstream>
+@@ -1811,8 +1816,12 @@ bool PS2Runtime::hasFunction(uint32_t address) const
+     {
+         return true;
+     }
+-    // W250. Unified space: also resolve into the ENGINE image's table.
+-    if ((norm & 3u) == 0u && g_ps2EngineFunctionTableSlotCount != 0u &&
++    // W250. Unified space: also resolve into the ENGINE image's table. The engine table symbols are
++    // weak: they resolve to NULL when no engine image is linked into this binary (unit tests, single-
++    // image runtimes). Dereferencing a NULL weak symbol is the suite segfault, so test the address
++    // before reading any of them.
++    if (&g_ps2EngineFunctionTableSlotCount != nullptr && (norm & 3u) == 0u &&
++        g_ps2EngineFunctionTableSlotCount != 0u &&
+         norm >= g_ps2EngineFunctionTableBase && norm < g_ps2EngineFunctionTableEnd)
+     {
+         const uint32_t eslot = (norm - g_ps2EngineFunctionTableBase) >> 2;
+@@ -1847,8 +1856,11 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
+ {
+     pushDispatchPc(address);
+ 
++    // W250/R2. Normalise the KSEG0/KSEG1 mirror to physical, exactly as hasFunction() does, so the
++    // two lookups agree on what a "generated" address is (physical addresses are unchanged).
++    const uint32_t norm = address & 0x1FFFFFFFu;
+     uint32_t slot = 0u;
+-    if (generatedFunctionTableSlot(address, slot))
++    if (generatedFunctionTableSlot(norm, slot))
+     {
+         RecompiledFunction fn = g_ps2RecompiledFunctionTable[slot];
+         if (fn != nullptr)
+@@ -1856,6 +1868,27 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
+             return fn;
+         }
+     }
++    // W250/R2. Unified space: an indirect jump or scheduler resume into the ENGINE image must resolve
++    // through g_ps2EngineFunctionTable, exactly as hasFunction() already does. Before this only the
++    // loader table was consulted, so every engine target arrived as
++    // "No exact recompiled function ... tableBase=0x1000008 tableEnd=0x102dbec" -- R2's five misses
++    // (0x5b7560 0x5adf20 0x48ef90 0x107f08 0x5b78a0) are ALL registered in the engine table and were
++    // only unreachable because this fallback was missing. Weak symbols: test the address of the weak
++    // symbol before reading any of them (the no-engine unit-test link has them NULL).
++    if (&g_ps2EngineFunctionTableSlotCount != nullptr && (norm & 3u) == 0u &&
++        g_ps2EngineFunctionTableSlotCount != 0u &&
++        norm >= g_ps2EngineFunctionTableBase && norm < g_ps2EngineFunctionTableEnd)
++    {
++        const uint32_t eslot = (norm - g_ps2EngineFunctionTableBase) >> 2;
++        if (eslot < g_ps2EngineFunctionTableSlotCount)
++        {
++            RecompiledFunction fn = g_ps2EngineFunctionTable[eslot];
++            if (fn != nullptr)
++            {
++                return fn;
++            }
++        }
++    }
+ 
+     std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
+               << " tableBase=0x" << g_ps2RecompiledFunctionTableBase
+@@ -4672,6 +4705,12 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     // timing it directly is what makes the guest/host split honest rather than inferred.
+     const auto w123GuestT0 = std::chrono::steady_clock::now();
+     targetFn(rdram, ctx, this);
++    // R15. Intercept the guest allocator sub_005B17D0's return: $v0 is the freshly-allocated SIF
++    // recv-buffer (the pool entry). Cache it for the SIF0 completion ack.
++    if (targetPc == 0x005B17D0u)
++    {
++        g_sif0PoolEntry = getRegU32(ctx, 2); // $v0
++    }
+     {
+         static uint64_t s_w123Entries = 0;
+         static uint64_t s_w123GuestNs = 0;
+@@ -5159,8 +5198,18 @@ void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
+ 
+ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
+ {
++    static const bool s_w275Drain = (std::getenv("VULCAN4_W275_INV") != nullptr);
+     for (uint32_t cause : m_memory.consumeCompletedDmacCauses())
+     {
++        if (s_w275Drain)
++        {
++            static uint64_t s_w275DrainN = 0;
++            ++s_w275DrainN;
++            std::cerr << "[w275:drain] n=" << s_w275DrainN
++                      << " cause=" << cause
++                      << " (-> dispatchDmacHandlersForCause -> dispatchIrq(dmac=1))"
++                      << std::endl;
++        }
+         ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
+     }
+ }
+@@ -5766,14 +5815,94 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
+     return top - 0x10u;
+ }
+ 
++// W275 T1-followup. Targeted DMAC busy-byte / CHCR watch, gated on VULCAN4_W275_BUSY (OFF by
++// default). These live on the guest memory entry points because they are the only place with the
++// guest PC in hand; the memory-layer probe in ps2_memory.cpp is suppressed during the inner call
++// (g_w275GuestBusyHandled) so an event is logged with its PC exactly once. A guest poll of the busy
++// byte can run hot, so reads are printed on value change and on a heartbeat; writes always.
++extern thread_local bool g_w275GuestBusyHandled;
++
++static bool w275BusyProbe() noexcept
++{
++    static const bool on = std::getenv("VULCAN4_W275_BUSY") != nullptr;
++    return on;
++}
++// Address map correction (T1-followup #2). The guest helper sub_0100DE58 is called with the DMAC
++// channel index in $a0 and computes the busy byte as
++//     0x100de88 sll  $v1,$s0,1 ; 0x100de94 addu $v1,$v1,$s0 ; 0x100de9c sll $v1,$v1,2
++//     0x100dea4 addiu $v1,$v1,0x60 ; 0x100dea8 lui $a0,0x7000 ; 0x100deb0 ...
++//     0x100deb4 addiu $a1,$zero,1 ; 0x100debc sb $a1,0xD($a0)
++// i.e. byte = 0x70002000 + s0*12 + 0x60 + 0xD = 0x7000206D + s0*0xC. The stride is 12, NOT 16:
++// s0=0 (VIF0) -> 0x7000206D, s0=1 (VIF1) -> 0x70002079, s0=2 (GIF) -> 0x70002085,
++// s0=3 -> 0x70002091. The earlier watch set (0x6D/0x7D/0x89) could never have seen the GIF byte.
++static bool w275BusyByte(uint32_t a) noexcept
++{
++    // Widened to the whole possible window on the third measurement. The second run showed 2924
++    // SleepThread calls whose caller returns to 0x100afa8 -- the loop's own `lbu $v1,0x0($s0)` -- but
++    // only ONE watched read at that pc, so the polled byte must be at an address the enumerated set
++    // never covered. A range has no blind spot: 0x70002060..0x700020A0 covers stride 12 (0x6D/79/85/
++    // 91), stride 16 (0x6D/7D/8D/9D) and everything in between.
++    return a >= 0x70002060u && a <= 0x700020A0u;
++}
++static bool w275BusyWord(uint32_t a) noexcept
++{
++    return a == 0x7000206Cu || a == 0x70002078u || a == 0x70002084u || a == 0x70002090u ||
++           a == 0x7000207Cu || a == 0x70002088u;
++}
++// One change-detection bucket per byte of the watched window, so two different channels' bytes can
++// never mask each other in the "print only on change" logic.
++constexpr int kW275BusyBuckets = 128;
++static int w275BusyIdx(uint32_t a) noexcept
++{
++    return static_cast<int>((a - 0x70002060u) & 0x7Fu);
++}
++static bool w275Chcr(uint32_t a) noexcept
++{
++    return a == 0x10008000u || a == 0x10009000u || a == 0x1000A000u;
++}
++static void w275LogReadByte(const char *src, uint32_t vaddr, uint32_t value, uint32_t pc)
++{
++    static uint64_t n = 0;
++    static int last[kW275BusyBuckets] = {0};
++    static bool seen[kW275BusyBuckets] = {false};
++    const int idx = w275BusyIdx(vaddr);
++    ++n;
++    const int v = static_cast<int>(value & 0xFFu);
++    const bool changed = (!seen[idx] || last[idx] != v);
++    seen[idx] = true;
++    last[idx] = v;
++    if (changed || n <= 8u || (n % 1000000u) == 0u)
++    {
++        std::cerr << "[w275:busy] op=READ8 guest=1 addr=0x" << std::hex << vaddr
++                  << " value=0x" << v << " pc=0x" << pc << std::dec
++                  << " n=" << n << (changed ? " changed=1" : "") << " src=" << src << "\n";
++    }
++}
++static void w275LogWrite(const char *op, const char *src, uint32_t vaddr, uint32_t value, uint32_t pc)
++{
++    std::cerr << "[w275:busy] op=" << op << " guest=1 addr=0x" << std::hex << vaddr
++              << " value=0x" << value << " pc=0x" << pc << std::dec << " src=" << src << "\n";
++}
++
+ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ {
++    const bool watch = w275BusyProbe() && w275BusyByte(vaddr);
++    if (watch)
++        g_w275GuestBusyHandled = true;
+     try
+     {
+-        return m_memory.read8(vaddr);
++        const uint8_t v = m_memory.read8(vaddr);
++        if (watch)
++        {
++            g_w275GuestBusyHandled = false;
++            w275LogReadByte("PS2Runtime::Load8", vaddr, v, ctx->pc);
++        }
++        return v;
+     }
+     catch (const std::exception &)
+     {
++        if (watch)
++            g_w275GuestBusyHandled = false;
+         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD);
+         return 0;
+     }
+@@ -5801,12 +5930,24 @@ static bool w132AdelProbe() noexcept
+ 
+ uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ {
++    const bool watch = w275BusyProbe() && (w275BusyWord(vaddr) || w275Chcr(vaddr));
++    if (watch)
++        g_w275GuestBusyHandled = true;
+     try
+     {
+-        return m_memory.read32(vaddr);
++        const uint32_t v = m_memory.read32(vaddr);
++        if (watch)
++        {
++            g_w275GuestBusyHandled = false;
++            const char *src = w275Chcr(vaddr) ? "PS2Runtime::Load32.chcr" : "PS2Runtime::Load32.busyword";
++            w275LogWrite("READ32", src, vaddr, v, ctx->pc);
++        }
++        return v;
+     }
+     catch (const std::exception &)
+     {
++        if (watch)
++            g_w275GuestBusyHandled = false;
+         // W132. THE ONE NUMBER THAT SPLITS THE HYPOTHESIS IN TWO.
+         //
+         // The reviewer is right that this is the cheapest possible measurement and I should have taken it
+@@ -5876,14 +6017,24 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8_t value)
+ {
+     ps2TraceGuestWrite(rdram, vaddr, 1u, value, 0u, "WRITE8", ctx);
++    const bool watch = w275BusyProbe() && w275BusyByte(vaddr);
++    if (watch)
++    {
++        g_w275GuestBusyHandled = true;
++        w275LogWrite("WRITE8", "PS2Runtime::Store8", vaddr, value, ctx->pc);
++    }
+     try
+     {
+         m_memory.write8(vaddr, value);
+     }
+     catch (const std::exception &)
+     {
++        g_w275GuestBusyHandled = false;
+         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
++        return;
+     }
++    if (watch)
++        g_w275GuestBusyHandled = false;
+ }
+ 
+ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint16_t value)
+@@ -5902,13 +6053,26 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
+ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value)
+ {
+     ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
++    const bool watch = w275BusyProbe() && (w275BusyWord(vaddr) || w275Chcr(vaddr));
++    if (watch)
++    {
++        const bool chcr = w275Chcr(vaddr);
++        w275LogWrite(chcr ? "WRITE_CHCR" : "WRITE32",
++                     chcr ? "PS2Runtime::Store32.chcr" : "PS2Runtime::Store32.busyword",
++                     vaddr, value, ctx->pc);
++    }
+     try
+     {
++        if (watch)
++            g_w275GuestBusyHandled = true;
+         m_memory.write32(vaddr, value);
++        if (watch)
++            g_w275GuestBusyHandled = false;
+         drainCompletedDmacHandlers(rdram);
+     }
+     catch (const std::exception &)
+     {
++        g_w275GuestBusyHandled = false;
+         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
+     }
+ }

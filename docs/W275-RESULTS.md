@@ -3257,3 +3257,24 @@ runtime cannot yet know the guest's recv-buffer allocation. `gs_packets` still 1
 **Next:** derive the guest recv-buffer allocation (the pool entry) — e.g. intercept the guest allocator
 return or read the IOP ack buffer — so `SignalSema(46)` (non-zero) fires; the GS/E3 picture work is the
 separate remaining blocker.
+
+---
+
+## R15 — pool-entry intercept is INERT; the SIF ack is NOT the render blocker (E3/GS is) (architect, 2026-10-08)
+
+**Attempted:** cached the guest allocator's return in `dispatchGuestBranch` (`g_sif0PoolEntry` on
+`targetPc==0x005B17D0`, read $v0 after `targetFn`) and used it in the SIF0 ack header.
+
+**Measured (45s `boot_w275r17.log`):** the allocator `0x005B17D0` has **zero** occurrences in the boot log —
+the guest never calls it this boot. `iSignalSema a0=0` (31×, ra=0x5b13d0), functions_entered=57432,
+`gs_packets=15` (unchanged), picture STILL the disclaimer.
+
+**Stop-condition reached (per the coordinator):** the SIF ack / `SignalSema(46)` is NOT the render blocker.
+The guest runs fine (pool reuses, distinct_pcs 748, full 45s `wallclock_deadline`), but `gs_packets=15`
+means no per-frame draw and the frame never reaches the screen.
+
+**Next wall = E3/GS:** the GS decode/present path — the game is running but the GS layer does not turn the
+guest's GIF/GS packets into a changed framebuffer. Stop chasing the SIF ack.
+
+Patch: `/home/or/vulcan4/tools/patches/ps2recomp-linux-r15-pool-entry-intercept.patch` (SIF.cpp +
+ps2_runtime.cpp).

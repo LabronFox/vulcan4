@@ -109,23 +109,204 @@ not this line.
 
 ## SEAT FINDINGS (appended as they land — 2026-10-08)
 
-### T1 — builder — Angle A (runtime) — OPEN
-Instrument the invocation queue: print every enqueue and every service with `kind`, `pc`, drain path;
-boot; diff `Interrupt` vs INTC counts; name the exact function that drops / never drains the DMAC one.
-Fix NOT yet. Owner: builder.
+### T1 — builder — Angle A (runtime) — **ANSWER: NO DROP. THE DMAC `Interrupt` INVOCATION IS ENQUEUED 35× AND RUN 35× — the W274 hypothesis is FALSIFIED**
 
-### T2 — measurer — Angle B (oracle) — OPEN
-Fresh `pcsx2-qt -debugger` boot; break at `0x100dae0`; confirm the real machine DOES enter the DMAC
-handler for this same VIF0 ch0 transfer; trace `AddDmacHandler` → completion → `dispatchIrq` →
-handler-entry. Owner: measurer.
+**There is no function that drains INTC but not DMAC, because there is no drain path split at all.**
+Both INTC and DMAC interrupt invocations enter the SAME queue (`m_pendingInvocations`) through the SAME
+`EeScheduler::queueInvocation` and are serviced by the SAME `EeScheduler::serviceInvocations` loop.
+
+Probe: env-gated `VULCAN4_W275_INV=1`, 6 print sites in `EeScheduler.cpp` (+135 lines) and 1 in
+`ps2_runtime.cpp` (+10 lines). Unset = byte-identical behaviour (all sites behind `w275InvTrace()`).
+Boot log: **`/mnt/ssd/vulcan4-build/run/boot_w275inv.log`** (17,802,502 B, 219,482 lines).
+
+**Deliverable 1 — enqueue vs service counts (raw, from the log).**
+
+| count | value |
+|---|---|
+| `[w275:enq]` (all) | **93** — every one `kind=Interrupt` |
+| `[w275:svc-pop]` (all) | **93** — every one `kind=Interrupt` |
+| `[w275:svc-run] kind=Interrupt` | **94** (93 fresh + 1 resume, see note) |
+
+**Deliverable 2 — the histograms MATCH on the handler address.** `enq` pc histogram vs
+`svc-run kind=Interrupt` pc histogram:
+
+| handler pc | enqueued | run |
+|---|---|---|
+| `0x100d838` | 50 | 50 |
+| **`0x100dae0` (FUN_0100DAE0 — the DMAC handler)** | **35** | **35** |
+| `0x1029388` | 8 | 8 |
+
+`0x100dae0` is entered **35 times**, at `depth=1`, by the same loop that enters the INTC handlers.
+`svc-run`/`svc-pop` n-sequences and pc sequences line up with `enq` from n=1 (`0x100dae0`) through n=81
+(`0x100d838`). Nothing is left behind.
+
+**Deliverable 3 — the named drain path (this is the whole chain, and it is the SAME for INTC and DMAC):**
+
+1. `ps2_memory.cpp:1992` `queueCompletedDmacCause()` →
+2. `ps2_runtime.cpp:5160` `drainCompletedDmacHandlers()` — measured 36 drains (25×cause1, 9×cause2, 1×cause0, 1 blank) →
+3. `Interrupt.cpp:68` `dispatchDmacHandlersForCause()` →
+4. `EeScheduler.cpp:1697` `dispatchIrq(dmac=1, cause)` — measured 36 `dmac=1` dispatches (vs 108 `dmac=0` INTC) →
+5. `EeScheduler.cpp:1222` `queueInvocation()` — **prints `[w275:enq]`** →
+6. `EeScheduler.cpp:1369` `serviceInvocations` `pop_front` — **prints `[w275:svc-pop]`** →
+7. `EeScheduler.cpp:1565` invocation run site, immediately before `function(m_rdram, &context, &m_runtime);` — **prints `[w275:svc-run]`**.
+
+**Corroboration at halt:** both threads report `invocations=0`, `pending_now=0`,
+`blocked_on_servicing=0` — there is no undrained invocation parked anywhere.
+
+**Why W274 mis-read it — two artifacts, both now corrected:**
+
+- `inv_by_kind=[intr=94,dmac=0,...]`: the harness label `dmac=` reads
+  `invocationsRunByKind[1]`, and slot 1 of `enum class GuestInvocationKind`
+  (`ee_scheduler.h:93`) is **`Alarm`, not DMAC** — there is no DMAC slot; DMAC invocations are
+  `Interrupt` (slot 0). `dmac=0` is a **vacuous zero** that has never counted anything DMAC.
+  The real DMAC number is inside `intr=94`.
+- `target_pc=0x100dae0` absent: that counter is only incremented in `dispatchGuestBranch`
+  (`ps2_runtime.cpp:4166`). Interrupt entries go through the scheduler's `function()` call, not a guest
+  branch, so its absence never meant "not entered".
+
+**The lone anomaly, stated honestly (not a drop):** one extra Interrupt run, `n=22309
+kind=Interrupt pc=0x100d8f8 tid=1 depth=1 step=292`, immediately after BaseFrame steps on tid2 —
+a re-entry/resume of an in-progress invocation (`0x100d838 + 0xC0`), so 94 runs from 93 pops.
+It leaves `pending=0` behind it. `svc-stuck` fired twice (n=1,2), both a transient nesting wait that
+resolved in the same `serviceInvocations` call.
+
+**Also measured (out of scope for the drop question, lead for a future fix):** our runtime builds the
+handler context as `a0=cause`, `a1=handler.argument` (=0x4), `gp=handler.gp`, `sp=0`, `ra=0`, and
+**never sets `a2` or `v1`**. Hardware (T2) enters at `0x100dae0` with `a0=0`, `a1=0x1FFFBC0`,
+`a2=0x81FC0`, `sp=0x81FC0`, `ra=0x81FEC`, `v1=0x100DAE0`. So the handler *is* entered but with a
+different argument/register context than the kernel trampoline supplies. Not fixed here.
+
+**Law-8 capture check (raw):**
+```
+135	0	ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+98	0	ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp      <- pre-existing 0x5b fix, patch already committed (d3fc63b)
+10	0	ps2xRuntime/src/lib/ps2_runtime.cpp
+-rw-rw-r-- 1 or or 10763 Oct  8 09:13 ../patches/ps2recomp-linux-w275-invocation-queue-probes.patch
+EeScheduler.cpp numstat_added=135 patch_added=135
+ps2_runtime.cpp numstat_added=10  patch_added=10
+```
+Patch written + per-file verified. **NOT committed** (task said "Do NOT commit"); the two probe files are
+captured so the work does not live only in the working tree.
+
+**Wall unchanged by this finding:** `halt=guest_blocked`, tid1 parked on `sema#7` `pc=0x0101f468`,
+tid2 sleeping `pc=0x0101f348`. The named cause (unserviced DMAC invocation) is wrong even though the
+wall is real. Next divergence hunt must move off the invocation queue.
+
+### T2 — measurer — Angle B (oracle) — **ANSWER: YES, hardware ENTERS `FUN_0100DAE0`**
+
+Oracle: PCSX2 DebugServer, GT4 SCUS-97328 (USA) v2.00, fresh `pcsx2-qt -debugger -fastboot`, breakpoints
+armed **before** the loader ran (`[UI] StartPaused=true`). Reproduced **twice**, identical cycle counts.
+
+**Deliverable 1 — does the breakpoint fire? YES.**
+
+| BP | meaning | FIRED | Cycles | Key regs at the hit |
+|---|---|---|---|---|
+| `0x0100ACA8` | registration fn entry | ✅ | 115,933,619 | `ra=0x0100A4A8` |
+| `0x0100DAE0` | **handler entry** | ✅ | **116,434,189** | `PC=0x0100DAE0`, `ra=0x00081FEC`, `sp=0x00081FC0`, **`a0=0x00000000`** (channel 0), `a1=0x01FFFBC0`, `a2=0x00081FC0`, `gp=0x01049770`, `v1=0x0100DAE0` |
+| `0x0100DCF0` | busy-byte clear site | ✅ | 116,434,220 | `a0=0x70002060` → `sb zero,0xD(a0)` writes **`0x7000206D`** |
+
+The clear site hits **+31 cycles** after handler entry. Busy byte at `0x7000206D` reads **`0x01` before**
+the single step and **`0x00` after** it — the handler *is* what clears it. The chain `0x100dae0` →
+`0x100dcf0` → clear is real and complete on hardware.
+
+**State at the handler entry (`0x100dae0`):** busy byte `0x7000206D = 0x01` (still set); DMAC ch0
+`0x10008000..0x1000803C` (CHCR/MADR/QWC/TADR) = **all zero** (transfer already done, channel off);
+`D_STAT 0x1000E010 = 0`, `I_STAT 0x1000F000 = 0`, `I_MASK 0x1000F010 = 0` — the kernel has already
+**ACKed** the interrupt before the handler runs (so "cause" is 0 by the time we observe it). Handler-id
+table `0x700020F0..FC` = `06 03 04 05`. `at = 0xB000E010` (kernel had just read D_STAT).
+
+**Deliverable 2 — the delivery path. The caller is KERNEL code, not game code.**
+
+`ra = 0x00081FEC` is the return address of a `jalr` at `0x00081FE4`. Disassembly of the caller:
+
+```text
+0x00081fe0:  0x3c1d0008    lui   sp, 0x0008
+0x00081fe4:  0x0060f809    jalr  ->v1          ; v1 = 0x0100DAE0 (the registered handler)
+0x00081fe8:  0x27bd1fc0    addiu sp, 0x1FC0    ; delay slot -> sp = 0x00081FC0
+0x00081fec:  0x2403fffb    li    v1, -0x5      ; <-- here is ra
+0x00081ff0:  0x0000000c    syscall             ; ExitHandler / ReturnFromException
+```
+
+with a twin trampoline at `0x00082000` (`li v1,-8; syscall`). This is the classic **EE-kernel exception
+trampoline**: set the kernel stack, `jalr` the registered handler, then `syscall` back to the kernel.
+So on hardware the DMAC handler is entered by the **EE kernel's own interrupt dispatch** — a `jalr` from
+kernel-installed code at `0x00081FE0` (inside the `0x80000` kernel region) — **not** by any game-code
+call, and **not** by a guest-visible `dispatchIrq` call. Path, end to end, measured:
+`AddDmacHandler(0,0x0100DAE0,0)` (called from `0x0100A4A8`→`0x0100ACA8`, via `0x0101F130`) → VIF0 ch0
+DMA completes → kernel ACKs D_STAT/INTC → **kernel trampoline `0x00081FE0` JALRs the handler** →
+`0x0100DAE0` → clears `0x7000206D` at `0x0100DCF0` → returns → `li v1,-5; syscall`.
+
+**Deliverable 3 — is `0x0100DAE0` entered by hardware for this transfer? YES** (cycles 116,434,189,
+`a0=0` = channel 0, same transfer W274 measured). Two independent fresh boots, same cycle.
+
+**Implication for our recomp (state plainly).** `0x00081FE0` is **below the recompiled image**
+(`0x00100000+`), so **nothing we recompile ever calls `0x0100DAE0`**. The JALR that enters it lives in
+BIOS/kernel-installed trampoline code. Therefore our `dispatchIrq` "matching" the handler
+(`cause=0 enabled=1 hasFn=1`) is **necessary but not sufficient**: the runtime must itself reproduce the
+kernel trampoline — on DMAC completion, *call* the registered handler the way the kernel does (with the
+kernel stack frame), then apply its effect. If our servicing only enqueues a `GuestInvocationKind::Interrupt`
+that the scheduler never turns into the call, `target_pc` stays 0 — exactly the W274 symptom.
+
+**Instrument gotchas (both verified this session):**
+
+1. **`pcsx2_get_backtrace` SIGSEGVs PCSX2** — `Unhandled SIGSEGV … DebugInterface.cpp:682 …
+   handleCommand DebugServer.cpp:787 … Aborting application`. Do **not** call it; it kills the emulator.
+2. **Post-`ExecPS2` instances are useless** — `0x01000000..` and `0x0100DAE0` read all zeros once
+   `ExecPS2` has run, and no save state exists. A **fresh boot with the BPs armed before the loader runs**
+   is mandatory. Guaranteed by `[UI] StartPaused=true` (`QtHost.cpp:238`); restored to `false` after.
+3. `PC=0x01000008` mid-`ExecPS2`-load is a transient pause, not a breakpoint hit; a halt is confirmed by
+   a frozen cycle counter (cycles unchanged across ≥4 s) with the PC pinned at the BP address.
 
 ### T3 — architect — Angle C (static, competes with T1) — OPEN
 Read `EeScheduler::dispatchIrq` (`EeScheduler.cpp:1697`) → enqueue → the drain/service loop; name the
 code path that services INTC but not DMAC, independently of T1. Owner: architect.
 
-### T4 — reviewer — falsify — OPEN
-(a) Re-verify the W274 claim from `boot_w274b.log` + source; (b) falsify T1/T2/T3 as they land.
-Owner: reviewer. Must falsify ≥2 findings.
+### T4 — reviewer — falsify — DONE (W274 claim FALSIFIED)
+
+**Verdict: the W274 claim "DMAC interrupt invocation is queued but never serviced" is FALSIFIED.**
+The handler `FUN_0100DAE0` was **entered**. Six of the claim's own cited evidences are wrong or vacuous:
+
+1. **`dmac=0` is a mislabel.** `inv_by_kind` slot `dmac` = `invocationsRunByKind[1]` =
+   `GuestInvocationKind::Alarm` (`ee_scheduler.h:93-103`; harness `vulcan4_harness.cpp:3659`). DMAC
+   invocations are `kind=Interrupt` = slot 0 (`intr`), so a serviced DMAC handler increments `intr`,
+   never `dmac`. The counter cannot see DMAC at all — it is a vacuous zero, not a DMAC-specific wall.
+2. **`0 target_pc=0x100dae0` is a proxy artifact.** `target_pc=` prints only in `[Yield]`
+   (`ps2_runtime.cpp:4112`) and `[Dispatch]` (`ps2_runtime.cpp:4166`), each capped at 400 lines
+   (`kMaxYieldTrace`/`kMaxCallTrace`), on the guest *branch/call* path. The interrupt-invocation service
+   path (`EeScheduler.cpp:1466` `function(m_rdram,&context,&m_runtime)`) prints neither. So 0 occurrences
+   does **not** mean "handler never entered" — it means the handler was never reached by a *guest branch*.
+3. **The invocation WAS queued.** `[w274:irq] dmac cause=0 handlers=3` (NOT `MASKED`) proves the mask gate
+   (`EeScheduler.cpp:1747`) passed for cause 0; the handler `{cause=0, enabled=1, h=0x100dae0, hasFn=1}`
+   matches the loop at `EeScheduler.cpp:1781`, so `queueInvocation` (`:1870`) was reached.
+4. **The invocation WAS serviced.** `pending_now=0` (queue empty at halt) + `pending_hi=1` (queue depth
+   never exceeded 1) + exactly **one** cause-0 dispatch (board 08:44 "queued/drain cause 0 ×1"). The only
+   drains of `m_pendingInvocations` are `serviceInvocations:1417`, `run():247/322`, and `reset():151`
+   (boot-init only; the `ExecPS2`-relaunch reset at `vulcan4_harness.cpp:2751` never fires, `ExecPS2=0`).
+   A queued-but-never-serviced invocation would leave `pending_now≥1` at halt → **contradiction** → it
+   was popped = serviced.
+5. **`missing_functions=0`** (boot log 66209) → once entered, the handler did not die on a missing function.
+6. **`irq_attach=0`, `irq_runsite=0`, `irq_done=0` are run()-only counters** (`EeScheduler.cpp:296/321/369`);
+   the harness drives via `serviceInvocations`, which never touches them → vacuous zeros, not evidence.
+
+**The real wall is downstream.** The handler runs, but its effect (clear busy byte `0x7000206D` / bit 8 of
+`0x10008000`, unblock `tid2`, `SignalSema(7)`) never materializes. Angle A's `[w275:svc-run]` trace should
+show `pc=0x100dae0` — if it does, that **confirms** (not contradicts) this finding, and the fix target
+moves from "invocation dropped" to "handler runs but effect missing / handler body diverges".
+
+*Falsified ≥2 findings:* (a) "dmac=0 is the wall", (b) "queued but never serviced", (c) "never entered
+(0 target_pc)", (d) "irq_attach/irq_done=0 as evidence".
+
+**Angle A (T1, builder) falsified — AGREED.** Their runtime trace (`VULCAN4_W275_INV=1`,
+`boot_w275inv.log`) landed and **independently confirms** my kill: `0x100dae0` enqueued 35× and RUN 35×,
+no drop. Reconciliation with my counters: 36 DMAC drains → 35 enqueues + 1, and that 1 is the first
+drain, which had `handlers=0` (`boot_w274irq.log:504` "[w274:irq] dmac cause=2 handlers=0", before
+`AddDmacHandler`). Their corrected artifacts are verbatim mine (`dmac=`=Alarm slot 1 of
+`ee_scheduler.h:93`; `target_pc` = branch-path counter `ps2_runtime.cpp:4166`). Their register-divergence
+lead is *accurate from source* — `dispatchIrq` sets `a0=cause, a1=handler.argument, gp, sp=0, ra=0`
+(`EeScheduler.cpp:1797-1871`) and never sets `a2`(r6)/`v1`(r3), while hardware enters via the COP0/KSEG1
+exception frame (`sp=0x81FC0, ra=0x81FEC, a1=0x1FFFBC0`) — but it stays a **lead** until someone shows
+`FUN_0100DAE0` actually reads `a1`/`sp` and dereferences it. Both required angles now agree: **serviced,
+not dropped**; the wall is downstream in the handler's effect. T3 (architect) still to falsify.
 
 ## RULE THAT GATES A FIX
 
@@ -146,3 +327,138 @@ angles agree, write the fix in `EeScheduler` servicing, rebuild (`-j4`, `nice -n
 
 `ExecPS2` fires and the engine is entered → **STOP + report entry PC.** A fresh capture ≠ disclaimer →
 **STOP** (milestone). Otherwise stop at a **new named limitation**, written down, record captured.
+
+### T3 — architect — Angle C (static) — ANSWER: the hypothesis is FALSE; the DMAC invocation IS serviced (35x)
+
+Static read of `EeScheduler.cpp` + cross-check against the builder's own `VULCAN4_W275_INV` trace
+(`boot_w275inv.log`, `/mnt/ssd/vulcan4-build/run/`) — the two agree, and both refute the W275 premise.
+
+**1. Enqueue function.** `EeScheduler::dispatchIrq` (EeScheduler.cpp:1797) builds the invocation
+(:1929-2005: `pc=handler.handler` :1931, `a0=cause` :1932, `a1=handler.argument` :1933, `gp=handler.gp`
+:1969, `sp=0` :1986, `ra=0` :1987) and calls `queueInvocation` (:2005 → :1250). The DMAC dispatch is
+NOT rejected by the mask gate — `[w275:dispatch] n=2 dmac=1 cause=0 mask=0xffffffff gate=pass`,
+`[w275:dispatch-match] ... matching=1 [en h=0x100dae0 arg=0x4 hasFn=1]`. So the DMAC invocation IS
+enqueued — **35 times** (`[w275:enq] pc=0x100dae0` ×35).
+
+**2. Drain/run function.** `EeScheduler::serviceInvocations` (EeScheduler.cpp:1299) drains the queue at
+:1414 (pop + attach) and runs it at :1566 (`function(m_rdram, &context, &m_runtime)`). The DMAC
+invocation is drained and RUN — **35 times** (`[w275:svc-pop] pc=0x100dae0` ×35,
+`[w275:svc-run kind=Interrupt pc=0x100dae0]` ×35). There is **no kind filter, no count gate, no
+`if(intc)` vs `if(dmac)` branch** in the servicing path: `dispatchIrq` sets `kind=Interrupt` identically
+for `dmac=true` and `dmac=false`, and `m_pendingInvocations` is a single FIFO drained uniformly.
+
+**3. Why "INTC drains but DMAC does not" is a false premise — the W274 numbers were measurement
+artifacts.** (a) `inv_by_kind=[...,dmac=0]` prints `invocationsRunByKind[1]` = the **Alarm** slot, not
+DMAC; the DMAC handler is `kind=Interrupt` (slot 0), so it is inside the `intr=94`. (b)
+"0 `target_pc=0x100dae0`" is the harness **arrival** histogram (`resolveFunction` @
+vulcan4_harness.cpp:2331), which structurally cannot see `serviceInvocations`' direct `function()` call
+— documented verbatim at vulcan4_harness.cpp:3352-3354 ("the population the arrival histogram
+structurally cannot see -- serviceInvocations() calls the generated function directly").
+
+**4. The real drop (downstream).** The handler runs but its effect fails. Boot report:
+`MMIO 0x7000206d accesses=5` across the whole run (the ch0 busy byte the cause-0 entry of the handler
+must clear; the handler is entered 35x across causes 0/1/2, yet the byte ends the run un-cleared and
+tid2 never wakes), `tid2:wait=sleep#0`, `tid1:wait=sema#7`, `ExecPS2` still 0. T2's oracle shows hardware
+enters the handler via the **EE-kernel trampoline 0x00081FE0** (`a0=0` channel, `a1=0x01FFFBC0`) — code
+below the recompiled image, so nothing we recompile ever calls `0x100dae0`; our `dispatchIrq` is the
+only entry. Our invocation sets `a0=cause`, `a1=arg=0x4`, and **leaves `a2`/`a3`/t-regs zeroed** — but
+FUN_0100DAE0's first real inputs are `sll v0,a3,2; lui v1,0x0103; addu v1,v1,v0; lw v1,0x2DF8(v1)`
+(it indexes a channel table by `a3`, then gates on the DMAC state word at `0x70002050`).
+
+**5. Fix site (hypothesis, NOT applied — for the builder+reviewer to confirm).** The drop is NOT in
+`serviceInvocations`. Two candidates, both in `ps2xRuntime/src/lib/`:
+- **`EeScheduler::dispatchIrq` invocation construction (EeScheduler.cpp:1932-1933, 1969)** — the
+  register contract for DMAC handlers is wrong/incomplete: the handler reads `a3` (channel index) and
+  gp-relative tables, but we set only `a0=cause, a1=arg, gp` and zero the rest.
+- **`Interrupt.cpp` `addHandler` (:26-40) → `addIrqHandler` (:1720)** — `argument` is read from `a3`
+  (r7), while the PS2 kernel's `AddDmacHandler(channel, handler, common)` third argument is `a2` (r6);
+  the captured `arg=0x4` is a stray register, not the guest's `0`.
+
+Stop condition unchanged: `ExecPS2` fires → STOP. No fix is written until T1 (runtime) and T3 (static)
+name the same drop point — they now do: **not the servicing path**; the handler runs and its
+busy-byte clear does not take effect.
+
+---
+
+## T1-followup — DECISIVE MEASUREMENT: the busy-byte trace (builder, 2026-10-08)
+
+Probe: `VULCAN4_W275_BUSY=1`, OFF by default. Two TUs: `ps2_runtime.cpp` (pc-bearing, via
+`ctx->pc` in `Load8/Store8/Load32/Store32`) and `ps2_memory.cpp` (pc-less backstop + the sites the
+runtime cannot reach: `write128` DQAQ, SPR_TO memcpy, `readIORegister`/`writeIORegister`). A
+`thread_local g_w275GuestBusyHandled` suppresses the double-log. Reads are throttled (value change /
+first 8 / n%1e6); writes are never throttled, so the write list below is COMPLETE.
+
+Patch: `tools/patches/ps2recomp-linux-w275-busybyte-probe.patch` (per-file capture check: EeScheduler
+135/135, System 98/98, ps2_memory 91/91, ps2_runtime 104/104 — all OK).
+
+Log: `/mnt/ssd/vulcan4-build/run/boot_w275busy.log` (6,381,697 bytes, 424 probe lines).
+Boot: tag=w275busy entries=2000000 budget=15s. Halted `guest_blocked` at elapsed_ms=6436.
+
+**Non-perturbation check.** W275busy vs the W274 probe run, byte for byte on every shape number:
+`functions_entered=723`, `true_guest_entries=1694274`, `halt=guest_blocked`, `intr_queued=93`,
+`intr_run=97`, `intr_run_by_kind=94`, `gs_packets=130`, `checkpoint_serviced=35`. Only
+`frames_presented` differs (358 vs 479, wall-clock). The probe changes nothing.
+
+### 1. Full write/read trace of 0x7000206D — COMPLETE, 5 events
+
+| # | op | value | guest pc | owning function | instruction |
+|---|----|-------|----------|-----------------|-------------|
+| 505 | WRITE8 | 0x00 | 0x100ac78 | (ch0 setup) | init |
+| 955 | READ8  | 0x00 | 0x100aed0 | `sub_0100AE78` | `lbu $v1,0x0($s1)` — the poll, n=1 |
+| 956 | WRITE8 | **0x01** | **0x100debc** | `sub_0100DE58` | `sb $a1,0xD($a0)`, a0=0x70002060 — **SET** |
+| 961 | WRITE8 | **0x00** | **0x100dcf0** | `sub_0100DAE0` | `sb $zero,0xD($a0)` — **CLEAR** |
+| 962 | READ8  | 0x00 | 0x100aed0 | `sub_0100AE78` | the poll, n=2 — reads 0, exits |
+
+Exactly two reads total (the throttle would have printed n=3..8 had the poll looped). **Nothing
+re-sets it.** Writes are unthrottled, so there is no hidden set.
+
+### 2. Does `WRITE8 0 @ pc 0x100dcf0` appear? — **YES.** The handler reached the clear.
+
+The clear LANDS. Candidate (a) wrong-branch, (b) re-set, and (c) split-read are ALL FALSIFIED for VIF0.
+
+The CHCR value the handler read at 0x100db10 was **0x70000045**: STR (bit 8, 0x100) CLEAR. The handler
+therefore takes the completion branch and clears the byte. (Raw register before the read: the kick
+wrote 0x10000145; `readIORegister` masks `& ~0x100u` and writes the masked value back —
+`ps2_memory.cpp:2576-2579`. The TAG field 0x7000 is unexplained by anything this probe watched; noted,
+not chased.)
+
+### 3. CHCR trace around the VIF0 completion (channel 0 = VIF0, `ps2_memory.cpp:2034`)
+
+```
+957  R32 0x10008000 = 0x00000040  pc=0x100dedc   pre-kick read
+958  W32 0x10008000 = 0x10000145  pc=0x100dee8   VIF0 kick (DIR|MOD=1|bit6|STR|TIE)
+960  R32 0x10008000 = 0x70000045  pc=0x100db10   handler sees STR clear -> COMPLETE
+961  W8  0x7000206d = 0x00        pc=0x100dcf0   clear
+```
+VIF0 is kicked **exactly once** in the whole boot. VIF1 (0x10009000) is kicked 26x and GIF
+(0x1000A000) 33x; their handler reads (pc=0x100db10) return STR-clear every time too. So the DMAC
+completion path is not special-cased broken for VIF0 — VIF0 simply runs once and then the guest blocks.
+
+### What this kills, and what is left
+
+The W274 mission hypothesis ("handler runs but its effect never lands") is **FALSIFIED**: the busy byte
+completes 0 -> 1 -> 0, the poll at 0x100aed0 reads the cleared 0, and `sub_0100AE78` exits. The wall is
+DOWNSTREAM of the byte. The surviving number in the boot report is `pending_hi=1` with
+`irq_attach=0 irq_runsite=0 irq_done=0 thread_attached=0` — a high-priority interrupt is pending and
+never attached/delivered; tid1 sits on `sema#7`, tid2 on `sleep#0`, `ExecPS2` 0.
+
+Two corrections to the mission brief's address map: the stride is 0x10, not 12 — the byte for ch2 is
+0x7000208D, not 0x70002089; and 0x7000207C / 0x70002088 are NOT busy flags — the guest uses them as
+saved-sp slots (`sw $sp,0x0($v1)` at 0x100af18 stores 0x1ffcda0 / 0x1045970, pointers). The only byte
+flag is 0x7000206D for channel 0; byte accesses at 0x7000207D / 0x70002089 are ZERO in the whole boot.
+
+### Law-8 capture check — RAW
+
+```
+$ cd tools/PS2Recomp && git diff --numstat
+135	0	ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+98	0	ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+91	2	ps2xRuntime/src/lib/ps2_memory.cpp
+104	2	ps2xRuntime/src/lib/ps2_runtime.cpp
+
+$ per-file added lines vs tools/patches/ps2recomp-linux-w275-busybyte-probe.patch
+EeScheduler.cpp  live=+135 patch=+135
+System.cpp       live=+98  patch=+98
+ps2_memory.cpp   live=+91  patch=+91
+ps2_runtime.cpp  live=+104 patch=+104
+```

@@ -3896,3 +3896,52 @@ should be reported as a picture change until a fresh boot says so.
 (SIF.cpp L665-676) tests `std::getenv("VULCAN4_SIFRPC") != nullptr`, so `VULCAN4_SIFRPC=0`/`=OFF` still
 **enables** the probe — Law 12 forbids that; the value must be parsed. Sent to the owner; not edited here
 (the file is owned by a running agent).
+
+---
+
+## R22 — Guest-side module inventory: `fileio`/`cdvdfsv` are IOPRP300.IMG residents, never loaded by name (measurer, 2026-10-08)
+
+**Question.** R20/R21 leave sid `0x80000001` unowned and debate whether `fileio` is loaded by name. Rather
+than guess from ps2sdk headers, this section reads the guest's own disc.
+
+**Method.** `CORE.GT4` on the disc is **encrypted** — 2,020,861 bytes of high-entropy data with no readable
+strings (`head -c 64 | xxd` shows no ELF magic). The decrypted `.rodata` already exists at
+`/mnt/ssd/gt4/work/rodata.bin`, so that is the readable EE-side string source. `IOPRP300.IMG;1` was
+extracted read-only from the user's own ISO with `isoinfo -x /IOPRP300.IMG;1` into
+`/mnt/ssd/tmp/ioprp/ioprp300.img` (SSD scratch, Law 1 — it never enters the repo).
+
+**Measured — what the EE names.** `strings rodata.bin | grep -iE '\.irx|\.img|ioprp'` yields exactly:
+`cdrom0:\IOPRP300.IMG;1`, `cdrom0:\IRX\`, `mcman.irx`, `mcserv.irx`, `mtapman.irx`, `padman.irx`,
+`sio2man.irx`, plus `rom0:ROMVER` / `rom0:UDNL` and `libmc: too old release of mcman/mcserv.irx`.
+**There is no `fileio`, `iopheap`, `xfileio`, `cdvdfsv`, `cdvdman`, `usbd` or `libsd` string anywhere in
+the EE binary.** So GT4 never calls `sceSifLoadModule("fileio")`; whatever `fileio.cpp`'s comment asserts
+about that call is not grounded in this binary.
+
+**Measured — what IOPRP300.IMG contains.** The image is a PS2 IOP ROM (header `RESET`/`ROMDIR`/`EXTINFO`/
+`SYSMEM`). Its modules, by SCE name string, in image order:
+
+```
+sysmem  loadcore  sifcmd  sifman  threadman  ioman  modload  fileio  cdvdman  cdvdfsv
+loadfile  timeman  romdrv  eesync  sysclib  stdio     (+ heaplib: "heaplib", "iop heap service (99/11/03)")
+```
+
+`fileio` is present (`PsIIfileio 3000`, `FILEIO_service`, `Multi Threaded Fileio module.(99/11/15)`,
+`No SIF service(fileio)`); `cdvdfsv`/`cdvdman` are present (`PsIIcdvdfsv 300p`, `PsIIcdvdman 300p`).
+**`iopheap` is not a module name in the image** — the heap service is `heaplib`. So a sid claimed by
+"iopheap" would be a phantom.
+
+**Consequence (grounded, not a guess).** `fileio` and `cdvdfsv` are **IOPRP-image residents**: the guest
+brings them up by loading `cdrom0:\IOPRP300.IMG;1` as a whole, never by per-module `sceSifLoadModule`.
+That is why `FileIoService`'s `moduleAliases() = {"fileio","xfileio"}` gate keeps it `active=0` forever —
+**the identical dormant-forever bug R20 fixed for cdvdfsv.** The fix has the same shape and now has
+evidence behind it: a service that the platform always has must not be gated on a load event.
+
+**NOT proven — do not assert.** Which module owns sid `0x80000001` is still unmeasured. Scanning the image
+for the sid immediate is inconclusive: MIPS stores it as a `lui`/`ori` pair, so `grep` for the 32-bit word
+finds only one incidental hit (offset 31319, in the `sifcmd` region), which is not a registration site.
+The oracle that settles it is **PCSX2 with a breakpoint on the IOP's `sceSifRegisterRpc`, logging each sid
+and its module** — not ps2sdk headers, not a byte scan. Until that runs, "sid 0x80000001 == fileio" is a
+hypothesis, and Law 3 forbids acting on it as fact.
+
+**Priority note.** R16 measured that delivering the `0x80000001` BIND reply did **not** change the picture,
+so that sid is not the render blocker; the CDVD bind (`0x80000592`, 13 retries) is the observed one.

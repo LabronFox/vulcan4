@@ -643,3 +643,23 @@ patch total added lines: 595   ( = 591 real + 4 '+++' header lines )
 All four modified files are carried by the patch. `System.cpp`'s +98 is the already-captured 0x5b
 GetEntryAddress fix (`ps2recomp-linux-w274-0x5b-getentryaddress.patch`); the other three are the
 W275 probes.
+
+### Mechanical gate — RAW (`bash .auto/verify-dish.sh`, 2026-10-08, clean tree)
+
+```
+=== VULCAN 4 dish gate — 2026-10-08 09:59 ===
+PASS  suite 497 tests, 0 failed
+PASS  newest commit authored as the captain
+PASS  working tree clean
+INFO  verify-menu.sh: not passed (last lines below) — screen is not the menu yet
+      newest capture : /mnt/ssd/vulcan4-build/run/w275busy-capture.png
+      GATE FAIL: the capture is BYTE-IDENTICAL to the disclaimer reference - the screen did not change.
+INFO  newest capture: /mnt/ssd/vulcan4-build/run/w275busy-capture.png
+INFO  newest log: /mnt/ssd/vulcan4-build/run/boot_w275tag4.log
+      halt=guest_blocked
+INFO  missing-function hits in that log: 0
+=== RESULT: MECHANICAL CLAIMS HOLD ===
+EXIT=0
+```
+The menu gate correctly reports the screen is still the disclaimer: this dish **names a boot blocker**,
+it does not draw the menu (law 4). `missing-function hits: 0` — the halt is not a dispatch miss.

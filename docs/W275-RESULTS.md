@@ -4146,3 +4146,375 @@ CAPTURE CHECK: PASS (every file's added lines are carried)
 **Not claimed:** nothing here says the picture will move once 0xFF is decoded. The measured fact is
 that the RPC plumbing is now honest end-to-end and the guest's throughput roughly doubled — and that
 the picture did **not** change.
+
+## R25 — the SIF register 4 seed is a FABRICATED constant; the oracle says 0x00070000 (builder, 2026-10-08)
+
+**Corrected record first.** R24 reported the new halt as `stuck_in_syscall` with "`sceSifGetReg` 0x7A
+187,366 hits with NEGATIVE v0 184,928 times". **That reading was wrong.** `[w119:spin]`'s `negV0`
+counts `getRegU32(ctx, 2)` sampled at probe ENTRY — i.e. the STALE `$v0` left by the preceding guest
+code, not the syscall's return (`ps2_runtime.cpp` L4940-5010, `v0Now` is read before the handler runs).
+Independently, `ps2_stubs::sceSifGetReg` (`SIF.cpp:472-501`) looks up `g_sifRegs`, defaults to 0 and
+`setReturnU32(ctx, value)` — it cannot return a negative. The real spin signature is a **constant**
+`$v0` (`v0Same ≈ hits`), and that is what 0x40 / 0x41 / 0x7A show.
+
+### The measured spin (run/boot_w276r24_on.log, ON arm, 30 s)
+
+```
+totalSyscalls=280000 ... 0x40(hits=61795 v0Same=61765 negV0=0) 0x41(hits=61773 v0Same=60916)
+0x7a(hits=61766 v0Same=61736) 0x2f(hits=46887 v0Same=250) 0x29(hits=45888 v0Same=1)
+```
+0x7A's first 128 logged calls (the log cap is exactly 128, so 123 is the first 128 minus 5 others):
+`123 × reg=0x4 value=0x20000 pc=0x5ae0b8 ra=0x5b7158`. The R3 poll `ra=0x5b0ac8` appears **once** —
+our R3 dispatch fix made it pass first try. The new wall is a SECOND poll of the same register.
+
+### The guest's second poll (generated sub_005b7148, ps2_recompiled_functions_42.cpp:28742-28840)
+
+```
+0x5b7150: jal  0x5AE0B0      # SifGetReg thunk
+0x5b7154: addiu $a0, $zero, 4            (delay slot)
+0x5b7158: lui   $v1, 0x4                 -> $v1 = 0x00040000
+0x5b715c: and   $v0, $v0, $v1
+0x5b7160: beqz  $v0, 0x5B718C            # bit 18 CLEAR -> return 0
+0x5b7164: daddu $v0, $zero, $zero        (delay slot)
+0x5b7168: ... func_5AE120(); func_5B94A0(1,1); func_5B94A0(0,1) ... return 1
+```
+A predicate: "does SIF reg 4 carry bit 0x40000?" Ours answers **no, forever**, so its caller spins
+(61,766 SifGetReg calls and the matching CreateSema/DeleteSema pair).
+
+### The divergence is the CONSTANT, and the oracle already measured it
+
+R3's hardware capture (this doc, §R3 MEASURER/ORACLE, PCSX2 DebugServer, GT4 USA v2.00, paused at
+PC=0x005b0ac8, first pass) records, in the same table, **`v0 = 0x00070000` HARDWARE vs
+`0x00000000` OURS** for the very call that reads reg 4. At that same pause, `s0` (the mask) = 0x00020000
+on BOTH sides.
+
+* Hardware `sceSifGetReg(4)` = **0x00070000** (bits 16, 17, 18 — it contains BOTH the 0x20000 the
+  0x5b0ac8 poll tests AND the 0x40000 the 0x5b7158 poll tests).
+* Ours = `g_sifRegs[0x4] = kSifBootReadyMask = 0x00020000` (`SIF.cpp:95,108`) — a constant with no
+  cited source. It is **0x00020000 short** of the measured value.
+
+So this is a **supplied-constant bug, not a recompiler bug**, and it is Oracle-grounded: the fix is to
+seed the register with the value hardware was measured returning, not to invent a new one.
+
+**Named limitation (no guessing):** the register's bit NAMES are not in this project's reference corpus
+(`sifman.h`, which defines `SIF_REG_*` / `SIF_STAT_CMDINIT`, is absent from `/mnt/ssd/tmp/ps2sdk-ref/`).
+The doc therefore records the register NUMBER and the two BIT VALUES the guest tests, and claims no
+symbol names. The canonical shape of the poll (`while (!(sceSifGetReg(SIF_REG_SMFLAG) & SIF_STAT_CMDINIT))`)
+is at `ee_kernel_src_sifcmd.c:271`, which supplies the shape but not the numbers.
+
+**Second divergence, same path, measured but NOT yet fixed (one variable at a time):** the next call,
+`sceSifGetReg(2)` at PC=0x005b0adc, is hardware **0x0001E640** vs ours **0x00000000**. Our run does
+proceed past it, so it is not what blocks the first divergence; it is recorded for the next round.
+
+**Fix applied this round (reg 4 only):** `SIF.cpp` seeds `g_sifRegs[0x4] = 0x00070000`, cited to the R3
+oracle capture. Not a probe: it is the correction of a fabricated stub return to measured hardware
+truth, so it is not gated behind an env var (gating it would mean shipping a value already known wrong).
+
+## R25 ADDENDUM — ORACLE: hardware reg 4 reads **0x00000000** at the 0x5b7158 poll (builder, 2026-10-08T16:03:38Z)
+
+Instrument: PCSX2 `-debugger` (DebugServer :21512), GT4 (USA) v2.00 ISO, **fresh boot**
+(`nice -n 10 bash /home/or/.hermes/scripts/pcsx2_oracle.sh restart`), breakpoint at PC=0x005b7158,
+`pcsx2_continue`. Stopped with `Paused: true`; engine code live at that PC — `ra = 0x005B7158` is
+exactly the return of the `jal 0x5AE0B0` at 0x5b7150, so **v0 holds the raw syscall-0x7A return and
+the BP sits on the instruction that consumes it** (`lui $v1,0x4` / `and $v0,$v1`).
+
+| read | HARDWARE (this measurement) | OURS (`run/boot_w276r25on.log`) |
+|---|---|---|
+| v0 @ 0x005b0ac8 | 0x00070000 (R3 §, cited not re-measured — see caveat) | 0x00070000 (the seed) |
+| **v0 @ 0x005b7158 (FIRST execution)** | **0x00000000** | **0x00020000** |
+| t9 = `sceSifGetReg(2)` (MSFLAG) | **0x0001E640** | 0x00000000 |
+
+### What this settles
+
+1. **Hardware reg 4 goes 0x00070000 → 0x00000000 across the guest's own three single-bit writes**
+   (`SetReg(4,0x40000)` 0x5b70b8, `SetReg(4,0x10000)` 0x5b70d4, `SetReg(4,0x20000)` 0x5b70e0).
+   0x70000 minus exactly those three bits is 0. So a write of a bit to reg 4 **CLEARS** it —
+   write-1-to-clear. That is precisely the protocol the manual corpus documents for the SIF flag
+   semaphore: *"If the EE sends 20000h to MSFLG, the IOP can read this and clear MSFLG by writing
+   20000h to it"* (`~/.config/opencode/skills/ps2-recomp-Agent-SKILL/resources/09-ps2tek.md`
+   L4318-4324), with the three values named there as *10000h SIF DMA/hardware initialized*,
+   *20000h SIFCMD initialized*, *40000h IOP has finished booting (sent by EESYNC)* (L4310-4316).
+2. **The poll failing on its FIRST pass is CORRECT on hardware.** Both sides mask with 0x00040000:
+   hardware 0x00000000 & 0x40000 = 0, ours 0x00020000 & 0x40000 = 0. Our *value* is wrong
+   (replace semantics) but the *tested bit* agrees. So reg-4 write semantics is **not** the wall —
+   it is a real divergence, but not the one blocking.
+3. **The wall is the missing IOP-side producer.** The unbounded loop
+   (`ps2_recompiled_functions_40.cpp`:0x577a68 `jal func_577F80` / 0x577a70 `jal func_5B7148` /
+   0x577a78 `beqz $v0,-0x14`) can only exit when something **raises** bit 0x40000: per the corpus
+   that flag is *sent by EESYNC* — an IOP→EE event. Our runtime has **no producer for any SIF flag**
+   (grep over `ps2xRuntime`: `SifSetMSFlag`/`SMCOM`/`smflag` have consumers and no writer), and
+   `sceSifSetReg` only replaces, so once the guest clears it, nothing can ever set it again.
+   Hardware reg 4 is a *semaphore with two writers*; ours is a variable with one.
+
+### Caveats — measured, not assumed
+
+* The 0x005b0ac8 breakpoint was armed in the **same** session but never reported a stop before the
+  0x5b7158 stop was reached (and the VM was never resumed after that stop). The 0x70000 at 0x5b0ac8
+  is therefore **cited from the R3 capture**, not re-measured here. Unexplained; recorded as a
+  caveat rather than papered over.
+* Whether the IOP eventually raises 0x40000 (i.e. whether hardware's loop exits at all) is being
+  measured with a **conditional** breakpoint `(v0 & 0x40000) != 0` on the same PC; that result is
+  appended below when it lands.
+* PCSX2's debugger cannot read SIF MMIO (`0x1000F200..0x1000F260` reads all zero — R3 caveat 3),
+  so every register-4 value in this doc comes from **v0 at a breakpoint**, never from a memory read.
+
+### SECOND STOP (same session, conditional BP `(v0 & 0x40000) != 0`) — the poll SUCCEEDS on hardware
+
+Breakpoint re-armed at PC=0x005b7158 as **conditional** (`(v0 & 0x40000) != 0`) and the VM resumed.
+It stopped: `PC: 0x005b7158 | Paused: true | Cycles: 1787805015`. Raw register dump:
+
+```
+  v0 = 0x00070000   <-- BIT 18 (0x40000) SET: the poll's beqz FALLS THROUGH, the loop EXITS
+  a0 = 0x00070000        a2 = 0x00010000      a1 = 0x0005342A     a3 = 0x052FAA00
+  v1 = 0x000001E8        t9 = 0x0001E640      s0 = 0x00000002     s1 = 0x01FFFCE0
+  ra = 0x005B7158        sp = 0x01FFFC80      pc = 0x005B7158
+```
+
+**This is the measurement that names the wall.** Two executions of the identical instruction
+0x5b7158, same session, same boot:
+
+| | cycles | v0 | bit 0x40000 |
+|---|---|---|---|
+| first execution | 1,646,393,845 | 0x00000000 | **clear** |
+| later execution | 1,787,805,015 | **0x00070000** | **SET** |
+
+So register 4 is **not** a one-writer variable: between the two reads its *whole* boot value came
+back. 0x00070000 = 0x40000 | 0x20000 | 0x10000 — the exact OR of the three bits the guest itself
+wrote at 0x5b70b8 / 0x5b70d4 / 0x5b70e0. Whatever produced this value, **hardware's reg-4 boot
+semaphore is re-asserted from outside the guest's own read/write loop**, and that repeat is exactly
+what our runtime cannot do (its `g_sifRegs[4]` is `= value`, one writer, no producer).
+
+### What is STILL open here (do not paper over)
+
+* **Who re-raised it.** Not identified yet. A WP (write watchpoint) on 0x1000F240 is the next
+  instrument. Note PCSX2 cannot READ SIF MMIO (R3 caveat 3), so the writer must be caught by a
+  watchpoint, not by reading the register.
+* **How many iterations.** The condition was accepted but the DebugServer's conditional-hit count has
+  not been read back, so "the 2nd pass" is NOT established — only "some later pass". The cycles
+  delta is 141,411,170, which is far too large for a tight poll iteration; either the loop body waits
+  a long time (func_577F80) or the two stops are separated by a whole boot phase.
+* The 0x5b0ac8 breakpoint armed earlier in the same session never reported a stop; the 0x70000 at
+  that PC is cited from R3, not re-measured.
+
+## R26 — the SIF register-4 boot semaphore is TWO-WRITER; a deferred boot model reproduces the oracle (builder, 2026-10-08)
+
+R25 proved the value we fed the guest at the 0x5b7158 poll (0x00070000 or 0, depending on the seed) was
+a *fabricated constant*. R26 replaces it with a model derived from the two sides of the hardware, and
+**the runtime now reproduces the oracle's two reads on the same instruction.**
+
+### R26.1 The model — EE clears, IOP sets
+
+SIF_SMFLG (reg 4) has two writers with OPPOSITE senses (ps2tek 09 L4313-4326):
+
+* **EE writes CLEAR bits** — `smflg &= ~value`. GT4's own sequence at 0x5b70b8 / 0x5b70d4 / 0x5b70e0
+  writes 0x40000, 0x10000, 0x20000 as *acknowledgements* of the three boot stages.
+* **IOP writes SET bits** — `smflg |= value`. Bits 0x10000 SIF init, 0x20000 SIFCMD init, 0x40000 IOP
+  boot done.
+
+An `smflg = value` single-writer register (what the runtime had) can express neither. That is why the
+guest's three clears landed and nothing ever re-raised the bits — and why R25 saw the poll hang.
+
+### R26.2 The fix — the raw reboot-iop CALL schedules, it does not complete
+
+`sceSifSetDma` (Kernel/Stubs/SIF.cpp, probe `VULCAN4_SIFRPC`, OFF by default) now **parses** the raw SIF
+RPC CALL it copies instead of only synthesising a completion. The one command decoded is GT4's actual
+boot transaction, measured verbatim (run/boot_w276r26c.log):
+
+```
+[sceSifSetDma:DESC] i=0 src=0x889ec0 dst=0x0 size=0x68 attr=0x44 pc=0x5ae068 ra=0x5b70c4
+[SIFRPC] reboot-iop arglen=32 mode=0 arg="rom0:UDNL cdrom0:\IOPRP300.IMG;1"
+```
+
+The 0x68-byte packet is a `SifIopResetPkt`: arglen at +0x10, mode at +0x14, the ASCII arg at +0x18.
+Command 0x80000003 (reboot-iop) sets `g_sifIopBootPending = 1` — **schedules the boot, does not claim it
+finished.** `iopSmflgServicePendingBoot()` runs at the top of `sceSifGetReg`, so the IOP's bits come back
+only when the guest next reads the register, which is exactly when hardware's IOP would have had time.
+
+Measured arm sequence, all of it (same log, absolute lines 65613-65626):
+
+```
+[sceSifSetReg] reg=0x4 prev=0x70000 value=0x40000   pc=0x5ae0a8 ra=0x5b70b8   <- EE clear 0x40000
+[sceSifSetReg] reg=0x4 prev=0x30000 value=0x10000   pc=0x5ae0a8 ra=0x5b70d4   <- EE clear 0x10000
+[sceSifSetReg] reg=0x4 prev=0x20000 value=0x20000   pc=0x5ae0a8 ra=0x5b70e0   <- EE clear 0x20000
+[sceSifGetReg] reg=0x4 value=0x0     pc=0x5ae0b8 ra=0x5b7158                <- loop, iteration 1
+[sceSifGetReg] reg=0x4 value=0x70000 pc=0x5ae0b8 ra=0x5b7158                <- loop, iteration 2 -> exits
+```
+
+`ra` is `0x5b7158` for BOTH reads: it is the same instruction in a poll loop, and the loop turns on the
+second pass. Compare the oracle's own numbers (R25 addendum, same file, above): first execution of the
+identical PC reads **0x00000000**, a later execution reads **0x00070000**. **Our runtime now produces
+0x0 then 0x70000 on that instruction.** The loop's exit condition (BIT17 = 0x20000) is then satisfied,
+and the next poll at ra=0x5b0ac8 reads 0x70000 and passes.
+
+### R26.3 Measured A/B — equal start, the wall MOVED (not removed)
+
+| | probe OFF (`VULCAN4_SIFRPC` unset) | probe ON |
+|---|---|---|
+| halt | `wallclock_deadline` | `missing_function` |
+| pc | — | `0x00577168` (elapsed_ms=6256) |
+| true_guest_entries | 25,006,440 (R25 ON reference) | **1,562,699** |
+| functions_entered | — | 12,546 |
+| frames_presented / gs_packets | 352 / 15 | 352 / **15** |
+| picture | 2005 disclaimer | 2005 disclaimer |
+
+Unset = byte-for-byte the previous behaviour (the probe is OFF by default; Law 12). The ON arm no longer
+burns 25 M guest entries spinning: it gets past the SMFLG gate in 6.2 s of guest time and is stopped by a
+**different** wall, three stages further down the boot.
+
+`gs_packets=15` is unchanged and there is still **no `[DBCMAN]` line anywhere**: the game is still
+loading. R5 is NOT reached.
+
+### R26.4 The new wall, diagnosed to the mechanism — 0x00577168 has no dispatch slot
+
+```
+VULCAN4 MISSING-BOUNDARIES n=1 : 0x0x00577168
+[guest-branch:missing-target] kind=IndirectCall op=JALR source=0x5773e4 target=0x577168
+    ... s0=0x617d98 s0[0]=0x577168 s0[8]=0x101a70 codeRegion=no policy=1
+VULCAN4 HARNESS detail=no generated function at this pc pc=0x00577168 ... elapsed_ms=6256
+```
+
+This is a real guest indirect call (`0x5773e0 lw v0,0(s0)` / `0x5773e4 jalr v0`, delay
+`0x5773e8 lw a0,4(s0)`) through a runtime-built table at s0=0x617d98 — past the image end (0x617A14), so
+the pointer is assembled at runtime and a byte scan of `w231-engine.bin` finds **zero** occurrences of
+0x00577168. The dispatch target is a legitimate 8-byte function:
+
+```
+0x577168: jr $ra          0x57716c: addiu v0,$zero,1     (returns 1)
+```
+
+**It is emitted** (`ps2_recompiled_functions_40.cpp:11731-11743`) but has **no slot in
+`g_ps2EngineFunctionTable`** — measured: 0x577168 → header 0, register_functions 0. Its immediate
+neighbour 0x577170, 8 bytes later, HAS one (`g_ps2EngineFunctionTable[1170522] =
+sub_00577100_0x577100; // 0x577170`). Slot = (vaddr − 0x100008)/4, and a JALR to a vaddr with no slot is
+exactly the harness's `no generated function` halt.
+
+**Root cause: the indirect-fallback promotion is scoped to the function that CONTAINS the unresolved
+jump, not to its target** (`ps2xRecomp/src/lib/control_flow_analyzer.cpp:420-457`). When a function has an
+unresolved indirect JR/JALR, only *that* function's own instruction addresses are inserted into
+`entryPoints` + `indirectFallbackEntryPoints`. The jump's **target** gets an entry only if it happens to
+be a known function start, or to fall inside some *other* function that itself has an unresolved jump.
+0x577168 is neither.
+
+This is a CORRECTION to an earlier draft of this section, which blamed `PS2RECOMP_NO_FALLBACKS` (W236).
+That knob was **not** set for this emit and is **measurably inactive**: the caller's own interior
+0x5773e4 *is* registered —
+
+```
+$ grep '0x5773e4' recomp_engine_w251/register_functions.cpp
+        g_ps2EngineFunctionTable[1170679] = sub_005773b8_0x5773b8; // 0x5773e4
+```
+
+— which is the fallback mechanism working exactly as written. Registering every address of the *jumping*
+function does not, and structurally cannot, register an address in a different function.
+
+**Evidence that 0x577100 is a merged multi-function blob:** Ghidra reports 0x577100 as one function
+covering 0x577100..0x5772e8+ (measured below: ten registered interiors of it, the last at 0x5772e8).
+The emitted code for 0x577168 already exists inside it; only the table slot is missing. The gap is
+therefore one slot line, not one function.
+
+**The sanctioned fix is a tool input, not an edit to generated output** (AGENTS.md: "Fix the tool input
+(TOML / analyzer / `tools/patches/`) and regenerate — never hand-edit generated output"). Add an interior
+`entry_points` entry to the engine TOML. `discoverAdditionalEntryPoints()` "prefers the existing wrapper
+when a configured entry lies inside a decoded function", so the address becomes a `case 0x…: goto label_…;`
+arm of its owner with no function duplication. Precedent: `tools/patches/gt4-w251-engine-interior-entries.patch`.
+
+### R26.5 Tool-freshness finding (caught before the regen, not after)
+
+`recomp_engine_w251/ps2_recomp` was dated **Oct 7 22:20** while `libps2_recomp_lib.a` was **Oct 8 10:14** —
+the binary did not contain the Oct-8 `instruction_translator.cpp` (+32) / `control_flow_emitter.cpp` (+22)
+changes. A regen with it would have silently emitted with a stale recompiler. It has been relinked
+(`make -j4 ps2_recomp`, now Oct 8 19:33) before any emit is run.
+
+### R26.6 Capture (Law 8)
+
+`tools/patches/ps2recomp-linux-w276-r26-live-complete.patch` (162,151 bytes), 21 files, **2331 added
+lines**. Per-file check RAW output — `bash tools/check-patch-capture.sh <patch> tools/PS2Recomp`:
+
+```
+FILE                                                 LIVE_ADD PATCH_ADD VERDICT
+ps2xIOP/src/modules/cdvd.cpp                              191      191 OK
+ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp                  703      703 OK
+ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp            285      285 OK
+ps2xRuntime/src/lib/ps2_memory.cpp                        212      212 OK
+ps2xRuntime/src/lib/Kernel/EeScheduler.cpp                202      202 OK
+ps2xRuntime/src/lib/ps2_runtime.cpp                       169      169 OK
+ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp               152      152 OK
+ps2xIOP/src/modules/fileio.cpp                            104      104 OK
+ps2xRuntime/include/ps2_runtime_macros.h                   90       90 OK
+ps2xRuntime/include/runtime/syscall_names.h                57       57 OK
+(10 further files, all OK)
+----
+CAPTURE CHECK: PASS (every file's added lines are carried)
+```
+
+Committed in the outer repo as `ab63e81 W276 R26: capture the complete live PS2Recomp tree as a patch`.
+The prior capture (R25) held 2155 lines against a live 2331, i.e. **176 added lines were in the working
+tree alone**; that gap is now closed.
+
+### R26.7 The fix, applied and verified at the emit (before paying the compile)
+
+Corrected root cause (see R26.4, rewritten): the miss is a **scoping** property of the W236
+indirect-fallback promotion, not the `PS2RECOMP_NO_FALLBACKS` knob. Confirmed a second time in this
+run's own emit log, which is full of lines like
+
+```
+[warning] control-flow function=sub_00616ee8 addr=0x616f50 - unresolved JR/JALR at ...; promoted 715 fallback entries
+```
+
+— 7,140 such promotions in the r26 emit. The knob is unset and the fallback is active, exactly as the
+slot-1170679 measurement said.
+
+Fix applied (tool input only — AGENTS.md: "never hand-edit generated output"):
+
+- `w251-engine_authoritative.toml` `general.entry_points` gained `"hook_577168@0x00577168"`
+  (212 → 213 entries), with a comment block carrying the corrected mechanism and the measured refutation.
+  Backup: `w251-engine_authoritative.toml.bak-r26`.
+- New emit TOML `w276-engine_r26.toml` = the w251 TOML with `general.output` pointed at
+  `recomp_engine_r26/`, so a failed run could not damage the known-good `recomp_engine_w251` (850 MB each,
+  82 GB free on `/mnt/ssd`).
+
+Emit command (recorded, run from `/mnt/ssd/gt4/work`, `nice -n 10 ionice -c3`, `TMPDIR=/mnt/ssd/tmp`):
+
+```
+PS2RECOMP_ENTRY_ADDR_CSV=/mnt/ssd/vulcan4-build/engine-symbols.csv \
+PS2RECOMP_TABLE_SYMBOL=g_ps2EngineFunctionTable \
+/mnt/ssd/vulcan4-build/ps2xRecomp/ps2_recomp w276-engine_r26.toml
+```
+
+Ran to `Recompilation completed successfully` in **under 45 s** (whole log 7,172 lines:
+`Functions processed: 19404, recompiled: 19404, stubs: 0, skipped: 0, decode failures: 0`,
+`collected 507582 resumable entry point(s) across 18846 owner function(s)`).
+
+Verification, three ways, all raw:
+
+```
+$ grep -n '0x577168' recomp_engine_r26/register_functions.cpp
+477553:        g_ps2EngineFunctionTable[1170520] = sub_00577100_0x577100; // 0x577168
+$ grep -n '// 0x577170' recomp_engine_r26/register_functions.cpp
+477554:        g_ps2EngineFunctionTable[1170522] = sub_00577100_0x577100; // 0x577170
+```
+
+Slot 1170520 = (0x577168 − 0x100008)/4, immediately before the already-registered neighbour's 1170522,
+owned by the same wrapper `sub_00577100_0x577100` — i.e. a resume entry, not a duplicated function.
+
+Whole-emit diff against `recomp_engine_w251` (md5 of all 50 `.cpp`/`.h` files, then content diff of the
+two that differ) — **the entire change is three lines**:
+
+```
+$ join -j2 <(sort -k2 a.md5) <(sort -k2 b.md5) | awk '$2!=$3{print "DIFFERS:",$1}'
+DIFFERS: ps2_recompiled_functions_40.cpp
+DIFFERS: register_functions.cpp
+
+$ diff w251/register_functions.cpp r26/register_functions.cpp      # 523416 -> 523417 table lines
+477538a477539
+> // 0x577168
+
+$ diff w251/ps2_recompiled_functions_40.cpp r26/ps2_recompiled_functions_40.cpp
+11589a11590
+>         case 0x577168u: goto label_577168;
+11730a11732
+> label_577168:
+```
+
+No function count change (19,404 both), no table-line change other than the one slot, no other file
+touched. The dispatch miss was **one slot line**, and the sanctioned path produced exactly it.

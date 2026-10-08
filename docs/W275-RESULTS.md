@@ -749,3 +749,89 @@ INFO  missing-function hits in that log: 0
 === RESULT: MECHANICAL CLAIMS HOLD ===
 GATE_EXIT=0
 ```
+
+## Segment D — SleepThread is UNTIMED (the W161 divergence), and ExecPS2 FIRES
+
+**Change.** `sce_SleepThread` (syscall 0x32) no longer reads `$a0` as microseconds. The guest
+trampoline at `0x101f340` sets only `$v1=0x32` and issues `syscall 0` — it never writes `$a0`, so the
+W88 "read $a0 as a duration" branch was reading a register the caller never set. ps2tek.md:5065 and
+09-ps2tek.md both give `32h SleepThread: void`. The W88 comment in `EeScheduler.cpp` asserting the
+opposite is replaced with the settlement. Two A/B knobs, BOTH OFF by default:
+`VULCAN4_W161_SLEEP_TIMED=1` (restores the W88 timed read) and `VULCAN4_W161_SLEEP_US=<n>`.
+`DelayThread`/semaphore code untouched.
+
+Files: `ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp`, `ps2xRuntime/src/lib/Kernel/EeScheduler.cpp`.
+
+### Measurement — 15 s plain boot, no probe env set
+
+Before = `boot_w275r1.log` (zero-QWC fix, SleepThread timed). After = `boot_w275sleept.log`
+(this fix). Both: `/mnt/ssd/vulcan4-build/run/`, engine `recomp_engine_w251`, `-j2`, probes OFF.
+
+| | before (`w275r1`) | after (`w275sleept`) |
+|---|---|---|
+| **ExecPS2 invocations** | **0** | **1** |
+| `functions_entered` | 751 | **10,417** |
+| `halt` | guest_blocked | guest_blocked |
+| `sce_SleepThread` calls (0x32) | 16,076 | **14** |
+| `sleepCurrentCalls` | 16,076 | 14 |
+| `vblanks_processed` | 50 | 50 |
+| `intr_queued` / `intr_run` | 118 / 119 | 67 / 58 |
+| `frames_presented` | 363 | 333 |
+| tid1 state | `status=2 wait=sema#7 pc=0x0101f468` | `status=Dormant pc=0x5ad8c8` |
+
+**EXECPS2 FIRED — the coordinator's stop condition. Entry PC reported:**
+
+```
+[execps2] entry=0x100008 gp=0x0 argc=2 argv=0x80075334
+VULCAN4 EXECPS2 -> unified resolve entry=0x00100008 (engine 0x00100008,0x00617a14)
+VULCAN4 EXECPS2 relaunch#1 entry=0x00100008 gp=0x00000000 argc=2 argv=0x80075334
+```
+
+The call site: `run_rpc` path — `[w119:unrouted] NEW syscall 0x7 raw=0x0 guestV1=0x7 a0=0x100008
+a1=0x0`, `PC=0x101f078 RA=0x1028b30`, `$a2=0x2 $a3=0x80075334`. So the guest invoked ExecPS2 with
+entry `0x100008`, `gp=0`, `argc=2`, `argv=0x80075334`. Both runs before this point load the same IRX
+set (SIO2MAN, MTAPMAN, MCMAN, MCSERV, PADMAN) — the module load is NOT the difference; what changes is
+that the guest now gets *past* it instead of parking 751 functions in.
+
+### The new wall (post-ExecPS2)
+
+The relaunch runs, then the EE hits five targets with no generated function and tid1 exits:
+
+```
+Error: No exact recompiled function for guest PC 0x5b7560 ... codeRegion=no
+[guest-branch:missing-target] kind=IndirectJump op=dispatch source=0x0 target=0x5b7560 pc=0x5b7560 ra=0x1001f0 sp=0x2000000 gp=0x6dddf0 a0=0x8a215c a1=0xffffffff
+Error: No exact recompiled function for guest PC 0x5adf20
+Error: No exact recompiled function for guest PC 0x48ef90
+Error: No exact recompiled function for guest PC 0x107f08
+Error: No exact recompiled function for guest PC 0x5b78a0
+```
+
+`0x04 sce_ExitThread calls=1 last_pc=0x005ad8c8` → `VULCAN4 THREADS runningThreadId=0 count=1` with
+tid1 `status=Dormant` → `halt=guest_blocked`. Note `0x5b7560` is an `IndirectJump` dispatched with
+`source=0x0` and `tableBase=0x1000008 tableEnd=0x102dbec` — the target is far outside the recompiled
+image, so this is a dispatch-input (analyzer/TOML) problem, not a runtime one.
+
+### Law-8 capture — RAW (Segment D)
+
+```
+$ cd tools/PS2Recomp && git diff --numstat
+171	6	ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+98	0	ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+28	7	ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+212	4	ps2xRuntime/src/lib/ps2_memory.cpp
+127	2	ps2xRuntime/src/lib/ps2_runtime.cpp
+
+# content check: every live added line must appear in the union of tools/patches/*.patch
+PASS  live_added=171  distinct=136  MISSING_from_patches=0  ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+PASS  live_added=98   distinct=74   MISSING_from_patches=0  ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+PASS  live_added=28   distinct=27   MISSING_from_patches=0  ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+PASS  live_added=212  distinct=150  MISSING_from_patches=0  ps2xRuntime/src/lib/ps2_memory.cpp
+PASS  live_added=127  distinct=86   MISSING_from_patches=0  ps2xRuntime/src/lib/ps2_runtime.cpp
+```
+
+Segment D's own files are carried whole by
+`tools/patches/ps2recomp-linux-w275-sleepthread-untimed.patch` (EeScheduler +171, Thread +28 —
+16905 bytes). A **count-based** check is not enough here and was rejected: the old patch
+`ps2recomp-linux-g18c-baselineframe.patch` shows `best+176` added lines for `EeScheduler.cpp` while the
+live diff is 171 — a bigger number that does not prove it carries today's lines. The check above
+compares line *content*, not counts.

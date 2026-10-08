@@ -1,0 +1,17 @@
+Add the interior-entry dispatch targets to the engine entry_points. Each is an interior address of a
+function reached only by a runtime-computed `jalr`/`jr` (packed sub-functions and shared return
+epilogues), so the control-flow analyzer cannot discover them as switch-case labels. collectInternal
+EntryTargetsImpl turns each into a `case 0x…u: goto label_…;` arm of its owner function.
+
+--- a/w251-engine_authoritative.toml
++++ b/w251-engine_authoritative.toml
+@@ entry_points = [
+   "handler_5B74E0@0x005B74E0",
+   "func_5B0850@0x005B0850",
++  "func_60B548@0x0060B548",
++  "func_60B590@0x0060B590",
++  "func_60B5C0@0x0060B5C0",
++  "func_60B608@0x0060B608",
++  "func_5DA258@0x005DA258",
++  "func_5DA308@0x005DA308",
+   "_sceCd_cd_read_intr@0x01014078",

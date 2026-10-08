@@ -2868,3 +2868,38 @@ this wall; (b) remaining `0x5a`/`0x5b` LIMITATIONs (`0x5b79f8`, `0x5b98d0`, `0x8
 
 Patch: `/home/or/vulcan4/tools/patches/ps2recomp-linux-r9-timer-idle-advance.patch` (EeScheduler.cpp full
 diff, reverse-apply OK).
+
+---
+
+## R10-R13 — interior-entry batch: dispatch misses cleared, guest now spins at 0x00580dd8 (architect, 2026-10-08)
+
+**Class batched.** The `missing_function` wall was the "runtime-computed `jalr` into a packed sub-function /
+shared epilogue" class — interior addresses of a function reached only by an indirect branch, so the
+control-flow analyzer never discovered them as switch-case labels. Added to `entry_points`
+(`/mnt/ssd/gt4/work/w251-engine_authoritative.toml`):
+```
+func_5B0850@0x005B0850   (R5)
+func_60B548@0x0060B548   func_60B590@0x0060B590
+func_60B5C0@0x0060B5C0   func_60B608@0x0060B608
+func_5DA258@0x005DA258   func_5DA308@0x005DA308
+```
+Regenerated (`PS2RECOMP_ENTRY_ADDR_CSV` + `PS2RECOMP_TABLE_SYMBOL=g_ps2EngineFunctionTable`), recompiled,
+relinked. Each addition became a `case 0x…u: goto label_…;` arm of its owner function (the
+`collectInternalEntryTargetsImpl` path).
+
+**Boot result** (45s `boot_w275r13.log`):
+
+| | R9 | R13 (batch) |
+|---|---|---|
+| functions_entered | 27730 | **32804** |
+| distinct_pcs | 282 | **747** |
+| ee_cycle | 1.11B | 1.40B |
+| intr_run | 191 | 197 |
+| halt | missing_function @0x0060b548 | **guest_cycle_no_progress @0x00580dd8** |
+
+The interior-entry dispatch misses are cleared: the halt is no longer `missing_function`. The guest now
+cycles on 1 address, `0x00580dd8` (ra=0x00580dac) — a SPIN/HANG, a new wall class (needs the same
+first-divergence-vs-oracle treatment, not another entry_point).
+
+Still latent: the sema id-allocation divergence (hardware signals id 41 vs our dense id 5), and the
+`0x5a`/`0x5b` LIMITATIONs (`0x5b79f8`, `0x5b98d0`, `0x80076000`).

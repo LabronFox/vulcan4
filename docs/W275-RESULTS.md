@@ -3566,3 +3566,24 @@ normal on hardware too.
 for the IOP to return the next SIF RPC command (file / track / car data) that makes `client[0]` non-zero and
 `func_5AF850` dispatch to the draw. The exact SIF cmd id needs either a recovered oracle or tracing the
 guest's `sceSifSetDma`/`SifCallRpc` posts (which command id the EE sends and the reply it expects).
+
+---
+
+## R5 E2 scope — the game is still loading via SIF RPC file I/O (SifCallRpc) + the MC/cdvd core.gt4 open (architect, 2026-10-08)
+
+**boot_w275r18.log facts:**
+- `sceSifSetDma` posts (after BIND): `src=0x886800` (0x14, setup), `0x886a80` (0x10),
+  `0x20886a40` (0x40, the main 64-byte SIF command), `0x888280` (0x8), `0x20886a40` (0x40, i=1). The cmd id
+  at +0x20 of the main command is `0x8000000A` (END, per the R16 trace); the BIND (`0x80000009`) is posted via
+  `SifBindRpc`, not `sceSifSetDma`.
+- File I/O: `[MC] Open guest='/BASCUS-97328GAMEDATA/core.gt4' host='…/mc0/BASCUS-97328GAMEDATA/core.gt4'
+  exists=0 result=-4` — the runtime maps the game's open onto an empty `mc0` host path and returns `-4`.
+
+**Verdict:** the game is still loading — it waits for the IOP's SIF RPC reply (the file/track/car data the
+EE posts via `SifCallRpc`) that makes `client[0x008899C0][0]` non-zero. That reply is a custom SIF RPC
+(fno in the `0x20886a40` payload), not a standard `0x80000009`/`0x8000000A`.
+
+**E2 sub-task scope:** model the IOP's SIF RPC file-I/O reply over the disc's `GT4.VOL` (read the volume and
+return the requested file data to the EE's `SifCallRpc`), and/or make the MC/cdvd open of `core.gt4` succeed.
+The exact RPC fno / command id needs either a recovered oracle (`pcsx2-qt -debugger`) or tracing the
+`SifCallRpc` payload at `0x20886a40`.

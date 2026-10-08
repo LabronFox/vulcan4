@@ -1,0 +1,39 @@
+W276 R27 -- the recompiler INPUT change that closes the 0x00577180 dispatch miss (the sibling of R26 0x00577168).
+Addresses and config only -- no game bytes. Apply to w276-engine_r26.toml.
+Emit verified: recomp_engine_r27/register_functions.cpp:493889
+  g_ps2RecompiledFunctionTable[1170526] = sub_00577170_0x577170; // 0x577180
+and ps2_recompiled_functions_40.cpp:66597 `case 0x577180u: goto label_577180;` + :66629 `label_577180:`.
+Slot check: (0x577180-0x100008)/4 = 1170526; the r26 0x577168 line is 1170520 (6 slots = 24 bytes apart).
+Measured halt, run/boot_w276r26on.log:
+  [guest-branch:missing-target] kind=IndirectCall op=JALR source=0x577430 target=0x577180 pc=0x577180
+  VULCAN4 HARNESS detail=no generated function at this pc pc=0x00577180
+=== diff (r26 -> r27)
+--- w276-engine_r26.toml	2026-10-08 19:36:08.947147641 +0300
++++ w276-engine_r27.toml	2026-10-08 20:01:05.754751099 +0300
+@@ -9,7 +9,7 @@
+ ghidra_output = ""
+ 
+ # Path to output directory
+-output = "/mnt/ssd/vulcan4-build/recomp_engine_r26/"
++output = "/mnt/ssd/vulcan4-build/recomp_engine_r27/"
+ 
+ # Single file output mode (recommended for large games)
+ single_file_output = true
+@@ -179,6 +179,17 @@
+   # discoverAdditionalEntryPoints() turns this into a resume entry under its owner
+   # (0x577100) -- the same shape as the already-registered neighbour 0x577170.
+   "hook_577168@0x00577168",
++  # R27: the SAME hole, its NEIGHBOUR. 0x577180 is the second of the two hooks the registrar at
++  # 0x577BF8 installs (0x577C28 writes record 0x655878=0x577168, 0x577C48 writes record
++  # 0x655880=0x577180 via the store helper 0x577170), and it is reached by a runtime JALR from
++  # 0x577430 inside the SAME {fn,arg} walk that calls 0x577168 (0x5773E4). It is 8 bytes --
++  # 0x577180 jr $ra / 0x577184 nop -- absent from engine-symbols.csv and from register_functions.cpp.
++  # Measured with VULCAN4_SIFRPC=1 on the r26 engine, run/boot_w276r26on.log:
++  #   [guest-branch:missing-target] kind=IndirectCall op=JALR source=0x577430 target=0x577180 pc=0x577180
++  #   VULCAN4 HARNESS detail=no generated function at this pc pc=0x00577180
++  # That run had already parsed TWO full raw SIF RPC passes (16 [SIFRPC] lines incl. the reboot-iop
++  # CALL) and got past R26's 0x577168 wall, so this is the next hole in the same class.
++  "hook_577180@0x00577180",
+   "handler_5B73C8@0x005B73C8",
+   "handler_5B7390@0x005B7390",
+   "handler_5B7408@0x005B7408",

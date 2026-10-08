@@ -4633,3 +4633,180 @@ at `pc=0x00580dd8` with `distinct_pcs=752`, `checkpoint_serviced=60`, `dispatche
 `serviced_invocations=122`, `blocked_on_servicing=0`, `vsync_tick=296`, `intr_queued=181`,
 `syscalls=37` / `total_syscall_calls=93244`, `missing_functions=0`. The next gap is still the one the
 dish named: nothing parses the raw SIF RPC call, so no read of GT4.VOL is ever issued.
+
+---
+
+## R27 — the probe-ON arm finally measured, and the wall is one address further out
+
+*2026-10-08, builder. Written against `run/boot_w276r26on.log` (6,304,725 bytes, tag `w276r26on`,
+45 s budget, 2,000,000 entries), the r26 engine (`recomp_engine_r26`, 47 objects) and
+`VULCAN4_SIFRPC=1`.*
+
+### R27.1 Why this run had to be redone, and what it proves
+
+R26's boot was measured on an engine that had **never been booted** — the harness predated the emit
+(R26.8). This run is the first one where `# engine=` in the log header names the emit the binary
+actually holds:
+
+```
+# W67 NAMED RUN tag=w276r26on entries=2000000 budget=45s at 20261008_195925
+# harness=2026-10-08 19:54:04.386691412 +0300
+# runtime=2026-10-08 19:27:56.800733181 +0300
+# engine=dir=/mnt/ssd/vulcan4-build/recomp_engine_r26 register_functions.cpp=2026-10-08 19:36:17.908707557 +0300 objects=47
+```
+
+**The r26 fix works.** `boot_w276r26c.log` (the pre-fix arm) halted at
+`no generated function at this pc pc=0x00577168` after 6,256 ms. This one never touches 0x577168.
+
+### R27.2 The raw result — probe ON, r26 engine
+
+```
+VULCAN4 BOOT REPORT functions_entered=12571 true_guest_entries=1562839 true_guest_exits=0 halt=missing_function bios_files=0 intr_queued=95 intr_run=78 intr_run_by_kind=66 gs_packets=15 frames_presented=354 gs_frame_reg_writes=2 (ctx0=2 ctx1=0) cop0_raised=INAPPLICABLE(0) cop0_delivered=INAPPLICABLE(0) pending_ip=0x0
+VULCAN4 THREADS eeCycle=30454380 nextEventCycle=34407093 runningThreadId=1 count=1
+    THREAD id=1 status=Ready prio=64 pc=0x5adcc8 ra=0x5b2e7c sp=0x1fffc90 entry=0x100008 waitReason=0 wakeupCount=0
+```
+
+Tag counts in the same log (`grep -ac`): `[DBCMAN]` **0**, `[SIFRPC]` **16**, `[fioOpen]` **6**,
+`[SetSyscall]` **29**, `[W105IRQ]` **260**, `[Yield]` **16**, `VULCAN 4 LIMITATION` **33**,
+`guest-branch:missing-target` **1**, `no generated function at this pc` **1**.
+
+`gs_packets=15` and `[DBCMAN]`=0 are **unchanged from the probe-OFF arm** — the RPC arm got further
+into the guest's startup, but no per-frame draw appeared, so the picture question is untouched (R5
+still not reached; see R27.6).
+
+### R27.3 The new wall, verbatim
+
+```
+[guest-branch:missing-target] kind=IndirectCall op=JALR source=0x577430 target=0x577180 pc=0x577180 ra=0x577438 sp=0x1fffef0 gp=0x6dddf0 a0=0x0 a1=0x1ffff80 a2=0x68be28 a3=0x14 s0=0x617d98 s1=0x68be28 v0=0x577180 v1=0x617da8 a0Readable=yes a0[0]=0x0 a0[4]=0x0 a0[8]=0x0 a0[c]=0x0 s0Readable=yes s0[0]=0x577168 s0[4]=0x0 s0[8]=0x101a70 s0[c]=0x0 recordReadable=no record[0]=0x0 record[4]=0x0 record[8]=0x0 record[c]=0x0 vtableReadable=no vtbl[0]=0x0 vtbl[4]=0x0 vtbl[8]=0x0 vtbl[c]=0x0 codeRegion=no policy=1 trace=0x5b72f8 -> 0x5b0f78 -> 0x5b0f78 -> 0x5adca0 -> 0x5b0db0 -> 0x5b0f78 -> 0x5ae060 -> 0x5b0e30 -> 0x5ae090 -> 0x5b1328 -> 0x5adcd0 -> 0x5b1298 -> 0x5adce0 -> 0x5adcb0 -> 0x5b2af8 -> 0x57f1
+VULCAN4 HARNESS detail=no generated function at this pc pc=0x00577180 distinct_pcs=748 checkpoint_serviced=38 dispatcher_transfers=28 serviced_invocations=66 service_frames=156 serviced_with_progress=65 blocked_on_servicing=0 invocations_run=78 vblanks_processed=56 frames_presented=354 intr_queued=95 intr_run=78 intr_run_by_kind=66 step_intr_run=66 irq_q=95 irq_attach=0 irq_runsite=0 irq_done=0 pending_now=11 pending_hi=44 thread_attached=0 inv_by_kind=[intr=66,dmac=0,override=0,other=0]
+```
+
+### R27.4 0x577180 is the *sibling* of 0x577168, not a new phenomenon
+
+Decoded from `/mnt/ssd/vulcan4-build/w231-engine.bin` (flat segment: **file offset = vaddr −
+0x100000**; `mips-linux-gnu-objdump` calls both the .bin and the .elf "file format not recognized",
+so this is `od -A x -t x4` + hand decode):
+
+```
+0x577170  lw v1,0(a1)          <- the store helper the registrar uses
+0x577174  sw a2,4(a0)
+0x577178  jr $ra
+0x57717c  sw v1,0(a0)          [delay]
+0x577180  jr $ra               <- THE MISS
+0x577184  nop
+0x577188  lw v1,0(a1)          <- the next registrar helper
+0x57718c  sw a2,4(a0)
+0x577190  jr $ra
+0x577194  sw v1,0(a0)          [delay]
+```
+
+The registrar at ~0x577BF8 installs exactly two hooks, and the walk that calls them is the `{fn,arg}`
+list at 0x5773E0-0x577434:
+
+```
+0x5773e4  jalr v0        (target 0x577168, from s0[0] where s0=0x617d98)
+0x5773e8  lw a0,4(s0)    [delay slot = the record's ARG]
+0x57742c  lw v0,0(v1)    (v1 = s0+0x10)
+0x577430  jalr v0        (target 0x577180)   <- the miss
+0x577434  lw a0,4(v1)    [delay slot]
+```
+
+Registration sites found by scanning the image for `lui hi; addiu rt,rt,lo` pairs reconstructing the
+target (`/mnt/ssd/tmp/scan/find_ptr.py`): **0x577168 n=1 → 0x577C28**, **0x577180 n=1 → 0x577C48**.
+Records written: `0x655878 = 0x577168` and `0x655880 = 0x577180`, through helper 0x577170.
+
+`0x577180` is **absent from `/mnt/ssd/vulcan4-build/engine-symbols.csv`** (19,404 Ghidra functions)
+and **absent from `recomp_engine_r26/register_functions.cpp`** — the identical shape to 0x577168, so
+the identical sanctioned remedy applies: a TOML `entry_points` line, regenerate, never hand-edit the
+emit (AGENTS.md: dispatch misses are BLOCKING; fix the tool input).
+
+This is the **second** instance of the class R26 named, and it confirms the class is real: any
+runtime-built pointer into a Ghidra hole lands in another function and the W236 fallback, which only
+promotes interiors of the function *containing* the unresolved jump
+(`ps2xRecomp/src/lib/control_flow_analyzer.cpp:442`), cannot see it.
+
+### R27.5 The emit, and what was verified in it — not inferred
+
+`w276-engine_r27.toml` = r26 + `"hook_577180@0x00577180"` + output → `recomp_engine_r27/`.
+Emit: `Recompilation completed successfully`, 50 files.
+
+```
+$ grep -n '0x577180' recomp_engine_r27/register_functions.cpp
+493889:        g_ps2RecompiledFunctionTable[1170526] = sub_00577170_0x577170; // 0x577180
+$ grep -rn 'label_577180\|case 0x577180u' recomp_engine_r27/*.cpp
+ps2_recompiled_functions_40.cpp:66597:        case 0x577180u: goto label_577180;
+ps2_recompiled_functions_40.cpp:66629:label_577180:
+```
+
+Slot arithmetic checks: `(0x577180 − 0x100008) / 4 = 1170526`, and the r26 line for 0x577168 is
+1170520 — 6 slots = 24 bytes = the two functions' distance. Both are resume entries owned by the
+enclosing function 0x577170, the same shape as the already-registered neighbour 0x577168.
+
+### R27.6 What the probe-ON arm actually got the game to do
+
+This is the part the dish wanted. With `VULCAN4_SIFRPC=1` the runtime now parses the guest's real raw
+SIF RPC traffic instead of synthesising a reply, and the guest walks **two full RPC passes**:
+
+```
+[SIFRPC] recvbuf a=0x80000002 b=0x886800 c=0x886740 d=0x0
+[SIFRPC] bind a=0x8899c0 b=0x80000001 c=0x1f10000 d=0x0
+[SIFRPC] call a=0x8899c0 b=0xff c=0x80000001 d=0x1
+[SIFRPC] bind a=0x874fa8 b=0x80000592 c=0x1f10080 d=0x0
+[SIFRPC] call a=0x874fa8 b=0x0 c=0x80000592 d=0x1
+[SIFRPC] bind a=0x657a40 b=0x80000593 c=0x1f10100 d=0x0
+[SIFRPC] call a=0x657a40 b=0x22 c=0x80000593 d=0x1
+[SIFRPC] reboot-iop arglen=32 mode=0 arg="rom0:UDNL cdrom0:\IOPRP300.IMG;1"
+[SIFRPC] iop-smflg reboot-IOP complete 0x0 -> 0x70000
+[SIFRPC] recvbuf a=0x80000002 b=0x886800 c=0x886740 d=0x0
+[SIFRPC] bind a=0x874fa8 b=0x80000592 c=0x1f10080 d=0x0
+[SIFRPC] call a=0x874fa8 b=0x0 c=0x80000592 d=0x1
+[SIFRPC] bind a=0x657a40 b=0x80000593 c=0x1f10100 d=0x0
+[SIFRPC] call a=0x657a40 b=0x22 c=0x80000593 d=0x1
+[SIFRPC] bind a=0x8899c0 b=0x80000001 c=0x1f10000 d=0x0
+[SIFRPC] call a=0x8899c0 b=0xff c=0x80000001 d=0x1
+```
+
+and it gets as far as **opening the game's own data files** (IOP-side fio, measured):
+
+```
+[fioOpen] FIRST-FOR-THIS-BUFFER buf=0x103f498 ra=0x10185ec path="rom0:ROMVER"
+[fioOpen] path="rom0:ROMVER" flags=0x1 -> fd=3
+[fioOpen] FIRST-FOR-THIS-BUFFER buf=0x10d1a50 ra=0x1005008 path="cdrom0:\CORE.GT4;1"
+[fioOpen] path="cdrom0:\CORE.GT4;1" flags=0x1 -> fd=4
+[fioOpen] FIRST-FOR-THIS-BUFFER buf=0x10d1a70 ra=0x1004e38 path="cdrom0:\CORE.GT4;1"
+[fioOpen] path="cdrom0:\CORE.GT4;1" flags=0x1 -> fd=5
+```
+
+`cdrom0:\CORE.GT4;1` opened **twice** and `rom0:ROMVER` once. The EE is no longer calling
+`sceSifSetDma` into a void — it is talking to IOP services by name and ID.
+
+### R27.7 THE NEXT GAP, NAMED — and it is file I/O, exactly as the dish predicted
+
+Every one of the guest's RPC calls now arrives at a real provider and is **refused, not faked**, with
+the project's own limitation line. These three refusals are the whole remaining wall between this
+boot and reads of GT4.VOL:
+
+| sid | rpc | calls | the refusal in the log |
+|---|---|---|---|
+| `0x80000001` | `0xff` | 2 | `VULCAN 4 LIMITATION: FileIO command 255 is not implemented — the guest asked for a filesystem operation this provider does not decode yet, and answering success would be a lie` |
+| `0x80000592` | `0` | 2 | `VULCAN 4 LIMITATION: CDVDFSV sid=0x80000592 rpc=0 is not implemented — unknown rpc number on the CD/DVD service, and answering success would be a lie` |
+| `0x80000593` | `0x22` (34) | 2 | `VULCAN 4 LIMITATION: CDVDFSV sid=0x80000593 rpc=34 is not implemented — unknown rpc number on the CD/DVD service, and answering success would be a lie` |
+
+So the ordering is now unambiguous and the dish's premise is **confirmed**:
+`fioOpen` succeeds → the guest binds its three services (`0x80000001` FileIO, `0x80000592` and
+`0x80000593` CD/DVD) → **calls them** → each call is refused → nothing reads GT4.VOL → `[DBCMAN]` stays
+0 → `gs_packets` stays 15 → the disclaimer stays on screen.
+
+The remaining unknowns to decode (Law 3 — refused, not guessed at), in dependency order:
+1. **FileIO `cmd 0xff` on sid 0x80000001.** Not a read yet — an `open`/`dopen`-family command the
+   provider does not decode. Its reply shape must come from the oracle, not from intuition.
+2. **CDVDFSV rpc 0 on 0x80000592** — the `CdInit`/status family (rpc 0 is conventionally `CdInit`).
+3. **CDVDFSV rpc 0x22 on 0x80000593** — a second, distinct CD service; rpc 34.
+4. Only then the **dbcman read surface over GT4.VOL** (ISO offset 0xcecb800, magic 0xacb990ad) that
+   the dish named.
+
+### R27.8 The picture, and it has not moved
+
+R5 requires the disclaimer to be gone. It is not: `gs_packets=15` in both arms, `[DBCMAN]`=0 in both
+arms, and the capture is unchanged. **STILL THE 2005 DISCLAIMER.** The dish's standing instruction is
+therefore not met, and no claim about the picture is made here.

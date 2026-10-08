@@ -3239,3 +3239,21 @@ is deriving the actual pool-entry pointer per command instead of the hard-coded 
 `SignalSema(46)` (not 0) fires. The GS/E3 is the separate picture blocker.
 
 Patch: `/home/or/vulcan4/tools/patches/ps2recomp-linux-r14-sif0-completion.patch` (updated SIF.cpp).
+
+---
+
+## R14b — pool entry is NOT at xfer.src+0x1C; cmd id 0x8000000A IS at +0x20 (architect, 2026-10-08)
+
+**Trace** (`[w275:sif0]`, R16 boot): `poolEntry=0x00000000 cmdId=0x8000000A` for every one of the 31 SIF1
+posts. So the command the EE posts (`xfer.src`) carries the cmd id at +0x20 but does **not** carry the pool
+entry at +0x1C (it is 0). The pool entry (`0x008735C4`) is the guest's recv buffer, allocated separately by
+the guest allocator (`jal 0x005B17D0`), and is filled into the IOP's **ack** (+0x1C), not the EE's command.
+
+**Net state:** `sub_005B1328` runs 31× (`iSignalSema ra=0x5b13d0`), the pool **does** reuse
+(distinct_pcs=748, functions_entered=56597), but `iSignalSema a0=0` (the entry `[0x8]` is 0) because the
+runtime cannot yet know the guest's recv-buffer allocation. `gs_packets` still 15 (no per-frame draw);
+`verify-menu.sh` still STRUCTURAL MATCH to the disclaimer (E3/GS).
+
+**Next:** derive the guest recv-buffer allocation (the pool entry) — e.g. intercept the guest allocator
+return or read the IOP ack buffer — so `SignalSema(46)` (non-zero) fires; the GS/E3 picture work is the
+separate remaining blocker.

@@ -127,6 +127,21 @@ instructions don't really help, mechanical blockers, to enforce rules, are more 
    dish appends to its doc.
 8. **Patch upstream, don't fork blindly.** Changes to `tools/PS2Recomp` go in `tools/patches/` with
    the reason, so a future `git pull` stays sane.
+   **AND NOTHING MAY LIVE ONLY IN THE WORKING TREE** (added 2026-10-08 after an audit found **1,065
+   uncommitted lines** — `ps2_runtime.cpp +921`, `ps2_runtime_macros.h +90`,
+   `instruction_translator.cpp +32`, `control_flow_emitter.cpp +22` — that NO patch carried: the w253
+   patch held only 567 of the 921 runtime lines, the w273 patch only 18 lines of `EeScheduler.cpp`).
+   Work that exists only in a working tree is work that a `git checkout`, a re-clone or a crash
+   deletes. So **before any dish may be called done**, the scribe runs the capture check and pastes
+   its RAW output into the dish doc:
+   ```bash
+   cd tools/PS2Recomp && git diff --numstat      # must be EMPTY, or every line must be in a patch
+   ls -la ../patches/ | tail -3                  # the patch carrying it, timestamped today
+   ```
+   Every change gets a patch under `tools/patches/`, verified **per file** against `--numstat` (a patch
+   carrying fewer added lines than the live diff has not captured it), committed in the outer repo.
+   **A dish whose gate exits 0 but whose source sits uncaptured is a FAILED dish.** The gate is the
+   deliverable; the record is what lets the next seat stand on your work instead of rediscovering it.
 9. **Never open an image in context.** Report the path; someone outside looks at it. (Reading images
    into a session breaks it permanently — there is a 20-image limit upstream.)
 10. **Commits author as the captain:** `Or Golan <or024662@gmail.com>`. Do not push.

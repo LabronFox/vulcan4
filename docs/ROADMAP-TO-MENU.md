@@ -40,7 +40,7 @@ forever — which is what we need. If we just say 'solve this', they report back
 | # | Rung | Gate (mechanical) | Status |
 |---|------|-------------------|--------|
 | **R1** | **The hand-off fires** — the unserviced DMAC interrupt invocation is serviced, the busy byte clears, sema 7 is signalled, `ExecPS2` runs | `grep -ac EXECPS2 boot_*.log` > 0 **and** the entry PC is recorded | ✅ `ExecPS2` count 1, entry `0x00100008` (boot_w275sleept.log) |
-| **R2** | **The engine actually executes** — entering the image does not immediately die; the first engine functions run and are named | boot log lists >0 executed PCs inside `0x00100000..0x00617A14`, and the halt is a named reason, not a crash | ⬜ |
+| **R2** | **The engine actually executes** — entering the image does not immediately die; the first engine functions run and are named | boot log lists >0 executed PCs inside `0x00100000..0x00617A14`, and the halt is a named reason, not a crash | ✅ 19 engine PCs, 0 dispatch misses, halt=`stuck_in_syscall` syscall 0x83 (boot_w275r2.log) |
 | **R3** | **The loader completes its own sequence** — file I/O, thread setup, GS/DMA init finish; the game's scheduler starts | no new LOUD limitation; threads run instead of parking; loader functions wind down | ⬜ |
 | **R4** | **GT4's own init reaches its main loop** — the game's state machine runs and advances | the game's state words advance across frames; frames presented keep climbing past the disclaimer's count | ⬜ |
 | **R5** | **Our GS presents GT4's own frames** — the picture changes from the disclaimer into something the game drew | a fresh capture whose structural signature differs from `.disclaimer-reference.png` beyond noise — **the captain's eyes confirm it is GT4 drawing** | ⬜ |

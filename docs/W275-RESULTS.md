@@ -4810,3 +4810,359 @@ The remaining unknowns to decode (Law 3 — refused, not guessed at), in depende
 R5 requires the disclaimer to be gone. It is not: `gs_packets=15` in both arms, `[DBCMAN]`=0 in both
 arms, and the capture is unchanged. **STILL THE 2005 DISCLAIMER.** The dish's standing instruction is
 therefore not met, and no claim about the picture is made here.
+
+---
+
+## R28 — THE ENGINE FUNCTION-POINTER-TABLE HOLES, AND WHY THE FIRST ATTEMPT DID NOTHING
+
+### R28.1 The two in-image tables and the JALR loop that walks them
+
+`SCUS_973.28`'s ELF maps vaddr 0x100000..0x617aa0 with **file offset = vaddr − 0xFF000**. Inside
+that image live two function-pointer tables that the engine walks:
+
+| table | vaddr | entries | shape |
+|---|---|---|---|
+| T1 | `0x616f24` | sentinel `0xffffffff`, then 370 pointers at `0x616f28`..`0x6174EC` | raw code pointers |
+| T2 | `0x6174f8` | 320 pointers, `T2[n] = T1[n] + 0x20` | raw code pointers |
+
+The JALR dispatch loop at **`0x5bc55c`** walks them top-down; the r27 halt at `0x594430` came out of
+that loop. Every pointer whose target is not a function *start* in the emit is a dispatch miss.
+
+### R28.2 The bug in the first fix, and the actual fix
+
+`mk28.py` inserted the 667 missing table entries with `src.rpartition('\n]')` — which finds the **last**
+`]` in the file. The last array in this TOML is `[performance] critical`, not `[general] entry_points`.
+So 667 hints landed in a list the recompiler never reads for entry points. `tomllib` proves it:
+`general.entry_points` was 214 in r27 **and 214 in r28**, and the r28 emit was therefore
+**function-identical to r27's** (18903 functions, 527560 entrypoints).
+
+The fix is a line-anchored injector (`/mnt/ssd/tmp/mk28b.py`): find the first line that is exactly
+`[general]`, then the first line after it that `startswith('entry_points = [')`, then the first line
+after **that** which is exactly `]` at column 0. Insert there.
+
+> **A tool-input fix that does not reach the tool input is not a fix.** The r27→r28 identity was the
+> measurement that caught it, not the intent.
+
+### R28.3 The r28 halt moves forward — to a single address
+
+With the r28 engine the halt is no longer the table walk. It is **one address**, `0x005c1d50`:
+
+```
+[guest-branch:missing-target] kind=IndirectCall op=JALR source=0x5c0ffc target=0x5c1d50
+VULCAN4 MISSING-BOUNDARIES n=1 : 0x0x005c1d50
+halt=missing_function ... gs_packets=15
+```
+
+`0x005c1d50` appears **zero times** as a 4-byte word anywhere in the image. It is formed at runtime
+by `*(*(obj+0x64)+4)` at `0x100f0c` and `jalr`'d at `0x5c0ffc`. It is real code: the oracle reaches
+`0x5c0fc8` (the same function) at Cycles 1815531758 with
+`a0=0x005c1d50 a1=0x005c1f98 a2=0x0 a3=0x006d6708` — register-for-register identical to our halt.
+It is not statically reachable, so it needs an **entry-point hint**, i.e. a tool-input fix.
+
+### R28.4 What the oracle measured at the two bind/call breakpoints (three measurements)
+
+PCSX2 DebugServer, live EE, **Pine IPC was not connected** so no state save/load was available.
+
+| # | breakpoint | Cycles | what it shows |
+|---|---|---|---|
+| 1 | `0x5b62b4` | 1810635448 | `v0=0x00022568` — inside the oracle `client->server` (client+0x24) is **non-NULL**; inside our runtime it is 0. The first divergence, two-sided. |
+| 2 | `0x5b62e8` | 1810654115 | `v0=0` after `sceSifCallRpc`, and the 4-byte receive buffer `0x889c80` went from all-zeros to `33 30 30 30 …` = word **`0x30303033`**, which the guest then copies to `0x889EA8` = client+0x28 (`0x5b6304`..`0x5b6310`). |
+| 3 | `0x5c0fc8` | 1815531758 | registers identical to our r28 halt (see R28.3). |
+
+---
+
+## R29 — THE TOOL-INPUT HOLE CLOSED, AND THE LOADFILE BIND SETTLED
+
+### R29.1 `0x005c1d50` closed at the tool input only
+
+`/mnt/ssd/gt4/work/w276-engine_r29.toml` is r28's config with `output` →
+`/mnt/ssd/vulcan4-build/recomp_engine_r29/` and one line inserted into `[general] entry_points`:
+
+```toml
+  "hook_5c1d50@0x005c1d50",
+```
+
+`tomllib` verified `entry_points` 882 → **883** and `0x005c1d50 present: True`. The emit proves the
+slot now exists — r29's `register_functions.cpp` line 522852 carries `5c1d50: 1`:
+
+```cpp
+g_ps2RecompiledFunctionTable[1247058] = sub_005C1D30_0x5c1d30; // 0x5c1d50
+```
+
+against `5c0fc8: 36`, `100ee0: 28`, `5c1f98: 4` for comparison. **The r28 emit had `5c1d50: 0`.**
+No generated output was hand-edited; the hole was closed by the tool input, per the project rule.
+
+### R29.2 The sid `0x80000006` bind loop, and what it actually is
+
+Measured, `/mnt/ssd/vulcan4-build/run/boot_w276r28on.log`:
+
+```
+[SIFRPC] bind a=0x889e80 b=0x80000006 c=0x0 d=0x0     # FIFTEEN times, lines 65684..66511
+```
+
+each preceded by the runtime's own:
+
+```
+VULCAN 4 LIMITATION: SIF RPC bind sid=0x80000006 client=0x889e80 has no server (no emulated IRX
+registered that sid and no HLE route can bind it), so cd->server stays NULL and the guest retries.
+Not fabricating a server.
+```
+
+The caller (`0x5b6268`..`0x5b6354`, disassembled out of `w231-engine.elf`) is a bind-once wrapper
+gated on a flag at `0x658358`. It calls `sceSifBindRpc(0x889e80, 0x80000006, 0)` at `0x5b629c`, then at
+`0x5b62b4` executes `lw v0,36(s0)` — **client->server at client+0x24** — and `beqz v0, 0x5b631c` takes
+the RETRY path when the server word is NULL. The guarded `sceSifCallRpc` at `0x5b62e0`
+(`fno 0xff`, recv `0x889c80`, rsize 4, `li t2,4` at `0x5b62dc`) is **never issued** while the bind
+returns NULL. That is the whole loop: a non-NULL server word is the only way past `0x5b62b4`.
+
+**Two distinct id namespaces, worth restating** because they are easy to conflate:
+- SIF **command ids**: `80000000h` Change SADDR, `80000001h` Set SREG, `80000009h` Bind, `8000000Ah` Call.
+- SIF **RPC server sids**: `80000001h` FILEIO, **`80000006h` LOADFILE**, `80000592h`/`80000593h`/
+  `80000597h`/`8000059Ah` CDVD, `80001300h` dbcman.
+
+The `beq r2,r0` at `0x5b62b4` SKIPS the call entirely when the bind returns NULL — so the "15 binds and
+never a call" shape is the guest's own control flow, not a runtime bug in the call path.
+
+### R29.3 The fix: an `IopService` that owns `0x80000006`
+
+New file `tools/PS2Recomp/ps2xIOP/src/modules/loadfile.cpp` (**208 lines**), registered in
+`CMakeLists.txt`, `module_factories.h` and `iop_subsystem.cpp`. It owns **one** sid (`0x80000006`) and
+declares **empty `moduleAliases()`** — the cdvdfsv/fileio reasoning verbatim: LOADFILE is IOP-resident
+(it is the thing that does the loading), so GT4 never `sceSifLoadModule`s it, and a service gated on an
+alias no load event will ever fire would stay dormant and the bind would keep failing. No aliases =
+always routed. Without the route `canBindRpc(0x80000006)` is false and the loop is unbreakable.
+
+An undocumented sid in the *routes* map is enough — `iop_module_manager.cpp`'s builtin-keys list was
+**deliberately left alone** ("loadfile" is absent from it, and it stays absent), because our empty
+alias list makes the key list irrelevant to this service.
+
+### R29.4 What is answered, and what is refused — the honesty line
+
+`handleRpc` answers exactly one function number: **`rpc=0xff`**, which is the one this image actually
+issues (from `li a1,255` at `0x5b62c8`). It is *not* any of ps2tek's documented `00h..05h`
+(SifLoadModule .. SifLoadElfEncrypted, `resources/09-ps2tek.md:6583`), and the corpus has nothing on
+it, so it is **given no meaning here** — only its number is known.
+
+The reply is the **oracle-measured** word `0x30303033` (R28.4 #2), written to the receive buffer, with
+`handled=true` and `resultAddress=request.receive.address`. The reasoning, in the file:
+
+> The SEMANTICS of the word are not decoded. It is written because matching the oracle is the safest
+> possible choice here: whatever the guest does with client+0x28 downstream, the real machine does it
+> with this value, so reproducing the value reproduces the machine's state.
+
+A **one-time** `VULCAN 4 LIMITATION:` states that the semantics are undecoded and cites its provenance
+(`PCSX2, breakpoint 0x5b62e8, Cycles 1810654115`). There is a second limitation if the guest ever asks
+for a reply shorter than the 4 measured bytes — `refuse`-and-report rather than silently truncating a
+half-updated buffer. **Every other LOADFILE rpc (00h..05h) is refused with an explicit limitation**, and
+`refuse()` answers `0`, never success: a module load that claimed success would make the guest jump
+into an IRX that was never loaded. Three debug metrics are exported (`loadfile_ff_calls`,
+`loadfile_refusals`).
+
+This is not a module loader. Nothing in it reads an IRX or an ELF; the disc-side load path is
+**dbcman's**, and this file does not touch it.
+
+### R29.5 LAW 8 CAPTURE CHECK — RAW OUTPUT
+
+`tools/patches/w276-r29-loadfile-sid-0x80000006.patch` (173,365 bytes). The check is **per file**,
+because a patch holding fewer added lines than the live diff has not captured it.
+
+```
+$ cd /home/or/vulcan4/tools/PS2Recomp && git diff --numstat | wc -l
+21
+
+$ awk '/^\+\+\+ /{f=substr($0,7); next} /^\+/{c[f]++} END{for(k in c) print k, c[k]}' <patch>  vs  numstat
+OK   live=   5 patch=   5 ps2xIOP/CMakeLists.txt
+OK   live=   5 patch=   5 ps2xIOP/src/iop_subsystem.cpp
+OK   live=   3 patch=   3 ps2xIOP/src/module_factories.h
+OK   live= 191 patch= 191 ps2xIOP/src/modules/cdvd.cpp
+OK   live= 104 patch= 104 ps2xIOP/src/modules/fileio.cpp
+OK   live= 208 patch= 208 ps2xIOP/src/modules/loadfile.cpp
+OK   live=  22 patch=  22 ps2xRecomp/src/lib/control_flow_emitter.cpp
+OK   live=  32 patch=  32 ps2xRecomp/src/lib/instruction_translator.cpp
+OK   live=   1 patch=   1 ps2xRuntime/include/ps2_call_list.h
+OK   live=  90 patch=  90 ps2xRuntime/include/ps2_runtime_macros.h
+OK   live=  57 patch=  57 ps2xRuntime/include/runtime/syscall_names.h
+OK   live= 202 patch= 202 ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+OK   live= 703 patch= 703 ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+OK   live=  12 patch=  12 ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp
+OK   live=  33 patch=  33 ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
+OK   live= 152 patch= 152 ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+OK   live=  35 patch=  35 ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h
+OK   live= 285 patch= 285 ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+OK   live=  28 patch=  28 ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+OK   live= 212 patch= 212 ps2xRuntime/src/lib/ps2_memory.cpp
+OK   live= 169 patch= 169 ps2xRuntime/src/lib/ps2_runtime.cpp
+--- files in live=21, files in patch=21
+files with MISSING capture: 0
+
+$ awk '/^\+\+\+ /{...} /^\+/{c[f]++} END{s=0; for(k in c) s+=c[k]; print s}' <patch>
+patch total added lines: 2549
+$ awk '{s+=$1} END{print s}' numstat
+numstat total added: 2549
+```
+
+> An earlier count of "2,409 added lines in the patch vs 2,549 in numstat" was a **checker bug**, not a
+> capture shortfall: `grep -c '^+[^+]'` excludes empty added lines (a bare `+`), of which this patch has
+> exactly 140. The `awk /^\+/` count above is the correct one and matches numstat exactly.
+
+Committed in the outer repo as `46e94e5`, author `Or Golan <or024662@gmail.com>`. Also committed:
+`tools/patches/w276-r28-engine-toml-fnptr-table-entry-points.patch` (74,076 B, 670 added lines).
+
+### R28.5 ORACLE MEASUREMENT #4 — the site our r28 run died on is a THREE-TARGET TRAMPOLINE
+
+PCSX2 DebugServer, live EE, stepped over the exact instruction the r28 run halted at. Cycles 1815531758
+→ **1815531795** (37 cycles), so the call returns immediately — this is a dispatcher, not a long job.
+
+`0x5c0fc8`..`0x5c1028`, disassembled with PCSX2's own disassembler:
+
+```asm
+0x005c0fc8:  addiu  sp, -0x40
+0x005c0fcc:  sd     s0,(sp)      ... s1..s6 and ra spilled ...
+0x005c0fd8:  dmove  s2, t0       ; s2 = 3rd callee
+0x005c0fe0:  dmove  s3, a1       ; s3 = 2nd callee
+0x005c0fe8:  dmove  s4, a2
+0x005c0ff0:  dmove  s5, a3
+0x005c1000:  dmove  s6, t1
+0x005c0ffc:  jalr   a0           ; CALL 1        <-- r28 halt: target 0x5c1d50, ra 0x5c1004
+0x005c1004:  jalr   s3           ; CALL 2
+0x005c1008:  dmove  s0, v0
+0x005c100c:  jalr   s2           ; CALL 3
+0x005c1010:  dmove  s1, v0
+0x005c1018:  dmove  a0, s0       ; s0 = return of CALL 1
+0x005c101c:  dmove  a1, s4
+0x005c1024:  dmove  a2, s1       ; s1 = return of CALL 2
+```
+
+Registers at the return (`PC=0x5c1004`, Cycles 1815531795) — the three targets, read off the machine:
+
+| reg | value | role |
+|---|---|---|
+| `s3` | `0x005C1F98` | **CALL 2** target |
+| `s2` (=`t0` at entry) | **`0x005C24C8`** | **CALL 3** target |
+| `v0` | `0x0088D950` | return value of CALL 1 |
+| `s1` | `0x00100EE0` | restored later as `a2` |
+
+So the trampoline runs **0x5c1d50 → 0x5c1f98 → 0x5c24c8** and then posts the first two results as
+`a0`/`a2` into a fourth call. All three callees are **function starts in the r29 emit** — verified,
+not assumed:
+
+```
+5c0fc8 -> g_ps2RecompiledFunctionTable[1246192] = sub_005C0FC8_0x5c0fc8; // 0x5c0fc8
+5c1d50 -> g_ps2RecompiledFunctionTable[1247058] = sub_005C1D30_0x5c1d30; // 0x5c1d50   <-- the r29 fix
+5c1f98 -> g_ps2RecompiledFunctionTable[1247204] = sub_005C1F98_0x5c1f98; // 0x5c1f98
+5c24c8 -> g_ps2RecompiledFunctionTable[1247536] = sub_005C24C8_0x5c24c8; // 0x5c24c8
+```
+
+0x5c1f98 and 0x5c24c8 were **already** slots; only 0x5c1d50 was the hole. The r29 entry-point hint is
+therefore the whole difference between the r28 halt and the trampoline executing.
+
+### R29 — what the LOADFILE rpc=0xff reply IS (oracle-decoded, 2026-10-08)
+
+The r28 measurement said the guest binds sid `0x80000006` and, because the bind returned NULL, its
+`beqz v0` at `0x5b62b4` skipped the call entirely. The r29 service answers it. What that call is for
+was then read straight off the live machine (PCSX2, EE paused at `PC=0x005c1004`, Cycles 1815531795) —
+the reply word is not a guess, and now its meaning is not a guess either:
+
+```asm
+0x005b6368:  lui    v1, 0x0089
+0x005b6384:  addiu  s1, v1, -0x6158     ; s1 = 0x889ea8  = client+0x28 (the copied reply)
+0x005b637c:  addiu  s3, v0, -0x7D64     ; s3 = 0x65829c  = the expected version string
+0x005b639c:  jal    0x57f188            ; memcmp(0x889ea8, 0x65829c, 4)
+0x005b63a4:  beqz   v0, ->0x5b63d4      ; equal -> return 0   <-- the match path
+; not equal: memcmp(0x889ea8, *(0x65835c), 4); if that differs too, memcmp(0x65829c, ...)
+```
+
+Read of the two constants, raw:
+
+```
+0x65829c : 33 30 30 30 00 00 00 00 5c 21 8a 00 04 00 00 00   |3000....\!......|
+0x65835c : b0 28 6d 00                                        ; -> 0x6d28b0
+0x6d28b0 : 2e 2e 2e 2e 00 00 00 00                            |....            |
+```
+
+So the guest is doing a **4-byte version handshake** against the ASCII string `"3000"` (expected) and
+`"...."` (the alternative), and the measured reply word `0x30303033` is exactly the little-endian
+bytes `33 30 30 30` = `"3000"`. The value written by the oracle at `0x889c80` is therefore the string
+the guest is waiting for — this is the version tag of the loader it is talking to, and the r29
+service now returns the matching one. `0x658360` in the same table reads `0x80014f40` (another SIF
+sid), and `0x658358` (the wrapper's "already bound" flag) is 0, set to `-1` by the reset path at
+`0x5b6410` — which is why the first call takes the bind branch at all.
+
+### R29 — LAW 8 capture check (raw, 2026-10-08 20:59)
+
+`tools/patches/w276-r29-loadfile-sif-rpc-server.patch` (173365 B) vs the live `git diff --numstat`
+of `tools/PS2Recomp` — the awk counts only real added lines (`^+`, not `^+++`):
+
+```
+$ cd tools/PS2Recomp && git diff --numstat
+5	0	ps2xIOP/CMakeLists.txt
+5	0	ps2xIOP/src/iop_subsystem.cpp
+3	0	ps2xIOP/src/module_factories.h
+191	0	ps2xIOP/src/modules/cdvd.cpp
+104	32	ps2xIOP/src/modules/fileio.cpp
+208	0	ps2xIOP/src/modules/loadfile.cpp
+22	0	ps2xRecomp/src/lib/control_flow_emitter.cpp
+32	0	ps2xRecomp/src/lib/instruction_translator.cpp
+1	0	ps2xRuntime/include/ps2_call_list.h
+90	0	ps2xRuntime/include/ps2_runtime_macros.h
+57	1	ps2xRuntime/include/runtime/syscall_names.h
+202	6	ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+703	3	ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+12	0	ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp
+33	0	ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
+152	0	ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+35	0	ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h
+285	35	ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+28	7	ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+212	4	ps2xRuntime/src/lib/ps2_memory.cpp
+169	5	ps2xRuntime/src/lib/ps2_runtime.cpp
+```
+
+Per-file coverage (live added lines vs the patch's added lines):
+
+```
+ps2xIOP/CMakeLists.txt                                  live+5     patch+5     OK
+ps2xIOP/src/iop_subsystem.cpp                           live+5     patch+5     OK
+ps2xIOP/src/module_factories.h                          live+3     patch+3     OK
+ps2xIOP/src/modules/cdvd.cpp                            live+191   patch+191   OK
+ps2xIOP/src/modules/fileio.cpp                          live+104   patch+104   OK
+ps2xIOP/src/modules/loadfile.cpp                        live+208   patch+208   OK
+ps2xRecomp/src/lib/control_flow_emitter.cpp             live+22    patch+22    OK
+ps2xRecomp/src/lib/instruction_translator.cpp           live+32    patch+32    OK
+ps2xRuntime/include/ps2_call_list.h                     live+1     patch+1     OK
+ps2xRuntime/include/ps2_runtime_macros.h                live+90    patch+90    OK
+ps2xRuntime/include/runtime/syscall_names.h             live+57    patch+57    OK
+ps2xRuntime/src/lib/Kernel/EeScheduler.cpp              live+202   patch+202   OK
+ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp                live+703   patch+703   OK
+ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp      live+12    patch+12    OK
+ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp       live+33    patch+33    OK
+ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp             live+152   patch+152   OK
+ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h               live+35    patch+35    OK
+ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp          live+285   patch+285   OK
+ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp          live+28    patch+28    OK
+ps2xRuntime/src/lib/ps2_memory.cpp                      live+212   patch+212   OK
+ps2xRuntime/src/lib/ps2_runtime.cpp                     live+169   patch+169   OK
+```
+
+21/21 OK, 0 SHORT, 0 missing.
+
+### R29 — the generic SIF RPC path is NOT the gap (measured, 2026-10-08)
+
+`rawRpcDeliverBatch()` (SIF.cpp, probe `VULCAN4_SIFRPC=1`, W276 R20) already parses the ps2sdk
+`SifRpcPktHdr` cid at `+0x08` and, for `SIF_CMD_RPC_CALL` (`0x8000000A`), reads rpc_number `+0x20`,
+send_size `+0x24`, recvbuf `+0x28`, recvsize `+0x2C`, rmode `+0x30`, sd `+0x34`, builds an
+`RpcRequest`, dispatches through `PS2IopTransport::handleRpc` → `IopSubsystem::handleRpc` **by sid**,
+and delivers a `SifRpcRendPkt_t` to the guest's own `sub_005B1328`. It is not missing.
+
+`run/boot_w276r28on.log` (probe ON) shows it running: `[SIFRPC] bind` x21, `[SIFRPC] call` x6, every
+call `handled=1` —
+
+```
+[SIFRPC] call a=0x8899c0 b=0xff c=0x80000001 d=0x1     ; FILEIO   rpc 0xff
+[SIFRPC] call a=0x874fa8 b=0x0  c=0x80000592 d=0x1     ; CDVDFSV  rpc 0
+[SIFRPC] call a=0x657a40 b=0x22 c=0x80000593 d=0x1     ; CDVDFSV  rpc 0x22
+```
+
+The wall is the other direction: 15 binds to sid `0x80000006` return NULL — `VULCAN 4 LIMITATION: SIF
+RPC bind sid=0x80000006 client=0x889e80 has no server ... Not fabricating a server.` (x8) — so the
+guest's `beqz v0` at `0x5b62b4` skips the CALL it guards, forever. R29 supplies that server.

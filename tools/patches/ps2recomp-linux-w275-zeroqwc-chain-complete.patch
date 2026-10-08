@@ -1,0 +1,366 @@
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 514db2a..5a6b449 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -10,9 +10,63 @@
+ #include <algorithm>
+ #include <string>
+ #include <vector>
++#include <cstdio>
++#include <cstdlib>
++
++// W275 T1-followup. The guest's own reads/writes of the DMAC busy byte are traced WITH the guest PC
++// by PS2Runtime::Load8/Store8 (ps2_runtime.cpp), and that path also lands here. This flag is raised
++// for the duration of that inner memory call so the memory-layer backstop below does not double-log
++// the same event (a guest poll of this byte can run very hot). OFF by default, like the whole probe.
++thread_local bool g_w275GuestBusyHandled = false;
+ 
+ namespace
+ {
++    // W275 T1-followup. Targeted DMAC busy-byte watch, gated on VULCAN4_W275_BUSY (OFF by default:
++    // unset reproduces today's behaviour byte for byte). The EE DMAC channel-busy byte lives in
++    // scratchpad at 0x7000206D + channel*12 for channels 0/1/2. This prints the raw scratchpad
++    // traffic on those bytes (and the 32-bit words that contain them) plus the three CHCR registers,
++    // so the write/read ordering can be read off a single boot.
++    inline bool w275BusyEnabled()
++    {
++        static const bool on = (std::getenv("VULCAN4_W275_BUSY") != nullptr);
++        return on;
++    }
++    inline bool w275BusyByte(uint32_t addr)
++    {
++        return addr == 0x7000206Du || addr == 0x7000207Du || addr == 0x70002089u;
++    }
++    inline bool w275BusyWord(uint32_t addr)
++    {
++        return addr == 0x7000206Cu || addr == 0x7000207Cu || addr == 0x70002088u;
++    }
++    inline bool w275ChcrAddr(uint32_t addr)
++    {
++        return addr == 0x10008000u || addr == 0x10009000u || addr == 0x1000A000u;
++    }
++
++    // W275 T1-followup #2. GIF chain-walk trace, gated on VULCAN4_W275_GIFTAG (OFF by default).
++    // The boot halts with a live-locking tid2 waiting on the ch2 (GIF, 0x1000A000) chain transfer:
++    // the CHCR kick (0x10000185 = DIR|MOD=1|TIE) enters the mode==1 walker and no completion ever
++    // follows. This prints TADR, every tag the walker actually reads (raw 16 bytes) and what became
++    // of chainBuf, so the drop point is readable instead of inferred.
++    inline bool w275GifTagEnabled()
++    {
++        static const bool on = (std::getenv("VULCAN4_W275_GIFTAG") != nullptr);
++        return on;
++    }
++    inline const char *w275ChName(uint32_t channelBase)
++    {
++        switch (channelBase)
++        {
++        case 0x10008000u: return "VIF0";
++        case 0x10009000u: return "VIF1";
++        case 0x1000A000u: return "GIF";
++        case 0x1000D000u: return "SPR_FROM";
++        case 0x1000D400u: return "SPR_TO";
++        default: return "?";
++        }
++    }
++
+     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
+     {
+         if (static_cast<uint64_t>(offset) + static_cast<uint64_t>(bytes) > static_cast<uint64_t>(regionSize))
+@@ -740,7 +794,13 @@ uint8_t PS2Memory::read8(uint32_t address)
+ 
+     if (scratch)
+     {
+-        return m_scratchpad[physAddr];
++        const uint8_t _v = m_scratchpad[physAddr];
++        if (w275BusyEnabled() && !g_w275GuestBusyHandled && w275BusyByte(address))
++        {
++            std::fprintf(stderr, "[w275:busy] op=READ8 addr=0x%08X value=0x%02X pc=na src=read8.scratch\n",
++                         address, static_cast<unsigned>(_v));
++        }
++        return _v;
+     }
+     if (physAddr < PS2_RAM_SIZE)
+     {
+@@ -827,7 +887,13 @@ uint32_t PS2Memory::read32(uint32_t address)
+ 
+     if (scratch)
+     {
+-        return loadScalar<uint32_t>(m_scratchpad, physAddr, PS2_SCRATCHPAD_SIZE, "read32 scratchpad", address);
++        const uint32_t _v = loadScalar<uint32_t>(m_scratchpad, physAddr, PS2_SCRATCHPAD_SIZE, "read32 scratchpad", address);
++        if (w275BusyEnabled() && !g_w275GuestBusyHandled && w275BusyWord(address))
++        {
++            std::fprintf(stderr, "[w275:busy] op=READ32 addr=0x%08X value=0x%08X pc=na src=read32.scratch\n",
++                         address, _v);
++        }
++        return _v;
+     }
+     if (physAddr < PS2_RAM_SIZE)
+     {
+@@ -938,6 +1004,11 @@ void PS2Memory::write8(uint32_t address, uint8_t value)
+ 
+     if (scratch)
+     {
++        if (w275BusyEnabled() && !g_w275GuestBusyHandled && w275BusyByte(address))
++        {
++            std::fprintf(stderr, "[w275:busy] op=WRITE8 addr=0x%08X value=0x%02X pc=na src=write8.scratch\n",
++                         address, static_cast<unsigned>(value));
++        }
+         m_scratchpad[physAddr] = value;
+     }
+     else if (physAddr < PS2_RAM_SIZE)
+@@ -1051,6 +1122,11 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
+ 
+     if (scratch)
+     {
++        if (w275BusyEnabled() && !g_w275GuestBusyHandled && w275BusyWord(address))
++        {
++            std::fprintf(stderr, "[w275:busy] op=WRITE32 addr=0x%08X value=0x%08X pc=na src=write32.scratch\n",
++                         address, value);
++        }
+         storeScalar<uint32_t>(m_scratchpad, physAddr, PS2_SCRATCHPAD_SIZE, value, "write32 scratchpad", address);
+     }
+     else if (physAddr < PS2_RAM_SIZE)
+@@ -1172,6 +1248,20 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+     if (scratch)
+     {
+         inRange(physAddr, sizeof(__m128i), PS2_SCRATCHPAD_SIZE, "write128 scratchpad", address);
++        if (w275BusyEnabled())
++        {
++            alignas(16) uint8_t _row[16];
++            _mm_storeu_si128(reinterpret_cast<__m128i *>(_row), value);
++            for (uint32_t _i = 0; _i < 16u; ++_i)
++            {
++                const uint32_t _a = address + _i;
++                if (w275BusyByte(_a))
++                {
++                    std::fprintf(stderr, "[w275:busy] op=WRITE128 addr=0x%08X byte=0x%08X value=0x%02X pc=na src=write128.scratch\n",
++                                 address, _a, static_cast<unsigned>(_row[_i]));
++                }
++            }
++        }
+         _mm_storeu_si128(reinterpret_cast<__m128i *>(&m_scratchpad[physAddr]), value);
+     }
+     else if (physAddr < PS2_RAM_SIZE)
+@@ -1208,6 +1298,11 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+ 
+ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ {
++    if (w275BusyEnabled() && !g_w275GuestBusyHandled && w275ChcrAddr(address))
++    {
++        std::fprintf(stderr, "[w275:busy] op=WRITE_CHCR addr=0x%08X value=0x%08X pc=na src=writeIORegister\n",
++                     address, value);
++    }
+     size_t timerIndex = 0u;
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+@@ -1380,6 +1475,15 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+         {
+             const auto dctrlIt = m_ioRegisters.find(0x1000E000u);
+             const bool dmacEnabled = (dctrlIt == m_ioRegisters.end()) || ((dctrlIt->second & 0x1u) != 0u);
++            if (w275GifTagEnabled())
++            {
++                std::fprintf(stderr,
++                             "[w275:giftag] KICK ch=%s addr=0x%08X value=0x%08X dctrl=0x%08X dmacEnabled=%d "
++                             "gsVRAM=%d\n",
++                             w275ChName(address & 0xFFFFFF00u), address, value,
++                             dctrlIt == m_ioRegisters.end() ? 0u : dctrlIt->second, dmacEnabled ? 1 : 0,
++                             m_gsVRAM ? 1 : 0);
++            }
+             if (!dmacEnabled)
+             {
+                 return true;
+@@ -1395,7 +1499,14 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 return true;
+             }
+ 
+-            if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) && (m_gsVRAM || channelBase == 0x10008000u))
++            const bool w275EnterGs =
++                (channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) &&
++                (m_gsVRAM || channelBase == 0x10008000u);
++            if (w275GifTagEnabled() && channelBase == 0x1000A000u && !w275EnterGs)
++            {
++                std::fprintf(stderr, "[w275:giftag] DROP ch=GIF reason=gsVRAM-guard (m_gsVRAM=0)\n");
++            }
++            if (w275EnterGs)
+             {
+                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
+                 {
+@@ -1431,6 +1542,16 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     const int kMaxChainTags = 4096;
+                     std::vector<uint8_t> chainBuf;
+ 
++                    const bool w275gt = w275GifTagEnabled() && channelBase == 0x1000A000u;
++                    if (w275gt)
++                    {
++                        std::fprintf(stderr,
++                                     "[w275:giftag] WALK ch=%s chcr=0x%08X mode=%u tie=%d asp=%u "
++                                     "tadr=0x%08X madr=0x%08X qwc=%u asr0=0x%08X asr1=0x%08X\n",
++                                     w275ChName(channelBase), value, mode, tieEnabled ? 1 : 0, asp,
++                                     tagAddr, madr, qwc, asr0, asr1);
++                    }
++
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+                     {
+                         const uint64_t bytes64 = static_cast<uint64_t>(qwCount) * 16ull;
+@@ -1488,6 +1609,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ 
+                     int tagsProcessed = 0;
+                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
++                    // W275. A chain of zero total QWC (e.g. NEXT -> END with QWC=0) is a LEGAL,
++                    // COMPLETED transfer: the DMAC clears STR and raises the channel's interrupt
++                    // exactly as if data had moved. The walker below only records data, so an
++                    // empty chainBuf must still mark the channel complete or the guest's wait
++                    // (FUN_0100AE78 polls the busy byte the handler clears) never terminates.
++                    bool chainWalkedToEnd = false;
+ 
+                     while (tagsProcessed < kMaxChainTags)
+                     {
+@@ -1500,6 +1627,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                         }
+                         catch (...)
+                         {
++                            if (w275gt)
++                                std::fprintf(stderr,
++                                             "[w275:giftag]   BREAK tag#%d tagAddr=0x%08X reason=translateAddress-threw\n",
++                                             tagsProcessed, currentTagAddr);
+                             break;
+                         }
+                         const uint8_t *tagBase;
+@@ -1515,7 +1646,14 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             tagMax = PS2_RAM_SIZE;
+                         }
+                         if (physTag + 16 > tagMax)
++                        {
++                            if (w275gt)
++                                std::fprintf(stderr,
++                                             "[w275:giftag]   BREAK tag#%d tagAddr=0x%08X reason=tag-out-of-range "
++                                             "phys=0x%08X tagMax=0x%08X spr=%d\n",
++                                             tagsProcessed, currentTagAddr, physTag, tagMax, tagInSPR ? 1 : 0);
+                             break;
++                        }
+ 
+                         const uint8_t *tp = tagBase + physTag;
+                         uint64_t tag = loadScalar<uint64_t>(tp, 0, 16, "dma chain tag", tagAddr);
+@@ -1601,8 +1739,24 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             appendData(dataAddr, tagQwc);
+                         if (irq && tieEnabled)
+                             endChain = true;
++
++                        if (w275gt)
++                        {
++                            std::fprintf(stderr,
++                                         "[w275:giftag]   tag#%d addr=0x%08X raw=%02X%02X%02X%02X%02X%02X%02X%02X"
++                                         "%02X%02X%02X%02X%02X%02X%02X%02X id=%u qwc=%u dw=%u irq=%d "
++                                         "end=%d payload=%d dataAddr=0x%08X nextTagAddr=0x%08X chainBuf=%zu\n",
++                                         tagsProcessed - 1, currentTagAddr,
++                                         tp[0], tp[1], tp[2], tp[3], tp[4], tp[5], tp[6], tp[7],
++                                         tp[8], tp[9], tp[10], tp[11], tp[12], tp[13], tp[14], tp[15],
++                                         id, tagQwc, addr, irq ? 1 : 0, endChain ? 1 : 0,
++                                         hasPayload ? 1 : 0, dataAddr, tagAddr, chainBuf.size());
++                        }
+                         if (endChain)
++                        {
++                            chainWalkedToEnd = true;
+                             break;
++                        }
+                     }
+ 
+                     m_ioRegisters[channelBase + 0x30] = tagAddr;
+@@ -1612,7 +1766,16 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     chcr = (chcr & 0x0000FFFFu) | (lastTagUpper << 16);
+                     m_ioRegisters[channelBase + 0x00] = chcr;
+ 
+-                    if (!chainBuf.empty())
++                    if (w275gt)
++                    {
++                        std::fprintf(stderr,
++                                     "[w275:giftag] END ch=%s tagsProcessed=%d chainBuf=%zu tagAddr=0x%08X "
++                                     "asr0=0x%08X asr1=0x%08X asp=%u chcrFinal=0x%08X enqueue=%s\n",
++                                     w275ChName(channelBase), tagsProcessed, chainBuf.size(), tagAddr,
++                                     asr0, asr1, asp, chcr, chainBuf.empty() ? "NO(chainBuf empty)" : "YES");
++                    }
++
++                    if (!chainBuf.empty() || chainWalkedToEnd)
+                     {
+                         PendingTransfer pt;
+                         pt.fromScratchpad = false;
+@@ -1644,6 +1807,15 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ 
+                 const bool autoProcessTransfers =
+                     (channelBase == 0x1000A000u) ? (m_gifPacketCallback || m_gifArbiter != nullptr) : true;
++                if (w275GifTagEnabled() && channelBase == 0x1000A000u)
++                {
++                    std::fprintf(stderr,
++                                 "[w275:giftag] PROCESS ch=GIF auto=%d cb=%d arbiter=%d pendingGif=%zu "
++                                 "pendingVif1=%zu pendingVif0=%zu\n",
++                                 autoProcessTransfers ? 1 : 0, m_gifPacketCallback ? 1 : 0,
++                                 m_gifArbiter ? 1 : 0, m_pendingGifTransfers.size(),
++                                 m_pendingVif1Transfers.size(), m_pendingVif0Transfers.size());
++                }
+                 if (autoProcessTransfers)
+                 {
+                     processPendingTransfers();
+@@ -1712,6 +1884,18 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
+         }
+         else
+         {
++            if (w275BusyEnabled())
++            {
++                for (uint32_t _i = 0; _i < chunk; ++_i)
++                {
++                    const uint32_t _a = PS2_SCRATCHPAD_BASE + scratchOffset + _i;
++                    if (w275BusyByte(_a))
++                    {
++                        std::fprintf(stderr, "[w275:busy] op=WRITE8 addr=0x%08X value=0x%02X pc=na src=spr_dma\n",
++                                     _a, static_cast<unsigned>(m_rdram[mainOffset + copied + _i]));
++                    }
++                }
++            }
+             std::memcpy(m_scratchpad + scratchOffset, m_rdram + mainOffset + copied, chunk);
+         }
+ 
+@@ -1747,6 +1931,20 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
+ void PS2Memory::processPendingTransfers()
+ {
+     const bool hadGif = !m_pendingGifTransfers.empty();
++    if (w275GifTagEnabled())
++    {
++        std::fprintf(stderr,
++                     "[w275:giftag]   SERVICED gif=%zu vif1=%zu vif0=%zu\n",
++                     m_pendingGifTransfers.size(), m_pendingVif1Transfers.size(),
++                     m_pendingVif0Transfers.size());
++        for (size_t di = 0; di < m_pendingGifTransfers.size(); ++di)
++        {
++            const auto &d = m_pendingGifTransfers[di];
++            std::fprintf(stderr,
++                         "[w275:giftag]     gifXfer[%zu] chainData=%zu qwc=%u spr=%d src=0x%08X\n",
++                         di, d.chainData.size(), d.qwc, d.fromScratchpad ? 1 : 0, d.srcAddr);
++        }
++    }
+     uint32_t observedGifQwc = 0u;
+     for (const auto &transfer : m_pendingGifTransfers)
+     {
+@@ -1966,6 +2164,11 @@ void PS2Memory::processPendingTransfers()
+         m_ioRegisters[D_STAT] = dstat;
+     };
+ 
++    if (w275GifTagEnabled())
++    {
++        std::fprintf(stderr, "[w275:giftag]   COMPLETE hadGif=%d hadVif0=%d hadVif1=%d\n",
++                     hadGif ? 1 : 0, hadVif0 ? 1 : 0, hadVif1 ? 1 : 0);
++    }
+     if (hadGif)
+     {
+         raiseDStatChannel(2u); // GIF channel
+@@ -2493,6 +2696,11 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+             {
+                 uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
+                 m_ioRegisters[address] = channelStatus;
++                if (w275BusyEnabled() && !g_w275GuestBusyHandled && w275ChcrAddr(address))
++                {
++                    std::fprintf(stderr, "[w275:busy] op=READ_CHCR addr=0x%08X value=0x%08X pc=na src=readIORegister\n",
++                                 address, channelStatus);
++                }
+                 return channelStatus;
+             }
+         }

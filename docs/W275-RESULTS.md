@@ -663,3 +663,71 @@ EXIT=0
 ```
 The menu gate correctly reports the screen is still the disclaimer: this dish **names a boot blocker**,
 it does not draw the menu (law 4). `missing-function hits: 0` — the halt is not a dispatch miss.
+
+---
+
+## Segment C — the zero-QWC chain completion fix (R1 gate attempt)
+
+*2026-10-08 · applied fix, rebuilt, booted, measured. Probes OFF for the R1 run.*
+
+**The fix** (ps2_memory.cpp, `tools/patches/ps2recomp-linux-w275-zeroqwc-chain-complete.patch`):
+`bool chainWalkedToEnd = false;` set true on the `endChain` break; gate widened
+`if (!chainBuf.empty())` → `if (!chainBuf.empty() || chainWalkedToEnd)`. A valid NEXT→END zero-QWC
+chain now pushes an empty `PendingTransfer`, so `hadGif=1`, the completion stanza raises D_STAT ch2 +
+`queueCompletedDmacCause(2)` and clears `GIF_CHANNEL+0x00` STR. Safe for the empty case: `pt.qwc = 0`
+and empty `chainData` fall through both consume branches (ps2_memory.cpp:1967/1973) without touching
+data.
+
+**R1 result — ExecPS2 does NOT fire.** `boot_w275r1.log` (probes OFF, 6,338,289 bytes, 0 frames):
+
+```
+grep -ac EXECPS2 boot_w275r1.log -> 0
+functions_entered=751  halt=guest_blocked  frames_presented=363  intr_run_by_kind=119
+thread_state=tid1:status=2:wait=sema#7:...:pc=0x0101f468:ra=0x01000de8
+             tid2:status=2:wait=sleep#0:...:pc=0x0101f348:ra=0x0100b680
+ee_cycle=248393998  next_event_cycle=250680249  sleepCurrentCalls=16076
+```
+
+**But the fix DOES change the mechanism** — the target poll is passed. `boot_w275r1busy.log`
+(`VULCAN4_W275_BUSY=1`), GIF busy byte 0x70002085:
+
+| | before fix (boot_w275tag4) | after fix (boot_w275r1busy) |
+|---|---|---|
+| set (=1) | 25 | 34 |
+| **clear at pc=0x100dcf0 (DMAC handler)** | **8** | **33** |
+| clear at pc=0x100afa8 (guest poll) | 24 (at 0x100af5c/0x100afa8) | **1** |
+
+So the empty-chain transfers now complete and the DMAC handler clears the GIF busy byte 33× instead of
+8× — the drop at line 1769 was real and is closed. tid2's return address moved off the busy poll:
+`ra=0x0100afa8` → `ra=0x0100b680`.
+
+**The NEW blocker — named, with a number, NOT fixed.** tid2 is now in the DMAC-struct handshake at
+0x100b628: `s0 = 0x70002050`, loop `ld v1,0(s0); beq s1,v1 -> jal 0x101f340` (SleepThread), i.e. spin
+until the qword at **0x70002050** changes from the snapshot at 0x100b668.
+
+```
+0x32 sce_SleepThread calls=16076  ra_count=0x0100b680 x16075, 0x0100afa8 x1
+                                  arg a0=0x00000001 x16075 (us=1), 0x100afa8/a0=0x8 x1
+0x42 sce_SignalSema   calls=57    a0 = 5 (25x), 6 (29x), 2 (1x), 4 (1x) -- NEVER 7
+SEM id=7 count=0 waiters=1
+```
+**SignalSema is called 57 times in the whole run and never once with `a0=7`.** tid1's only reason to be
+runnable is sema7 being signalled, and nothing signals it. That is the next blocker: sema7 has no
+signaller on this path.
+
+The coordinator's suspicion (a W161 SleepThread-as-timed-sleep / `completeTimedSleeps` gap) is **not**
+what is observed here: the sleeps are `us=1` and they *do* return (tid2 re-checks 16,075 times), so the
+timed-sleep wake path works. The wall is the missing SignalSema(7).
+
+### Law-8 capture — RAW (Segment C)
+
+```
+$ cd tools/PS2Recomp && git diff --numstat
+164	0	ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+98	0	ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+212	4	ps2xRuntime/src/lib/ps2_memory.cpp
+127	2	ps2xRuntime/src/lib/ps2_runtime.cpp
+
+ps2_memory.cpp  live+=212  patch+=212  PASS   (tools/patches/ps2recomp-linux-w275-zeroqwc-chain-complete.patch)
+EeScheduler/System/ps2_runtime carried by ps2recomp-linux-w275-t1b-giftag-empty-chain.patch (164/98/127)
+```

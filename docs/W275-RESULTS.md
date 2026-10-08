@@ -2903,3 +2903,200 @@ first-divergence-vs-oracle treatment, not another entry_point).
 
 Still latent: the sema id-allocation divergence (hardware signals id 41 vs our dense id 5), and the
 `0x5a`/`0x5b` LIMITATIONs (`0x5b79f8`, `0x5b98d0`, `0x80076000`).
+
+---
+
+## R13 spin @0x00580dd8 — static decode (architect, 2026-10-08)
+
+**Verdict in one line:** the EE is a *producer* spinning for a free 0x40-byte command buffer in the pool at
+**0x888240**; the buffer is only returned by the **IOP/SIF response path**, which never fires.
+
+### 1. What the spinning function is
+`0x00580dd8` is inside `sub_00580cd8` (0x580cd8–0x580fc0) — `ps2_recompiled_functions_40.cpp:67308`
+(`sub_00580cd8_0x580cd8`).
+
+The loop at `0x580dd8` (`file 40:67595-67620`) is a **pure register countdown delay**:
+```
+0x580dcc: v0 = 0x100000 (lui 0x10) ; v1 = -1
+0x580dd8: v0 -= 1 ; nop x4 ; bne v0, v1, 0x580dd8
+```
+It exits on its own after 0x100001 iterations when **`$v0 == $v1 == 0xFFFFFFFF`**. It reads **no memory**
+— it is the *delay limb* of a busy-wait. The halt reports "cycling 1 address" because the PC spends nearly
+all wall time here, but the actual hang is the **outer poll loop** that re-enters it.
+
+### 2. ra=0x00580dac — the caller
+`ra=0x580dac` is the return address of `jal func_5B17D0` at **0x580da4** (`file 40:67508`), *inside the same
+function*. The enclosing loop is `label_580d98` (`file 40:67497`):
+```
+0x580d98: v0 = func_5B17D0(0x874FA8, 0x80000592, 0)   ; a1=0x80000592 = IOP command
+0x580dac: if (v0 >= 0)  -> 0x580dfc  (proceed / post)
+          else: if (*(0x655ED0) > 0) func_5B0750(0x6CE138)   ; drain pending
+                delay(0x100000); goto 0x580d98
+```
+
+### 3. What it waits on (the exit condition)
+`func_5B17D0` (`file 41:198095`) returns **-1** when `func_5B11F0(0x888240)` returns **NULL**.
+`func_5B11F0` (`file 41:195840`) is the pool allocator:
+- count = `*(0x888248)` (read 0x5b1208), entries = `*(0x888244)` (read 0x5b1214), stride **0x40** (0x5b1274)
+- in-use flag = **bit0 of `*(entry + 0x10)`** (read 0x5b1220, `andi 0x1` 0x5b1224)
+- returns NULL when `count <= 0` **or** every entry has bit0 set.
+
+**The word that must change: `0x888240 + n*0x40 + 0x10`, bit0 must become 0** (one entry freed).
+
+### 4. Who should write it
+`func_5B1298` (`file 41:196122`) frees an entry: `*(entry+0x10) &= 0xFFFFFFFE` (store at **0x5b12b0**).
+Its callers are the reclaim/completion side:
+- `sub_005b1508` — `jal func_5B1298` at 0x5b15a4 / 0x5b15dc / 0x5b163c
+- `sub_005b1328` — at 0x5b13d0
+- `sub_005b19b0` — at 0x5b1b18 / 0x5b1b5c
+
+`sub_005b1508` is called from **exactly one** site: `jal` at **0x520708** inside `sub_00520698`
+(0x520698–0x520738, `file 37:30118`). `sub_00520698` is called only from `sub_0051f0f0`
+(0x51f0f0–0x51f8b8, `file 37:19000`) at 0x51f43c/0x51f4e8/0x51f580/0x51f680/0x51f768. **`sub_0051f0f0` has
+no direct `jal` caller anywhere in the recompiled output** — it is reached indirectly (registered handler /
+interrupt vector). That is the IOP/SIF response callback chain:
+```
+IOP response → sub_0051f0f0 → sub_00520698 (0x520708) → sub_005b1508 → func_5B1298  (frees pool entry)
+```
+
+**Conclusion:** `sub_00580cd8` posts a 0x40-byte command packet to the IOP (command `0x80000592`) and spins
+for a free pool buffer. The buffer is only released when the IOP completes the request and the SIF/response
+handler frees it via `func_5B1298`. If the IOP response (SIF RPC reply / DMA-done interrupt) never arrives,
+the pool stays full and the EE spins forever — this is the likely divergence to chase against the oracle
+(PCSX2: does the IOP ever ack command `0x80000592` at this point?).
+
+---
+
+## R13 ORACLE PASS — hardware's value at the spin's exit condition vs ours (measurer, 2026-10-08T16:12Z)
+
+Oracle: fresh `pcsx2-qt -debugger -fastboot /home/or/tidy/disk-images/gt.iso` (GT4 SCUS-97328), 4 breakpoints:
+`0x00580dd8` (the spin), `0x00580dac[cond v0<0]` (the exit condition word), `0x005b1280` (the pool-exhaustion
+NULL return), `0x005b1298` (the pool release).
+
+### The side-by-side
+
+| | HARDWARE (PCSX2 oracle) | OURS (boot_w275r13.log) |
+|---|---|---|
+| exit-condition word `a1 := v0` at `0x00580dac` | `0x00000000` (twice: Cycles 1,643,360,223 and 1,796,240,744) | negative (`-1`) on the 33rd call |
+| `0x00580db0 bgezl a1` | **TAKEN** → `pc = 0x00580dfc` | not taken → `0x580db8` |
+| `0x00580dd8` (the spin) | **never executed** over a run to Cycle 3,166,640,005 | 4096 dispatches → halt `guest_cycle_no_progress`, `ee_cycle=1405775538` |
+| `0x005b1280` (pool exhaustion) | **never fires** | reached |
+| pool descriptor `[0x00888240]` (alloc counter) | `0x00008d88` = **36,232** allocations through **32** slots ⇒ heavy reuse | 32 allocations, all 32 slots, **zero reuse** |
+
+**First disagreeing instruction: `0x00580db0 bgezl a1`.** Hardware `(int)a1 >= 0` → taken → `0x00580dfc`.
+Ours falls through to the `0x100000`-iteration delay loop at `0x00580dd8`. Everything after that is a symptom.
+
+### What our runtime isn't delivering — hardware-measured
+
+`0x005b1298` (the pool release) **fired on hardware** at Cycle 3,166,640,005 with:
+
+- `a0 = 0x20886A80` — the pool entry being freed
+- `ra = 0x005B13D8`
+- `sp = 0x00081EE0` — the **EE kernel stack** ⇒ **interrupt context**, not thread context
+- `s2 = 0x00081F20` — a kernel-stack event struct
+
+The handler is **`sub_005B1328`** (`0x5B1328`–`0x5B13E0`), entered with `a0` = that kernel-stack struct. Its
+`[a0+0x1C]` points at the request entry `0x00873F00`, which contains:
+
+```
++0x00 = 0x20886A80   pool-entry back-pointer
++0x04 = 0x00008D88   allocation-counter snapshot (== [0x00888240])
++0x08 = 0x0000002E   SEMA ID (46)  -- positive, so SignalSema IS called
++0x14 = 0x00113E70
++0x18 = 0x006D5DF0   guest callback's gp
++0x1C = 0x00000000   guest callback (NULL for this request)
+```
+
+Handler body, verbatim from PCSX2's native disassembler:
+
+```
+0x5B1348  lw v1,0x20(s2) ; lui v0,0x8000 | ori 0xA
+0x5B134C  beq v1,0x8000000A -> 0x5B1374        ; status OK
+0x5B1354  bnez (sltu v1) -> 0x5B13BC           ; other status: free only
+0x5B1364  beq v1,0x80000009 -> 0x5B13AC        ; status 9: copy fields
+0x5B1374  lw s1,0x1C(s2)                       ; the request entry
+0x5B1384  lw v0,0x18(s1) ; gp = v0             ; relocate gp for the callback
+0x5B1390  lw v0,0x1C(s1) ; jalr v0 ; a0=[s1+0x20]   ; call the guest callback
+0x5B13BC  lw a0,0x8(s1)                        ; SEMA ID
+0x5B13C0  bltz a0 -> 0x5B13D0                  ; skip if negative
+0x5B13C8  jal 0x005ADCD0                       ; <-- SignalSema(46)      **THE MISSING STEP**
+0x5B13D0  jal 0x005B1298 ; a0 = [s1]           ; <-- release the pool entry **THE MISSING STEP**
+```
+
+### Ours, from `boot_w275r13.log` (proves the release never happens)
+
+- 34 `[sceSifSetDma:DESC]` lines, all `ra=0x5b0d8c`; the `src` values march
+  `0x20886A40 → 0x20887200` (`31 * 0x40`) — **all 32 pool entries, each used exactly once, zero reuse**.
+- Line 67017 `sce_SignalSema calls=16 ra_count=0x01009cd0x4,0x0100b2c4x2,0x0100b1a0x2,0x01000b74x2,
+  0x01000df0x2,0x005b2e7cx2,0x0101b674x1,0x005bec9cx1` — **no `ra=0x5b13c8`**: the completion handler
+  never runs on our side.
+- Line 67029 `sce_WaitSema ra_count=0x005b18b4x32`; line 67025 `sce_DeleteSema ra_count=0x005b18bcx32`;
+  line 67013 `sce_CreateSema ra_count=0x005b1854x32` ⇒ exactly **32** successful `0x5B17D0` cycles; the
+  **33rd** returns `-1` at `0x5B1810` (`0x5B11F0` found no free slot).
+- Spin report line: `inv_by_kind=[intr=185,dmac=0,override=0,other=0]` — our runtime dispatched **zero**
+  DMA handlers, although GT4 registered one for **channel 5 (SIF0)** at `0x005B0E30`
+  (`sce_AddDmacHandler a0=0x00000005 a1=0x005b0e30`) and enabled it (`sce_EnableDmac a1=0x005b0e30`).
+- The cause is already declared in the log, lines 65472–65487: `VULCAN 4 LIMITATION: EE syscall 0x0B
+  AddSbusIntcHandler(cause=0..15) registered with id N -- SBUS interrupts are IOP-side and are never
+  delivered to a recompiled EE; the handler will not run and the cause will not be dispatched.`
+
+### Named chain (hardware)
+
+```
+SIF0 DMA completion interrupt
+  → dmac/SBUS dispatch (channel 5 handler 0x005B0E30 / 16 SBUS causes)
+    → sub_0051f0f0 → sub_00520698 (jal at 0x520708)
+      → sub_005b1508
+        → sub_005B1328  · 0x5B13C8 SignalSema(46)  · 0x5B13D0 sub_005B1298 (release pool entry)
+```
+
+Ours: `sceSifSetDma` is HLE'd and signals the wait sema itself, so `WaitSema` succeeds 32× — but the guest's
+release at `0x5B13D0` never executes, because the guest-side completion chain above is never entered. The
+32-slot pool at `0x00888240` fills, allocation #33 returns NULL, `0x5B17D0` returns `-1`, `0x580db0` is not
+taken, and the guest enters the delay loop whose exit condition hardware never even evaluates.
+
+### Instrument notes (both owned)
+
+1. `pcsx2_get_backtrace` while paused at `0x5B1298` **killed the emulator** (DebugServer `ECONNREFUSED`,
+   no `pcsx2` process). Relaunched cleanly: `pcsx2-qt -debugger -fastboot
+   /home/or/tidy/disk-images/gt.iso`, pid 981105, port 21512 listening. Do not call `get_backtrace` at a
+   high-iteration PC in this build.
+2. Harness `maxCycleRepeats=4096` is ~256× below the guest's legitimate 1,048,576-iteration delay loop
+   (`0x580dcc lui v0,0x0010` / `0x580dd8 addiu v0,-1` / `0x580dec bne v0,v1`), and
+   `EeScheduler::checkpointDue()`'s slice/priority branch yields on every back-edge (+32 cycles each), so
+   even a *correct* entry into that delay loop is misreported as `guest_cycle_no_progress`. Log line 66887
+   `VULCAN4 CYCLESUM loads=0 branches=0` confirms the harness never regained control anywhere but `0x580dd8`.
+
+**No fix written** — the architect's static pass owns it.
+
+---
+
+## R14 — SIF0 completion dispatch + maxCycleRepeats: spin cleared, guest runs full 45s (architect, 2026-10-08)
+
+**Fix (two parts):**
+1. `SIF.cpp sceSifSetDma`: after the EE→IOP (SIF1) copy, queue an `Interrupt` invocation for the SIF0
+   completion handler `sub_005B1328` (0x5b1328) with `a0 = xfer.src` per posted transfer, so the pool
+   entry is freed and `SignalSema(46)` fires (the hardware DMAC ch5 completion path).
+2. `vulcan4_harness.cpp`: `maxCycleRepeats` 4096 → `0x400000` (4,194,304), clearing the guest's legit
+   1,048,576-iteration delay loop that was misreported as `guest_cycle_no_progress`.
+
+**Boot result** (45s `boot_w275r14.log`):
+
+| | R13 | R14 |
+|---|---|---|
+| functions_entered | 32804 | **56119** |
+| ee_cycle | 1.40B | 2.92B |
+| vblanks_processed | 336 | 643 |
+| frames | 1349 | 2495 |
+| intr_run | 197 | 251 |
+| halt | guest_cycle_no_progress @0x580dd8 | **wallclock_deadline** (full 45s) |
+
+The 0x580dd8 spin is gone; the guest runs the whole 45s (`wallclock_deadline`, no wall), top PC
+`0x005b2980`.
+
+**Caveat:** `SignalSema ra=0x5b13c8` is still 0 in the tally — the `sub_005B1328` invocation's `a0`
+(the IOP→EE ack buffer the handler reads at +0x1C/+0x20) is likely wrong. The `maxCycleRepeats` raise is
+the definite half; the SIF0 completion `a0` needs oracle verification (the handler checks command ids
+0x8000000A/0x80000009 against `a0[0x20]`).
+
+Patch: `/home/or/vulcan4/tools/patches/ps2recomp-linux-r14-sif0-completion.patch` (SIF.cpp).

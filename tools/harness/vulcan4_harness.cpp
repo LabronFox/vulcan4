@@ -1120,7 +1120,10 @@ namespace
         // clear one call's internal loops. 4096 clears the measured worst case by >20x while
         // still naming a real hang; beyond that the instruction and wall-clock budgets are the
         // honest backstop.
-        uint64_t maxCycleRepeats = 4096;
+        // R14. The R4.8 oracle measured the guest's legit delay loop at 1,048,576 iterations of a
+        // single `addiu v0,v0,-1` cycle; 4096 (~256x below) misreported it as guest_cycle_no_progress.
+        // Raise to clear that loop with margin while still naming a real hang.
+        uint64_t maxCycleRepeats = 0x400000ull; // 4,194,304
         int maxSeconds = 120;            // wall clock
     };
 

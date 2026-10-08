@@ -2061,3 +2061,183 @@ ALL-COVERED
 $ ls -la tools/patches/ps2recomp-linux-r4-sif0-dmac-dispatch.patch
 -rw-rw-r--r-- 1 or or 1143 Oct  8 12:11 ps2recomp-linux-r4-sif0-dmac-dispatch.patch   <- SIF.cpp, 11 added lines
 ```
+
+---
+
+## R4 spin (corrected) — `0x5b1150` polls `SifGetReg(0x80000002)` which returns 0 → E2 (IOP/SIF0 ack), not a stub gap (architect, 2026-10-08)
+
+The prior R4 SIF0-DMAC-dispatch fix is **reverted**: the coordinator measured `writeEeRange` never runs,
+and the ch5 handler `sub_005b0e30` IS entered — the "never dispatched" hypothesis was wrong.
+
+**Static trace of the actual spin** (`sub_005b0e30`, `ps2_recompiled_functions_41.cpp:195480`):
+```
+0x5b1144: lui   a0, 0x8000         ; a0 = 0x80000000
+0x5b1148: jal   func_5AE0B0          ; SifGetReg (0x7A)
+0x5b114c: ori   a0, a0, 0x2          ; a0 = 0x80000002   (delay slot)
+0x5b1150: bnez  v0, 0x5b11b0         ; skip the spin iff v0 != 0
+```
+- `func_5AE0B0` (0x5ae0b0) = `addiu v1, zero, 0x7A; syscall 0` — the **SifGetReg (0x7A) thunk, N fixed**;
+  the caller only supplies a0=0x80000002 (log 66926: `0x7a ... ra=0x005b1150 a0=0x80000002 a1=0x006dddf0`).
+- The engine needs `SifGetReg(0x80000002) != 0` to take the `bnez v0 → 0x5b11b0` skip.
+- Ours returns **0**: `SIF.cpp::seedDefaultSifRegsLocked()` seeds `g_sifRegs[kSifRegMsCom]=0`
+  (`kSifRegMsCom = 0x80000002u`), and nothing in the runtime ever writes that key
+  (`sceSifSetReg` only ever writes 0x80000000 and 0x80000001 in this boot). So v0=0 → the spin runs.
+
+**What 0x80000002 is:** the SIF master-command register — the IOP's SIF0 response/ack to the EE, which the
+engine polls after `SifSetReg(0x80000000, 0)` + `SifSetReg(0x80000001, 0x00886818)` (the RPC buffer setup).
+Our IOP model never produces that ack.
+
+**VERDICT — E2, not a stub gap (do not fake):** the runtime's IOP/SIF model must write a non-zero
+acknowledgment to `g_sifRegs[0x80000002]` when it responds to the engine's SIF RPC init, so
+`SifGetReg(0x80000002) != 0` at 0x5b1148. This is the SIF0/IOP-response modeling gap, not a return-value bug.
+
+**Next wall (confirmed, not to be fixed now):** the unrecompiled TLB blob — `0x55-0x59 → 0x80075000`
+(`0x56 WaitEventFlag` hits "override handler 0x800750c8 has no generated function" 48×); the runtime has no
+TLB/COP0-mailbox model (W274 T2 §5). Still behind the current spin.
+
+---
+
+## R4 (runtime angle) — where the SIF RPC init ack belongs (design, NOT applied)
+
+**The handshake, decoded.** GT4's sifcmd `SifInitRpc` low-level (inside the ch5 handler `sub_005b0e30`) runs the
+standard SCE SIF-RPC init over raw registers:
+
+| Register | W/R | Meaning | Value GT4 uses |
+|---|---|---|---|
+| `0x80000000` | EE writes | `SIF_RPC_ID` — RPC init command | `0` |
+| `0x80000001` | EE writes | `SIF_RPC_SDATA` — EE send-buffer addr | `0x00886818` (EE RDRAM) |
+| `0x80000002` | IOP writes / EE polls | `SIF_RPC_RDATA` — IOP receive-buffer addr | **the ack** |
+
+The engine polls `sceSifGetReg(0x80000002)` at 0x5b1148 until non-zero. On real hardware the IOP's SCE sifcmd module
+receives the SIF1 command, publishes its RPC receive buffer in IOP RAM, and writes that address back through SIF0 —
+so `SifGetReg(0x80000002) != 0`.
+
+**Why ours spins (no bridge exists).** The EE's `g_sifRegs` map in `SIF.cpp` is only touched by EE stubs.
+Nothing on the IOP side can write it:
+- `IopRpcBridge::dispatchSifManImport` / `dispatchSifCmdImport` (iop_rpc.cpp) fire **only on IOP import thunks**
+  (IOP code calling sifman/sifcmd), never on an EE `SifSetReg`.
+- `IopSubsystem::onSifTransfer → IopEmulator::onSifTransfer → IopRpcBridge::onSifTransfer` is a **documented no-op**
+  ("The EE SIF transport owns the actual directional memory movement").
+- `signalRpcCompletionSema` (RPC.cpp:145) signals an EE RPC-completion semaphore; `IopHost::writeGuest` writes EE RAM
+  for DMA replies. Neither reaches `g_sifRegs[0x80000002]`.
+- `iop_memory` models no `0x1000F200`/`0x1F803800` SIF register file at all.
+
+So the ack **cannot** come from the IOP emulator today — it has no SIF register/DMA/interrupt path.
+
+**FIX SITE: `ps2_stubs::sceSifSetReg` (SIF.cpp:763).** It is the only site that observes the init writes and owns
+the reply key. Add, inside the existing `g_sifCmdStateMutex`-locked block after `g_sifRegs[reg] = value;`:
+- on `reg == kSifRegSubAddr` (0x80000001) **and** `g_sifRegs[kSifRegMsCom] == 0u` (0x80000002 still unacked):
+  `const uint32_t recvBuf = runtime ? runtime->allocateIopMemory(64u, 64u) : 0u;` then `g_sifRegs[kSifRegMsCom] = recvBuf;`
+
+**ACK VALUE + justification.** The ack is the IOP's RPC receive-buffer address. We reply with the address of a buffer
+**reserved from the runtime's own IOP allocator** (`allocateIopMemory(64,64)`; first allocation lands at
+`IopMemory::HeapBase = 0x00120000`, non-zero and inside the 2 MB IOP RAM). It is not a hardcoded guess:
+- the poll only requires non-zero (`bnez v0 → 0x5b11b0`), and the value must be a valid IOP RAM target for any later
+  SIF0 reply DMA — an actually-allocated buffer satisfies both;
+- it models what the real IOP sifcmd module does (publish *a* receive buffer); the specific address is an IOP-side
+  implementation detail that even differs across game revisions, and it is **unknowable from the EE side**.
+Re-arms naturally: `resetSifState`/`sceSifExitCmd` reseed `0x80000002 = 0`, so a re-init triggers the hook again.
+
+**E2 sub-task (the honest long-term fix, not to be faked into this hook):** model a SIF command-register mailbox in
+`IopEmulator`/`IopRpcBridge` so the IOP produces the ack itself (shared SIF register file + SIF1-in/SIF0-out +
+interrupt), replacing the EE-side hook. Optionally measure the bit-exact hardware receive-buffer address with PCSX2
+(break at 0x5b1148, read `v0` after the first non-zero `SifGetReg(0x80000002)`).
+
+**Not applied / not committed** — design only, per instruction.
+
+---
+
+## R4 · MEASURER · the SIF "ack" — what reality does (PCSX2 DebugServer, 3 boots)
+
+Task asked: the exact ack value(s) + timing + writer for `g_sifRegs[0x80000002]`, so the runtime can
+synthesize it. Measurement says the premise is wrong: **reg 0x80000002 is not the ack surface, and the
+value the runtime needs to produce is not a buffer address.**
+
+### 1. Address of reg 0x80000002 — NOT MMIO
+
+It is entry [2] of the 32-entry EE-kernel table `sif_regs[32]`, base **0x800212C0**, so reg2 lives at
+**0x800212C8**:
+
+- read:  `lw v0, 0x12C0(at)` @ **0x80006D68**  (`at = 0x80020000 + (reg<<2)`)
+- write: `sw a1, 0x12C0(at)` @ **0x80006C98**, guarded by `sltiu v1,v0,0x0020` (index < 32)
+
+The SIF MMIO windows (0x1000F000 / 0x1000F200) read back all zeros through this build — the register is
+served from kernel RAM, not from the SIF block.
+
+### 2. Writer of the initial 0 — the BIOS
+
+Live disasm at **0x9FC00CBC**:
+
+```
+0x9fc00cbc: 3c04a008  lui   a0, 0xA008          ; end = 0xA0080000
+...
+0x9fc00cd0: 7ca20000  sq    v0, (a1)           ; v0 = 0 (por v0,zero,zero)
+0x9fc00cd4: 24a50010  addiu a1, 0x10
+0x9fc00ce4: 1440fffa  bnez  v0, ->0x9FC00CD0
+```
+
+a1 = 0xA00212C0 (uncached alias of the table), a0 = 0xA0080000. Caught by a write watchpoint on
+0x800212C8 at EE cycle **8,115,350**, stored value **0**, caller ra = **0xbfc008d4**. The BIOS
+zero-fills the *whole* sif_regs table.
+
+### 3. What the engine's poll actually reads
+
+Poll site: `jal SifGetReg` @ **0x5B114C**, result consumed at **0x5B1150** (`bnez v0` early-out;
+slow path `jal 0x005B0DB0` send, then spin `jal 0x005B0880; beqz v0`).
+
+| run | call#1 value | call#1 cycle | call#2 value | call#2 cycle | engine writes reg2=1 @0x5B11A8 |
+|---|---|---|---|---|---|
+| r4e | 1 | 1,641,908,483 | 0 | 1,787,808,418 | 1,787,834,936 |
+| r4i | 1 | 1,635,282,239 | 0 | 1,779,588,415 | 1,779,616,230 |
+| r4k | 1 | 1,630,360,856 | 0 | 1,774,661,942 | 1,774,688,525 |
+
+**One value, not a sequence: 1 on the first poll, 0 on the second.** Absolute cycle stamps drift run
+to run; the Δ (~26.6k cycles) is the stable quantity.
+
+In r4k the BP at 0x5B11A8 was armed from before ELF entry and did **not** fire before call#1 — so the
+engine did not write the 1 that call#1 sees. Writer of that first 1 is still unmeasured (BIOS only
+zero-fills; 0x5B11A8 has not fired yet). **Open item.**
+
+### 4. The real ack surface — RDRAM 0x008869C0
+
+- read by **0x005B0880** (`v0 = *(0x008869C0 + index*4); jr ra`)
+- cleared by the 32-iteration loop 0x5B09A0-0x5B09C8 and by `sq zero` @ 0x00100160
+- written **1** by the store helper **0x005B0850**'s `sw v1,(v0)` @ **0x005B0868**
+  (`lw v0,0x10(a0); lw a2,0x1c(a1); lw v1,0x14(a0); sll v0,v0,2; addu v0,a2; jr ra; sw v1,(v0)`)
+- reached by the indirect **`jalr a2` @ 0x005B0F48** inside dispatcher **0x005B0E30**
+  (SCE sifcmd low-level handler; handler table base **0x00886818**, stride 0x0C)
+
+### 5. Writer / mechanism — an EE interrupt running the game's own handler
+
+At the dispatcher entry the return address is **ra = 0x00081FEC**, **sp = 0x00081FC0** — i.e. control
+came from `jalr v1` @ **0x00081FE4** (`addiu sp,0x1FC0` in the delay slot) and returns via
+`li v1,-5; syscall` @ 0x00081FEC, the EE kernel **interrupt trampoline**.
+
+r4hunt6 timeline: dispatcher entry cycle 1,787,896,200 → store helper 1,787,896,338 → engine writes
+reg2=1 @1,787,896,535.
+
+So the ack is **asynchronous, delivered by an EE interrupt ~26,600 cycles (~180 µs @ 147.456 MHz)
+after the spin starts, and executed by the game's own SIF handler**. Not IOP DMA. Not a BIOS routine.
+
+### 6. Consequence — do not write a fix, but here is what the fix must target
+
+Nothing needs to be synthesized in `g_sifRegs[0x80000002]` to unblock the spin: the spin waits on
+**RDRAM 0x008869C0 == 1**. The architect's SIF.cpp:763 hook (recvBuf = allocateIopMemory) targets the
+wrong variable at the wrong site, and the "break at 0x5b1148, read v0 for a receive-buffer address"
+sub-task is refuted — at 0x5b1148, a1 == gp == 0x006dddf0 in every measured hit, not a buffer address.
+
+### 7. Instrument limits measured (for the next seat)
+
+- An execution BP or a memcheck-break that fires inside EE BIOS/kernel context **cannot be resumed
+  past**: the EE stays pinned at the same PC and cycle count forever (reproduced at 0x9fc00cd0 and
+  0x80006c98). Removing the execution BP is the only way out; a memcheck cannot be removed without
+  crashing.
+- `remove_watchpoint` / `remove_memcheck` **double-frees and kills PCSX2** — `double free or
+  corruption (fasttop)`, same family as `clear_all_breakpoints`.
+- memcheck `action=log` emits **nothing** to stdout, never increments its hit counter, and pushes
+  nothing to a persistent socket: a dead instrument.
+- `pcsx2_step` hangs and conditional breakpoints never fire (pre-existing).
+
+Logs: /mnt/ssd/tmp/pcsx2-r4i.log (crash), /mnt/ssd/tmp/pcsx2-r4j.log, /mnt/ssd/tmp/pcsx2-r4k.log.
+Scratch instruments: /tmp/r4hunt4.py, /tmp/r4hunt6.py, /tmp/r4hunt7.py, /tmp/r4listen.py.
+Raw: /tmp/r4w7.out, /tmp/r4poll.out, /tmp/r4k.out.

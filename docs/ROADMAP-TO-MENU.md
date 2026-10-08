@@ -27,11 +27,10 @@ forever — which is what we need. If we just say 'solve this', they report back
 
 - Engine **fully linked**: 19,404 functions, 273,876 engine symbols in the harness (347 MB binary).
 - Engine image **placed byte-perfect** in RDRAM `0x00100000..0x00617A14` (identical to the hardware dump).
-- **`ExecPS2` fires 0 times** → the engine is entered **zero** times. `halt=guest_blocked`,
-  `functions_entered=723`, `true_guest_entries=1,694,274`, `bios_files=0`, `frames_presented` varies.
-- The wakeup chain is measured end-to-end: `tid2` (only `SignalSema(7)` waker) polls the DMA-busy byte →
-  the VIF0 transfer completes → the DMAC handler `FUN_0100DAE0` is registered and matches → **it is
-  never entered** → the busy byte never clears → `tid1` waits on sema 7 forever → no hand-off.
+- **`ExecPS2` FIRES — R1 done.** `count=1`, entry `0x00100008`, `functions_entered=10417` (up from 751),
+  `bios_files=0`. The wakeup chain is closed: zero-QWC GIF chain completes (STR clear + DMAC cause) →
+  handler clears the busy byte → `SleepThread` is untimed (W161 fixed) → tid2 wakes → `SignalSema(7)` →
+  `ExecPS2`. Two DMAC/sleep fixes carried in `ps2recomp-linux-w275-*.patch`.
 - Picture: the 2005 disclaimer. `bash .auto/verify-menu.sh` → exit 1.
 
 ---
@@ -40,7 +39,7 @@ forever — which is what we need. If we just say 'solve this', they report back
 
 | # | Rung | Gate (mechanical) | Status |
 |---|------|-------------------|--------|
-| **R1** | **The hand-off fires** — the unserviced DMAC interrupt invocation is serviced, the busy byte clears, sema 7 is signalled, `ExecPS2` runs | `grep -ac EXECPS2 boot_*.log` > 0 **and** the entry PC is recorded | 🔄 W275 in flight |
+| **R1** | **The hand-off fires** — the unserviced DMAC interrupt invocation is serviced, the busy byte clears, sema 7 is signalled, `ExecPS2` runs | `grep -ac EXECPS2 boot_*.log` > 0 **and** the entry PC is recorded | ✅ `ExecPS2` count 1, entry `0x00100008` (boot_w275sleept.log) |
 | **R2** | **The engine actually executes** — entering the image does not immediately die; the first engine functions run and are named | boot log lists >0 executed PCs inside `0x00100000..0x00617A14`, and the halt is a named reason, not a crash | ⬜ |
 | **R3** | **The loader completes its own sequence** — file I/O, thread setup, GS/DMA init finish; the game's scheduler starts | no new LOUD limitation; threads run instead of parking; loader functions wind down | ⬜ |
 | **R4** | **GT4's own init reaches its main loop** — the game's state machine runs and advances | the game's state words advance across frames; frames presented keep climbing past the disclaimer's count | ⬜ |

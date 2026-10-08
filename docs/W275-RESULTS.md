@@ -2541,3 +2541,240 @@ a separate, still-open wall.
 
 Patch: `/home/or/vulcan4/tools/patches/ps2recomp-linux-r6-tlb-stubs.patch` (+285/−35 full System.cpp diff,
 reverse-apply OK — carries the R6 TLB stubs on top of the pre-existing W275 probes in that file).
+
+## R6 static angle — sema5 wakeup source (SignalSema(5) never fires)
+
+### 1. Where tid1 blocks (the wall)
+`sub_005b17d0` (0x5b17d0–0x5b19b0, engine file 41) is an async-op completion-wait:
+- `0x5b184c jal func_5ADCA0` = CreateSema (struct on stack, init_count 0) → id stored at `0x8($s1)`.
+- `0x5b1884 jal func_5B0DB0` = the async op (SIF0/DMA send).
+- `0x5b18ac jal func_5ADCE0` = WaitSema, `a0 = lw 0x8($s1)` = **sema id 5**.
+  cite: `ps2_recompiled_functions_41.cpp:198397` (jal), `:198403` (a0 load). Parked pc=0x5adce8, ra=0x5b18b4.
+Sema5 = count 0, 1 waiter (boot report). Only tid1 exists → the wake must come from an INTERRUPT.
+
+### 2. SignalSema(5) sites — none fire
+- Engine SignalSema stub = `func_5ADCC0` (0x5adcc0, `li v1,0x42`), `ps2_recompiled_functions_41.cpp:173207`.
+- **158** call sites (`jal/j func_5ADCC0`) across files 32/38/39/40/42. **Every one loads a0 from a memory
+  slot** (`READ32(base+off)`); **none** loads literal 5. The sema id is a runtime struct-field value.
+- Proof none fired: boot log `0x42 sce_SignalSema calls=13` lists ra ONLY in 0x0100xxxx (kernel) — zero
+  0x005xxxxx (engine) call sites executed. The 2 `SignalSema(5)` (ra=0x0100b1a0, kernel `sub_0100B108`) are a
+  boot handshake, consumed by the 2 kernel `WaitSema(5)` (ra=0x0100b144) BEFORE tid1 ever waits.
+
+### 3. The interrupt handler that should wake sema5 — and the FALSE guard
+Engine registers two interrupt handlers (boot log AddIntcHandler/AddDmacHandler):
+- **INTC line 0xb → `sub_005b8158`** (0x5b8158–0x5b8450, file 42). FIRST action after prologue:
+  `lw v0,0x0(0x10001010); andi v0,0x400; beqz v0 → 0x5b8308` (early return).
+  cite `ps2_recompiled_functions_42.cpp:34643` (load), `:34647` (mask), `:34651` (branch).
+  0x10001010 = **EE Timer 2 MODE** (`kEeTimerBases[2]=0x10001000`, mode offset 0x10 —
+  `src/lib/ps2_memory.cpp:199-206`); 0x400 = bit 10 = **EQUF** (compare-match flag,
+  `kEeTimerModeEquf = 1<<10`, `ps2_memory.cpp:216`).
+- **DMAC line 5 (SIF0) → `sub_005b0e30`** (0x5b0e30, file 41).
+
+**Why neither fires (missing state):**
+- Boot report `inv_by_kind=[intr=52,dmac=0,override=0,other=0]`, `irq_attach=0 irq_runsite=0 irq_done=0` —
+  the harness raises 52 synthetic VBLANKs and **zero DMAC (SIF0) interrupts**, and never attaches/runs a
+  guest IRQ handler.
+- `sub_005b8158`'s guard reads **Timer 2 EQUF (0x10001010 & 0x400)**; the harness never advances Timer 2
+  to its compare value, so EQUF stays 0 and the handler bails at `0x5b8194 → 0x5b8308` every entry.
+
+**Net:** sema5's wake is an interrupt-driven completion signal (SIF0 DMAC, or the Timer-2 frame handler).
+The word that is never set = `READ32(0x10001010) & 0x400` (Timer 2 EQUF) — and the DMAC interrupt source is
+never delivered at all (`dmac=0`). No fix written (static analysis only).
+
+---
+
+# R6 ORACLE ANGLE — what REALITY does (PCSX2 DebugServer + Ghidra)
+
+**Date 2026-10-08.** Seat: measurer (the oracle). Instrument: PCSX2 `-debugger`, DebugServer :21512,
+game `Gran Turismo 4 (SCUS-97328)`, PID 858872, log `/mnt/ssd/vulcan4/tmp/pcsx2-r6-b5.log`.
+Every number below was read from the live oracle; the source is named for each. **No fix is written here.**
+Mission text as handed to this seat: *"name the sema5 signaller on hardware — deliverable: the SignalSema(5)
+caller (pc + ra + thread) on hardware, and the condition that gates it."*
+
+## 0. THE ANSWER IN ONE LINE
+
+On hardware there is **no `SignalSema(5)`**: id 5 is never used. The semaphore the recomp calls "sema5" is a
+recomp-local dense id, and its hardware counterpart is signalled from **interrupt/kernel context** — pc
+`0x00557AF0`, ra `0x00081FEC` (the kernel exception vector's own return), thread = the kernel interrupt
+stack (`sp = 0x00081FC0`), never a game thread. The signal is gated by a **two-stage** check: the handle
+validator at `0x00578290`, then **CP0 Status bit 0** at `0x005784AC`.
+
+---
+
+## 1. Hardware semaphore ids are dynamic — "sema5" does not exist
+
+Measured ids at the stubs `0x005ADCE0` (WaitSema) / `0x005ADCD0` (iSignalSema) / `0x005ADCC0` (SignalSema)
+across this and prior sessions: **4, 7, 17, 26, 30, 31, 40, 41**. A probe with `a0 == 5` at every stub
+never fired in any session.
+
+The EE kernel assigns semaphore ids densely from its own allocator; they are therefore a property of the
+**run**, not of the program. The recomp's id 5 comes from `EeScheduler::allocatePositiveId`
+(`m_nextSemaphoreId = 1`) — a recomp-local counter. **The two numbers are in different id spaces and must
+not be compared.** The hardware equivalent of the recomp's "sema5" is the semaphore the park site creates
+for itself (next section).
+
+## 2. The park site is reached on hardware, and its WaitSema argument is dynamic
+
+- BP at `0x005b18ac` (the `jal 0x005ADCE0` WaitSema) **fired** at cycles 2014530152. `s1 = 0x008899C0`,
+  `ra = 0x005B188C`. (Disproves any doubt that hardware never executes this site.)
+- The argument is **not a constant**: `[s1+8]` read `0x1E` (30) on the first invocation and `0x1F` (31) on
+  the second. The id is created by the same function — `jal 0x005ADCA0` (CreateSema) at `0x005b184c`,
+  return stored at `0x005b1858` — with the RPC name `"SceSifrpcBind"` (`0x006D25D8`).
+- Confirmed at the stub `0x005ADCE0`: `a0 = 0x0000001F (31)`, `ra = 0x005B18B4`, `s1 = 0x0086CC84`,
+  `k0 = 0x70030C13`.
+
+So the recomp's constant `WaitSema(5)` corresponds to a **freshly created id per call** on hardware.
+
+## 3. The signaller: pc + ra + thread (measured twice, byte-identical)
+
+**pc = `0x00557AF0`.**
+
+Handler entry (BP at `0x00557AF0`, two independent captures):
+
+| reg | value | meaning |
+|---|---|---|
+| `v1` | `0x00557AF0` | the `jalr v1` target of the kernel exception vector |
+| `ra` | `0x00081FEC` | **the vector's own return address** — entered directly, no game caller |
+| `sp` | `0x00081FC0` | **the kernel interrupt stack** (`lui sp,0x0008` + delay slot `addiu sp,sp,0x1FC0`) |
+| `k0` | `0x70030C12` | CP0 Status mirrored into k0 at interrupt entry |
+| `a0` | `0x00000002` | the dispatcher's index/channel at entry |
+| `a1` | `0x00000129` | **the semaphore handle, supplied by the dispatcher** |
+| `a3` | `0x00000129` | same handle, mirrored |
+
+Body (live disasm, 11 instructions):
+
+```
+0x00557af0: addiu sp, -0x10
+0x00557af4: sd    ra, (sp)
+0x00557af8: jal   ->0x00578480      ; GT4's signal-a-semaphore helper
+0x00557afc: dmove a0, a1            ; DELAY SLOT: the handle is the handler's own a1
+0x00557b00: SYNC
+0x00557b04: ei
+0x00557b08: dmove v0, zero
+0x00557b0c: ld    ra, (sp)
+0x00557b10: jr    ra
+0x00557b14: addiu sp, 0x10
+```
+
+The signal it issues (BP at `0x005ADCD0`, identical in both captures):
+
+- `a0 = 0x00000029` → **semaphore id 41** (handle `0x129`, validator index `0x29`)
+- `ra = 0x005784C8` (inside the helper), `sp = 0x00081F90`, `k0 = 0x70030C12`, `s0 = 0x29`
+
+Stack proof that the caller is `0x00557AF0` (read live at the stub, `sp = 0x00081F90`, 64 B):
+
+```
+[0x81F90] = 0x80019160   ; helper's saved s0
+[0x81FA0] = 0x00557B00   ; helper's saved ra  -> 0x00557AF0 + 0x10  == THIS handler
+[0x81FB0] = 0x00081FEC   ; handler's saved ra -> the kernel vector's jalr return
+[0x81FB8] = 0x00081FEC
+```
+
+**thread:** interrupt/kernel context — the kernel interrupt stack, entered from the exception vector. The
+signal is **not** issued by a game thread. (This is why a recomp that models "a game thread signals sema"
+will never reproduce it.)
+
+**The handle is a dispatcher-supplied argument.** The handler does not look the handle up: it signals
+whatever the kernel dispatcher placed in `a1` when it entered the handler. Therefore the identity of the
+semaphore that gets signalled is decided at **handler-registration time**, and the gate on "does the signal
+happen at all" is **whether the interrupting line asserts** — not any value inside the handler.
+
+A second, distinct once-per-frame signaller reaches the same helper through GT4's own stub: the handler at
+`0x00551728` loads its handle from the fixed slot `[0x0064C718] = 0x0000011A` → validator index `0x1A` →
+**id 26**; measured Δ cycles 4,918,903 ≈ 294.912 MHz ÷ 59.94 = one frame. `[0x0064C718]` is **unchanged**
+(`0x0000011A`) at the moment the id-41 signal fires, proving the two signallers are genuinely different
+paths, not one path re-entered.
+
+## 4. The gate (disassembled live, two stages)
+
+**(a) handle validator, `0x00578290`** — runs first, in the helper at `0x00578490`:
+
+```
+0x00578294: sra  v1, a0, 0x08
+0x005782a0: and  v1, 0x7FFFFF      ; v1 = generation = (handle >> 8) & 0x7FFFFF
+0x005782a4: andi a0, 0x00FF        ; a0 = index = handle & 0xFF
+0x005782ac: beqz v1, ->0x005782C8  ; generation == 0 -> error
+0x005782bc: lw   v0, 0x4550(at)    ; v0 = table[0x00874550 + index*4]
+0x005782c0: beq  v1, v0, ->0x005782D8
+0x005782c8: (error path) -> a0 = -1
+```
+
+and in the helper, `0x0057849c-0x005784a4`:
+
+```
+0x0057849c: li   v0, -1
+0x005784a0: beql s0, v0, ->0x005784EC   ; id == -1  ->  RETURN, NO SIGNAL AT ALL
+```
+
+So a stale or wrong-generation handle produces **no signal whatsoever** — not a failed signal, an absent one.
+
+**(b) CP0 Status bit 0, `0x005784ac-0x005784b8`:**
+
+```
+0x005784ac: mfc0  v0, Status
+0x005784b0: xori  v0, 1
+0x005784b4: andi  v0, 1
+0x005784b8: beqzl v0, ->0x005784D8    ; IE == 0 -> iSignalSema
+0x005784c0: jal   ->0x005ADCD0        ; iSignalSema(-0x43)
+0x005784d8: jal   ->0x005ADCC0        ; SignalSema(0x42)
+```
+
+Measured `Status = 0x70030C12` at every stub hit → bit 0 = 0 → **iSignalSema** (`0x005ADCD0`). `SignalSema`
+(`0x005ADCC0`) is taken only when bit 0 is set. The helper's full frame is `0x20` bytes
+(`sd s0,(sp); sd s1,8(sp); sd ra,0x10(sp)`), so the caller's ra is at `sp+0x10`.
+
+## 5. Consequence for the recomp — leads, NOT fixes
+
+1. **The engine stub scan targets the wrong stub.** All interrupt-context signals go to **`0x005ADCD0`
+   (iSignalSema, syscall `-0x43`)** via helper `0x00578480`. `0x005ADCC0` (SignalSema, `0x42`) is reached
+   only when CP0 Status bit 0 is set. A scan of "the 158 call sites of `0x5adcc0`" therefore **cannot see
+   the real wake path**; the path to scan is `0x005ADCD0` and its single static caller `0x005784C0`.
+2. **The values to gate on** are the validator table entry `table[0x00874550 + index*4]` vs
+   `(handle>>8) & 0x7FFFFF`, and CP0 Status bit 0 — not the syscall number.
+3. **Recomp-side lead:** `ei` compiles to `ctx->cop0_status |= 0x10000; // Enable interrupts` (bit 16) while
+   the guest gate tests **bit 0** (`andi v0,1`). The guest's own signal path would therefore choose the
+   *wrong* stub if it were ever reached. Reported as a lead.
+4. **Cross-seat correction (my own earlier false lead, now withdrawn):** `sub_00551728_0x551728` **is**
+   emitted and **is** registered — `ps2_recompiled_functions_38.cpp` / `register_functions.cpp:467482-467483`,
+   `g_ps2RecompiledFunctionTable[1131976] = sub_00551728_0x551728; // 0x551728` and `[1131982] ... // 0x551740`
+   (engine build: `g_ps2EngineFunctionTable[...]`). The "zero references" claim came from grepping the wrong
+   symbol name (`func_551728`). What remains genuinely open: **no reader of that function table was found
+   outside `register_functions.cpp`** — so the JALR/dynamic-dispatch consumer is still unidentified.
+
+## 6. What was NOT observed (and the instrument that was checked first)
+
+- **No signal to the park site's semaphore (ids 30/31)** during ~1.65 s / 485 M cycles of free run.
+- A one-shot BP at **`0x005b18b4`** — the instruction *after* the park-site WaitSema call, which executes
+  only if the wait **RETURNED** — **did not fire** in ~920 M cycles, while the EE sat in the kernel idle loop
+  `0x00081FC0` with `Paused: false` and the frame timer running (`QObject::startTimer` lines in the log,
+  confirming active rendering). This is consistent with the completion being signalled in kernel/interrupt
+  context on a line the recomp never delivers — matching the architect's `dmac=0`, `irq_attach=0`.
+- Before drawing any conclusion the instrument was verified running: `pcsx2_status` showed `Paused: false`
+  with a changing PC/cycle count, and the emulator log showed live frame timers.
+
+## 7. Instrument defects found this session (all measured, all on this build)
+
+1. Setting a breakpoint while the emulator is **RUNNING** → `double free or corruption (fasttop)`.
+2. `pcsx2_get_backtrace` **hard-aborts the emulator** (`DebugInterface.cpp:682` ← `DebugServer.cpp:787`
+   ← `DebugServer.cpp:909`). Do not call it.
+3. **Removing a BP while paused leaves PC parked at that address**; it needs `pcsx2_step` to leave.
+4. `pcsx2_read_memory` returns **all zeros** for the EE hardware-register window (`0x10000000`, `0x1000F000`,
+   `0x10001000`) while a positive control (`0x0064C710`) returns real data.
+5. `pcsx2_evaluate("[0x1000F000]")`, `[0x1000F010]`, `[0x10001010]` all return the failure sentinel
+   `0xffffffff`. **Consequence: the architect's Timer2-EQUF hypothesis (`[0x10001010] & 0x400`) cannot be
+   verified by reading hardware registers on this oracle build** — it must be decided another way (a BP on
+   the handler, or a host-side trace), not by reading the register.
+6. **Conditional breakpoints never fire** on this build: `cond a0 == 26` (a known-true condition, the handler
+   signals 26 every frame) never fired, while an unconditioned one-shot at the same address did.
+7. **The cycle counter is non-monotonic** — consecutive reads gave 3936394118 → 3197931520 → 114055806.
+   Any cadence claim must rest on an adjacent monotonic pair (the one-frame figure in §3 does).
+8. `temporary=True` breakpoints are sometimes **consumed without ever pausing** (list shows none set, yet
+   the emulator kept running).
+
+## 8. Ghidra note
+
+Ghidra holds only the main ELF (`.text 0x01000000-0x0102DC0F`), so `0x00551728`, `0x00578290`,
+`0x00578480`, `0x00557AF0` and `0x005ADxxx` have **no static presence**. Every overlay measurement in this
+section was taken from the live oracle, not from Ghidra.
+
+**No fix written.** Emulator left running (PID 858872); no relaunch was needed this session.

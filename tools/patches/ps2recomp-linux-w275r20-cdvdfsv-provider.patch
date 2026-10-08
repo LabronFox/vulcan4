@@ -1,0 +1,215 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index e35218d..8d19375 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -29,6 +29,7 @@ add_library(ps2_iop STATIC
+     src/modules/libsd.cpp
+     src/modules/fileio.cpp
+     src/modules/mcserv.cpp
++    src/modules/cdvd.cpp
+ )
+ 
+ target_compile_features(ps2_iop PUBLIC cxx_std_20)
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index 11262fc..d4d1668 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -24,6 +24,7 @@ namespace ps2x::iop
+             coreServices.emplace_back(detail::createDbcmanService(host));
+             coreServices.emplace_back(detail::createLibSdService(host));
+             coreServices.emplace_back(detail::createFileIoService(host));
++            coreServices.emplace_back(detail::createCdvdService(host));
+             refreshServiceModuleKeys();
+             rebuildRoutes();
+         }
+diff --git a/ps2xIOP/src/module_factories.h b/ps2xIOP/src/module_factories.h
+index d8f583f..f6a4db8 100644
+--- a/ps2xIOP/src/module_factories.h
++++ b/ps2xIOP/src/module_factories.h
+@@ -8,4 +8,5 @@ namespace ps2x::iop::detail
+     std::unique_ptr<IopService> createLibSdService(IopHost &host);
+     std::unique_ptr<IopService> createFileIoService(IopHost &host);
+     std::unique_ptr<IopService> createMcservService(IopHost &host);
++    std::unique_ptr<IopService> createCdvdService(IopHost &host);
+ }
+diff --git a/ps2xIOP/src/modules/cdvd.cpp b/ps2xIOP/src/modules/cdvd.cpp
+new file mode 100644
+index 0000000..813d16e
+--- /dev/null
++++ b/ps2xIOP/src/modules/cdvd.cpp
+@@ -0,0 +1,175 @@
++#include "module_factories.h"
++
++#include <array>
++#include <cstdio>
++#include <memory>
++
++namespace ps2x::iop::detail
++{
++    namespace
++    {
++        // The one CD/DVD SIF RPC service id we have MEASURED. GT4's init posts its bind here and
++        // retries it thirteen times (docs/W275-RESULTS.md R20, boot_sifpkt.log: 13 of 17 SIF
++        // transactions are cd=0x00874FA8 sid=0x80000592), because nothing answered it. That is the
++        // sid this provider exists to claim.
++        //
++        // Do NOT add neighbouring ids on the theory that they are also cdvdfsv. 0x80000593/0x95/0x97/
++        // 0x9C appear nowhere in the corpus, the docs, or a trace -- and `cdvdfsv_rpc1..rpc4` are
++        // rpc NUMBERS inside this one server (libcdvd-rpc.h names the packets that way), not separate
++        // service ids. Claiming an ungrounded sid would make canBindRpc() answer true for a service
++        // we do not own and let this provider reply to whatever really binds there -- a wrong answer
++        // that looks right, which Law 3 forbids. Add a sid only with a trace that shows a bind to it.
++        constexpr uint32_t kCdvdSid = 0x80000592u;
++
++        // rpc numbers on kCdvdSid, from ps2sdk libcdvd-rpc.h (ps2dev, Academic Free License 2.0).
++        // Only rpc1 is decoded; the rest are named so a refusal can say WHAT it refused rather than
++        // just printing a bare number.
++        constexpr uint32_t kCdvdRpcInit = 1;       // cdvdfsv_rpc1_inpacket_t  { int m_mode }
++        constexpr uint32_t kCdvdRpc2 = 2;          // cdvdfsv_rpc2_inpacket_t  { int m_mode }
++        constexpr uint32_t kCdvdRpcScmd = 3;       // cdvdfsv_rpc3_*: the SCMD/NCMD command channel
++        constexpr uint32_t kCdvdRpcSearchFile = 4; // cdvdfsv_rpc4_*: sceCdSearchFile
++
++        // ps2sdk libcdvd's disk-ready completion value: the drive is spun up and the disc is
++        // readable. Same constant Kernel/Stubs/CD.cpp and iop_cdvd.cpp already answer with, so the
++        // EE sees one consistent story for both the RPC and the import path.
++        constexpr int32_t kCdvdDiskReadyComplete = 2;
++
++        // cdvdfsv_rpc1_outpacket_t { m_retres, m_cdvdfsv_ver, m_cdvdman_ver, m_debug_mode } -- field
++        // order verified against ps2sdk libcdvd-rpc.h L69-75. The two version words are the only
++        // fields whose VALUES we cannot ground: cdvdfsv/cdvdman live in the console's IOP ROM, and
++        // that ROM is not an input this project ships or reads, so no build of ours can know what the
++        // real module reports. These are the ps2sdk interface revisions of the protocol implemented
++        // below; m_retres is the field the guest actually gates on. Stated as a limitation at runtime
++        // rather than passed off as measured.
++        constexpr int32_t kCdvdfsvInterfaceVersion = 6;
++        constexpr int32_t kCdvdmanInterfaceVersion = 6;
++        constexpr int32_t kCdvdDebugMode = 0;
++
++        // cdvdfsv is resident in the IOP ROM. GT4 never sceSifLoadModule's it -- there is a
++        // "cdvdfsv" entry in the module manager's builtin keys, but no load event ever fires for a
++        // ROM module, so a service gated on that load would stay dormant forever and the bind would
++        // keep failing. Returning no aliases means "not gated on a load", which is exactly the
++        // truth for a module the platform always has.
++        class CdvdService final : public IopService
++        {
++        public:
++            explicit CdvdService(IopHost &host)
++                : m_host(host)
++            {
++            }
++
++            [[nodiscard]] std::string_view name() const override { return "cdvd"; }
++
++            [[nodiscard]] std::span<const uint32_t> sids() const override { return kSids; }
++
++            [[nodiscard]] std::span<const std::string_view> moduleAliases() const override
++            {
++                return {};
++            }
++
++            void reset() override { m_announcedInitLimitation = false; }
++
++            [[nodiscard]] RpcResult handleRpc(const RpcRequest &request) override
++            {
++                if (request.sid != kCdvdSid)
++                {
++                    return refuse(request, "not a CD/DVD service id");
++                }
++
++                switch (request.function)
++                {
++                case kCdvdRpcInit:
++                    return doInit(request);
++                case kCdvdRpc2:
++                    // rpc2 answers with a single retres and, in the ROM, tells the caller the drive
++                    // is warm. Same completion value as the DiskReady import path; no version words
++                    // to invent, so this one carries no limitation line.
++                    return replyWord(request, kCdvdDiskReadyComplete);
++                case kCdvdRpcScmd:
++                    return refuse(request, "the SCMD/NCMD command channel is not decoded");
++                case kCdvdRpcSearchFile:
++                    return refuse(request, "sceCdSearchFile is not decoded");
++                default:
++                    return refuse(request, "unknown rpc number on the CD/DVD service");
++                }
++            }
++
++        private:
++            void writeBytes(GuestBuffer receive, const void *source, uint32_t size) const
++            {
++                if (receive.address == 0u || receive.size < size)
++                {
++                    return;
++                }
++                (void)m_host.writeIopMemory(receive.address, source, size);
++            }
++
++            RpcResult replyWord(const RpcRequest &request, int32_t value) const
++            {
++                writeBytes(request.receive, &value, sizeof(value));
++
++                RpcResult result;
++                result.handled = true;
++                result.resultAddress = request.receive.address;
++                return result;
++            }
++
++            RpcResult doInit(const RpcRequest &request)
++            {
++                if (!m_announcedInitLimitation)
++                {
++                    m_announcedInitLimitation = true;
++                    std::fprintf(stderr,
++                                 "VULCAN 4 LIMITATION: CDVDFSV init version words are the ps2sdk "
++                                 "interface revisions (%d, %d), not the values the console ROM "
++                                 "would report — the IOP ROM is not an input this project ships, so "
++                                 "its cdvdfsv/cdvdman version bytes cannot be read; m_retres is the "
++                                 "only field the guest checks in practice (mode %u)\n",
++                                 kCdvdfsvInterfaceVersion, kCdvdmanInterfaceVersion, readMode(request));
++                }
++
++                const int32_t reply[4] = {1, kCdvdfsvInterfaceVersion, kCdvdmanInterfaceVersion,
++                                          kCdvdDebugMode};
++                writeBytes(request.receive, reply, sizeof(reply));
++
++                RpcResult result;
++                result.handled = true;
++                result.resultAddress = request.receive.address;
++                return result;
++            }
++
++            [[nodiscard]] uint32_t readMode(const RpcRequest &request) const
++            {
++                uint32_t mode = 0u;
++                if (request.send.address == 0u || request.send.size < sizeof(mode))
++                {
++                    return 0u;
++                }
++                (void)m_host.readIopMemory(request.send.address, &mode, sizeof(mode));
++                return mode;
++            }
++
++            // Law 2/Law 3: name the exact gap and answer failure. A fabricated success here would
++            // let the guest believe it read data it never read -- and this is the file-read path, so
++            // a lie here surfaces as corrupted game data several hundred frames later.
++            RpcResult refuse(const RpcRequest &request, const char *what) const
++            {
++                std::fprintf(stderr,
++                             "VULCAN 4 LIMITATION: CDVDFSV sid=0x%08x rpc=%u is not "
++                             "implemented — %s, and answering success would be a lie\n",
++                             request.sid, request.function, what);
++
++                return replyWord(request, 0);
++            }
++
++            IopHost &m_host;
++            bool m_announcedInitLimitation = false;
++            inline static constexpr std::array<uint32_t, 1> kSids{kCdvdSid};
++        };
++    }
++
++    std::unique_ptr<IopService> createCdvdService(IopHost &host)
++    {
++        return std::make_unique<CdvdService>(host);
++    }
++}

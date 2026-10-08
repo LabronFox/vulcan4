@@ -3602,3 +3602,231 @@ the real blocker is deeper — the engine's data load of `GT4.VOL` / track-car d
 file open+read of `GT4.VOL`) and provide the volume's file data so the engine finishes loading, `client[0]`
 goes non-zero and `func_5AF850` dispatches to the draw. The exact file/read call needs the recovered oracle
 (`pcsx2-qt -debugger`) or a cdvd-read trace. Do not stall on the `core.gt4` MC open.
+
+---
+
+## Engine disc-read gap — GT4.VOL is read via raw SIF RPC CALL (0x8000000A), which the runtime never parses (architect, 2026-10-08)
+
+Read-only investigation. Deliverable: the engine's disc-read calls + the runtime gap + fix scope.
+
+### 1. Engine's disc reads after ExecPS2 (boot_w275r18.log, absolute lines)
+
+After `[execps2]` / `EXECPS2 relaunch#1` (L65490-65492) there are **no EE file-I/O syscalls at all**:
+
+- **fioOpen/fioRead/fioLseek: 0 calls after ExecPS2.** The only `fioOpen` in the whole 68,595-line log is
+  LOADER phase, served by `vfs()`: `rom0:ROMVER` (L257-258), `cdrom0:\CORE.GT4;1` -> fd 4 and fd 5
+  (L1127-1128, L1136-1137). `CORE.GT4` is the game executable itself; `GT4.VOL` is never opened EE-side.
+- **sceCdRead/sceCdGetToc/sceCdReadChain (CD.cpp): 0 calls after ExecPS2.**
+- **SifCallRpc/sceSifCallRpc (RPC.cpp): 0 calls.** The CALLKIND table (L68238) confirms the only syscalls
+  after ExecPS2 are `sce_sceSifSetDChain`, `sce_sceSifSetReg`, `sce_sceSifGetReg`, `sce_SetSyscall`,
+  `sce_sceSifSetDma`, `sce_iSignalSema`.
+- **The engine's actual game-data read is raw SIF RPC.** `sce_sceSifSetDma calls=36` (L68259), every one
+  `ra=0x5b0d8c`, posting a 0x40-byte command from the ring `0x20886a40 -> 0x20887200` (step 0x40). The
+  command id at packet **+0x20 = 0x8000000A** — that is `SIF_CMD_RPC_CALL` (W275 L3410 already labels it
+  `SIF_CMD_CALL`), an RPC to the IOP's `dbcman` module (SID `0x80001300`), which is GT4's `GT4.VOL`
+  streaming module. The RPC fno (SID|fno) sits at packet +0x00 in the 0x20886a40 payload.
+- **Result:** L68137 `halt=wallclock_deadline functions_entered=57932 gs_packets=15 frames_presented=2482`.
+  The 0x5b2980 frame loop presents the 2005 disclaimer 2,482 times while `client[0x008899C0][0]` stays 0,
+  because the IOP file-data reply never comes.
+
+### 2. How the runtime serves disc reads today (tools/PS2Recomp, file:line)
+
+- **EE fio** `ps2xRuntime/src/lib/Kernel/Syscalls/FileIO.cpp` `fioOpen` (L24)/`fioRead` (L140) -> `vfs()`
+  over host files. Only the loader's CORE.GT4 uses this; the engine does not.
+- **EE cdvd** `ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp` `sceCdRead` (L209)/`sceCdGetToc` (L420) read raw
+  sectors from the ISO. Engine does not call them.
+- **IOP** `ps2xIOP/`: an emulator (`emulator/iop_emulator.cpp`, runs in EE-cycle lockstep via
+  `runEeCycles`) + 4 HLE services registered in `iop_subsystem.cpp` L23-26: mcserv, **dbcman**, libsd, fileio.
+  `dbcman` (`modules/dbcman.cpp`) is GT4's VOL module: SID `0x80001300` (L14), check-version `0x80001363`
+  (L15) answered with `0x0310`, and every other RPC falls into the `[DBCMAN:stub]` branch (L82-110) which
+  writes **nothing** to the receive buffer.
+- **RPC dispatch** `iop_subsystem.cpp` `handleRpc` (L198) routes `sid -> service`, but it is only reached
+  from `RPC.cpp` `SifCallRpc` (L414) — the EE libc RPC syscall. The engine **bypasses** that entry by posting
+  raw `SIF_CMD_RPC_CALL` packets itself.
+
+### 3. The exact gap
+
+Two stacked, each alone blocking:
+
+1. **Unwired dispatch path.** `sceSifSetDma` (`ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp` L633) handles the
+   engine's raw posts but never parses `SIF_CMD_RPC_CALL` (0x8000000A): it copies EE->IOP (writeIopMemory),
+   calls `PS2IopTransport::notifyTransfer` (a no-op downstream — `iop_rpc.cpp` `onSifTransfer` is `(void)transfer`),
+   and then synthesizes hardcoded END+BIND completions to `sub_005B1328` (SIF.cpp L759-838). No `RpcRequest`
+   is ever constructed, so `IopSubsystem::handleRpc` -> `DbcmanService::handleRpc` is never invoked. (This is
+   also why the boot log shows zero `[DBCMAN:stub]`/`check-version` lines after ExecPS2.)
+2. **Missing dbcman read surface.** Even when routed, `dbcman.cpp` implements only check-version; the VOL
+   open/read/lseek/close RPCs would still write nothing to the EE recv buffer.
+
+It is **not** a "not-found result" (the `core.gt4` MC open `-4` at L1102-1122 is loader-phase and already
+falls back to the disc) and **not** an unwired EE syscall (`missing_functions=0`). It is a missing **IOP SIF
+RPC CALL dispatch** plus a **stubbed dbcman data path**.
+
+### 4. Fix scope (next dish)
+
+1. **SIF.cpp `sceSifSetDma`:** when a posted packet carries `0x8000000A` at +0x20, parse the RPC payload
+   (fno/SID at +0x00, send/recv pointers+sizes), build a `ps2x::iop::RpcRequest`, call
+   `PS2IopTransport::handleRpc` (which reaches `IopSubsystem::handleRpc`), then copy the returned file bytes
+   into the EE recv buffer and complete the SIF0 ack via `sub_005B1328` so `client[0x008899C0][0]` goes non-zero.
+2. **`modules/dbcman.cpp`:** implement the VOL read surface over `GT4.VOL` — open the volume (ISO offset
+   `0xcecb800`, magic `0xacb990ad`, 23 top-level entries, path-keyed tree; format already decoded in
+   `docs/AUDIO-SURVEY.md` §1) and serve open/read/lseek/close, writing file bytes to the EE recv buffer.
+3. **Pin the SID/fno first** (oracle PCSX2 `pcsx2-qt -debugger`, or a packet dump at `0x20886a40+0x00`):
+   candidates are `dbcman` `0x80001300` (HLE exists) vs `cdvdfsv` (no HLE — `iop_module_manager.cpp` L64-65
+   only satisfies its load, so a cdvdfsv-targeted read would be a larger new service).
+
+## R20 — the SIF bind gap is `canBindRpc`, not a missing `_request_bind`; CDVDFSV provider landed (architect, 2026-10-08)
+
+**The refutation first (measured, not inferred).** The dish's premise — "the game streams GT4.VOL via raw SIF RPC to the IOP's *dbcman*, which our runtime stubs" — is false. `boot_w275r18.log` / `boot_sifpkt.log`
+show 17 SIF transactions, **none to dbcman**; 13 are `cd=0x00874FA8 sid=0x80000592`, which is the CDVD
+family `CdInit` bind, retried. So part 2 of the dish (a dbcman read surface over GT4.VOL) was **not built** —
+it would have been a large new service hung on a refuted premise.
+
+**The real seam, read from the tree (`ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp`).** The honest EE-side
+RPC primitives already exist — they are W276 R20 work, and they contain **no invented values**:
+
+- `SifRpcRawBind(rdram, runtime, clientPtr, sid)` (RPC.cpp L418-477): clears the client, looks up
+  `g_rpc_servers[sid]`, and if absent **and** `PS2IopTransport::canBindRpc(runtime, sid)` allocates a real
+  `t_SifRpcServerData` via `rpcAllocServerAddr(rdram)`, memsets it, publishes it, and sets
+  `client->server = serverPtr` — returning `{sd, buf, cbuf}`.
+- `SifRpcRawCall(rdram, ctx, runtime, clientPtr, rpcNum, mode, sendBuf, sendSize, recvBuf, recvSize)`
+  (RPC.cpp L479-564): already builds an `RpcRequest` and calls `PS2IopTransport::handleRpc`.
+
+So the 13 retries have exactly one cause: **`canBindRpc(0x80000592)` returned false.** `canBindRpc` →
+`IopSubsystem::routes` → `serviceActive()` → `IopModuleManager::isLoaded(service.moduleAliases())`, and no
+registered service claimed a CDVD sid. Nothing was broken about the bind *algorithm* — the sid had no owner.
+
+**The fix that follows: own the sid.** New provider
+`tools/PS2Recomp/ps2xIOP/src/modules/cdvd.cpp` — `CdvdService final : public IopService`, modelled on
+`modules/fileio.cpp`:
+
+- `sids() = { 0x80000592 }` — **the one measured sid, and deliberately nothing else.** An earlier draft of
+  this provider claimed `0x80000593/0x95/0x97/0x9C` on the theory that they were the SCMD/SearchFile/DiskReady
+  siblings. That was an inference, not a measurement: none of those ids appears in the corpus, the docs, or a
+  trace, and `cdvdfsv_rpc1..rpc4` are **rpc numbers inside this one server** (that is how `libcdvd-rpc.h` names
+  the packets), not separate service ids. An ungrounded sid is not a harmless extra — it makes `canBindRpc()`
+  answer *true* for a service this provider does not own, so whatever really binds there would get an answer
+  from us. That is a wrong answer that looks right (law 3). The ids are therefore dropped, and the comment in
+  the source says to add one only alongside a trace showing a bind to it. Dispatch is by **rpc_number** instead.
+- `moduleAliases()` returns **`{}`** ⇒ always active. This is the honest mechanism for a **ROM-resident**
+  module: cdvdman/cdvdfsv are in the IOP ROM and GT4 never `sceSifLoadModule`s them (measured: 5 physical IRX
+  loads — SIO2MAN, MTAPMAN, MCMAN, MCSERV, PADMAN — none cdvd), so a service gated on a load event would stay
+  dormant forever and the bind would keep failing. `IopModuleManager::isLoaded` returns `true` for empty
+  aliases; `m_builtinKeys` already contains `"cdvdman"`/`"cdvdfsv"`.
+- `handleRpc`: dispatch on `request.function` (**rpc number**), because that is the axis the ROM actually
+  multiplexes on. **rpc1** replies the ps2sdk `cdvdfsv_rpc1_outpacket_t`
+  `{m_retres=1, m_cdvdfsv_ver, m_cdvdman_ver, m_debug_mode=0}` — field order and both packet shapes verified
+  verbatim against `/mnt/ssd/tmp/ps2sdk-ref/libcdvd-rpc.h` L64-75 (`rpc1_inpacket_t { int m_mode }`, 4 bytes,
+  which is what `readMode()` reads). **rpc2** replies the single `m_retres` its own outpacket defines, carrying
+  the same `2` (`kCdvdReadyComplete`) that `iop_cdvd.cpp` uses on the import path, so both paths tell the EE
+  one story. **rpc3** (the SCMD/NCMD channel) and **rpc4** (`sceCdSearchFile`) print
+  `VULCAN 4 LIMITATION: CDVDFSV sid=0x… rpc=N is not implemented — …` and answer **failure (retres=0)**,
+  never a fabricated success (laws 2/3). That turns the run log into the measurement of the next file-I/O gap
+  — which is what this dish is for.
+- Declared limitation, emitted once at init: the IOP-ROM `cdvdfsv`/`cdvdman` version *words* are not an input
+  this project ships (we ship the user's disc, not the console ROM), so the values returned are the ps2sdk
+  **interface revisions** (6, 6). `m_retres` is the field the guest gates on; if GT4 rejects init on a version
+  check, this pair is the first thing to revisit. (`grep cdvdfsv_ver` across the skill corpus: **no hits**, so
+  the ROM values are not verifiable from anything in the tree — refusing to invent them is the correct move.)
+
+**Wiring (three edits, all compile-verified):** `module_factories.h` declares `createCdvdService`; registered
+in `iop_subsystem.cpp` next to the other four; `src/modules/cdvd.cpp` added to the **explicit** source list in
+`ps2xIOP/CMakeLists.txt` (sources there are listed, not globbed). Standalone verification: `cmake --build`
+of the `ps2_iop` target in `/mnt/ssd/tmp/iopchk` → `Built target ps2_iop`, exit 0.
+
+**Consequence, and the exact edit SIF.cpp still needs.** With the sid owned, `canBindRpc(0x80000592)` is true,
+so `sceSifSetDma`'s bind branch should call `SifRpcRawBind` rather than synthesize a reply. The fabricated
+block in `Stubs/SIF.cpp` (and the second one in `sceSifSetReg` at `0x00886740`/`0x00886818`) is an
+**invented** `sd = 0x00047E88` plus a hardcoded `cd = 0x008899C0`; the measured CALL's `sd` is provably
+**self-referential** (`sceSifCallRpc` sets `call->sd = cd->server`, echoing the invented bind value back), so
+those constants carry no information and must be deleted. Classification of a posted packet must use the
+**header cid at +0x08** — the `+0x20` word is the RPC-family *inner* cid (cid in a RendPkt, sid in a BindPkt,
+rpc_number in a CallPkt), which is why both earlier readings of the wire layout looked right for their own
+field.
+
+**Also found, and worth a dish of its own — a probable SECOND bind failure behind this one.**
+`modules/fileio.cpp` declares `kFileIoSid = 0x80000001u` **and gates itself on a module load**
+(`moduleAliases() = {"fileio", "xfileio"}`), so it is one of the `active=0` services in the probe above. Two
+independent measurements say that is a problem, not a style question:
+
+- The board (`.auto/crew/board.md`, R5 packet dump) recorded a real bind for **(cd=0x008899c0, sid=0x80000001)**
+  — a *second* client, distinct from CDVD's (cd=0x00874fa8, sid=0x80000592). And hardware answered it: the
+  oracle in R16 measured client 0x008899c0's `+0x24` (0x008899E4) holding **0x00047E88**, which is < 0x200000,
+  i.e. a genuine **IOP-RAM server descriptor**. So on hardware that bind *succeeded* and produced a server; ours
+  cannot, for the identical reason CDVD's could not — the sid has no active owner.
+- Generalising R20: `fileio`/`ioman` is ROM-resident on a real PS2, exactly like cdvdfsv. A service gated on a
+  load event it never receives is dormant forever, and `canBindRpc` then answers false — the R20 mechanism
+  verbatim, on a second sid.
+
+**Measured, same probe (2026-10-08):** `canBindRpc(0x80000001) = false`. So the guess is now evidence — the guest
+*does* ask to bind this sid, hardware *did* answer it, and this build *cannot*. One line added to the probe, no
+new code.
+
+**Correction to an earlier note in this same section.** A draft of R20 asserted `0x80000001` "is **IOPHEAP**"
+and that "the real FILEIO sid is `0x80000003`". Both halves were guessed, and the first is contradicted by the
+measured bind above; `0x80000001` is a plausible-and-measured FILEIO id (`fileio.cpp`'s own comment cites
+ps2sdk `ee/rpc/fileio/fileio_client.h` for its command numbers, so its sid was researched too). No replacement
+id is asserted here: the corpus in `/mnt/ssd/tmp/ps2sdk-ref` contains **no** `sceSifRegisterRpc` call sites at
+all, so neither id is groundable from the tree. What is recorded is the actionable shape — *if* a FILEIO bind is
+still failing once CDVD's is fixed, the fix is the **same** `moduleAliases() = {}` change R20 made for cdvdfsv,
+and the measurement that decides it is one more of these probes, not a guess.
+
+Left untouched in this dish: out of scope, it belongs in its own patch with its own probe, and guessing a new
+sid for it would repeat exactly the mistake R20.1 retired.
+
+**No build of the harness, no boot, no picture yet.** The provider compiles and is wired; the boot measurement
+is blocked on the SIF.cpp edit above, which is owned by the running E2 agent.
+
+### R20.1 — the sid claim is MEASURED, not hoped for (probe, 2026-10-08)
+
+Compiling proves the provider *exists*; it does not prove the sid became *claimable*, which is the entire
+blocker. So the claim was measured directly, without touching SIF.cpp or the harness. Scratch probe on the SSD
+(`/mnt/ssd/tmp/cdvdsid-probe/probe.cpp`, **not** in the repo — it links `ps2xIOP`, not the game):
+a stub `IopHost` backing `readIopMemory`/`writeIopMemory` the way `PS2IopHostAdapter` does, one `IopSubsystem`,
+then `canBindRpc` on both the measured sid and a dropped one, `debugSnapshot`, and a real rpc1 `RpcRequest`
+carrying `m_mode = 7`:
+
+```
+VULCAN 4 LIMITATION: CDVDFSV init version words are the ps2sdk interface revisions (6, 6), … (mode 7)
+VULCAN 4 LIMITATION: CDVDFSV sid=0x80000592 rpc=3 is not implemented — the SCMD/NCMD command channel …
+canBindRpc(0x80000592 CDVD)   = TRUE
+canBindRpc(0x80000593 ungrounded) = false  (must be false)
+service 'MCSERV' active=0 sids=0x80000400 0x80000480
+service 'dbcman' active=0 sids=0x80001300
+service 'libsd'   active=0 sids=0x80000701
+service 'fileio'  active=0 sids=0x80000001
+service 'cdvd'    active=1 sids=0x80000592
+handleRpc rpc1 handled=1 result=0x00002000
+init reply = { 1, 6, 6, 0 }
+rpc3 refusal retres = 0  (must be 0)
+EXIT=0
+```
+
+Four things this pins down that no amount of compiling could:
+
+1. **`canBindRpc(0x80000592)` is now TRUE.** That single boolean was the whole 13-retry wall (R20 above). It is
+   true because `cdvd` is the one service showing `active=1` while the other four are dormant on their loads —
+   the empty-`moduleAliases()` mechanism doing exactly the job it was chosen for.
+2. **The dropped ids are really gone:** `canBindRpc(0x80000593)` is `false`, and there is **no** `DIAGNOSTIC:`
+   line, i.e. `rebuildRoutes` did not hit the duplicate-sid path that would have cleared *every* route
+   (`iop_subsystem.cpp` L58-64). Worth stating because a duplicate would have silently taken the whole table
+   down, including the sid this dish is here to fix.
+3. **The outpacket is byte-correct and read from the right place.** `init reply = { 1, 6, 6, 0 }` — exactly
+   `cdvdfsv_rpc1_outpacket_t` in libcdvd-rpc.h field order — and `mode 7` echoed back proves `readMode()` pulled
+   the guest's `m_mode` out of the send buffer rather than reporting a constant.
+4. **The refusal is honest on the wire, not just in the log:** rpc3 answers `retres = 0` (failure) alongside its
+   limitation line, so the guest sees a failed read, not a plausible empty one.
+
+**A false alarm, recorded so nobody re-chases it.** The first probe run printed `init reply = { 0, 0, 0, 0 }`
+while the log lines were correct. That is *not* a bug in the provider: `writeBytes` calls
+`m_host.writeIopMemory`, and the probe's first stub host left that hook at the interface's default `return
+false`, so the write was swallowed by the *test double*. The pattern is the established one — `modules/fileio.cpp`
+writes all four of its replies the same way — and re-running with the hook backed by real IOP RAM gave
+`{ 1, 6, 6, 0 }`. The one-store question that could have made this a genuine defect is also settled:
+`PS2Runtime::writeIopMemory` → `IopSubsystem::writeMemory` → the IOP emulator's RAM (`ps2_runtime.cpp` L854-857),
+which is the *same* store `IopSubsystem::readMemory` reads, so a reply written by a service and the buffer the EE
+reads back are coherent — there is no second copy to fall out of sync.
+
+**What the probe does NOT prove:** that the running engine reaches `handleRpc` with this sid. The probe calls
+`IopSubsystem::handleRpc` directly; whether `SifRpcRawCall` gets there from the guest still requires the boot,
+because it depends on the SIF.cpp path owned by the E2 agent. Everything on this side of that seam is now
+measured rather than assumed.

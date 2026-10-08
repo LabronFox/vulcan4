@@ -1,0 +1,409 @@
+=== W277: LOADFILE SifLoadModule (rpc=0) + IopHost::loadModule bridge ===
+# The engine loads its IOP drivers via raw SIF RPC LOADFILE (sid 0x80000006) rpc=0
+# (SifLoadModule), which the R29 loadfile service refused. This patch:
+#  1. adds IopHost::loadModule (bridges the loadfile service to PS2Runtime::loadIopModule)
+#  2. implements rpc=0 in loadfile.cpp: read the inline path, load the IRX, reply moduleId.
+# Verified: 16 IRX modules load (SIO2MAN..SMAP), dbcman+cdvd+0x80000400 bind and answer.
+
+diff --git a/ps2xIOP/include/ps2x/iop/iop_host.h b/ps2xIOP/include/ps2x/iop/iop_host.h
+index 1eceb08..7fe7956 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_host.h
++++ b/ps2xIOP/include/ps2x/iop/iop_host.h
+@@ -109,6 +109,20 @@ namespace ps2x::iop
+ 
+         virtual int32_t memoryCard(const MemoryCardRequest &request) = 0;
+ 
++        // Load an IOP module (IRX) from the disc image, the same path the EE syscall
++        // sceSifLoadModule uses. W277: the raw SIF RPC LOADFILE rpc=0 (SifLoadModule) reaches the
++        // loadfile service instead of the syscall, and the service must be able to perform the load.
++        // The default fails so host/test stubs stay source-compatible; PS2IopHostAdapter overrides it.
++        virtual ModuleLoadResult loadModule(std::string_view path,
++                                            const void *arguments,
++                                            uint32_t argumentSize)
++        {
++            (void)path;
++            (void)arguments;
++            (void)argumentSize;
++            return ModuleLoadResult{false, -1, -1};
++        }
++
+         virtual bool hasGuestFunction(uint32_t address) const = 0;
+         virtual bool invokeGuestFunction(uint64_t callToken,
+                                          uint32_t address,
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 8d46e03..d3563b6 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -405,6 +405,16 @@ void PS2IopHostAdapter::closeHostFile(uint64_t handle)
+     }
+ }
+ 
++ps2x::iop::ModuleLoadResult PS2IopHostAdapter::loadModule(std::string_view path,
++                                                          const void *arguments,
++                                                          uint32_t argumentSize)
++{
++    // W277: the loadfile service (raw SIF RPC LOADFILE rpc=0 = SifLoadModule) performs the same
++    // physical IRX load as the EE syscall sceSifLoadModule. Route both through the runtime's single
++    // loader so a module loaded by either path ends up in the one IOP emulator.
++    return m_runtime.loadIopModule(path, arguments, argumentSize);
++}
++
+ int32_t PS2IopHostAdapter::memoryCard(const ps2x::iop::MemoryCardRequest &request)
+ {
+     using Handler = void (*)(uint8_t *, R5900Context *, PS2Runtime *);
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.h b/ps2xRuntime/src/lib/ps2_iop_host.h
+index 89d8576..eb9e763 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -74,6 +74,12 @@ public:
+ 
+     int32_t memoryCard(const ps2x::iop::MemoryCardRequest &request) override;
+ 
++    // W277: the raw SIF RPC LOADFILE rpc=0 (SifLoadModule) reaches the loadfile service, which must
++    // load the IRX through the same path the EE syscall sceSifLoadModule uses.
++    ps2x::iop::ModuleLoadResult loadModule(std::string_view path,
++                                           const void *arguments,
++                                           uint32_t argumentSize) override;
++
+     bool hasGuestFunction(uint32_t address) const override;
+     bool invokeGuestFunction(uint64_t callToken,
+                              uint32_t address,
+diff --git a/ps2xIOP/src/modules/loadfile.cpp b/ps2xIOP/src/modules/loadfile.cpp
+new file mode 100644
+index 0000000..e48603f
+--- /dev/null
++++ b/ps2xIOP/src/modules/loadfile.cpp
+@@ -0,0 +1,333 @@
++#include "module_factories.h"
++#include "rpc_reply.h"
++
++#include <array>
++#include <cstdint>
++#include <cstdio>
++#include <mutex>
++#include <sstream>
++#include <string>
++#include <vector>
++
++namespace ps2x::iop::detail
++{
++    namespace
++    {
++        // LOADFILE -- the IOP Module/ELF loader, SIF RPC server id 0x80000006.
++        //
++        // WHY THIS FILE EXISTS. GT4's EE code binds 0x80000006 and never gets a server, so the
++        // guest's own retry loop cannot exit. MEASURED 2026-10-08, /mnt/ssd/vulcan4-build/run/
++        // boot_w276r28on.log lines 65684..66511: `[SIFRPC] bind a=0x889e80 b=0x80000006 c=0x0 d=0x0`
++        // occurs FIFTEEN times before the run dies, and each one is preceded by the runtime's own
++        //
++        //   VULCAN 4 LIMITATION: SIF RPC bind sid=0x80000006 client=0x889e80 has no server (no
++        //   emulated IRX registered that sid and no HLE route can bind it), so cd->server stays NULL
++        //   and the guest retries. Not fabricating a server.
++        //
++        // The bind caller, disassembled out of w231-engine.elf (0x5b6268..0x5b6354), is a
++        // bind-once wrapper gated on a flag at 0x658358: it calls sceSifBindRpc(0x889e80,
++        // 0x80000006, 0) at 0x5b629c, then at 0x5b62b4 executes `lw v0,36(s0)` -- client->server at
++        // client+0x24 -- and `beqz v0, 0x5b631c` takes the RETRY path when the runtime could not
++        // bind. So the guest has no way past this line except a non-NULL server word.
++        //
++        // The server word and the call it guards are BOTH ORACLE-MEASURED against the live PCSX2
++        // (see kFfReplyWord and kRpcFf below), which is why this service answers rather than
++        // refuses: this is behaviour read off the real machine, not behaviour invented here.
++        //
++        // WHAT IS *NOT* CLAIMED. This is not a module loader. Nothing here reads an IRX or an ELF
++        // off the disc; the disc-side load path is dbcman's, and it is untouched by this file. The
++        // five documented LOADFILE functions (ps2tek resources/09-ps2tek.md:6583 -- 00h
++        // SifLoadModule .. 05h SifLoadElfEncrypted) are NOT decoded and are refused below with an
++        // explicit limitation. Only the one function number this image actually issues is answered,
++        // and only with the word the oracle was measured writing.
++        constexpr uint32_t kLoadFileSid = 0x80000006u;
++
++        // Function number on kLoadFileSid, from the call site at 0x5b62c8 (`li a1,255`). It is not
++        // any of ps2tek's documented 00h..05h, and the corpus has nothing on it -- so the number is
++        // all that is known and it is not given a meaning here.
++        constexpr uint32_t kRpcFf = 0xffu;
++
++        // ORACLE MEASUREMENT, not an invention. PCSX2, live EE, breakpoint at the instruction after
++        // the guest's sceSifCallRpc (0x5b62e8, Cycles 1810654115): the call returned v0 = 0, and the
++        // 4-byte receive buffer 0x889c80 went from all-zeros to 33 30 30 30 .. i.e. this word. The
++        // guest then copies exactly those 4 bytes to client+0x28 = 0x889ea8 (0x5b6304-0x5b6310).
++        //
++        // The SEMANTICS of the word are not decoded. It is written because matching the oracle is
++        // the safest possible choice here: whatever the guest does with client+0x28 downstream, the
++        // real machine does it with this value, so reproducing the value reproduces the machine's
++        // state. A LIMITATION line states the gap once, at the first reply, rather than passing the
++        // value off as understood.
++        constexpr uint32_t kFfReplyWord = 0x30303033u;
++
++        // cdvdfsv/fileio reasoning, and it applies verbatim: LOADFILE is resident on the IOP (it is
++        // the thing that does the loading), so GT4 never sceSifLoadModule's it. A service gated on
++        // an alias that no load event will ever fire would stay dormant and the bind would keep
++        // failing -- which is exactly the bug this file fixes. No aliases = always routed.
++        class LoadFileService final : public IopService
++        {
++        public:
++            explicit LoadFileService(IopHost &host)
++                : m_host(host)
++            {
++            }
++
++            [[nodiscard]] std::string_view name() const override { return "loadfile"; }
++
++            [[nodiscard]] std::span<const uint32_t> sids() const override { return kSids; }
++
++            [[nodiscard]] std::span<const std::string_view> moduleAliases() const override
++            {
++                return {};
++            }
++
++            void reset() override
++            {
++                std::lock_guard<std::mutex> lock(m_mutex);
++                m_ffCalls = 0u;
++                m_refusals = 0u;
++                m_moduleLoads = 0u;
++                m_announcedFfLimitation = false;
++            }
++
++            [[nodiscard]] RpcResult handleRpc(const RpcRequest &request) override
++            {
++                if (request.sid != kLoadFileSid)
++                {
++                    return RpcResult{};
++                }
++
++                if (request.function == kRpcFf)
++                {
++                    return doFf(request);
++                }
++
++                // W277. rpc=0 is SifLoadModule (ps2tek 09-ps2tek.md L6583). The engine loads its IOP
++                // drivers this way -- the first one measured is cdrom0:\IRX\SIO2MAN.IRX;1. Answer it
++                // by actually loading the IRX through the same loader the EE syscall uses, not by
++                // refusing; a refusal is what kept the guest in its retry loop.
++                if (request.function == 0u)
++                {
++                    return doLoadModule(request);
++                }
++
++                return refuse(request);
++            }
++
++            void appendDebugMetrics(std::vector<DebugMetric> &metrics) const override
++            {
++                std::lock_guard<std::mutex> lock(m_mutex);
++                metrics.push_back({"loadfile_ff_calls", m_ffCalls, false});
++                metrics.push_back({"loadfile_module_loads", m_moduleLoads, false});
++                metrics.push_back({"loadfile_refusals", m_refusals, false});
++            }
++
++        private:
++            // The measured reply above is only meaningful if it fits: the guest asks for 4 bytes
++            // (`li t2,4` at 0x5b62dc). Refuse loudly rather than truncating silently if that ever
++            // changes, because a short write here would hand the guest a half-updated buffer.
++            RpcResult doFf(const RpcRequest &request)
++            {
++                uint64_t calls = 0u;
++                bool announce = false;
++                {
++                    std::lock_guard<std::mutex> lock(m_mutex);
++                    calls = ++m_ffCalls;
++                    announce = !m_announcedFfLimitation;
++                    m_announcedFfLimitation = true;
++                }
++
++                if (request.receive.address == 0u || request.receive.size < sizeof(kFfReplyWord))
++                {
++                    std::fprintf(stderr,
++                                 "VULCAN 4 LIMITATION: LOADFILE sid=0x%08x rpc=0xff asked for a %u-byte "
++                                 "reply (receive=0x%08x) and the only measured reply is %zu bytes — "
++                                 "refusing rather than truncating it into the guest's buffer\n",
++                                 request.sid, request.receive.size, request.receive.address,
++                                 sizeof(kFfReplyWord));
++                    return replyWord(request, 0);
++                }
++
++                if (announce)
++                {
++                    std::fprintf(stderr,
++                                 "VULCAN 4 LIMITATION: LOADFILE rpc=0xff reply 0x%08x is the word the "
++                                 "oracle wrote to 0x889c80 (PCSX2, breakpoint 0x5b62e8, Cycles "
++                                 "1810654115) — its SEMANTICS are not decoded, only its value is "
++                                 "measured; the guest copies it to client+0x28. Every other LOADFILE "
++                                 "rpc (00h..05h SifLoadModule/SifLoadElf) is refused, not faked\n",
++                                 kFfReplyWord);
++                }
++
++                {
++                    std::ostringstream message;
++                    message << "[LOADFILE:HLE] rpc=0xff reply=0x" << std::hex << kFfReplyWord
++                            << " call=" << std::dec << calls;
++                    m_host.log(LogLevel::Info, message.str());
++                }
++
++                return replyWord(request, static_cast<int32_t>(kFfReplyWord));
++            }
++
++            RpcResult replyWord(const RpcRequest &request, int32_t value) const
++            {
++                const uint32_t word = static_cast<uint32_t>(value);
++                if (request.receive.address != 0u &&
++                    request.receive.size >= sizeof(uint32_t))
++                {
++                    (void)m_host.writeGuest(request.receive.address, &word, sizeof(word));
++                }
++
++                RpcResult result;
++                result.handled = true;
++                result.resultAddress = request.receive.address;
++                return result;
++            }
++
++            // W277 diagnostic: for rpc=0 (SifLoadModule) the send buffer is the loadfile inpacket
++            // { mode, arg1, arg2, arg3 } where arg1 is the guest pointer to the module path. Dump it
++            // so the exact module being asked for is known, before deciding whether to serve it.
++            void dumpSend(const RpcRequest &request) const
++            {
++                if (request.send.address == 0u || request.send.size < 16u)
++                {
++                    std::fprintf(stderr, "[LOADFILE:send] rpc=%u send=0x%08x size=%u (no packet)\n",
++                                 request.function, request.send.address, request.send.size);
++                    return;
++                }
++                uint32_t packet[4]{};
++                (void)m_host.readGuest(request.send.address, packet, sizeof(packet));
++                const uint32_t mode = packet[0];
++                const uint32_t arg1 = packet[1];
++                const uint32_t arg2 = packet[2];
++                const uint32_t arg3 = packet[3];
++                std::string path;
++                if (arg1 != 0u && arg1 < 0x02000000u)
++                {
++                    char buf[128]{};
++                    (void)m_host.readGuest(arg1, buf, sizeof(buf) - 1u);
++                    path.assign(buf);
++                    if (path.size() > 100u)
++                    {
++                        path.resize(100u);
++                    }
++                }
++                std::fprintf(stderr,
++                             "[LOADFILE:send] rpc=%u mode=0x%08x arg1=0x%08x arg2=0x%08x arg3=0x%08x "
++                             "path=\"%s\"\n",
++                             request.function, mode, arg1, arg2, arg3, path.c_str());
++            }
++
++            // W277: SifLoadModule. The send buffer is the loadfile inpacket, MEASURED 2026-10-08 on
++            // the live run (boot_w277diag.log): { mode @0, arg_len @4, then the null-terminated
++            // module path INLINE starting at @8, then the argument bytes }. arg1 is NOT a pointer in
++            // this image's protocol -- the path travels inside the packet, so read it from +8.
++            RpcResult doLoadModule(const RpcRequest &request)
++            {
++                if (request.send.address == 0u || request.send.size < 9u)
++                {
++                    return refuse(request);
++                }
++
++                const uint32_t pathAddr = request.send.address + 8u;
++                const uint32_t remaining = request.send.size - 8u;
++                char path[256]{};
++                size_t pathLen = 0u;
++                while (pathLen < sizeof(path) - 1u && pathLen < remaining)
++                {
++                    char c = '\0';
++                    if (!m_host.readGuest(pathAddr + static_cast<uint32_t>(pathLen), &c, 1u))
++                    {
++                        break;
++                    }
++                    if (c == '\0')
++                    {
++                        break;
++                    }
++                    path[pathLen++] = c;
++                }
++                path[pathLen] = '\0';
++                if (pathLen == 0u)
++                {
++                    return refuse(request);
++                }
++
++                uint32_t argLen = 0u;
++                (void)m_host.readGuest(request.send.address + 4u, &argLen, sizeof(argLen));
++                std::vector<uint8_t> args;
++                if (argLen != 0u && argLen <= 0x10000u)
++                {
++                    args.resize(argLen);
++                    const uint32_t argsAddr = pathAddr + static_cast<uint32_t>(pathLen) + 1u;
++                    if (!m_host.readGuest(argsAddr, args.data(), argLen))
++                    {
++                        args.clear();
++                    }
++                }
++
++                const ps2x::iop::ModuleLoadResult loaded =
++                    m_host.loadModule(path, args.empty() ? nullptr : args.data(), argLen);
++                const int32_t reply =
++                    (loaded.handled && loaded.moduleId > 0) ? loaded.moduleId : -1;
++
++                {
++                    std::lock_guard<std::mutex> lock(m_mutex);
++                    ++m_moduleLoads;
++                }
++                {
++                    std::ostringstream message;
++                    message << "[LOADFILE:HLE] SifLoadModule path=\"" << path << "\" argLen="
++                            << argLen << " -> moduleId=" << (loaded.handled ? loaded.moduleId : -1);
++                    m_host.log(LogLevel::Info, message.str());
++                }
++                if (reply < 0)
++                {
++                    std::fprintf(stderr,
++                                 "VULCAN 4 LIMITATION: LOADFILE SifLoadModule path=\"%s\" could not "
++                                 "be loaded (handled=%d moduleId=%d) — the file is missing from the "
++                                 "cdrom0: root or the IOP loader refused it; the guest will retry\n",
++                                 path, loaded.handled ? 1 : 0, loaded.moduleId);
++                }
++                return replyWord(request, reply);
++            }
++
++            // Law 2 / Law 3: name the gap, answer failure. A module load that claims success would
++            // make the guest jump into an IRX that was never loaded -- a wild branch several hundred
++            // frames later, which is a far more expensive bug than an honest -1 here.
++            RpcResult refuse(const RpcRequest &request)
++            {
++                {
++                    std::lock_guard<std::mutex> lock(m_mutex);
++                    ++m_refusals;
++                }
++
++                if (request.function == 0u)
++                {
++                    dumpSend(request);
++                }
++
++                std::fprintf(stderr,
++                             "VULCAN 4 LIMITATION: LOADFILE sid=0x%08x rpc=%u is not implemented — "
++                             "the guest asked the module loader for a function this provider does not "
++                             "decode (only the measured rpc=0xff is answered); the disc-side load path "
++                             "is dbcman's and is not touched here, and answering success would be a "
++                             "lie\n",
++                             request.sid, request.function);
++
++                return replyWord(request, 0);
++            }
++
++            IopHost &m_host;
++            mutable std::mutex m_mutex;
++            uint64_t m_ffCalls = 0u;
++            uint64_t m_refusals = 0u;
++            uint64_t m_moduleLoads = 0u;
++            bool m_announcedFfLimitation = false;
++            inline static constexpr std::array<uint32_t, 1> kSids{kLoadFileSid};
++        };
++    }
++
++    std::unique_ptr<IopService> createLoadFileService(IopHost &host)
++    {
++        return std::make_unique<LoadFileService>(host);
++    }
++}

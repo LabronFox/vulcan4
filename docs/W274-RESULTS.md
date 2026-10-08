@@ -1204,3 +1204,32 @@ Supporting from our side (already on the board, §T4, `docs/W274-RESULTS.md`): o
   over Pine+DebugServer. / BLOCKED BY: measurer #1 holds the only instance, no checkpoint on disk. /
   NEED: a fresh `pcsx2-qt -debugger` boot owned by one seat, with BP at 0x0100AED4.`
 
+
+---
+
+## Lead's state — 2026-10-08 (end of W274 debug run)
+
+### What was DONE this dish
+- **T1 link**: full 19,404 engine relinked (347 MB, 20,127 `nm -C`). Boot unchanged → link necessary, NOT sufficient.
+- **T2 0x5b**: `emulateGuestGetEntryAddress` (98 lines) applied + built; patch `ps2recomp-linux-w274-0x5b-getentryaddress.patch`. Boot unchanged (0x5b 6× → 1 LOUD line) → 0x5b NOT the blocker.
+- **T3 sema#7 → DMAC root**: 5 independent angles converged (oracle ×2, Ghidra static, kernel audit, HLE diff).
+
+### The wall, precisely (all measured this session)
+1. tid2 (FUN_01000BA0) is the ONLY SignalSema(7) waker (Ghidra static).
+2. tid2 parks in the DMA-completion poll (0x0100AF50), waiting for D0_CHCR.STR (bit 8 of 0x10008000) and the busy byte 0x7000206D.
+3. The VIF0 ch0 transfer (CHCR=0x145, mode=1 chain, TADR=0x1fffdb0, 3 tags → 2704 bytes) **COMPLETES**: `[w274:dmac] queued/drain cause 0 ×1`, STR cleared.
+4. The DMAC handler FUN_0100DAE0 (0x100dae0) is registered (AddDmacHandler 0/1/2) and matches dispatchIrq (cause=0 enabled=1 hasFn=1).
+5. **FUN_0100DAE0 is NEVER entered** (0 `target_pc=0x100dae0` in the log) → the interrupt invocation is queued but never serviced → busy byte never clears → tid2 loops → tid1 WaitSema(7) → ExecPS2=0.
+
+### Precise bug (handoff)
+The DMAC interrupt invocation (GuestInvocationKind::Interrupt, queued by dispatchIrq) is **not serviced**. The INTC invocations (94) run; the single DMAC one does not. Fix is in EeScheduler invocation servicing (`serviceInvocations` / dispatch loop), NOT the transfer and NOT ps2_memory.
+
+### Temporary probes (OFF by default, need law-8 capture or revert before "done")
+`VULCAN4_W274_DMA`-gated `[w274:dma]/[w274:dma2]/[w274:tag]/[w274:dmac]/[w274:irq]` logs in:
+- `ps2xRuntime/src/lib/ps2_memory.cpp` (3 sites)
+- `ps2xRuntime/src/lib/ps2_runtime.cpp` (1 site)
+- `ps2xRuntime/src/lib/Kernel/EeScheduler.cpp` (1 site)
+These are diagnostic-only; must be captured in a patch or removed. Working tree has uncommitted changes.
+
+### Not reached
+`ExecPS2=0`, `halt=guest_blocked`, picture still the disclaimer. The wall is now named to ONE unserviced DMAC interrupt invocation.

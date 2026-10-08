@@ -1,0 +1,116 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index a9866db..9fc816d 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -436,6 +436,96 @@ namespace ps2_syscalls
+     // the guest loses its frame: that is G1.8's measured wall, where GT4's convergence-loop
+     // $s2/$s3 were reset every third iteration and hasInvocation() latched so every later 0x83
+     // silently fell through to our builtin instead of the guest's own code.
++    // ---------------------------------------------------------------------
++    // W274: GT4's OWN GetEntryAddress, installed over kernel syscall 0x5B.
++    //
++    // GT4's loader (SCUS_973.28, sub_0102AA90) copies a 0x330-byte blob with its
++    // own Copy syscall and patches the table:
++    //   Copy(dest=0x80075000, src=0x01036300, size=0x330)  @ 0x0102AAD0
++    //   SetSyscall(0x5B, 0x80075000)                       @ 0x0102AAE8
++    //   for n in {0x55..0x59}: SetSyscall(n, GetEntryAddress(n))  @ 0x0102AB00
++    //
++    // The blob's 0x5B handler (RDRAM 0x00075000) is a pure table LOOKUP: it scans a
++    // 6-entry {number,handler} table at RDRAM 0x00075300 and returns the paired word
++    // (0 when the number is absent). That is NOT the kernel primitive, which returns
++    // the ADDRESS of the writable syscall-table slot 0x80011F80+n*4 for the caller to
++    // write through. Returning the slot address here would make the loader install a
++    // table slot as a syscall handler. So the builtin case 0x5B cannot be reused; this
++    // is a different primitive and the guest must keep its own.
++    //
++    // The table is read LIVE out of rdram, never baked in (law 1). If it is not there,
++    // refuse loudly instead of inventing an address.
++    // ---------------------------------------------------------------------
++    static bool emulateGuestGetEntryAddress(uint8_t *rdram, R5900Context *ctx,
++                                           uint32_t syscallNumber, uint32_t handler)
++    {
++        constexpr uint32_t kGt4Syscall = 0x5Bu;
++        constexpr uint32_t kGt4HandlerPhys = 0x00075000u; // 0x80075000 & 0x1FFFFFFF
++        constexpr uint32_t kGt4TableAddr = 0x80075300u;   // blob+0x300
++        constexpr uint32_t kGt4TableCount = 6u;           // blob scans exactly 6 entries
++
++        // Strictly scoped: ONLY GT4's blob, ONLY on 0x5B. Anything else falls through
++        // untouched to the LOUD W250 limitation in the caller.
++        if (syscallNumber != kGt4Syscall || (handler & 0x1FFFFFFFu) != kGt4HandlerPhys)
++        {
++            return false;
++        }
++
++        static bool announced = false;
++        if (!announced)
++        {
++            announced = true;
++            std::cerr
++                << "VULCAN 4 LIMITATION: syscall 0x5B is emulated as GT4's OWN GetEntryAddress "
++                   "(guest blob installed by SetSyscall(0x5B,0x80075000), Copy source 0x01036300), NOT "
++                   "the kernel primitive that returns the writable syscall-table slot 0x80011F80+n*4. "
++                   "Emulated: scan GT4's 6-entry {number,handler} table at RDRAM 0x00075300, return the "
++                   "paired handler, 0 when the number is absent. Table read live from rdram."
++                << std::endl;
++        }
++
++        const uint8_t *table = getConstMemPtr(rdram, kGt4TableAddr);
++        if (!table)
++        {
++            std::cerr << "VULCAN 4 LIMITATION: syscall 0x5B (GT4 GetEntryAddress) — RDRAM 0x"
++                      << std::hex << kGt4HandlerPhys << std::dec
++                      << " region is not mapped; cannot look up an entry. Returning KE_ERROR."
++                      << std::endl;
++            setReturnS32(ctx, KE_ERROR);
++            return true;
++        }
++
++        uint32_t firstNumber = 0u;
++        std::memcpy(&firstNumber, table, sizeof(firstNumber));
++        if (firstNumber == 0u)
++        {
++            // Asked before GT4's own Copy(0x80075000, 0x01036300, 0x330) ran, or that Copy never ran.
++            std::cerr << "VULCAN 4 LIMITATION: syscall 0x5B (GT4 GetEntryAddress) — GT4's entry table at "
++                         "RDRAM 0x00075300 is empty, so GT4's own blob was never copied there. Returning "
++                         "KE_ERROR exactly as before this stub (was the W250 line)."
++                      << std::endl;
++            setReturnS32(ctx, KE_ERROR);
++            return true;
++        }
++
++        const uint32_t wanted = getRegU32(ctx, 4); // $a0 = syscall number to resolve
++        for (uint32_t i = 0u; i < kGt4TableCount; ++i)
++        {
++            uint32_t number = 0u;
++            uint32_t entry = 0u;
++            std::memcpy(&number, table + (i * 8u), sizeof(number));
++            std::memcpy(&entry, table + (i * 8u) + 4u, sizeof(entry));
++            if (number == wanted)
++            {
++                setReturnU32(ctx, entry);
++                return true;
++            }
++        }
++
++        setReturnU32(ctx, 0u); // GT4's blob returns 0 for "no such entry"
++        return true;
++    }
++
+     bool dispatchSyscallOverride(uint32_t syscallNumber, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         uint32_t handler = 0u;
+@@ -453,6 +543,14 @@ namespace ps2_syscalls
+             return false;
+         }
+ 
++        // W274: an override target can legitimately have no generated function when the guest
++        // installed its OWN blob below both images (GT4 does exactly this for 0x5B). Emulate the
++        // ones we have read out of the guest; everything else keeps hitting the W250 line below.
++        if (emulateGuestGetEntryAddress(rdram, ctx, syscallNumber, handler))
++        {
++            return true;
++        }
++
+         if (!runtime->hasFunction(handler))
+         {
+             // W250. NEVER silent: an override target with no generated function is a LOUD limitation

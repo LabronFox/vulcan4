@@ -3514,3 +3514,30 @@ send/parse). Our guest sits in `sub_00580cd8`'s 1,048,576-iteration delay loop (
 game's GIF path3 draw packets so `func_5AF850` completes and the frame reaches the screen. The frame-done
 flag + BIND reply are now correct; the remaining gap is the GIF/GS frontend upload path, not a per-frame
 signal.
+
+---
+
+## E3/GS deep — frame loop runs (software pacing), frame-done correct, but no GIF draw (architect, 2026-10-08)
+
+**Oracle** (paused @0x005b29c0):
+- client `0x008899C0`: `[0x00]=0` (cmd byte — the normal "empty" path), `[0x04]=6`, `[0x08]=7`,
+  `[0x14]=0x00047ED0`, `[0x18]=0x006DDDF0` (gp), `[0x24]=0x00047E88` (frame-done).
+- GS CSR `0x12001000 = 0` (idle).
+
+So hardware matches our R16 state — the frame-done flag and client layout are correct, and cmd byte 0 is
+the normal path (func_5AF850's `beqz v0` jump is the empty-packet case, not a failure).
+
+**Static** (`sub_00580cd8`, the frame loop):
+```
+0x580da4: jal func_5B17D0        ; allocator (a0=s1, a1=0x80000592, a2=0)
+0x580db0: bgezl a1, ...          ; alloc ok -> func_5B0750
+0x580dc4: jal func_5B0750        ; -> func_5AF850 (packet parser)
+0x580dd8: addiu v0,v0,-1 ... bne ; 1,048,576-iter software delay (UNCONDITIONAL frame pacing)
+```
+The delay is not a failure retry — it is the game's frame-pacing spin. The game IS running its frame loop,
+the frame-done flag is right, but `gs_packets` stays 15: the game never reaches the GIF path3 draw call
+inside `func_5AF850` / the render logic.
+
+**Verdict:** the per-frame pace is the software delay + the allocator (not a hardware VSync/VSINT/SIGNAL).
+The remaining gap is the **GIF path3 upload trigger**: trace what state inside `func_5AF850` makes the game
+emit XYZ2/XYZ3/SPRITE on hardware, and drive that in the GS frontend. Named, not written.

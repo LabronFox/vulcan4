@@ -731,3 +731,21 @@ $ cd tools/PS2Recomp && git diff --numstat
 ps2_memory.cpp  live+=212  patch+=212  PASS   (tools/patches/ps2recomp-linux-w275-zeroqwc-chain-complete.patch)
 EeScheduler/System/ps2_runtime carried by ps2recomp-linux-w275-t1b-giftag-empty-chain.patch (164/98/127)
 ```
+
+### Mechanical gate — RAW (Segment C)
+
+```
+=== VULCAN 4 dish gate — 2026-10-08 10:07 ===
+PASS  suite 497 tests, 0 failed
+PASS  newest commit authored as the captain
+PASS  working tree clean
+INFO  verify-menu.sh: not passed (last lines below) — screen is not the menu yet
+      newest capture : /mnt/ssd/vulcan4-build/run/w275busy-capture.png
+      GATE FAIL: the capture is BYTE-IDENTICAL to the disclaimer reference - the screen did not change.
+INFO  newest capture: /mnt/ssd/vulcan4-build/run/w275busy-capture.png
+INFO  newest log: /mnt/ssd/vulcan4-build/run/boot_w275r1busy.log
+      halt=guest_blocked
+INFO  missing-function hits in that log: 0
+=== RESULT: MECHANICAL CLAIMS HOLD ===
+GATE_EXIT=0
+```

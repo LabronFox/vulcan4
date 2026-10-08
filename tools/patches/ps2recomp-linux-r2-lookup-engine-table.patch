@@ -1,0 +1,253 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 3d8160f..7d87df8 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1811,8 +1811,12 @@ bool PS2Runtime::hasFunction(uint32_t address) const
+     {
+         return true;
+     }
+-    // W250. Unified space: also resolve into the ENGINE image's table.
+-    if ((norm & 3u) == 0u && g_ps2EngineFunctionTableSlotCount != 0u &&
++    // W250. Unified space: also resolve into the ENGINE image's table. The engine table symbols are
++    // weak: they resolve to NULL when no engine image is linked into this binary (unit tests, single-
++    // image runtimes). Dereferencing a NULL weak symbol is the suite segfault, so test the address
++    // before reading any of them.
++    if (&g_ps2EngineFunctionTableSlotCount != nullptr && (norm & 3u) == 0u &&
++        g_ps2EngineFunctionTableSlotCount != 0u &&
+         norm >= g_ps2EngineFunctionTableBase && norm < g_ps2EngineFunctionTableEnd)
+     {
+         const uint32_t eslot = (norm - g_ps2EngineFunctionTableBase) >> 2;
+@@ -1847,8 +1851,11 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
+ {
+     pushDispatchPc(address);
+ 
++    // W250/R2. Normalise the KSEG0/KSEG1 mirror to physical, exactly as hasFunction() does, so the
++    // two lookups agree on what a "generated" address is (physical addresses are unchanged).
++    const uint32_t norm = address & 0x1FFFFFFFu;
+     uint32_t slot = 0u;
+-    if (generatedFunctionTableSlot(address, slot))
++    if (generatedFunctionTableSlot(norm, slot))
+     {
+         RecompiledFunction fn = g_ps2RecompiledFunctionTable[slot];
+         if (fn != nullptr)
+@@ -1856,6 +1863,27 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
+             return fn;
+         }
+     }
++    // W250/R2. Unified space: an indirect jump or scheduler resume into the ENGINE image must resolve
++    // through g_ps2EngineFunctionTable, exactly as hasFunction() already does. Before this only the
++    // loader table was consulted, so every engine target arrived as
++    // "No exact recompiled function ... tableBase=0x1000008 tableEnd=0x102dbec" -- R2's five misses
++    // (0x5b7560 0x5adf20 0x48ef90 0x107f08 0x5b78a0) are ALL registered in the engine table and were
++    // only unreachable because this fallback was missing. Weak symbols: test the address of the weak
++    // symbol before reading any of them (the no-engine unit-test link has them NULL).
++    if (&g_ps2EngineFunctionTableSlotCount != nullptr && (norm & 3u) == 0u &&
++        g_ps2EngineFunctionTableSlotCount != 0u &&
++        norm >= g_ps2EngineFunctionTableBase && norm < g_ps2EngineFunctionTableEnd)
++    {
++        const uint32_t eslot = (norm - g_ps2EngineFunctionTableBase) >> 2;
++        if (eslot < g_ps2EngineFunctionTableSlotCount)
++        {
++            RecompiledFunction fn = g_ps2EngineFunctionTable[eslot];
++            if (fn != nullptr)
++            {
++                return fn;
++            }
++        }
++    }
+ 
+     std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
+               << " tableBase=0x" << g_ps2RecompiledFunctionTableBase
+@@ -5159,8 +5187,18 @@ void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
+ 
+ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
+ {
++    static const bool s_w275Drain = (std::getenv("VULCAN4_W275_INV") != nullptr);
+     for (uint32_t cause : m_memory.consumeCompletedDmacCauses())
+     {
++        if (s_w275Drain)
++        {
++            static uint64_t s_w275DrainN = 0;
++            ++s_w275DrainN;
++            std::cerr << "[w275:drain] n=" << s_w275DrainN
++                      << " cause=" << cause
++                      << " (-> dispatchDmacHandlersForCause -> dispatchIrq(dmac=1))"
++                      << std::endl;
++        }
+         ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
+     }
+ }
+@@ -5766,14 +5804,94 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
+     return top - 0x10u;
+ }
+ 
++// W275 T1-followup. Targeted DMAC busy-byte / CHCR watch, gated on VULCAN4_W275_BUSY (OFF by
++// default). These live on the guest memory entry points because they are the only place with the
++// guest PC in hand; the memory-layer probe in ps2_memory.cpp is suppressed during the inner call
++// (g_w275GuestBusyHandled) so an event is logged with its PC exactly once. A guest poll of the busy
++// byte can run hot, so reads are printed on value change and on a heartbeat; writes always.
++extern thread_local bool g_w275GuestBusyHandled;
++
++static bool w275BusyProbe() noexcept
++{
++    static const bool on = std::getenv("VULCAN4_W275_BUSY") != nullptr;
++    return on;
++}
++// Address map correction (T1-followup #2). The guest helper sub_0100DE58 is called with the DMAC
++// channel index in $a0 and computes the busy byte as
++//     0x100de88 sll  $v1,$s0,1 ; 0x100de94 addu $v1,$v1,$s0 ; 0x100de9c sll $v1,$v1,2
++//     0x100dea4 addiu $v1,$v1,0x60 ; 0x100dea8 lui $a0,0x7000 ; 0x100deb0 ...
++//     0x100deb4 addiu $a1,$zero,1 ; 0x100debc sb $a1,0xD($a0)
++// i.e. byte = 0x70002000 + s0*12 + 0x60 + 0xD = 0x7000206D + s0*0xC. The stride is 12, NOT 16:
++// s0=0 (VIF0) -> 0x7000206D, s0=1 (VIF1) -> 0x70002079, s0=2 (GIF) -> 0x70002085,
++// s0=3 -> 0x70002091. The earlier watch set (0x6D/0x7D/0x89) could never have seen the GIF byte.
++static bool w275BusyByte(uint32_t a) noexcept
++{
++    // Widened to the whole possible window on the third measurement. The second run showed 2924
++    // SleepThread calls whose caller returns to 0x100afa8 -- the loop's own `lbu $v1,0x0($s0)` -- but
++    // only ONE watched read at that pc, so the polled byte must be at an address the enumerated set
++    // never covered. A range has no blind spot: 0x70002060..0x700020A0 covers stride 12 (0x6D/79/85/
++    // 91), stride 16 (0x6D/7D/8D/9D) and everything in between.
++    return a >= 0x70002060u && a <= 0x700020A0u;
++}
++static bool w275BusyWord(uint32_t a) noexcept
++{
++    return a == 0x7000206Cu || a == 0x70002078u || a == 0x70002084u || a == 0x70002090u ||
++           a == 0x7000207Cu || a == 0x70002088u;
++}
++// One change-detection bucket per byte of the watched window, so two different channels' bytes can
++// never mask each other in the "print only on change" logic.
++constexpr int kW275BusyBuckets = 128;
++static int w275BusyIdx(uint32_t a) noexcept
++{
++    return static_cast<int>((a - 0x70002060u) & 0x7Fu);
++}
++static bool w275Chcr(uint32_t a) noexcept
++{
++    return a == 0x10008000u || a == 0x10009000u || a == 0x1000A000u;
++}
++static void w275LogReadByte(const char *src, uint32_t vaddr, uint32_t value, uint32_t pc)
++{
++    static uint64_t n = 0;
++    static int last[kW275BusyBuckets] = {0};
++    static bool seen[kW275BusyBuckets] = {false};
++    const int idx = w275BusyIdx(vaddr);
++    ++n;
++    const int v = static_cast<int>(value & 0xFFu);
++    const bool changed = (!seen[idx] || last[idx] != v);
++    seen[idx] = true;
++    last[idx] = v;
++    if (changed || n <= 8u || (n % 1000000u) == 0u)
++    {
++        std::cerr << "[w275:busy] op=READ8 guest=1 addr=0x" << std::hex << vaddr
++                  << " value=0x" << v << " pc=0x" << pc << std::dec
++                  << " n=" << n << (changed ? " changed=1" : "") << " src=" << src << "\n";
++    }
++}
++static void w275LogWrite(const char *op, const char *src, uint32_t vaddr, uint32_t value, uint32_t pc)
++{
++    std::cerr << "[w275:busy] op=" << op << " guest=1 addr=0x" << std::hex << vaddr
++              << " value=0x" << value << " pc=0x" << pc << std::dec << " src=" << src << "\n";
++}
++
+ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ {
++    const bool watch = w275BusyProbe() && w275BusyByte(vaddr);
++    if (watch)
++        g_w275GuestBusyHandled = true;
+     try
+     {
+-        return m_memory.read8(vaddr);
++        const uint8_t v = m_memory.read8(vaddr);
++        if (watch)
++        {
++            g_w275GuestBusyHandled = false;
++            w275LogReadByte("PS2Runtime::Load8", vaddr, v, ctx->pc);
++        }
++        return v;
+     }
+     catch (const std::exception &)
+     {
++        if (watch)
++            g_w275GuestBusyHandled = false;
+         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD);
+         return 0;
+     }
+@@ -5801,12 +5919,24 @@ static bool w132AdelProbe() noexcept
+ 
+ uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ {
++    const bool watch = w275BusyProbe() && (w275BusyWord(vaddr) || w275Chcr(vaddr));
++    if (watch)
++        g_w275GuestBusyHandled = true;
+     try
+     {
+-        return m_memory.read32(vaddr);
++        const uint32_t v = m_memory.read32(vaddr);
++        if (watch)
++        {
++            g_w275GuestBusyHandled = false;
++            const char *src = w275Chcr(vaddr) ? "PS2Runtime::Load32.chcr" : "PS2Runtime::Load32.busyword";
++            w275LogWrite("READ32", src, vaddr, v, ctx->pc);
++        }
++        return v;
+     }
+     catch (const std::exception &)
+     {
++        if (watch)
++            g_w275GuestBusyHandled = false;
+         // W132. THE ONE NUMBER THAT SPLITS THE HYPOTHESIS IN TWO.
+         //
+         // The reviewer is right that this is the cheapest possible measurement and I should have taken it
+@@ -5876,14 +6006,24 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8_t value)
+ {
+     ps2TraceGuestWrite(rdram, vaddr, 1u, value, 0u, "WRITE8", ctx);
++    const bool watch = w275BusyProbe() && w275BusyByte(vaddr);
++    if (watch)
++    {
++        g_w275GuestBusyHandled = true;
++        w275LogWrite("WRITE8", "PS2Runtime::Store8", vaddr, value, ctx->pc);
++    }
+     try
+     {
+         m_memory.write8(vaddr, value);
+     }
+     catch (const std::exception &)
+     {
++        g_w275GuestBusyHandled = false;
+         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
++        return;
+     }
++    if (watch)
++        g_w275GuestBusyHandled = false;
+ }
+ 
+ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint16_t value)
+@@ -5902,13 +6042,26 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
+ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value)
+ {
+     ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
++    const bool watch = w275BusyProbe() && (w275BusyWord(vaddr) || w275Chcr(vaddr));
++    if (watch)
++    {
++        const bool chcr = w275Chcr(vaddr);
++        w275LogWrite(chcr ? "WRITE_CHCR" : "WRITE32",
++                     chcr ? "PS2Runtime::Store32.chcr" : "PS2Runtime::Store32.busyword",
++                     vaddr, value, ctx->pc);
++    }
+     try
+     {
++        if (watch)
++            g_w275GuestBusyHandled = true;
+         m_memory.write32(vaddr, value);
++        if (watch)
++            g_w275GuestBusyHandled = false;
+         drainCompletedDmacHandlers(rdram);
+     }
+     catch (const std::exception &)
+     {
++        g_w275GuestBusyHandled = false;
+         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
+     }
+ }

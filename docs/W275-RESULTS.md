@@ -906,3 +906,163 @@ owned: it is the only reason this dish's gate is not green.
 
 **Segment D is therefore a FAILED-GATE dish by law 4, with the gate output above.** What it proves
 is the measurement: ExecPS2 fires. The suite SEGFAULT is the handoff.
+
+---
+
+## R2 — the 5 dispatch misses: root cause + fix (architect, 2026-10-08)
+
+**Claim in tasks.md (rejected):** "0x5b7560/0x5adf20/0x48ef90 ARE in CSV yet missed · 0x5b78a0 is an
+analyzer gap · 0x107f08 is a loader entry". Measured against the artifacts, this is wrong on all three.
+
+**Measured truth — all 5 are already recompiled and registered in the ENGINE table:**
+
+| target | engine-symbols.csv? | engine register_functions.cpp? | entry vs target | why missed |
+|---|---|---|---|---|
+| 0x5b7560 | YES `FUN_005b7560` size 4 (line 16938) | YES slot 1236310 `sub_005b7560_0x5b7560` | function ENTRY | lookupFunction = loader table only |
+| 0x5adf20 | YES `FUN_005adf20` size 16 (line 16798) | YES slot 1226694 `sub_005adf20_0x5adf20` | function ENTRY | same |
+| 0x48ef90 | YES `FUN_0048ef90` size 4 (line 12636) | YES slot 932834 `sub_0048ef90_0x48ef90` | function ENTRY | same |
+| 0x107f08 | NO | YES slot 8128 `sub_00107f08_0x107f08` | function ENTRY (recompiler-discovered) | same |
+| 0x5b78a0 | NO | YES slot 1236518 `sub_005b7788_0x5b7788` `// 0x5b78a0` | interior jump TARGET inside sub_005b7788 | same |
+
+(`grep -in "0x005b7560"` etc. — the CSV stores 8-digit uppercase hex, which is why a 6-digit grep
+read as "not in CSV".)
+
+**Root cause (single, uniform):** `PS2Runtime::lookupFunction` (`ps2xRuntime/src/lib/ps2_runtime.cpp:1850`)
+resolves a guest PC against ONLY `g_ps2RecompiledFunctionTable` (loader, base `0x1000008` end
+`0x102dbec`). Two other resolvers already handle the second image:
+- `hasFunction` (same file :1803) falls through to `g_ps2EngineFunctionTable` (W250 block);
+- the harness arrival loop's `resolveFunction` (vulcan4_harness.cpp:1605) consults both (W241).
+
+The EE Scheduler drive loop (`EeScheduler.cpp:332` gate → `:351` resolve) uses `hasFunction` for the
+gate (passes for engine addresses) then `lookupFunction` for the pointer (fails for engine addresses).
+So an engine target passes the gate and then dies in the lookup, printing exactly
+`No exact recompiled function ... tableBase=0x1000008 tableEnd=0x102dbec`, returning the
+`missingFunction` lambda, which `reportMissingFunction`s with `kind=IndirectJump op=dispatch source=0x0`
+— byte-for-byte the boot-log line 65588. `sce_ExitThread @0x005ad8c8` → tid1 Dormant → halt guest_blocked.
+
+**Fix (applied):** `lookupFunction` now normalises KSEG0/KSEG1 and falls through to
+`g_ps2EngineFunctionTable`, mirroring `hasFunction` including the weak-symbol null guard (so the
+no-engine unit-test link still resolves `&g_ps2EngineFunctionTableSlotCount == nullptr`). This is a
+runtime source fix, NOT a TOML/analyzer change and NOT generated-code regeneration.
+
+- Patch: `/home/or/vulcan4/tools/patches/ps2recomp-linux-r2-lookup-engine-table.patch` (reverse-apply
+  check passed against the live tree — the patch carries exactly the applied change).
+- Rebuild (the driver directs rebuild+boot): `cd /mnt/ssd/vulcan4-build && VULCAN4_ENGINE_DIR=/mnt/ssd/vulcan4-build/recomp_engine_w251 bash /home/or/vulcan4/tools/harness/build_harness.sh`
+
+The 6 added lines beyond the board's W275 "127/2" ps2_runtime.cpp numstat are these two R2 hunks;
+the rest of ps2_runtime.cpp's diff remains the W275 probe work, already captured in the w275 patches.
+
+## Segment E (R2) — `lookupFunction` falls through to the engine table; the 5 misses are GONE
+
+**Change (architect-authored, in the tree uncommitted when measured).** `PS2Runtime::lookupFunction`
+(`ps2_runtime.cpp:1850`) normalised the address and consulted ONLY `g_ps2RecompiledFunctionTable`
+(the loader table). `hasFunction` had always also consulted `g_ps2EngineFunctionTable`, and the engine
+image — the GT4 code the recompiler emitted into the second image, base `0x00100000`, end `0x00617A14`
+— holds every one of R1's five blocks. So an indirect jump or a scheduler resume into the engine image
+resolved as "No exact recompiled function" while `hasFunction` said the address existed. R2 makes
+`lookupFunction` mirror `hasFunction`: normalise, try the loader table, then fall through to the engine
+table (weak-symbol-guarded so the no-engine unit-test link still works). Diff: **ps2_runtime.cpp
++158/-5** (was +127/-2 before R2).
+
+### Measurement — 15 s plain boot, probes OFF, `boot_w275r2.log` vs `boot_w275sleept.log`
+
+Both in `/mnt/ssd/vulcan4-build/run`, engine `recomp_engine_w251`, `-j2`, no probe env set.
+
+| | R1 (`w275sleept`) | **R2 (`w275r2`)** |
+|---|---|---|
+| ExecPS2 invocations | 1 | 1 |
+| **`functions_entered`** | 10,417 | **10,446** |
+| `true_guest_entries` | 1,535,095 | **1,730,333** |
+| **`ee_cycle`** | 3,770,458 | **37,262,408** (9.9×) |
+| `frames_presented` | 333 | **864** (2.6×) |
+| `distinct_pcs` | 188 | **207** |
+| **`halt`** | `guest_blocked` | **`stuck_in_syscall`** |
+| `sce_ExitThread` (0x04) | **1** call at `pc=0x005ad8c8` | **0** |
+| `[guest-branch:missing-target]` events | **1** line / 5 targets | **0** |
+| `grep -ac 'missing-target\|no generated function'` | 49 | 57 |
+| tid1 | `status=Dormant pc=0x5ad8c8` | `status=0(running) pc=0x005b0ac8` |
+
+**R2's gate: the dispatch misses are gone, the thread survives, the halt is a NAMED reason.**
+`functions_entered` rose only +29 because it counts *distinct generated functions entered*, and the
+recompiled set was already nearly saturated — the growth is in **work, not in reach**: 9.9× the
+EE cycles and 2.6× the presented frames for the same 15 s wall clock. The block that ended R1 —
+`sce_ExitThread` at `pc=0x005ad8c8`, killing tid1 (`status=Dormant count=1 runningThreadId=0`) — does
+not happen at all in R2. tid1 is alive and running at `pc=0x005b0ac8`, which is **past** `0x5ad8c8`.
+
+**Engine-image PCs executed: 19 distinct** inside `0x00100000..0x00617A14`, measured from the distinct
+`last_pc=` values on every syscall tally line (`/mnt/ssd/tmp/r2_pcs.txt`, 33 distinct syscall-site PCs,
+19 in range). Plus the running PC `0x005b0ac8` itself, in range. `> 0` — gate met.
+
+### The new wall (named, not a crash)
+
+```
+VULCAN4 BOOT REPORT ... halt=stuck_in_syscall ...
+VULCAN4 HARNESS detail=blocked inside SCE syscall 0x83 (FindAddress), guest pc 0x005b0ac8
+    -- this syscall is the wall  pc=0x005b0ac8 distinct_pcs=207 ... ee_cycle=37262408
+    ... thread_state=tid1:status=0:wait=none#0:pc=0x005b0ac8:ra=0x005b0ac8 ... deadline_s=15
+  0x83 sce_FindAddress calls=4 last_pc=0x005b7410
+     ra_count=0x010286dcx1,0x010286f0x1,0x005b74acx1,0x005b74c0x1
+     a0=0x80000000  a1=0x80080000  s0=0x010286dc/0x01035350, 0x005b74ac/0x00658368
+```
+
+This is the **watchdog deadline**, not a deadlock: the guest was alive and executing when the 15 s
+budget expired. `activeSyscallId()` was 0x83, so the harness names it. FindAddress was called only
+**4** times (so it is not the livelock shape the harness also detects), each over the window
+`0x80000000..0x80080000` — 131,072 words. The caller `ra=0x010286dc` / `0x010286f0` is in the
+`0x0102xxxx` loader/IRX region and `ra=0x005b74ac` / `0x005b74c0` is in the engine image.
+
+**Counter, and it matters: the 57 `no generated function` hits in R2 are NOT the R1 misses.** They are
+a *different*, pre-existing limitation and none of them is a dispatch miss:
+
+```
+57  VULCAN 4 LIMITATION: syscall 0xNN override handler 0xADDR has no generated function in either
+    image — not invoking (was silent KE_ERROR).
+```
+48 of the 57 are syscall 0x56; handlers `0x5b79f8`, `0x5b98d0`, `0x800750c8`, `0x80076000` — the
+`0x8007xxxx` ones are the IOP-side addresses R1 also reported. `grep -ac
+'\[guest-branch:missing-target\]'` in R2 is **0**. So the coordinator's grep
+`'missing-target\|no generated function'` reads 57 while the *dispatch misses it is meant to count*
+are 0 — the two are not the same thing and the number alone would have been misread.
+
+### Law-8 capture — RAW (Segment E)
+
+```
+$ cd tools/PS2Recomp && git diff --numstat
+171	6	ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+98	0	ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+28	7	ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+212	4	ps2xRuntime/src/lib/ps2_memory.cpp
+158	5	ps2xRuntime/src/lib/ps2_runtime.cpp
+
+PASS  live_added=171  distinct=136  MISSING_from_patches=0  ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+PASS  live_added=98   distinct=74   MISSING_from_patches=0  ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+PASS  live_added=28   distinct=27   MISSING_from_patches=0  ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+PASS  live_added=212  distinct=150  MISSING_from_patches=0  ps2xRuntime/src/lib/ps2_memory.cpp
+PASS  live_added=158  distinct=111  MISSING_from_patches=0  ps2xRuntime/src/lib/ps2_runtime.cpp
+```
+
+The R2 fallback is carried by `tools/patches/ps2recomp-linux-r2-lookup-engine-table.patch`
+(11,222 bytes, 158 added lines vs the live 158 — the whole-file diff, so it carries the earlier
+ps2_runtime.cpp work as well and cannot under-capture).
+
+### Confirmation boot — 45 s, same binary, probes OFF (`boot_w275r2long.log`)
+
+| | 15 s | **45 s** |
+|---|---|---|
+| `functions_entered` | 10,446 | **10,458** |
+| `true_guest_entries` | 1,730,333 | **2,380,133** |
+| `ee_cycle` | 37,262,408 | **63,253,716** |
+| `frames_presented` | 864 | **2,620** (3.03×) |
+| `vblanks_processed` | 57 | 62 |
+| `sce_FindAddress calls` | 4 | **4** (unchanged) |
+| `sce_ExitThread calls` | 0 | **0** |
+| `[guest-branch:*]` / `No exact recompiled function` | 0 / 0 | **0 / 0** |
+| halt | `stuck_in_syscall` | `stuck_in_syscall` (same pc `0x005b0ac8`) |
+
+**So the FindAddress halt is NOT a hard wall and NOT a re-entry loop.** Frames keep presenting
+*linearly* (864 → 2,620 = 3.03× for 3.0× wall clock), no dispatch miss ever occurs, and `FindAddress`
+is called **4 times in both runs** — the guest is not stuck inside it. The wall is the 15 s / 45 s
+**deadline**: tid1 is alive and `status=0 (running)` at `pc=0x005b0ac8` doing guest-side compute.
+`functions_entered` climbs only +12 over 3× the time, which is the signature of a **guest loop inside
+the already-recompiled set** — reach is saturated; the growth is in cycles executed, not functions
+reached. That is the next thing to name (what is at `0x005b0ac8`), not a dispatch miss.

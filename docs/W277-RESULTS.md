@@ -80,3 +80,29 @@ menu.
 - `missing_functions=0` on r30 (was 1 on w277mod: `pc=0x0058dfe0`).
 - Runs compared: `boot_w277mod.log` (halt=missing_function, 15 gs_packets, the pink screen the
   captain rejected) vs `boot_w277r30.log` (wallclock_deadline, 41 gs_packets, 0 missing).
+
+## R30b — PCDV/Pcdv bound, the whack-a-mole is the PDI CDVD streamer
+
+After the SifLoadModule fix, the remaining walls resolve in sequence, each revealing the next:
+
+1. `bind sid=0x50434456` ("PCDV") → no server. Stub `ps2xIOP/src/modules/pdicdvd.cpp`
+   (patch `ps2recomp-linux-w277-pdicdvd-service.patch`) claims it, gated on pdicdvd/libpdi aliases.
+2. `bind sid=0x50636476` ("Pcdv") → no server. Same stub claims it (two sids).
+3. `[PCDV:stub] rpc=0x0 send=0x86ccc0 sendSize=0x40 recv=0` — the first real DVD call, send-only.
+4. missing-target `0x578288` (JALR 0x578118) — an 8-byte `jr ra;nop` Ghidra missed between
+   FUN_00578230 (ends 0x578284) and the 0x578290 routine. Closed at the tool input:
+   `w276-engine_r30.toml` adds `"hook_578288@0x00578288"` (entry_points 884→885), emit 19404/19404.
+5. missing-target `0x5477c8` (JALR 0x578714) — THE CURRENT WALL, same class. Not yet closed.
+
+`boot_w277r30b.log`: functions_entered=13108 halt=missing_function pc=0x005477c8, and the trace is
+now DEEP in the PDI CDVD manager (0x575098, 0x578968, 0x578cf0, 0x575e60, 0x5769f0, a new tid6 at
+0x5786f0). The game has finished loading drivers and is executing the DVD streamer's own code — the
+streamer is no longer "stubbed at the bind", it is running and missing Ghidra-missed call targets.
+
+## The honest verdict
+
+The LOADFILE wall is ANSWERED (16 drivers load, all service binds resolve), and two Ghidra-missed
+functions are closed at the tool input. The picture has NOT advanced to a human-verified GT4 screen.
+What remains is a mechanical grind: each `missing-target` (0x5477c8 next) is an 8-byte or small
+`jr ra`/leaf Ghidra missed, closed by one TOML entry + emit + rebuild. The DVD streamer RPCs
+themselves are not yet decoded — that is the real protocol work after the grind.

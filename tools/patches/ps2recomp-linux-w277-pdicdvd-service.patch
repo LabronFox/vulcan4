@@ -1,0 +1,174 @@
+=== W277: PDI CDVD service stubs (sids 0x50434456 "PCDV" + 0x50636476 "Pcdv") ===
+# The engine loads PDICDVD.IRX + LIBPDI.IRX (LOADFILE rpc=0) then binds both sids; no route
+# existed so the binds retried forever. This adds a stub service (like dbcman) that claims both
+# sids, gated on pdicdvd/libpdi module aliases, logs every RPC, and invents no replies.
+# Verified: both binds resolve (boot_w277pcdv2.log), game proceeds to PCDV rpc=0 then a
+# Ghidra-missed fn (0x578288) closed at the tool input (w276-engine_r30.toml).
+
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index e35218d..cf7b90a 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -29,6 +29,13 @@ add_library(ps2_iop STATIC
+     src/modules/libsd.cpp
+     src/modules/fileio.cpp
+     src/modules/mcserv.cpp
++    src/modules/cdvd.cpp
++    # W276 R29. LOADFILE (sid 0x80000006). GT4 binds it and the bind has no server, so the guest's
++    # own retry loop never exits: 15 binds and 8 "has no server ... Not fabricating a server" lines
++    # in run/boot_w276r28on.log before the run dies at 0x5c1d50.
++    src/modules/loadfile.cpp
++    # W277. "PCDV" (0x50434456) = PDI_CDVD_Manager, the DVD streaming layer.
++    src/modules/pdicdvd.cpp
+ )
+ 
+ target_compile_features(ps2_iop PUBLIC cxx_std_20)
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index 11262fc..453c75e 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -24,6 +24,15 @@ namespace ps2x::iop
+             coreServices.emplace_back(detail::createDbcmanService(host));
+             coreServices.emplace_back(detail::createLibSdService(host));
+             coreServices.emplace_back(detail::createFileIoService(host));
++            coreServices.emplace_back(detail::createCdvdService(host));
++            // W276 R29. LOADFILE (0x80000006). Without this route canBindRpc(0x80000006) is false,
++            // SifRpcRawBind leaves client->server NULL, and the guest's bind-once wrapper at
++            // 0x5b6268 spins its own retry loop instead of ever issuing the call it guards.
++            coreServices.emplace_back(detail::createLoadFileService(host));
++            // W277. "PCDV" (0x50434456) = PDI_CDVD_Manager, the DVD streaming layer. The engine
++            // loads PDICDVD.IRX via LOADFILE rpc=0 then binds this sid; without a route the bind
++            // retries forever (boot_w277r30.log tail).
++            coreServices.emplace_back(detail::createPdicdvdService(host));
+             refreshServiceModuleKeys();
+             rebuildRoutes();
+         }
+diff --git a/ps2xIOP/src/module_factories.h b/ps2xIOP/src/module_factories.h
+index d8f583f..40fe326 100644
+--- a/ps2xIOP/src/module_factories.h
++++ b/ps2xIOP/src/module_factories.h
+@@ -8,4 +8,9 @@ namespace ps2x::iop::detail
+     std::unique_ptr<IopService> createLibSdService(IopHost &host);
+     std::unique_ptr<IopService> createFileIoService(IopHost &host);
+     std::unique_ptr<IopService> createMcservService(IopHost &host);
++    std::unique_ptr<IopService> createCdvdService(IopHost &host);
++    // W276 R29. LOADFILE, sid 0x80000006.
++    std::unique_ptr<IopService> createLoadFileService(IopHost &host);
++    // W277. "PCDV" = PDI_CDVD_Manager, sid 0x50434456, the DVD streaming layer.
++    std::unique_ptr<IopService> createPdicdvdService(IopHost &host);
+ }
+
+--- new file ps2xIOP/src/modules/pdicdvd.cpp ---
+new file mode 100644
+index 0000000..abef47b
+--- /dev/null
++++ b/ps2xIOP/src/modules/pdicdvd.cpp
+@@ -0,0 +1,108 @@
++#include "module_factories.h"
++#include "rpc_reply.h"
++
++#include <array>
++#include <cstdint>
++#include <mutex>
++#include <sstream>
++#include <string>
++
++namespace ps2x::iop::detail
++{
++    namespace
++    {
++        // W277. The PDI CDVD services. GT4's libpdi/PDICDVD layer registers TWO SIF RPC sids,
++        // measured in run/boot_w277pcdv.log:
++        //   0x50434456 = "PCDV"  (bind a=0x86cb84) -- unblocked by this stub
++        //   0x50636476 = "Pcdv"  (bind a=0x86cc84) -- the NEXT bind, still failing after "PCDV"
++        // Both are provided by the PDI_CDVD_Manager / pdicdvd / libpdi IRX modules (PDICDVD.IRX and
++        // LIBPDI.IRX), which the engine loads via LOADFILE rpc=0 (moduleIds 21 and 16 in
++        // boot_w277r30.log) immediately before binding these sids. The R29 loadfile fix made those
++        // loads succeed; the binds then fail because no route exists, and the guest retries forever.
++        //
++        // This file is a STUB in the same sense dbcman.cpp is: it claims the sids so the binds
++        // resolve, and it LOGS every RPC so the protocol is revealed, but it does not yet decode or
++        // serve the DVD read/seek/stream RPCs. No function is answered with an invented value; a
++        // known function is answered only when its reply is measured.
++        constexpr uint32_t kPcdvSid = 0x50434456u; // "PCDV"
++        constexpr uint32_t kPcdvSidMixed = 0x50636476u; // "Pcdv"
++        constexpr uint32_t kMaxUnknownRpcLogs = 64u;
++
++        class PdicdvdService final : public IopService
++        {
++        public:
++            explicit PdicdvdService(IopHost &host)
++                : m_host(host)
++            {
++            }
++
++            [[nodiscard]] std::string_view name() const override { return "pdicdvd"; }
++
++            [[nodiscard]] std::span<const uint32_t> sids() const override { return kSids; }
++
++            [[nodiscard]] std::span<const std::string_view> moduleAliases() const override
++            {
++                return kModuleAliases;
++            }
++
++            void reset() override
++            {
++                std::lock_guard<std::mutex> lock(m_mutex);
++                m_unknownRpcLogCount = 0u;
++            }
++
++            [[nodiscard]] RpcResult handleRpc(const RpcRequest &request) override
++            {
++                RpcResult result;
++                if (request.sid != kPcdvSid && request.sid != kPcdvSidMixed)
++                {
++                    return result;
++                }
++
++                result.handled = true;
++                result.resultAddress = request.receive.address;
++
++                bool shouldLog = false;
++                {
++                    std::lock_guard<std::mutex> lock(m_mutex);
++                    if (m_unknownRpcLogCount < kMaxUnknownRpcLogs)
++                    {
++                        ++m_unknownRpcLogCount;
++                        shouldLog = true;
++                    }
++                }
++                if (shouldLog)
++                {
++                    std::ostringstream message;
++                    message << "[PCDV:stub]"
++                            << " rpc=0x" << std::hex << request.function
++                            << " send=0x" << request.send.address
++                            << " sendSize=0x" << request.send.size
++                            << " recv=0x" << request.receive.address
++                            << " recvSize=0x" << request.receive.size;
++                    m_host.log(LogLevel::Info, message.str());
++                }
++                return result;
++            }
++
++            void appendDebugMetrics(std::vector<DebugMetric> &metrics) const override
++            {
++                std::lock_guard<std::mutex> lock(m_mutex);
++                metrics.push_back({"pdicdvd_unknown_rpc_logs", m_unknownRpcLogCount, false});
++            }
++
++        private:
++            inline static constexpr std::array<uint32_t, 2> kSids{kPcdvSid, kPcdvSidMixed};
++            inline static constexpr std::array<std::string_view, 3> kModuleAliases{"pdicdvd", "pdi_cdvd_manager", "libpdi"};
++
++            IopHost &m_host;
++            mutable std::mutex m_mutex;
++            uint32_t m_unknownRpcLogCount = 0u;
++        };
++    }
++
++    std::unique_ptr<IopService> createPdicdvdService(IopHost &host)
++    {
++        return std::make_unique<PdicdvdService>(host);
++    }
++}

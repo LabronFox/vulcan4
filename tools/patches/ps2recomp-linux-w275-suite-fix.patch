@@ -1,0 +1,19 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 3d8160f..94f504e 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1811,8 +1811,12 @@ bool PS2Runtime::hasFunction(uint32_t address) const
+     {
+         return true;
+     }
+-    // W250. Unified space: also resolve into the ENGINE image's table.
+-    if ((norm & 3u) == 0u && g_ps2EngineFunctionTableSlotCount != 0u &&
++    // W250. Unified space: also resolve into the ENGINE image's table. The engine table symbols are
++    // weak: they resolve to NULL when no engine image is linked into this binary (unit tests, single-
++    // image runtimes). Dereferencing a NULL weak symbol is the suite segfault, so test the address
++    // before reading any of them.
++    if (&g_ps2EngineFunctionTableSlotCount != nullptr && (norm & 3u) == 0u &&
++        g_ps2EngineFunctionTableSlotCount != 0u &&
+         norm >= g_ps2EngineFunctionTableBase && norm < g_ps2EngineFunctionTableEnd)
+     {
+         const uint32_t eslot = (norm - g_ps2EngineFunctionTableBase) >> 2;

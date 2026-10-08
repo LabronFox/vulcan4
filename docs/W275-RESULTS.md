@@ -2058,6 +2058,6 @@ OK  ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp live=28 patchAdded=56
 OK  ps2xRuntime/src/lib/ps2_memory.cpp live=212 patchAdded=924
 OK  ps2xRuntime/src/lib/ps2_runtime.cpp live=158 patchAdded=3274
 ALL-COVERED
-$ ls -la tools/patches/ | tail -3
--rw-rw-r--r-- 1 or or 1143 Oct  8 12:0X ps2recomp-linux-r4-sif0-dmac-dispatch.patch   <- SIF.cpp, 11 added lines
+$ ls -la tools/patches/ps2recomp-linux-r4-sif0-dmac-dispatch.patch
+-rw-rw-r--r-- 1 or or 1143 Oct  8 12:11 ps2recomp-linux-r4-sif0-dmac-dispatch.patch   <- SIF.cpp, 11 added lines
 ```

@@ -3100,3 +3100,30 @@ the definite half; the SIF0 completion `a0` needs oracle verification (the handl
 0x8000000A/0x80000009 against `a0[0x20]`).
 
 Patch: `/home/or/vulcan4/tools/patches/ps2recomp-linux-r14-sif0-completion.patch` (SIF.cpp).
+
+---
+
+## R14 follow-up — sub_005B1328 a0 decompiled; picture still the disclaimer (architect, 2026-10-08)
+
+**a0 correction (decompiled, not yet fixed):** `sub_005B1328` (0x5b1328-0x5b13f8) reads:
+```
+s2 = a0
+v1 = a0[0x20]          ; command id, == 0x8000000A or 0x80000009
+s1 = a0[0x1C]          ; pool entry pointer
+a0[0x24] -> s1[0x24]   ; free-list update
+a0[0x28] -> s1[0x14]   ; free-list update
+if s1[0x8] >= 0: jal func_5ADCD0 (SignalSema) with a0 = s1[0x8]   ; sema 46
+```
+So `a0` is the **SIF command header** (a ~0x2C-byte ack buffer with the pool entry at +0x1C and the command
+id at +0x20), NOT `xfer.src` (the 20-byte transfer payload). My R14 `a0 = xfer.src` is wrong: the invocation
+runs, reads garbage at `xfer.src+0x20`, and bails — `SignalSema ra=0x5b13c8` is still 0. The exact ack buffer
+address is the guest-allocated pool slot (the `0x00888240` region, returned by the guest's own
+`jal 0x005B17D0` allocator); nailing it needs the oracle.
+
+**Picture (R5 gate):** `bash .auto/verify-menu.sh` → `STRUCTURAL MATCH` to the disclaimer (1 colour,
+non-black 0.1085 vs reference 0.1150). The screen is STILL the disclaimer — the GS has not drawn GT4's
+frames yet. That is the R5 enabler E3/GS work, not a boot blocker.
+
+Net: the R14 `maxCycleRepeats` raise is the definite half (spin cleared, full-45s boot); the SIF0
+completion `a0` still needs the oracle-correct buffer before `SignalSema ra=0x5b13c8` fires and the pool
+reuses.

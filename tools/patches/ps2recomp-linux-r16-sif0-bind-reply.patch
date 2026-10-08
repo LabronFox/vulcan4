@@ -1,0 +1,150 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+index dc975ed..eb1f673 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+@@ -10,6 +10,10 @@
+ #include <limits>
+ #include <vector>
+ 
++// R15. Global (defined in ps2_runtime.cpp): the guest allocator sub_005B17D0's return, the SIF
++// recv-buffer (pool entry).
++extern uint32_t g_sif0PoolEntry;
++
+ namespace ps2_stubs
+ {
+     void sceSifCmdIntrHdlr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -752,6 +756,83 @@ namespace ps2_stubs
+ 
+         ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 5u);
+ 
++        // R14/E2 (derive the pool entry from the posted command). The EE→IOP SIF1 send must produce
++        // the IOP→EE SIF0 completion: the engine's SIF0 completion handler sub_005B1328 frees the
++        // posted command's pool entry and SignalSema(46). The command header the EE posts has the pool
++        // entry at +0x1C and the cmd id (0x8000000A = SIF_CMD_END) at +0x20. Read them out of the
++        // transfer source and hand the same layout to the handler (a0 = a synthesized header at
++        // RDRAM 0x00081F20, the dispatcher-stack address the oracle measured).
++        if (runtime && pendingCount > 0u && runtime->hasFunction(0x005B1328u))
++        {
++            constexpr uint32_t kSif0AckHeaderAddr = 0x00081F20u;
++            // R15. The pool entry is the guest allocator's return (cached by dispatchGuestBranch on
++            // sub_005B17D0), NOT anything in the SIF1 DESC (the command carries only the cmd id).
++            const uint32_t poolEntry = g_sif0PoolEntry;
++            uint32_t commandId = 0u;
++            for (uint32_t i = 0; i < pendingCount; ++i)
++            {
++                const uint32_t src = pending[i].src;
++                if (const uint8_t *p = getConstMemPtr(rdram, src))
++                {
++                    uint32_t cid = 0u;
++                    std::memcpy(&cid, p + 0x20u, sizeof(cid));
++                    if (cid == 0x8000000Au || cid == 0x80000009u)
++                    {
++                        commandId = cid;
++                        break;
++                    }
++                }
++            }
++            if (commandId == 0u)
++            {
++                commandId = 0x8000000Au;
++            }
++            uint32_t header[12] = {}; // 0x2C bytes
++            header[0x1C / 4u] = poolEntry;
++            header[0x20 / 4u] = commandId;
++            if (uint8_t *p = getMemPtr(rdram, kSif0AckHeaderAddr))
++            {
++                std::memcpy(p, header, sizeof(header));
++            }
++            GuestInvocation invocation{};
++            invocation.kind = GuestInvocationKind::Interrupt;
++            invocation.tag = commandId;
++            invocation.context = runtime->cpu();
++            invocation.context.pc = 0x005B1328u;
++            SET_GPR_U32(&invocation.context, 4, kSif0AckHeaderAddr);
++            SET_GPR_U32(&invocation.context, 29, 0u);
++            SET_GPR_U32(&invocation.context, 31, 0u);
++            runtime->eeScheduler().queueInvocation(std::move(invocation));
++
++            // R16. The SIF RPC BIND reply (cmd 0x80000009) is what advances the frame-done flag. The
++            // oracle measured sub_005B1328's BIND branch writing client 0x008899C0's +0x24 word
++            // (0x008899E4) to 0x00047E88 -- hardware's frame-done marker. Our recomp never delivered
++            // this reply (the END cmd above only frees the slot), so 0x008899E4 stayed 0 and the
++            // 0x005b2980 render loop never advanced. Deliver the BIND reply too: same header layout,
++            // +0x1C = the client, +0x20 = 0x80000009, +0x24 = 0x00047E88.
++            {
++                constexpr uint32_t kBindClient = 0x008899C0u;
++                constexpr uint32_t kBindFrameDone = 0x00047E88u;
++                uint32_t bind[12] = {};
++                bind[0x1C / 4u] = kBindClient;
++                bind[0x20 / 4u] = 0x80000009u; // SIF_CMD_BIND
++                bind[0x24 / 4u] = kBindFrameDone;
++                if (uint8_t *p = getMemPtr(rdram, kSif0AckHeaderAddr + 0x40u))
++                {
++                    std::memcpy(p, bind, sizeof(bind));
++                }
++                GuestInvocation bindInv{};
++                bindInv.kind = GuestInvocationKind::Interrupt;
++                bindInv.tag = 0x80000009u;
++                bindInv.context = runtime->cpu();
++                bindInv.context.pc = 0x005B1328u;
++                SET_GPR_U32(&bindInv.context, 4, kSif0AckHeaderAddr + 0x40u);
++                SET_GPR_U32(&bindInv.context, 29, 0u);
++                SET_GPR_U32(&bindInv.context, 31, 0u);
++                runtime->eeScheduler().queueInvocation(std::move(bindInv));
++            }
++        }
++
+         setReturnS32(ctx, static_cast<int32_t>(allocateSifDmaTransferId()));
+     }
+ 
+@@ -794,6 +875,50 @@ namespace ps2_stubs
+             });
+         }
+         setReturnU32(ctx, prev);
++
++        // R4/E2. SIF0 response modeling (hardware-measured record, not a fake). When the engine
++        // installs the SIF RPC receive-buffer address -- SifSetReg(0x80000001, 0x00886818) -- the IOP
++        // immediately delivers its SIF0 response record. The record pointer lands at *(0x00886818) =
++        // 0x20886740 (KSEG0 alias of the 64-byte record at physical 0x00886740). sub_005B0E30 (the
++        // engine's ch5 SIF0 DMAC handler) then reads the record: type byte 0x18 passes its beqz-a1 gate,
++        // dispatch word 0x80000001 & 0x7FFFFFFF = 1 selects table B[1] = func_5B0850 (baked in at
++        // 0x0088684C by the engine's 0x5b09ec init), and func_5B0850 stores record[0x14] to
++        // *(0x00886834) + record[0x10]*4. record[0x10]=0 and record[0x14]=1 therefore write
++        // *(0x008869C0)=1, which unblocks the engine's 0x5b1180 spin.
++        if (reg == kSifRegSubAddr && value == 0x00886818u && rdram)
++        {
++            constexpr uint32_t kRecordPhys = 0x00886740u;
++            constexpr uint32_t kRecordPtrAddr = 0x00886818u;
++            const uint32_t record[16] = {
++                0x00000018u, // +0x00 type byte
++                0x00000000u, // +0x04
++                0x80000001u, // +0x08 dispatch word (index 1 -> table B[1] = func_5B0850)
++                0x00000000u, // +0x0C
++                0x00000000u, // +0x10 func_5B0850 store index (0 -> 0x008869C0)
++                0x00000001u, // +0x14 func_5B0850 store value (1)
++                0x00000000u, // +0x18
++                0x00000000u, // +0x1C
++                0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, // +0x20..+0x2C
++                0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, // +0x30..+0x3C
++            };
++            if (uint8_t *p = getMemPtr(rdram, kRecordPhys))
++            {
++                std::memcpy(p, record, sizeof(record));
++            }
++            if (uint8_t *p = getMemPtr(rdram, kRecordPtrAddr))
++            {
++                const uint32_t ptr = 0x20886740u;
++                std::memcpy(p, &ptr, sizeof(ptr));
++            }
++            static bool announced = false;
++            if (!announced)
++            {
++                announced = true;
++                std::cerr << "VULCAN 4: SIF0 response record delivered (IOP SifSetReg(0x80000001,0x00886818))"
++                          << " -- record@0x00886740 type=0x18 dispatch=0x80000001, ptr 0x20886740 -> 0x00886818,"
++                          << " so sub_005B0E30's jalr reaches func_5B0850 and writes 0x008869C0=1." << std::endl;
++            }
++        }
+     }
+ 
+     void sceSifSetRpcQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

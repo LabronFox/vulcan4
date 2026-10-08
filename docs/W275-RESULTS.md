@@ -3468,3 +3468,21 @@ PCSX2 left running and paused at `0x005b29c0` (DebugServer 21512 reachable); thr
 (`0x005b28f0`, `0x005b17d0`, `0x005b29c0`) and one watchpoint (`0x008899e4-0x008899e8`, 3 hits) still armed.
 The watchpoint's `last_PC` always reads `0x00000000` — do not trust it to name the writer; use it only to stop,
 then single-step and re-read the address (that is how the writer above was identified).
+
+---
+
+## R16 — SIF BIND reply delivered; gs_packets still 15, picture still the disclaimer → E3/GS (architect, 2026-10-08)
+
+**Fix:** delivered the SIF RPC BIND reply (cmd 0x80000009) as a second `sub_005B1328` invocation with the
+oracle layout — header `+0x1C = 0x008899C0` (client), `+0x20 = 0x80000009`, `+0x24 = 0x00047E88`
+(frame-done), `a0 = 0x81F60` — so the handler's `sw v0,0x24(s1)` writes `0x008899E4 = 0x00047E88`.
+
+**Boot result** (45s `boot_w275r18.log`): functions_entered=57932, distinct_pcs=752, `gs_packets=15`
+(unchanged), picture STILL the disclaimer (`verify-menu` STRUCTURAL MATCH, 1 colour). The render loop does
+not advance.
+
+**Stop-condition:** the frame-done write is not sufficient — the wall is **E3/GS**: the guest runs a full
+45s (`wallclock_deadline`, pool reuses) but the GS layer turns the guest's GIF/GS state into no visible
+framebuffer. Stop chasing SIF.
+
+Patch: `/home/or/vulcan4/tools/patches/ps2recomp-linux-r16-sif0-bind-reply.patch` (SIF.cpp).

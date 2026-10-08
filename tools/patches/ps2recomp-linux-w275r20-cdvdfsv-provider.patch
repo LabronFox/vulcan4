@@ -34,10 +34,10 @@ index d8f583f..f6a4db8 100644
  }
 diff --git a/ps2xIOP/src/modules/cdvd.cpp b/ps2xIOP/src/modules/cdvd.cpp
 new file mode 100644
-index 0000000..813d16e
+index 0000000..4e92354
 --- /dev/null
 +++ b/ps2xIOP/src/modules/cdvd.cpp
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,183 @@
 +#include "module_factories.h"
 +
 +#include <array>
@@ -48,18 +48,21 @@ index 0000000..813d16e
 +{
 +    namespace
 +    {
-+        // The one CD/DVD SIF RPC service id we have MEASURED. GT4's init posts its bind here and
-+        // retries it thirteen times (docs/W275-RESULTS.md R20, boot_sifpkt.log: 13 of 17 SIF
-+        // transactions are cd=0x00874FA8 sid=0x80000592), because nothing answered it. That is the
-+        // sid this provider exists to claim.
++        // The CD/DVD SIF RPC service id family, MEASURED from the real cdvdfsv module in GT4's own
++        // IOPRP300.IMG (docs/W275-RESULTS.md R23): the module's own sceSifRegisterRpc calls register
++        // {0x80000592, 0x80000593, 0x80000595, 0x80000597, 0x8000059A, 0x8000059C}. GT4's init posts
++        // its bind to 0x80000592 and retries it thirteen times (R20, boot_sifpkt.log: 13 of 17 SIF
++        // transactions are cd=0x00874FA8 sid=0x80000592) because nothing answered it. Claim the whole
++        // measured family so a bind to any of them is answered rather than retried forever; only rpc1
++        // is decoded, every other rpc/sid refuses honestly rather than replying success.
 +        //
-+        // Do NOT add neighbouring ids on the theory that they are also cdvdfsv. 0x80000593/0x95/0x97/
-+        // 0x9C appear nowhere in the corpus, the docs, or a trace -- and `cdvdfsv_rpc1..rpc4` are
-+        // rpc NUMBERS inside this one server (libcdvd-rpc.h names the packets that way), not separate
-+        // service ids. Claiming an ungrounded sid would make canBindRpc() answer true for a service
-+        // we do not own and let this provider reply to whatever really binds there -- a wrong answer
-+        // that looks right, which Law 3 forbids. Add a sid only with a trace that shows a bind to it.
-+        constexpr uint32_t kCdvdSid = 0x80000592u;
++        // An earlier version of this file asserted the neighbours were "grounded nowhere" and must
++        // not be added. R23 REFUTED that by disassembly: they are cdvdfsv's own registrations. Do not
++        // reinstate that claim. Keep the rule it was trying to protect, though: a sid is claimed only
++        // when the module's own code registers it -- not on a theory that adjacent ids must also work.
++        constexpr uint32_t kCdvdSid = 0x80000592u; // primary id in the trace
++        constexpr std::array<uint32_t, 6> kCdvdSids{kCdvdSid, 0x80000593u, 0x80000595u,
++                                                    0x80000597u, 0x8000059Au, 0x8000059Cu};
 +
 +        // rpc numbers on kCdvdSid, from ps2sdk libcdvd-rpc.h (ps2dev, Academic Free License 2.0).
 +        // Only rpc1 is decoded; the rest are named so a refusal can say WHAT it refused rather than
@@ -111,7 +114,12 @@ index 0000000..813d16e
 +
 +            [[nodiscard]] RpcResult handleRpc(const RpcRequest &request) override
 +            {
-+                if (request.sid != kCdvdSid)
++                bool knownSid = false;
++                for (uint32_t sid : kCdvdSids)
++                {
++                    knownSid = knownSid || sid == request.sid;
++                }
++                if (!knownSid)
 +                {
 +                    return refuse(request, "not a CD/DVD service id");
 +                }
@@ -204,7 +212,7 @@ index 0000000..813d16e
 +
 +            IopHost &m_host;
 +            bool m_announcedInitLimitation = false;
-+            inline static constexpr std::array<uint32_t, 1> kSids{kCdvdSid};
++            inline static constexpr std::array<uint32_t, 6> kSids{kCdvdSids};
 +        };
 +    }
 +

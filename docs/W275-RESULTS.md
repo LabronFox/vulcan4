@@ -3945,3 +3945,64 @@ hypothesis, and Law 3 forbids acting on it as fact.
 
 **Priority note.** R16 measured that delivering the `0x80000001` BIND reply did **not** change the picture,
 so that sid is not the render blocker; the CDVD bind (`0x80000592`, 13 retries) is the observed one.
+
+## R23 — MEASURED: IOP sid ownership, from each module's own `sceSifRegisterRpc`
+
+**Why:** R22 left sid ownership of `0x80000001` as an unproven hypothesis (a byte scan for
+`lui`/`ori` sid immediates was inconclusive). The SIF agent was reasoning about it from LLM recall.
+This closes that with measurement. **Not** from ps2sdk headers and **not** from a whole-image byte
+scan — from each module's own instruction stream.
+
+**Method.** `/mnt/ssd/tmp/ioprp/ioprp300.img` (the user's own disc; md5 `d88d1a77e763ef642274fb5b9169bc58`,
+extracted per R22, lives on the SSD — Law 1). Found all 16 embedded ELFs, split them into separate
+files, and read **each module's own SCE name from its header** (`PsII…`) — the earlier scan's labels
+were shifted one module because it used `rfind(b'PsII')` and reported the *previous* module's name.
+Then `mips-linux-gnu-objdump -D -b binary -m mips:isa32 -EL` per module and read the `$a1` argument at
+every `sceSifRegisterRpc` call site.
+
+**Call-shape proof** (the shape is what makes it RegisterRpc, not a guess at a lone immediate):
+`sceSifRegisterRpc(sd, sid, func, buf, cfunc, cbuf, qd)` = `a0,a1,a2,a3, [sp+16],[sp+20],[sp+24]`.
+cdvdfsv @file-off `0x4418`:
+```
+lui a0,0x0 ; addiu a0,a0,0x5858   ; sd
+lui a1,0x8000; ori a1,a1,0x592    ; sid = 0x80000592
+lui a2,0x0 ; addiu a2,a2,0x694    ; func
+lui a3,0x0 ; addiu a3,a3,0x6688   ; buf
+sw zero,16(sp) ; sw zero,20(sp) ; sw s0,24(sp)  ; cfunc=0, cbuf=0, qd=s0
+jal 0x4bc8
+```
+fileio @file-off `0x2470`: identical shape, `a0=0x3358, a1=0x80000001, a2=0x1e68, a3=0x33a0`.
+
+**MEASURED sid registrations (arg in `$a1`):**
+
+| module | file-off | sid(s) registered by the module itself |
+|---|---|---|
+| **fileio** | 0x19910 | **0x80000001**, 0x80000003, 0x80000007 |
+| **cdvdfsv** | 0x33290 | **0x80000592**, 0x80000593, 0x80000595, 0x80000597, 0x8000059A, 0x8000059C |
+| **loadfile** | 0x3b530 | 0x80000006 |
+| sifcmd | 0x4440 | (uses `a0` for SIF CMD ids 0x80000008/09/0A/0C — `sceSifAddCmdHandler`, not RegisterRpc sids) |
+| all others | — | no `a1` sid-shaped RegisterRpc site found |
+
+**Consequence 1 — R20's cdvd.cpp comment is REFUTED.** It says `0x80000593/0x95/0x97/0x9C appear
+nowhere in the corpus… Do NOT add neighbouring ids`. Measurement shows those *are* cdvdfsv's own
+registered sids — the module registers the whole family `{592,593,595,597,59A,59C}`. The comment is
+factually wrong and would make a future seat delete correct sids. `kCdvdSid = 0x80000592` remains
+correct and is now doubly grounded (trace bind + the module's own registration).
+
+**Consequence 2 — fileio owns `0x80000001`, the FIRST sid GT4 binds.** The guest's first RPC client
+(`0x008899C0`) binds `0x80000001` (R16/R20). `FileIoService` declares exactly that sid
+(`kFileIoSid = 0x80000001`) — matching — **but** it gates on `moduleAliases() = {"fileio","xfileio"}`,
+and fileio is resident in `IOPRP300.IMG`, never `sceSifLoadModule`d by name (R22). An alias gate that
+never fires is the same dormant-forever class of bug R20 fixed for cdvdfsv by emptying its aliases.
+**Remaining runtime unknown (do NOT assert):** whether our `IopModuleManager` marks `"fileio"` loaded
+when GT4 loads `IOPRP300.IMG` — if it does not, FileIoService is dormant and the first client binds
+into nothing. Measurable at runtime via whether FileIoService reports active.
+
+**Not claimed:** nothing here says answering these binds alone unblocks the picture. R16's architect
+already measured that delivering the `0x80000001` BIND reply did **not** change the picture
+(`gs_packets` still 15, still the disclaimer).
+
+**Capture (Law 8):** the R20 cdvd patch gained the corrected `cdvd.cpp`. Regenerated
+`tools/patches/ps2recomp-linux-w275r20-cdvdfsv-provider.patch`; `git apply --numstat` == live
+`git diff --numstat` per file (`cdvd.cpp` 183 == 183). No source sits only in the working tree for
+this deliverable.

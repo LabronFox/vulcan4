@@ -2241,3 +2241,251 @@ sub-task is refuted — at 0x5b1148, a1 == gp == 0x006dddf0 in every measured hi
 Logs: /mnt/ssd/tmp/pcsx2-r4i.log (crash), /mnt/ssd/tmp/pcsx2-r4j.log, /mnt/ssd/tmp/pcsx2-r4k.log.
 Scratch instruments: /tmp/r4hunt4.py, /tmp/r4hunt6.py, /tmp/r4hunt7.py, /tmp/r4listen.py.
 Raw: /tmp/r4w7.out, /tmp/r4poll.out, /tmp/r4k.out.
+
+---
+
+## R4 (reconciled) — `jalr a2 @0x5b0f48` → func_5B0850 is gated by the record TYPE byte, which is the IOP's SIF0 payload (E2) (architect, 2026-10-08)
+
+Static trace of `sub_005B0E30` (0x5b0e30-0x5b11c8, `ps2_recompiled_functions_41.cpp`):
+
+**The handler is baked in by the engine, not supplied by the IOP.** Init at 0x5b09cc-0x5b09ec populates the
+record array `0x00886840`:
+```
+0x5b09e4: sw v0,0x6840(t1)   ; 0x00886840[0] = 0x005B0870
+0x5b09ec: sw v1,0xC(a0)      ; 0x0088684C[3] = 0x005B0850   <- func_5B0850
+0x5b09f0: sw s1,0x10(a0)     ; 0x00886850[4] = 0x00886818
+```
+
+**The dispatch chain** (`jalr a2` @0x5b0f48):
+```
+0x5b0e48: lw  a3, 0x6818(v1)   ; a3 = *(0x00886818) = current-record pointer
+0x5b0e4c: lbu v0, 0(a3)        ; v0 = record type byte
+0x5b0e50: andi a1, v0, 0xff    ; a1 = type
+0x5b0e54: beqz a1, 0x5b0f64    ; <-- DECIDING GATE: type==0 -> return, no dispatch
+0x5b0ed8: lw  v1, 0xC(s1)      ; v1 = *(0x00886824) = 0x00886840 (record array)
+0x5b0ee0: addu v0, a1, v1      ; v0 = array + type*stride
+0x5b0ee4: lw  a2, 0(v0)        ; a2 = handler (func_5B0850 for type 3)
+0x5b0ee8: beqz a2, 0x5b0f58    ; handler==0 -> skip
+0x5b0ef0: lw  v1, 8(v0)        ; gp = record gp
+0x5b0f48: jalr a2              ; -> func_5B0850
+0x5b0868: sw  v1, 0(v0)        ; (inside func_5B0850) -> 0x008869C0 = 1
+```
+
+**The deciding register is a1 (record type byte).** It is the first gate and the only one that is DYNAMIC —
+the handler pointers are baked into `0x00886840`. The record (and its type byte) is the **IOP's SIF0
+payload**: the engine set the sub-buffer address `SifSetReg(0x80000001, 0x00886818)` and the IOP writes the
+command record there over SIF0. Our IOP model never delivers it, so the type byte stays 0, `beqz a1` returns
+early, `func_5B0850` never runs, `0x008869C0` stays 0, and the 0x5b1180 spin never exits.
+
+**VERDICT — E2 (IOP SIF0 response modeling), not a stub gap; do not fake.** Precise enabler: the runtime's
+IOP/SIF model must write a non-zero command record (a type byte != 0, with the 12-byte record fields the
+dispatcher reads) to the buffer at `0x00886818` on the engine's SIF init, so `sub_005B0E30`'s `jalr a2`
+reaches `func_5B0850` and sets `0x008869C0=1`.
+
+Also reconciled with the oracle: my earlier `SifGetReg(0x80000002)` reading was refuted — 0x80000002 is
+entry[2] of the kernel table at 0x800212C0 (→ 0x800212C8), read by `lw v0,0x12C0(at)` @0x80006D68, and the
+game's own code writes 1 there @0x005B11A8. It is not SIF MMIO.
+
+---
+
+## R4 ORACLE — the exact SIF0 record, measured on PCSX2
+
+Objective: capture the byte-for-byte record the IOP delivers to the engine's receive buffer, its type, and
+the handler it selects. Instrument: PCSX2 DebugServer build, fresh `-debugger -fastboot` boot, GT4 USA v2.00.
+All figures are hardware events (PC / cycle / memory), never frame or function counts.
+
+### Correction to the model: 0x00886818 is a CTX struct, the record is at 0x00886740
+
+`SifSetReg(0x80000001, 0x00886818)` installs a 0x60-byte context struct. `ctx+0x00` is the *current-record
+pointer*, not the record. Measured (u32 @0x00886818):
+
+```
++00 = 0x20886740  current record ptr (uncached mirror of 0x00886740)
++04 = 0x208867c0  next record ptr  (ring of 2 buffers, 0x80 apart)
++08 = 0x0001e640
++0C = 0x00886840  table B base
++10 = 0x00000020  table B count = 32
++14 = 0             table A base   (empty)
++18 = 0             table A count  (empty)
++1C = 0x008869c0  FLAG base
++20 = 0
++24 = 0
+```
+
+### Correction to the model: table B stride is 12 bytes, fields {handler, arg, gp}
+
+`0x00886840 + 12*k`. So `0x0088684C` is entry **1** (not "entry 3") and `0x00886850 = 0x00886818` is entry 1's
+**arg**, not a handler. 32 entries x 12 = 0x180 bytes, ending exactly at the flag base (`0x00886840+0x180 =
+0x008869C0`). Full populated dump:
+
+```
+[0]  = { 0x005b0870, 0x00886818, 0x00000000 }
+[1]  = { 0x005b0850, 0x00886818, 0x00000000 }
+[8]  = { 0x005b1328, 0x00888240, 0x006dddf0 }
+[9]  = { 0x005b1700, 0x00888240, 0x006dddf0 }
+[10] = { 0x005b1920, 0x00888240, 0x006dddf0 }
+[12] = { 0x005b1438, 0x00888240, 0x006dddf0 }
+[17] = { 0x005b23b8, 0x00889a00, 0x006dddf0 }
+[18] = { 0x005803e0, 0x00000000, 0x006dddf0 }
+[19] = { 0x005b28a8, 0x00889a40, 0x006dddf0 }
+[28] = { 0x00590b80, 0x00885ac0, 0x006dddf0 }
+```
+(indices 2-7, 11, 13-16, 20-27, 29-31 are zero.)
+
+### The record — byte-for-byte, captured at the 0x5b0e4c gate
+
+Breakpoint at `0x5b0e4c` (the `lbu v0,0(a3)` that reads the type), condition `[a3+8] == 0x80000001`, 64 bytes
+at 0x00886740, pristine (before the dispatcher clears byte 0):
+
+```
+00886740  18 00 00 00 00 00 00 00  01 00 00 80 00 00 00 00
+00886750  00 00 00 00 01 00 00 00  01 00 00 80 00 00 00 00
+00886760  0a 00 00 80 00 00 00 00  00 00 00 00 00 00 00 00
+00886770  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+```
+
+As u32 LE — this is the message the dispatcher consumes:
+
+| off | value | meaning |
+|---|---|---|
+| +0x00 | `0x00000018` | **TYPE byte = 0x18** (length; nonzero -> gate passes) |
+| +0x04 | 0 | |
+| +0x08 | `0x80000001` | dispatch word: bit31 set, idx = 1 |
+| +0x0C | 0 | |
+| +0x10 | `0x00000000` | flag index |
+| +0x14 | `0x00000001` | value to store |
+| +0x18 | `0x80000001` | (next entry / leftover) |
+| +0x1C | 0 | |
+| +0x20 | `0x8000000a` | (next entry) |
+
+Only the first 0x18 bytes are this message. **The type byte is a LENGTH, not an index** — the dispatcher
+copies `ceil(type/16)*16` bytes to the stack (0x18 -> 0x20, 0x40 -> 0x40). The handler index comes from the
+separate word at msg+0x08.
+
+### Dispatch -> handler
+
+`idx = (msg+0x08) & 0x7FFFFFFF = 1` -> `table B[1] = 0x005B0850`, arg `0x00886818`, gp 0.
+
+Call convention (measured, and the reverse of the earlier guess): **a0 = MESSAGE pointer, a1 = table-entry
+ARG.** `func_5B0850`:
+
+```
+0x5b0850: lw  v0, 0x10(a0)   ; v0 = msg[0x10] = 0   (flag index)
+0x5b0854: lw  a2, 0x1C(a1)   ; a2 = ctx[0x1C] = 0x008869C0  (flag base)
+0x5b0858: lw  v1, 0x14(a0)   ; v1 = msg[0x14] = 1   (value)
+0x5b085c: sll v0, v0, 2
+0x5b0860: addu v0, a2
+0x5b0864: jr  ra
+0x5b0868: sw  v1, 0(v0)      ; *(0x008869C0 + idx*4) = value
+```
+
+Empirical confirmation at PC=0x005b0864 (cycle 1,787,896,355): v0=0x008869C0, v1=0x00000001,
+a0=0x00081F20 (msg copy on the stack), a1=0x00886818, a2=0x008869C0, ra=0x005B0F50, gp=0. After execution
+0x008869C0 read `0x00000001`, and the 0x5b1180 spin **exited** — the emulator ran forward from cycle
+1,787,896,355 to 4,246,064,214.
+
+The spin is `while (func_5B0880(0) == 0);` — `func_5B0880(a0)` = `*(0x008869C0 + a0*4)`.
+
+### Provenance: the record BODY is written by a non-EE agent (IOP SIF0 DMA)
+
+Two write watchpoints on the record buffer:
+
+- `0x00886740..0x00886780`: **5 hits, all at PC=0x005b0e78** — the dispatcher's own `sb zero,(a3)` clearing
+  the type byte. Exactly one EE write per dispatch.
+- `0x00886748..0x00886760` (the body, which the dispatcher never writes): **0 hits, ever.**
+- Yet the body content changed between two consecutive dispatches (read A `40400200 403f8700 .. 003f8700`;
+  read B `40400000 00cb8600 .. 44ca8600`) with no EE write observed.
+
+Conclusion: the EE only clears byte 0 of the record; the message body arrives by DMA (SIF0), which PCSX2's
+EE write-watchpoints do not observe. This is the hardware-event confirmation of the E2 verdict.
+
+The dispatcher runs in asynchronous kernel/interrupt context: the breakpoint's ra = `0x00081FEC`, inside the
+EE callback trampoline at `0x00081FE0` (`lui sp,0x0008 / jalr v1 / addiu sp,sp,0x1FC0 / li v1,-5 / syscall`),
+consistent with a DMA-completion interrupt.
+
+### The enabler shape (for whoever builds it — no fix written here)
+
+The ring is drained message by message; each message carries its own type and dispatch index. A single
+message (idx 1) unblocks THIS spin, but the drain must deliver *all* of them or flags go missing. A second,
+different message was captured earlier at the same buffer (cycle 1,641,919,852):
+
+```
++00 = 0x40        (length 64)
++08 = 0x80000008  -> table B[8] = 0x005B1328, arg 0x00888240
++14 = 0x20886a40
++1C = 0x008899c0
++20 = 0x80000009
++24 = 0x00047e88
++28 = 0x00047ed0
+```
+
+### Instrument notes (corrections to the board's limits list)
+
+- `remove_breakpoint` is SAFE (used repeatedly, PCSX2 alive). Only `remove_watchpoint` /
+  `clear_all_breakpoints` kill it.
+- Conditional EE breakpoints with a memory operand WORK: `[a3+8] == 0x80000001` fired correctly.
+- Watchpoints on RDRAM fire for EE writes and their hit count is reliable.
+- `pcsx2_step` inside kernel context times out (does not advance) — read registers at the BP instead.
+
+No fix was written; this is the oracle measurement only.
+
+---
+
+## R4 E2 fix — SIF0 response record delivery (oracle-measured record, not a fake) (architect, 2026-10-08)
+
+Implemented in `ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp` `sceSifSetReg`. Trigger: the engine calls
+`SifSetReg(0x80000001, 0x00886818)` (installing the SIF RPC receive-buffer address). Delivery:
+```
+RDRAM[0x00886818] = 0x20886740        (record pointer, KSEG0 alias)
+RDRAM[0x00886740..0x0088677F] = 64-byte record:
+  +0x00 = 0x18          (type byte)
+  +0x08 = 0x80000001    (dispatch word)
+  +0x10 = 0x0           (func_5B0850 store index)
+  +0x14 = 0x1           (func_5B0850 store value)
+  rest  = 0
+```
+
+**Why this exact record** (static trace, `ps2_recompiled_functions_41.cpp`):
+- `sub_005B0E30` 0x5b0e4c reads type byte; `beqz a1` @0x5b0e54 is passed (0x18 != 0).
+- 0x5b0eac reads dispatch word; 0x5b0ec8 `a1 = 0x80000001 & 0x7FFFFFFF = 1`; 0x5b0ed8-0x5b0ee4 computes
+  `a2 = *(0x00886840 + 1*12 + 0) = *(0x0088684C) = 0x005B0850` (func_5B0850, baked in by init 0x5b09ec).
+- 0x5b0f48 `jalr a2` with `a0=sp` (record copy), `a1=*(0x00886850)=0x00886818` (the CTX).
+- `func_5B0850` 0x5b0850: `v0=sp[0x10]` (index), `a2=*(0x00886818+0x1C)=*(0x00886834)=0x008869C0`
+  (base), `v1=sp[0x14]` (value); 0x5b0868 `sw v1, 0(base + index*4)` → `0x008869C0 + 0 = 0x008869C0 = 1`.
+- `0x008869C0=1` is the ack the engine's 0x5b1180 spin (`jal 0x5b0880; beqz v0,loop`) polls.
+
+Patch: `/home/or/vulcan4/tools/patches/ps2recomp-linux-r4-sif0-record.patch` (+44/-0, reverse-apply OK).
+
+Rebuild (coordinator directs): `cd /mnt/ssd/vulcan4-build && VULCAN4_ENGINE_DIR=/mnt/ssd/vulcan4-build/recomp_engine_w251 bash /home/or/vulcan4/tools/harness/build_harness.sh`
+
+Expected next wall (unfixed, behind this): the unrecompiled TLB blob — `0x55-0x59 → 0x80075000`
+(`0x56 WaitEventFlag` 48× "override handler 0x800750c8 has no generated function"); runtime has no
+TLB/COP0-mailbox model (W274 T2 §5).
+
+---
+
+## R4 E2 result — SIF0 record delivery WORKS; next wall = `missing_function` @0x005b0850 (architect, 2026-10-08)
+
+Rebuilt (`VULCAN4_ENGINE_DIR=/mnt/ssd/vulcan4-build/recomp_engine_w251 build_harness.sh`) and booted 15s
+(`boot_w275r4e2.log`) + 45s (`boot_w275r4e2long.log`).
+
+| | R4 (before) | R4 E2 (after) |
+|---|---|---|
+| halt | `stuck_in_syscall` (0x5b1180 spin) | `missing_function` @ **0x005b0850** |
+| functions_entered | 10547 | 10443 |
+| distinct_pcs | 217 | 208 |
+| frames | 846 | 342 / 329 |
+| intr_run | 111 | 62 |
+
+The SIF0 record delivery is confirmed: `sub_005B0E30`'s `jalr a2` @0x5b0f48 now reaches **func_5B0850
+(0x005B0850)** (the halt detail shows `pc=0x005b0850 ra=0x005b0f50`, i.e. the dispatch fired). But
+0x005B0850 has no generated function: it is an INTERIOR entry point of `sub_005b07d0` (0x5b07d0) whose
+switch cases are `0x5b0808/0x5b082c/0x5b083c/0x5b0880/0x5b0898` — `0x5b0850` is absent, and it is not in
+`g_ps2EngineFunctionTable` (register_functions.cpp registers only 0x5b083c and 0x5b0880 for that function).
+It is reached only by the runtime-computed `jalr a2` (a2 = record-array entry `0x0088684C`), so the
+recompiler could not statically discover it as a jump target.
+
+**Next wall — tool-input dispatch miss:** add `0x005b0850` as an entry point (a switch-case label of
+`sub_005b07d0`) in the engine recompilation — TOML `entry_points` / analyzer function list — and regenerate
+`recomp_engine_w251`. The TLB blob wall (`0x56 WaitEventFlag` 48×, 0x55-0x59 → 0x80075000) is still BEHIND
+this new wall; the boot does not reach it yet.

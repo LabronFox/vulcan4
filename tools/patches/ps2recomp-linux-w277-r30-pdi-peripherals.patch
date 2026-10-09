@@ -3684,10 +3684,31 @@ index a9866db..b3b144f 100644
          {
              // W250. NEVER silent: an override target with no generated function is a LOUD limitation
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
-index 512ca97..0f2cecc 100644
+index 512ca97..8ed2f0e 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
-@@ -391,6 +391,14 @@ namespace ps2_syscalls
+@@ -381,16 +381,35 @@ namespace ps2_syscalls
+         GuestThread *target = ee.thread(id);
+         if (!target)
+         {
++            static uint64_t s_startNoThid = 0u;
++            if (s_startNoThid++ < 32u)
++            {
++                std::fprintf(stderr, "[EE] StartThread unknown id=%d\n", id);
++            }
+             setReturnS32(ctx, KE_UNKNOWN_THID);
+             return;
+         }
+         if (target->status != EeThreadStatus::Dormant)
+         {
++            static uint64_t s_startNotDormant = 0u;
++            if (s_startNotDormant++ < 32u)
++            {
++                std::fprintf(stderr, "[EE] StartThread not-dormant id=%d status=%d entry=0x%x\n",
++                             id, static_cast<int>(target->status), target->entry);
++            }
+             setReturnS32(ctx, KE_NOT_DORMANT);
+             return;
          }
          if (!runtime->hasFunction(target->entry))
          {
@@ -3702,7 +3723,7 @@ index 512ca97..0f2cecc 100644
              setReturnS32(ctx, KE_ERROR);
              return;
          }
-@@ -644,18 +652,39 @@ namespace ps2_syscalls
+@@ -644,18 +663,39 @@ namespace ps2_syscalls
      void SleepThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
      {
          EeScheduler &ee = scheduler(rdram, ctx, runtime);
@@ -3715,12 +3736,7 @@ index 512ca97..0f2cecc 100644
 +        // 09-ps2tek.md give "32h SleepThread: void", and ps2sdk's `SleepThread(void)` takes no
 +        // argument at all -- the trampoline func_101F340 sets only $v1 = 0x32 and never touches $a0,
 +        // so whatever we read out of $a0 is the CALLER's leftover register, not a duration.
-         //
--        // W161 (Sanji). Test knob, OFF by default. ps2sdk says `SleepThread(void)` takes NO argument,
--        // so reading a0 as a duration is a deviation. VULCAN4_W161_SLEEP_US overrides the value we
--        // treat as the duration, so one binary can A/B the timed and untimed (SDK/upstream) behaviour
--        // without a rebuild. Delete with the dish that settles which is correct.
--        uint32_t microseconds = ctx != nullptr ? getRegU32(ctx, 4) : 0u;
++        //
 +        // Measured cost of getting it wrong (W275 R1): tid2 at guest 0x100b628 spins on the 8-byte
 +        // counter at 0x70002050, which the VBlank/GS handler FUN_0100D838 (INTC cause 2) increments at
 +        // 0x100d8b4 (`sd v1,0(s1)`) before its waiter-walk calls WakeupThread on the parked sleepers.
@@ -3730,7 +3746,12 @@ index 512ca97..0f2cecc 100644
 +        // the run halted guest_blocked with tid2 still "asleep" after 16,075 calls. On hardware
 +        // SleepThread PARKS the thread until WakeupThread: the handler's walk is what wakes it, and
 +        // that walk needs the thread to actually be in an untimed wait to find it.
-+        //
+         //
+-        // W161 (Sanji). Test knob, OFF by default. ps2sdk says `SleepThread(void)` takes NO argument,
+-        // so reading a0 as a duration is a deviation. VULCAN4_W161_SLEEP_US overrides the value we
+-        // treat as the duration, so one binary can A/B the timed and untimed (SDK/upstream) behaviour
+-        // without a rebuild. Delete with the dish that settles which is correct.
+-        uint32_t microseconds = ctx != nullptr ? getRegU32(ctx, 4) : 0u;
 +        // So $a0 is ignored. wokeup_count is consumed first (unchanged); the wait is untimed
 +        // (EeWaitPayload monostate), and sce_WakeupThread (EeScheduler::wakeupThread) already
 +        // makeReady()s a thread parked with reason Sleep.

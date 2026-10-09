@@ -45,6 +45,36 @@ index 1eceb08..7fe7956 100644
          virtual bool hasGuestFunction(uint32_t address) const = 0;
          virtual bool invokeGuestFunction(uint64_t callToken,
                                           uint32_t address,
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 4832d8f..686da50 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -4,6 +4,7 @@
+ #include "../iop_emulator_const.h"
+ 
+ #include <algorithm>
++#include <cstdio>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -57,6 +58,17 @@ namespace ps2x::iop::detail
+             thread.stackBase = m_memory.allocate(thread.stackSize + kStackGuardBytes, 16u);
+             if (thread.stackBase == 0u)
+             {
++                // W277/R4 diagnostic: the PDI DVD init's poll loop retries CreateThread when this
++                // fires — log the requested size so "out of IOP memory" is measured, not assumed.
++                {
++                    static uint64_t s_createThreadOom = 0u;
++                    if (s_createThreadOom < 32u)
++                    {
++                        ++s_createThreadOom;
++                        std::fprintf(stderr, "[IOP] CreateThread OOM stackSize=0x%x (heap cursor near 0x120000)\n",
++                                     thread.stackSize);
++                    }
++                }
+                 setV0(-400);
+                 return true;
+             }
 diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
 index ad58fb4..b3e4e98 100644
 --- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp

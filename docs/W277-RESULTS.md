@@ -360,3 +360,13 @@ write. So the streamed DVD data stays in IOP RAM and the "ready" tag the EE disp
 arrives. Wall = the IOP→EE transfer path for the streamed data / ready signal, not the init, not the
 imports. Next: instrument the `libpdi:42` copy (0xc5fa0) to see its destination and whether it is
 supposed to push to EE via SIF DMA.
+
+## R30ar — scheduling is NOT the wall (round-robin measured, reverted)
+
+Corrected round-robin across priority queues (start prio 0, rotate) ran tid1 and left
+functions_entered=13648, gs_packets=15, and the tag store-watch still shows only the
+dispatcher's clear (0x5607bc). So the producer thread is not the missing piece: it runs and
+writes nothing to 0x00874304, and the IOP writeGuest trace is equally clean. The wall is the
+**command enqueue** — the IOP's SifSetDma targets 0x8851c0 while the game's DMA receive buffer
+is 0x00874300. Reverted the round-robin (wrong PS2 priority semantics). Next: port PCSX2
+Sif0.cpp's SIF0 DMA routing so the IOP reply lands in the game's receive buffer.

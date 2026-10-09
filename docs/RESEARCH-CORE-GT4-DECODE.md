@@ -86,6 +86,34 @@ bootstrap), dump the guest's image buffer, and diff it against
   "our inflate leaves byte `+0xNNNNN` wrong, PCSX2's does not", which is a far sharper statement than
   any of the spin-address walls.
 
+## 6. RESULT — our runtime's own decode, measured against the golden image (same day)
+
+`VULCAN4_RDRAM_DUMP=100000:5D5ECC:our-image.bin` (the harness already had a whole-image dump for
+exactly this question), one 120-second run (`boot_ourimg.log`: `functions_entered=147411`,
+`frames_presented=6639`, `gs_packets=15`, `iop_instructions=1892`, `halt=wallclock_deadline`),
+then a byte diff against `CORE.GT4.dec.bin`:
+
+| Segment | Size | Result |
+|---|---|---|
+| `.reginfo` @ `0x006179FC` | 24 B | **identical** |
+| `.text` @ `0x00100000` | 5,339,668 B | **BYTE-IDENTICAL — 0 differing bytes** |
+| `.data` @ `0x00617A80` | 779,132 B | 15,916 differing bytes |
+
+**The game's own engine image is decoded correctly by our runtime.** The 5.34 MB of GT4's code that the
+bootstrap inflates out of `CORE.GT4` matches PCSX2's memory exactly — which retires the W229 "two DEFLATE
+calls write the same output word" wall with a measurement instead of a story.
+
+The `.data` deltas, classified: **15,899 are the game initialising its own data at runtime** (values like
+`0x00617AB0` — an address inside the image pointing at itself — and `0xFFFFFFFF` sentinels, where the
+file holds zeros); **12 bytes are content we do not have** (`ours = 0, golden != 0`) and 5 differ on both
+sides. **Caveat, stated: this dump is taken at HALT, after the engine has run for two minutes**, so those
+12 bytes may equally be the engine clearing slots it owns. They are not a wall until the same dump is
+taken **at the hand-off** (the moment the bootstrap gives control to `0x00100008`).
+
+So the file lane's state is: **initial load = correct and proven; remaining question = the streaming
+path** (`SIF0` chain routing / the IOP's `PDI` modules writing the tag at `0x00874304`), which is where
+`GT4.VOL`'s streamed assets (`.pss/.es/.sqt/.ins/.ads`, `carsound`) are served from.
+
 ## 5. Sources (MIT — readable references we may port from, with attribution)
 
 - GT Modding Hub — *Executables (CORE.GT3/CORE.GT4)*: `nenkai.github.io/gt-modding-hub/ps2/executables/`

@@ -1750,19 +1750,6 @@ index 498bbe9..9b6b456 100644
  // W130. THE WRITER-WATCH FILTER AND THE READ PROBE THAT TEACHES IT THE ADDRESSES.
  //
  // The watch set holds up to four 32-bit guest addresses. The read probe (emitted by the translator at
-diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
-index 0e8d454..1da06dd 100644
---- a/ps2xRuntime/include/runtime/ee_scheduler.h
-+++ b/ps2xRuntime/include/runtime/ee_scheduler.h
-@@ -597,6 +597,8 @@ private:
-     bool m_rescheduleRequested = false;
-     bool m_timeSliceExpired = false;
-     bool m_insideInterrupt = false;
-+    // W277/R4: round-robin cursor across the ready priority queues (starvation fix).
-+    uint32_t m_roundRobinPriority = 0;
-     uint32_t m_pendingEeTimerInterrupts = 0;
-     uint64_t m_eeCycle = 0;
-     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
 diff --git a/ps2xRuntime/include/runtime/syscall_names.h b/ps2xRuntime/include/runtime/syscall_names.h
 index 4636c5e..7ca6193 100644
 --- a/ps2xRuntime/include/runtime/syscall_names.h
@@ -1871,7 +1858,7 @@ index 4636c5e..7ca6193 100644
 -static const unsigned kSyscallNameCount = 58;
 +static const unsigned kSyscallNameCount = 114;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index 4a6e44b..421f1b7 100644
+index 4a6e44b..06b5e8b 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -54,6 +54,34 @@ namespace
@@ -2201,31 +2188,6 @@ index 4a6e44b..421f1b7 100644
          // W111. sub_0100D838 IS THE HANDLER THAT UNBLOCKS THE SPIN. It is
          //     0x100d848  addiu $s1, $v0, 0x50            ; s1 = 0x70002050
          //     0x100d888  ld    $v1, 0x50($s1)
-@@ -2301,8 +2531,15 @@ void EeScheduler::removeReady(GuestThread &item)
- 
- GuestThread *EeScheduler::selectReady()
- {
--    for (auto &queue : m_readyQueues)
-+    // W277/R4: the LGDEV dispatcher (prio 13) busy-polls and the producer (prio 64) is lower
-+    // priority, so a strict highest-first select starves the producer and the 0x00874304 tag is
-+    // never written. Round-robin across the ready queues (start after the last selected priority,
-+    // wrap) so a lower-priority ready thread still gets scheduled. This is a starvation fix, not
-+    // the PS2's strict priority rule; it is the mechanism that lets the producer run.
-+    for (uint32_t step = 0u; step < kPriorityCount; ++step)
-     {
-+        const uint32_t priority = (m_roundRobinPriority + step + 1u) % kPriorityCount;
-+        auto &queue = m_readyQueues[priority];
-         if (queue.empty())
-         {
-             continue;
-@@ -2312,6 +2549,7 @@ GuestThread *EeScheduler::selectReady()
-         GuestThread *selected = thread(id);
-         assert(selected != nullptr);
-         assert(selected->status == EeThreadStatus::Ready);
-+        m_roundRobinPriority = priority;
-         return selected;
-     }
-     return nullptr;
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
 index dc975ed..054593e 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp

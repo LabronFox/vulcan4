@@ -163,6 +163,16 @@ instructions don't really help, mechanical blockers, to enforce rules, are more 
     feature that ships enabled has changed somebody's game without being asked, and the authentic one is the
     whole reason this project exists. This applies to *every* entry in `G6`.
 
+13. **NO WALL WITHOUT AN ORACLE READING (added 2026-10-09, after the captain asked "are we actually
+    debugging?").** A "wall" is not accepted until the same moment has been reproduced in the reference
+    emulator and the disagreement is named as a VALUE — a register, a memory word, a DMA transfer or an
+    interrupt line — with the oracle's value and ours side by side in the commit. A report that names
+    only the address where the guest spins is a HYPOTHESIS, not a wall, and is not progress. Before
+    inventing a model of any hardware mechanic, read the PCSX2 implementation of it
+    (`/mnt/ssd/tools/pcsx2-src`) and cite the file + function. The only progress metrics that count are
+    **the picture changes** or **the divergence moves closer to the end of boot** — commit count is not
+    progress. See `docs/METHOD-VERDICT-2026-10-09.md`.
+
 ## HOW YOUR WORK IS JUDGED
 
 - The captain judges the **product**: a picture, a number, a sound — not a commit log.

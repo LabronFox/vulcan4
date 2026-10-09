@@ -2210,7 +2210,7 @@ index 4a6e44b..06b5e8b 100644
          //     0x100d848  addiu $s1, $v0, 0x50            ; s1 = 0x70002050
          //     0x100d888  ld    $v1, 0x50($s1)
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
-index dc975ed..2e776fe 100644
+index dc975ed..fa58abd 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
 @@ -1,15 +1,23 @@
@@ -2304,7 +2304,7 @@ index dc975ed..2e776fe 100644
          uint32_t value = 0u;
          bool shouldLog = false;
          {
-@@ -626,6 +672,469 @@ namespace ps2_stubs
+@@ -626,6 +672,474 @@ namespace ps2_stubs
          setReturnS32(ctx, 0);
      }
  
@@ -2664,8 +2664,13 @@ index dc975ed..2e776fe 100644
 +                static uint64_t s_rend = 0u;
 +                if (s_rend++ < 256u)
 +                {
-+                    std::fprintf(stderr, "[SIFRPC] REND -> 0x5B1328 cid=0x%x cd=0x%x pkt=0x%x rpcId=0x%x\n",
-+                                 commandId, cdPtr, pktAddr, rpcId);
++                    int32_t sema = -1;
++                    if (auto *cl = reinterpret_cast<t_SifRpcClientData *>(getMemPtr(rdram, cdPtr)))
++                    {
++                        sema = cl->hdr.sema_id;
++                    }
++                    std::fprintf(stderr, "[SIFRPC] REND -> 0x5B1328 cid=0x%x cd=0x%x pkt=0x%x rpcId=0x%x sema_id=0x%x\n",
++                                 commandId, cdPtr, pktAddr, rpcId, sema);
 +                }
 +            }
 +            return true;
@@ -2774,7 +2779,7 @@ index dc975ed..2e776fe 100644
      void sceSifSetDma(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
      {
          const uint32_t dmatAddr = getRegU32(ctx, 4);
-@@ -664,6 +1173,63 @@ namespace ps2_stubs
+@@ -664,6 +1178,63 @@ namespace ps2_stubs
              return;
          }
  
@@ -2838,7 +2843,7 @@ index dc975ed..2e776fe 100644
          std::array<Ps2SifDmaTransfer, 32u> pending{};
          uint32_t pendingCount = 0u;
          bool ok = true;
-@@ -752,6 +1318,95 @@ namespace ps2_stubs
+@@ -752,6 +1323,95 @@ namespace ps2_stubs
  
          ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 5u);
  
@@ -2934,7 +2939,7 @@ index dc975ed..2e776fe 100644
          setReturnS32(ctx, static_cast<int32_t>(allocateSifDmaTransferId()));
      }
  
-@@ -773,7 +1428,19 @@ namespace ps2_stubs
+@@ -773,7 +1433,19 @@ namespace ps2_stubs
              {
                  prev = it->second;
              }
@@ -2955,7 +2960,7 @@ index dc975ed..2e776fe 100644
              shouldLog = shouldTraceSifReg(reg) && g_sifSetRegLogCount < 128u;
              if (shouldLog)
              {
-@@ -794,6 +1461,50 @@ namespace ps2_stubs
+@@ -794,6 +1466,50 @@ namespace ps2_stubs
              });
          }
          setReturnU32(ctx, prev);

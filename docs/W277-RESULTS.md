@@ -275,3 +275,28 @@ This is the boundary the captain's OpenAdhoc note predicted: the driver layer is
 divergence is engine-side (interrupt delivery to the freshly-started media/script threads). Next action:
 root-cause the StartThread block + 903 undelivered interrupts against the PCSX2 oracle and
 `10-agent-guardrails.md` §3 (fix taxonomy) — this is an interrupt/thread wall, not a missing RPC.
+
+## R30m (cont.) — the "interrupt wall" is a command-dispatcher spin
+
+Root-caused the stall (oracle-disasm + recompiled source, not inferred):
+
+- tid10 parks at `0x5608e0` inside `sub_00560778_0x560778`, a **command dispatcher**. It reads a
+  command tag at `*(0x00874304)` and branches on it:
+  `beq a0,0x010B2400 → 0x560908` / `(a0 & 0xFFFF0000)==0x010B0000 → 0x560900`; **neither matching falls
+  into `label_5608e0` — a `goto` loop (`b 0x5608e0`) that only yields at `runtime->eeCheckpointDue()`**.
+- The recompiled loop *does* carry the checkpoint check, but the guest re-spins after it: the command
+  tag at `0x00874304` is not a valid command, so the dispatcher never takes a dispatch branch.
+- `pending_now=903 irq_attach=0` is a symptom of the same thing: the dispatcher thread spins, so the
+  scheduler never reaches the "attach interrupt to running thread" path; the interrupts queue.
+
+The command tag at `0x00874304` is **dynamic** — `0x010B2400`/`0x010B0000` appear nowhere as literals in
+the recompiled engine (verified by grep), so the tag is computed by a producer (an IOP module writing
+via SIF DMA, not a static boot value). The RPC completion callback `FUN_005780f8` reads a reply struct
+(`*(a0+52)`, `*(a0+56)`) but does **not** write `0x00874300`, so it is the *consumer* of the DMA'd data,
+not the enqueuer. The producer is the IOP module the stubs replaced: the real PDISTR/PDISPU2/etc. write
+the command into the queue via `sceSifSetDma` when they finish; my stubs signal completion but never
+issue that DMA, so the dispatcher spins on a never-written tag.
+
+Next action: oracle-trace which IOP module writes `0x00874304` and what the 0x40/0x240 B replies +
+SIF DMA payload actually are, then reproduce the DMA write in the stub. This is still the empty-stub
+gap — not a scheduler/interrupt-delivery bug.

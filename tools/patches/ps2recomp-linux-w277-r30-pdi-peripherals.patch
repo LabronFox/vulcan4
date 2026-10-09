@@ -3750,10 +3750,25 @@ index 512ca97..0f2cecc 100644
          setReturnS32(ctx, KE_OK);
      }
 diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
-index 8d46e03..d3563b6 100644
+index 8d46e03..0fdc9a5 100644
 --- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
 +++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
-@@ -405,6 +405,16 @@ void PS2IopHostAdapter::closeHostFile(uint64_t handle)
+@@ -149,6 +149,14 @@ bool PS2IopHostAdapter::readGuest(uint32_t address, void *destination, size_t si
+ 
+ bool PS2IopHostAdapter::writeGuest(uint32_t address, const void *source, size_t size)
+ {
++    // W277/R4: log every IOP->EE write so the 0x00874300 tag writer is named (or proven absent).
++    {
++        static uint64_t s_wg = 0u;
++        if (s_wg++ < 256u)
++        {
++            std::fprintf(stderr, "[IOP:writeGuest] addr=0x%x size=0x%zx\n", address, size);
++        }
++    }
+     if (!source && size != 0)
+     {
+         return false;
+@@ -405,6 +413,16 @@ void PS2IopHostAdapter::closeHostFile(uint64_t handle)
      }
  }
  

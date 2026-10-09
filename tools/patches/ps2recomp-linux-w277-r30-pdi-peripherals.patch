@@ -1858,7 +1858,7 @@ index 4636c5e..7ca6193 100644
 -static const unsigned kSyscallNameCount = 58;
 +static const unsigned kSyscallNameCount = 114;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index 4a6e44b..908071c 100644
+index 4a6e44b..fec723c 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -54,6 +54,34 @@ namespace
@@ -1896,7 +1896,26 @@ index 4a6e44b..908071c 100644
      template <typename Map>
      int allocatePositiveId(int &nextId, const Map &objects)
      {
-@@ -753,13 +781,43 @@ void EeScheduler::sleepCurrent(uint32_t microseconds)
+@@ -300,6 +328,18 @@ void EeScheduler::run()
+             running->invocations.push_back(std::move(invocation));
+             continue;
+         }
++        // W277/R4 diagnostic: WHY is the attach not taken while the dispatcher spins? Dump the
++        // condition once, so the stall is a fact (pending vs invocation depth) not an inference.
++        if (!m_pendingInvocations.empty() && !running->invocations.empty())
++        {
++            static uint64_t s_attachBlocked = 0u;
++            if (s_attachBlocked++ < 16u)
++            {
++                std::fprintf(stderr, "[EE] attach blocked pending=%zu invDepth=%zu pc=0x%x tid=%d\n",
++                             m_pendingInvocations.size(), running->invocations.size(),
++                             context.pc, running->id);
++            }
++        }
+ 
+         if (!m_runtime.hasFunction(context.pc))
+         {
+@@ -753,13 +793,43 @@ void EeScheduler::sleepCurrent(uint32_t microseconds)
          return;
      }
  
@@ -1946,7 +1965,7 @@ index 4a6e44b..908071c 100644
      constexpr uint64_t kCyclesPerMicrosecond = 295ull; // kEeClockHz is 294912000, i.e. 294.912/us
      const uint64_t deadline = m_eeCycle + (static_cast<uint64_t>(microseconds) * kCyclesPerMicrosecond);
      if (microseconds != 0u)
-@@ -1232,6 +1290,23 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+@@ -1232,6 +1302,23 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
      {
          m_pendingInvocationsHighWater = m_pendingInvocations.size();
      }
@@ -1970,7 +1989,7 @@ index 4a6e44b..908071c 100644
      m_pendingInvocations.push_back(std::move(invocation));
      m_checkpointPending.store(true, std::memory_order_release);
  }
-@@ -1352,6 +1427,27 @@ EeServiceResult EeScheduler::serviceInvocations(int stepBudget)
+@@ -1352,6 +1439,27 @@ EeServiceResult EeScheduler::serviceInvocations(int stepBudget)
                  }
                  else
                  {
@@ -1998,7 +2017,7 @@ index 4a6e44b..908071c 100644
                      result = ranAnything ? EeServiceResult::Ran : EeServiceResult::Blocked;
                  }
                  break;
-@@ -1370,6 +1466,19 @@ EeServiceResult EeScheduler::serviceInvocations(int stepBudget)
+@@ -1370,6 +1478,19 @@ EeServiceResult EeScheduler::serviceInvocations(int stepBudget)
          {
              GuestInvocation invocation = std::move(m_pendingInvocations.front());
              m_pendingInvocations.pop_front();
@@ -2018,7 +2037,7 @@ index 4a6e44b..908071c 100644
              if (getRegU32(&invocation.context, 29) == 0u)
              {
                  SET_GPR_U32(&invocation.context, 29, invocationStackTop());
-@@ -1378,6 +1487,29 @@ EeServiceResult EeScheduler::serviceInvocations(int stepBudget)
+@@ -1378,6 +1499,29 @@ EeServiceResult EeScheduler::serviceInvocations(int stepBudget)
              ranAnything = true;
              continue;
          }
@@ -2048,7 +2067,7 @@ index 4a6e44b..908071c 100644
  
          R5900Context &context = running->activeContext();
  
-@@ -1462,6 +1594,25 @@ EeServiceResult EeScheduler::serviceInvocations(int stepBudget)
+@@ -1462,6 +1606,25 @@ EeServiceResult EeScheduler::serviceInvocations(int stepBudget)
                      ++m_stepIntrRun;
                  }
              }
@@ -2074,7 +2093,7 @@ index 4a6e44b..908071c 100644
              ++m_schedulerSteps;
              function(m_rdram, &context, &m_runtime);
              m_insideInterrupt = false;
-@@ -1699,6 +1850,27 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
+@@ -1699,6 +1862,27 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
      assertExecutor();
      const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
  
@@ -2102,7 +2121,7 @@ index 4a6e44b..908071c 100644
      // W105. SEPARATE (A) FROM (B). ONE RUN, ONE ANSWER.
      //
      // vblanks_processed=224 with interrupts_raised=0 means 224 VBlankStart events each called
-@@ -1789,6 +1961,20 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
+@@ -1789,6 +1973,20 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
      }
      std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
                { return left.order < right.order; });
@@ -2123,7 +2142,7 @@ index 4a6e44b..908071c 100644
      for (const EeIrqHandler &handler : matching)
      {
          GuestInvocation invocation{};
-@@ -1797,6 +1983,16 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
+@@ -1797,6 +1995,16 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
          SET_GPR_U32(&invocation.context, 4, cause);
          SET_GPR_U32(&invocation.context, 5, handler.argument);
  

@@ -370,3 +370,12 @@ writes nothing to 0x00874304, and the IOP writeGuest trace is equally clean. The
 **command enqueue** — the IOP's SifSetDma targets 0x8851c0 while the game's DMA receive buffer
 is 0x00874300. Reverted the round-robin (wrong PS2 priority semantics). Next: port PCSX2
 Sif0.cpp's SIF0 DMA routing so the IOP reply lands in the game's receive buffer.
+
+## R30ar (cont.) — the wall is the SIF0 DMA chain routing, not scheduling
+
+PCSX2 Sif0.cpp:88 `sif0ch.madr = tag[1]` — the SIF0 destination is the game's DMA-chain tag
+MADR, not the IOP descriptor. The dispatcher stores 0x20874300 to 0x654a84 (its SIF0 receive
+MADR = 0x00874300) and clears it; the IOP's one `SifSetDma` writes `dst=0x8851c0` (a different
+buffer, 0x80 B). So the command never lands at 0x00874300. Missing mechanism: the EE-side SIF0
+DMA chain (MADR/tag) routing from the game's CHCR, which our runtime does not model. Port
+PCSX2 Sif0.cpp (HandleEETransfer/`sif0ch.madr=tag[1]`) into ps2xRuntime's SIF0 path.

@@ -2210,7 +2210,7 @@ index 4a6e44b..06b5e8b 100644
          //     0x100d848  addiu $s1, $v0, 0x50            ; s1 = 0x70002050
          //     0x100d888  ld    $v1, 0x50($s1)
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
-index dc975ed..054593e 100644
+index dc975ed..2e776fe 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
 @@ -1,15 +1,23 @@
@@ -2304,7 +2304,7 @@ index dc975ed..054593e 100644
          uint32_t value = 0u;
          bool shouldLog = false;
          {
-@@ -626,6 +672,458 @@ namespace ps2_stubs
+@@ -626,6 +672,469 @@ namespace ps2_stubs
          setReturnS32(ctx, 0);
      }
  
@@ -2657,6 +2657,17 @@ index dc975ed..054593e 100644
 +            SET_GPR_U32(&invocation.context, 31, 0u);
 +            runtime->eeScheduler().queueInvocation(std::move(invocation));
 +            ++g_rawRpcReplyCount;
++            // W277/R4: the REND -> sub_005B1328 (_request_end) is what frees the pool and signals the
++            // producer's semaphore. Log that it is delivered, and for which cid, so the enqueue chain
++            // can be checked against the tag (0x00874304) that never gets written.
++            {
++                static uint64_t s_rend = 0u;
++                if (s_rend++ < 256u)
++                {
++                    std::fprintf(stderr, "[SIFRPC] REND -> 0x5B1328 cid=0x%x cd=0x%x pkt=0x%x rpcId=0x%x\n",
++                                 commandId, cdPtr, pktAddr, rpcId);
++                }
++            }
 +            return true;
 +        }
 +
@@ -2763,7 +2774,7 @@ index dc975ed..054593e 100644
      void sceSifSetDma(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
      {
          const uint32_t dmatAddr = getRegU32(ctx, 4);
-@@ -664,6 +1162,63 @@ namespace ps2_stubs
+@@ -664,6 +1173,63 @@ namespace ps2_stubs
              return;
          }
  
@@ -2827,7 +2838,7 @@ index dc975ed..054593e 100644
          std::array<Ps2SifDmaTransfer, 32u> pending{};
          uint32_t pendingCount = 0u;
          bool ok = true;
-@@ -752,6 +1307,95 @@ namespace ps2_stubs
+@@ -752,6 +1318,95 @@ namespace ps2_stubs
  
          ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 5u);
  
@@ -2923,7 +2934,7 @@ index dc975ed..054593e 100644
          setReturnS32(ctx, static_cast<int32_t>(allocateSifDmaTransferId()));
      }
  
-@@ -773,7 +1417,19 @@ namespace ps2_stubs
+@@ -773,7 +1428,19 @@ namespace ps2_stubs
              {
                  prev = it->second;
              }
@@ -2944,7 +2955,7 @@ index dc975ed..054593e 100644
              shouldLog = shouldTraceSifReg(reg) && g_sifSetRegLogCount < 128u;
              if (shouldLog)
              {
-@@ -794,6 +1450,50 @@ namespace ps2_stubs
+@@ -794,6 +1461,50 @@ namespace ps2_stubs
              });
          }
          setReturnU32(ctx, prev);
@@ -3070,7 +3081,7 @@ index 2c98016..a5c30ea 100644
      {
          removeHandler(rdram, ctx, runtime, false);
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
-index 96c0317..e7c85fa 100644
+index 96c0317..89708c2 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
 @@ -411,6 +411,158 @@ namespace ps2_syscalls
@@ -3232,7 +3243,25 @@ index 96c0317..e7c85fa 100644
      void SifCallRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
      {
          std::lock_guard<std::recursive_mutex> rpcCallLock(g_sif_call_rpc_mutex);
-@@ -732,6 +884,39 @@ namespace ps2_syscalls
+@@ -612,6 +764,17 @@ namespace ps2_syscalls
+         {
+             completionSemaphore = endParameter;
+         }
++        // W277/R4 diagnostic: what semaphore the LGDEV rpc completion signals. If it is 0 the
++        // producer that enqueues the 0x00874304 tag is never woken.
++        if (sid == 0x046d046du)
++        {
++            static uint64_t s_lgdevSema = 0u;
++            if (s_lgdevSema++ < 16u)
++            {
++                std::fprintf(stderr, "[EE] lgdev rpc sema_id=0x%x endParam=0x%x completionSema=0x%x rpc=%u mode=0x%x\n",
++                             client->hdr.sema_id, endParameter, completionSemaphore, rpcNum, mode);
++            }
++        }
+ 
+         {
+             ps2x::iop::RpcRequest request{};
+@@ -732,6 +895,39 @@ namespace ps2_syscalls
              };
  
              setReturnS32(&parent, 0);

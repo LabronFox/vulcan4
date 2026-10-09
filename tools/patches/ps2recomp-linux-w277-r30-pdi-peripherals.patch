@@ -190,7 +190,7 @@ index e5f63a9..2c9e0c2 100644
              {
                  cpu.pc = target;
 diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
-index cf4fdc6..e7c535f 100644
+index cf4fdc6..dbfdacc 100644
 --- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
 +++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
 @@ -9,6 +9,7 @@
@@ -259,7 +259,7 @@ index cf4fdc6..e7c535f 100644
              if (server.serverData != 0u)
              {
                  m_memory.write32(server.serverData + 0x20u, server.sid);
-@@ -298,6 +336,16 @@ namespace ps2x::iop::detail
+@@ -298,6 +336,18 @@ namespace ps2x::iop::detail
                                                                 request.send.size,
                                                                 0u,
                                                                 server.gp);
@@ -270,6 +270,8 @@ index cf4fdc6..e7c535f 100644
 +            std::ostringstream out;
 +            out << "[IOP] RpcServer sid=0x" << std::hex << request.sid
 +                << " rpc=0x" << request.function << " func=0x" << server.function
++                << " send=0x" << request.send.address << " sendSz=0x" << request.send.size
++                << " recv=0x" << request.receive.address << " recvSz=0x" << request.receive.size
 +                << " -> ret=0x" << returnPointer << std::dec;
 +            m_host.log(LogLevel::Info, out.str());
 +        }
@@ -2999,7 +3001,7 @@ index 2c98016..a5c30ea 100644
      {
          removeHandler(rdram, ctx, runtime, false);
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
-index 96c0317..9a8931d 100644
+index 96c0317..e7c85fa 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
 @@ -411,6 +411,158 @@ namespace ps2_syscalls
@@ -3161,6 +3163,46 @@ index 96c0317..9a8931d 100644
      void SifCallRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
      {
          std::lock_guard<std::recursive_mutex> rpcCallLock(g_sif_call_rpc_mutex);
+@@ -732,6 +884,39 @@ namespace ps2_syscalls
+             };
+ 
+             setReturnS32(&parent, 0);
++            // W277/R4: the physical IOP RPC runs the IRX function but never emits the REND
++            // (SifRpcEnd) that the raw path (rawRpcDeliverReply) does. That REND is what hands the
++            // completion to the guest's own _request_end (0x005B1328), which frees the SIF0 pool
++            // entry and updates the client. Without it the producer that writes the dispatcher tag
++            // (0x00874304) never fires. Deliver the REND for a handled physical RPC.
++            if (iopResult.handled && runtime->hasFunction(0x005B1328u))
++            {
++                auto *client = reinterpret_cast<t_SifRpcClientData *>(getMemPtr(rdram, clientPtr));
++                const uint32_t pktAddr = client ? client->hdr.pkt_addr : 0u;
++                const uint32_t rpcId = client ? client->hdr.rpc_id : 0u;
++                uint8_t rend[0x40u] = {};
++                const uint32_t header = 0x40u;
++                std::memcpy(rend + 0x00u, &header, sizeof(header));
++                const uint32_t endCid = 0x80000008u; // SIF_CMD_RPC_END
++                std::memcpy(rend + 0x08u, &endCid, sizeof(endCid));
++                std::memcpy(rend + 0x14u, &pktAddr, sizeof(pktAddr));
++                std::memcpy(rend + 0x18u, &rpcId, sizeof(rpcId));
++                std::memcpy(rend + 0x1Cu, &clientPtr, sizeof(clientPtr));
++                const uint32_t callCid = 0x8000000Au; // SIF_CMD_RPC_CALL
++                std::memcpy(rend + 0x20u, &callCid, sizeof(callCid));
++                std::memcpy(rend + 0x24u, &serverPtr, sizeof(serverPtr));
++                constexpr uint32_t kRendAddr = 0x00081F20u;
++                if (uint8_t *p = getMemPtr(rdram, kRendAddr))
++                    std::memcpy(p, rend, sizeof(rend));
++                GuestInvocation rendInv{};
++                rendInv.kind = GuestInvocationKind::Interrupt;
++                rendInv.context = parent;
++                rendInv.context.pc = 0x005B1328u;
++                SET_GPR_U32(&rendInv.context, 4, kRendAddr);
++                SET_GPR_U32(&rendInv.context, 29, 0u);
++                SET_GPR_U32(&rendInv.context, 31, 0u);
++                runtime->eeScheduler().queueInvocation(std::move(rendInv));
++            }
+             if (endFunction == 0u || iopResult.callbackPolicy == ps2x::iop::CallbackPolicy::Suppress)
+             {
+                 completeClient(parent, endFunction != 0u);
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h
 index 5e9a446..639a742 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h

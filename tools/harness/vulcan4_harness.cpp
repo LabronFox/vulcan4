@@ -2827,6 +2827,48 @@ int main(int argc, char *argv[])
                     break;
                 }
 
+                // W279 2026-10-09 (Caine). DUMP AT THE HAND-OFF, not at the end of the run.
+                //
+                // WHY. `VULCAN4_RDRAM_DUMP` fires at HALT, by which time the engine has been running
+                // for minutes and has written its own pointers into .data -- so a byte diff against
+                // CORE.GT4's decoded image cannot separate "our decode is wrong" from "the game
+                // initialised this itself". MEASURED 2026-10-09: at halt, .text was byte-identical
+                // (5,339,668 B, 0 differences) but .data held 15,916 deltas of which 15,899 were the
+                // guest's own writes, leaving 12 bytes unclassified only because the dump was late.
+                // This one fires the moment the bootstrap hands control to the decoded image, when
+                // RDRAM must hold exactly the file's segments and nothing else.
+                //
+                // Env-gated and OFF by default, like every other probe here: unset means the run is
+                // byte-for-byte what it was. Same spec as VULCAN4_RDRAM_DUMP: addr:len[:path].
+                if (const char *handoffSpec = std::getenv("VULCAN4_RDRAM_DUMP_AT_HANDOFF"))
+                {
+                    unsigned hoAddr = 0u, hoLen = 0u;
+                    char hoPath[512] = {0};
+                    if (std::sscanf(handoffSpec, "%x:%x:%511s", &hoAddr, &hoLen, hoPath) >= 2)
+                    {
+                        const char *const hoResolved =
+                            hoPath[0] != 0 ? hoPath : "/mnt/ssd/vulcan4-build/run/rdram_handoff.bin";
+                        constexpr unsigned kHandoffRdramBytes = 0x02000000u;
+                        if (hoAddr < kHandoffRdramBytes)
+                        {
+                            const unsigned hoClamped = hoLen > (kHandoffRdramBytes - hoAddr)
+                                                           ? (kHandoffRdramBytes - hoAddr)
+                                                           : hoLen;
+                            std::ofstream hoOut(hoResolved, std::ios::binary | std::ios::trunc);
+                            if (hoOut)
+                            {
+                                hoOut.write(reinterpret_cast<const char *>(rdram + hoAddr),
+                                            static_cast<std::streamsize>(hoClamped));
+                                hoOut.flush();
+                                std::cout << "VULCAN4 RDRAM_DUMP_AT_HANDOFF addr=0x" << std::hex << hoAddr
+                                          << " len=0x" << hoClamped << std::dec
+                                          << " entry=" << toHex(xEntry) << " path=" << hoResolved
+                                          << " ok=" << (hoOut.good() ? 1 : 0) << std::endl;
+                            }
+                        }
+                    }
+                }
+
                 R5900Context fresh{};
                 fresh.pc = xEntry;
                 fresh.r[4] = _mm_set_epi64x(0, static_cast<int64_t>(xArgc));

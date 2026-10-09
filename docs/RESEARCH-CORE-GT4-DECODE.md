@@ -114,6 +114,42 @@ So the file lane's state is: **initial load = correct and proven; remaining ques
 path** (`SIF0` chain routing / the IOP's `PDI` modules writing the tag at `0x00874304`), which is where
 `GT4.VOL`'s streamed assets (`.pss/.es/.sqt/.ins/.ads`, `carsound`) are served from.
 
+## 7. THE HAND-OFF — CLOSED, with zero differences (same day)
+
+The late-dump caveat in §6 is now resolved, because the dump moved to the right moment. New harness
+probe (off by default): `VULCAN4_RDRAM_DUMP_AT_HANDOFF=addr:len[:path]` fires **the instant the
+bootstrap gives control to the decoded image** — `VULCAN4 EXECPS2 -> unified resolve entry=0x00100008`,
+`relaunch#1 entry=0x00100008 gp=0x00000000 argc=2 argv=0x80075334` — when RDRAM must hold exactly the
+file's segments and nothing else.
+
+```
+dump handoff-image.bin: 6119116 B at 0x100000   golden: 6119116 B
+  seg1 0x006179fc       24 B  diffbytes=0  first=none
+  seg2 0x00100000  5339668 B  diffbytes=0  first=none
+  seg3 0x00617a80   779132 B  diffbytes=0  first=none
+VERDICT: decode is byte-identical to the file
+```
+
+**All 6,118,824 bytes — `.reginfo`, `.text` and `.data` — are byte-identical to the file's own content at
+the hand-off.** The twelve bytes §6 could not classify were the engine's own runtime writes, as
+suspected; that question is closed by measurement, not by argument.
+
+**The file lane is therefore finished and proven:**
+
+1. the disc read is real (all 2,020,861 bytes of `CORE.GT4` served by `fioRead`),
+2. our in-guest DEFLATE decode is **byte-exact** (the W229 wall is retired),
+3. the hand-off to `0x00100008` happens with the correct image in RDRAM, the correct entry, `argc=2`
+   and `argv=0x80075334`.
+
+What remains on the file path is **streaming**, not loading: the `SIF0` chain routing / the IOP's `PDI`
+modules that serve `GT4.VOL`'s streamed assets at runtime and write the command tag at `0x00874304` —
+the wall the crew had been circling, now the *last* one on this path instead of the first.
+
+Tooling added today (all committed): `tools/oracle/vg_oracle.py` (live oracle client),
+`tools/analysis/decode_core_gt4.py` (golden decode), `tools/oracle/compare_decoded_image.py`
+(oracle vs decode), `tools/oracle/compare_rdram_dump.py` (dump vs file, with the missing-content
+classification), and the harness hand-off probe.
+
 ## 5. Sources (MIT — readable references we may port from, with attribution)
 
 - GT Modding Hub — *Executables (CORE.GT3/CORE.GT4)*: `nenkai.github.io/gt-modding-hub/ps2/executables/`

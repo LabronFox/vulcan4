@@ -103,7 +103,7 @@ index ad58fb4..b3e4e98 100644
                  cpu.gpr[2] = kCdvdStatusPause;
                  return true;
 diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
-index e5f63a9..7ce1233 100644
+index e5f63a9..2c9e0c2 100644
 --- a/ps2xIOP/src/emulator/iop_emulator.cpp
 +++ b/ps2xIOP/src/emulator/iop_emulator.cpp
 @@ -308,11 +308,23 @@ namespace ps2x::iop::detail
@@ -135,8 +135,32 @@ index e5f63a9..7ce1233 100644
              }
              if (iequals(call.library, "ioman") && ioman.dispatchImport(call.ordinal, cpu, *this))
                  return ImportDisposition::Handled;
+@@ -343,6 +355,23 @@ namespace ps2x::iop::detail
+                 return ImportDisposition::Handled;
+ 
+             const uint32_t target = imports.resolve(call.library, call.ordinal, call.version);
++            // W277/R4 diagnostic: which library each import resolves to (or fails). The Pcdv init
++            // calls "libpdi:32" — this line shows whether LIBPDI's export table actually served it.
++            {
++                static uint64_t s_importTrace = 0u;
++                if (iequals(call.library, "libpdi") || iequals(call.library, "cdvdman") ||
++                    iequals(call.library, "pdistr") || iequals(call.library, "pdicdvd"))
++                {
++                    if (s_importTrace < 512u)
++                    {
++                        ++s_importTrace;
++                        std::ostringstream itr;
++                        itr << "[IOP] import " << call.library << ':' << call.ordinal
++                            << " v=0x" << std::hex << call.version << " -> 0x" << target << std::dec;
++                        log(LogLevel::Info, itr.str());
++                    }
++                }
++            }
+             if (target != 0u)
+             {
+                 cpu.pc = target;
 diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
-index cf4fdc6..7946157 100644
+index cf4fdc6..34658f4 100644
 --- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
 +++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
 @@ -9,6 +9,7 @@
@@ -147,7 +171,29 @@ index cf4fdc6..7946157 100644
  #include <vector>
  
  namespace ps2x::iop::detail
-@@ -221,6 +222,14 @@ namespace ps2x::iop::detail
+@@ -104,6 +105,21 @@ namespace ps2x::iop::detail
+             for (uint32_t i = 0u; i < pendingCount; ++i)
+             {
+                 const PendingTransfer &transfer = pending[i];
++                // W277/R4 diagnostic: the IOP→EE DMA writes (SifSetDma). The PDI DVD init is supposed
++                // to write the dispatcher command tag (0x00874304) this way; this shows whether it
++                // does, and to where.
++                {
++                    static uint64_t s_sifdmaTrace = 0u;
++                    if (s_sifdmaTrace < 512u)
++                    {
++                        ++s_sifdmaTrace;
++                        std::ostringstream dm;
++                        dm << "[IOP] SifSetDma src=0x" << std::hex << transfer.source
++                           << " dst=0x" << transfer.destination << " size=0x" << transfer.size
++                           << std::dec;
++                        m_host.log(LogLevel::Info, dm.str());
++                    }
++                }
+                 if (!m_memory.readRam(transfer.source, scratch.data(), transfer.size) || !m_host.writeGuest(transfer.destination, scratch.data(), transfer.size))
+                 {
+                     setV0(0u);
+@@ -221,6 +237,14 @@ namespace ps2x::iop::detail
              server.callbackBuffer = m_memory.read32(stackPointer + 20u);
              server.queue = m_memory.read32(stackPointer + 24u);
              m_servers[server.sid] = server;
@@ -162,7 +208,7 @@ index cf4fdc6..7946157 100644
              if (server.serverData != 0u)
              {
                  m_memory.write32(server.serverData + 0x20u, server.sid);
-@@ -298,6 +307,16 @@ namespace ps2x::iop::detail
+@@ -298,6 +322,16 @@ namespace ps2x::iop::detail
                                                                 request.send.size,
                                                                 0u,
                                                                 server.gp);

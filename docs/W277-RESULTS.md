@@ -328,3 +328,35 @@ Result r30r: all service binds resolve (HLE), `halt=stuck_in_syscall` back at th
 `0x5608e0`, picture still the disclaimer. The route up R4 is now concrete: **make the PDI peripherals
 register their own sids** (find why their init defers registration), then the physical IRX — not the
 stub — is the producer. Record: patch `ps2recomp-linux-w277-r30-pdi-peripherals.patch`.
+
+## R30v/w/x — the import chain is fine; the wall is the PDI DVD init not writing the tag
+
+Traced the Pcdv `rpc=0` through the physical IRX (PDICDVD.IRX + LIBPDI.IRX, mips objdump):
+
+- The Pcdv dispatcher (`0xc8980`/offset 0x1380) dispatches on a0 and **always returns 0** — that is
+  normal, not a failure; the reply is delivered out-of-band.
+- The init leg (`a0==0`) calls import **`libpdi:32`**, which resolves to **`0xc6d88` = LIBPDI offset
+  `0x2188`** (a real function, verified against the export table `0x41C00000` at file 0x2550). The
+  import registry and the relocations are working.
+- The chain is `0x2188 → 0x1f78 → 0x1f40 → …` (all inside LIBPDI) — a multi-level PDI init.
+- The IOP executes it (95.5M instr) but issues **only one `sceSifSetDma`** the whole run
+  (`src=0x78b78 dst=0x8851c0 size=0x80`) — **never a write to `0x00874304`**. So the PDI init never
+  produces the dispatcher command over SIF DMA; the producer the EE dispatcher waits on still does not
+  fire. The reply path is not `sceSifSetDma` — it is the RPC `returnPointer`/callback, which carries an
+  empty buffer because the init leg writes nothing into `server.buffer`.
+
+Next: decompile `0x1f40` (the leaf of the init chain) to see what it writes and through which
+mechanism (SifSendCmd / callback / another DMA), then make that path produce the tag. Record: patch
+`ps2recomp-linux-w277-r30-pdi-peripherals.patch`.
+
+## R30y (cont.) — the worker thread streams via libpdi, but nothing transfers to the EE
+
+The init leg creates AND starts an IOP worker thread (CreateThread thbase:4 succeeds — OOM trace is
+0 — then StartThread thbase:6). The worker entry `0x12fc` loops while a flag at `0x1854` is set
+(init's delay-slot `sb v0,0x1854` stores 1), calling `0xf40` (stream position via `libpdi:103`/`libpdi:42`)
+then `0x1634` (64-byte copy, `libpdi:42`) then `DelayThread(100000)`. All IOP-side. The worker never
+issues `sceSifSetDma` to EE `0x00874304`, and the run's only SIF DMA is one unrelated `0x80`-byte
+write. So the streamed DVD data stays in IOP RAM and the "ready" tag the EE dispatcher polls never
+arrives. Wall = the IOP→EE transfer path for the streamed data / ready signal, not the init, not the
+imports. Next: instrument the `libpdi:42` copy (0xc5fa0) to see its destination and whether it is
+supposed to push to EE via SIF DMA.

@@ -190,7 +190,7 @@ index e5f63a9..2c9e0c2 100644
              {
                  cpu.pc = target;
 diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
-index cf4fdc6..34658f4 100644
+index cf4fdc6..e7c535f 100644
 --- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
 +++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
 @@ -9,6 +9,7 @@
@@ -223,7 +223,28 @@ index cf4fdc6..34658f4 100644
                  if (!m_memory.readRam(transfer.source, scratch.data(), transfer.size) || !m_host.writeGuest(transfer.destination, scratch.data(), transfer.size))
                  {
                      setV0(0u);
-@@ -221,6 +237,14 @@ namespace ps2x::iop::detail
+@@ -197,6 +213,20 @@ namespace ps2x::iop::detail
+             std::memcpy(packet.data() + 4u, &extraDestination, sizeof(extraDestination));
+             std::memcpy(packet.data() + 8u, &commandId, sizeof(commandId));
+ 
++            // W277/R4 diagnostic: IOP→EE SIF commands (SifSendCmd). The PDI worker thread may push
++            // the streamed data / ready signal this way rather than via SifSetDma.
++            {
++                static uint64_t s_sifcmdTrace = 0u;
++                if (s_sifcmdTrace < 64u)
++                {
++                    ++s_sifcmdTrace;
++                    std::ostringstream sc;
++                    sc << "[IOP] SifSendCmd id=0x" << std::hex << commandId
++                       << " size=0x" << packetSize << " extraDst=0x" << extraDestination
++                       << " extraSize=0x" << extraSize << std::dec;
++                    m_host.log(LogLevel::Info, sc.str());
++                }
++            }
+             if (!m_host.sendSifCommand(commandId, packet.data(), packetSize))
+             {
+                 // A command without an EE handler is still a completed DMA on  real hardware. Only malformed packets fail above.
+@@ -221,6 +251,14 @@ namespace ps2x::iop::detail
              server.callbackBuffer = m_memory.read32(stackPointer + 20u);
              server.queue = m_memory.read32(stackPointer + 24u);
              m_servers[server.sid] = server;
@@ -238,7 +259,7 @@ index cf4fdc6..34658f4 100644
              if (server.serverData != 0u)
              {
                  m_memory.write32(server.serverData + 0x20u, server.sid);
-@@ -298,6 +322,16 @@ namespace ps2x::iop::detail
+@@ -298,6 +336,16 @@ namespace ps2x::iop::detail
                                                                 request.send.size,
                                                                 0u,
                                                                 server.gp);

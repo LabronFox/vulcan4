@@ -45,6 +45,97 @@ index 1eceb08..7fe7956 100644
          virtual bool hasGuestFunction(uint32_t address) const = 0;
          virtual bool invokeGuestFunction(uint64_t callToken,
                                           uint32_t address,
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index ad58fb4..3fc066d 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -280,6 +280,26 @@ namespace ps2x::iop::detail
+                 cpu.gpr[2] = kCdvdReadyComplete;
+                 return true;
+ 
++            case 24: // sceCdReadClock (0x18) — the PDI DVD modules poll this to track the stream
++                // position. Fill a valid "playing" clock at the last seek LSN and report success, so
++                // the streamer advances instead of treating the disc as stuck (was the dominant
++                // unhandled import: 199,987 calls in boot_w277r30m.log).
++            {
++                std::array<uint8_t, 12u> clock{};
++                auto bcd = [](uint32_t v) -> uint8_t { return static_cast<uint8_t>(((v / 10u) << 4) | (v % 10u)); };
++                clock[0] = 1u; // stat: playing
++                clock[1] = bcd((currentLsn / 75u) % 60u);
++                clock[2] = bcd(currentLsn / (75u * 60u));
++                clock[3] = 0u;
++                clock[4] = bcd(currentLsn % 75u);
++                const uint32_t track = 1u;
++                std::memcpy(clock.data() + 8u, &track, sizeof(track));
++                if (a0 != 0u)
++                    (void)memory.writeRam(a0, clock.data(), clock.size());
++                cpu.gpr[2] = 1u;
++                return true;
++            }
++
+             case 28: // sceCdStatus
+                 cpu.gpr[2] = kCdvdStatusPause;
+                 return true;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index e5f63a9..7ce1233 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -308,11 +308,23 @@ namespace ps2x::iop::detail
+                     break;
+                 }
+             }
+-            if (iequals(call.library, "modload") && call.ordinal == 13u)
+-            {
+-                checkKelfPathCallback = {a0, cpu.gpr[28]};
+-                setV0(0);
+-                return ImportDisposition::Handled;
++            // W277/R4. GT4's IRX modules import the loadcore library under the older name
++            // "modload", not "loadcore". Only ordinal 13 (checkKelfPathCallback) was wired; every
++            // other ordinal fell through to the generic resolver and logged
++            // "[IOP] unhandled import modload:16" — so the module's RegisterLibraryEntries-style
++            // init never ran and it never registered its SIF RPC server. Route the whole library
++            // through loadcore.dispatchImport, keeping the 13 special-case.
++            if (iequals(call.library, "modload"))
++            {
++                if (call.ordinal == 13u)
++                {
++                    checkKelfPathCallback = {a0, cpu.gpr[28]};
++                    setV0(0);
++                    return ImportDisposition::Handled;
++                }
++                if (loadcore.dispatchImport(call.ordinal, cpu))
++                    return ImportDisposition::Handled;
++                return ImportDisposition::Missing;
+             }
+             if (iequals(call.library, "ioman") && ioman.dispatchImport(call.ordinal, cpu, *this))
+                 return ImportDisposition::Handled;
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index cf4fdc6..a632647 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -9,6 +9,7 @@
+ #include <array>
+ #include <cstring>
+ #include <limits>
++#include <sstream>
+ #include <vector>
+ 
+ namespace ps2x::iop::detail
+@@ -221,6 +222,14 @@ namespace ps2x::iop::detail
+             server.callbackBuffer = m_memory.read32(stackPointer + 20u);
+             server.queue = m_memory.read32(stackPointer + 24u);
+             m_servers[server.sid] = server;
++            // W277/R4 diagnostic: which physical IRX registered which sid. Proves (or refutes)
++            // that the disc's own modules are the authoritative servers, the LLE route.
++            {
++                std::ostringstream out;
++                out << "[IOP] RegisterRpc sid=0x" << std::hex << server.sid
++                    << " func=0x" << server.function << " buf=0x" << server.buffer << std::dec;
++                m_host.log(LogLevel::Info, out.str());
++            }
+             if (server.serverData != 0u)
+             {
+                 m_memory.write32(server.serverData + 0x20u, server.sid);
 diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
 index 11262fc..3b73890 100644
 --- a/ps2xIOP/src/iop_subsystem.cpp
@@ -1001,10 +1092,10 @@ index 0000000..5f5d68c
 +}
 diff --git a/ps2xIOP/src/modules/pdiperiph.cpp b/ps2xIOP/src/modules/pdiperiph.cpp
 new file mode 100644
-index 0000000..bb54ad0
+index 0000000..b72f251
 --- /dev/null
 +++ b/ps2xIOP/src/modules/pdiperiph.cpp
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,180 @@
 +#include "module_factories.h"
 +#include "rpc_reply.h"
 +
@@ -1034,7 +1125,10 @@ index 0000000..bb54ad0
 +        // init every PDI service uses) and log the rest.
 +        constexpr uint32_t kPdistrSid = 0x53545250u; // "STRP"
 +        constexpr uint32_t kPdispu2Sid = 0x534d5550u; // "SMUP"
++        constexpr uint32_t kSpupSid = 0x53505550u; // "SPUP" = PDISPU2 SPU2 audio (r30n wall)
++        constexpr uint32_t kSputSid = 0x53505554u; // "SPUT" = PDISPU2 SPU2 (r30o wall)
 +        constexpr uint32_t kPdiusbHostSid = 0x54485550u; // "THUP"
++        constexpr uint32_t kPdiusbMainSid = 0x62737550u; // "Pusb" = PDIUSB main (r30p wall)
 +        constexpr uint32_t kPdiusbExtSid = 0x45535550u; // "ESUP"
 +        constexpr uint32_t kPdiusbKbSid = 0x424b5550u; // "BKUP"
 +        constexpr uint32_t kPbgmSid = 0x5042474du; // "PBGM" (bound after PDIUSB/USTORAGE; LGDEV/POWOFF/RTINETB era)
@@ -1050,7 +1144,10 @@ index 0000000..bb54ad0
 +            {
 +            case kPdistrSid: return "pdistr";
 +            case kPdispu2Sid: return "pdispu2";
++            case kSpupSid: return "spup";
++            case kSputSid: return "sput";
 +            case kPdiusbHostSid: return "pdiusb-host";
++            case kPdiusbMainSid: return "pdiusb-main";
 +            case kPdiusbExtSid: return "pdiusb-ext";
 +            case kPdiusbKbSid: return "pdiusb-kb";
 +            case kPbgmSid: return "pbgm";
@@ -1089,7 +1186,9 @@ index 0000000..bb54ad0
 +            {
 +                RpcResult result;
 +                if (request.sid != kPdistrSid && request.sid != kPdispu2Sid &&
-+                    request.sid != kPdiusbHostSid && request.sid != kPdiusbExtSid &&
++                    request.sid != kSpupSid && request.sid != kSputSid &&
++                    request.sid != kPdiusbHostSid && request.sid != kPdiusbMainSid &&
++                    request.sid != kPdiusbExtSid &&
 +                    request.sid != kPdiusbKbSid && request.sid != kPbgmSid &&
 +                    request.sid != kNumericSid && request.sid != kMpg1Sid &&
 +                    request.sid != kMpg2Sid && request.sid != kVoiceSid)
@@ -1157,11 +1256,13 @@ index 0000000..bb54ad0
 +            }
 +
 +        private:
-+            inline static constexpr std::array<uint32_t, 10> kSids{kPdistrSid, kPdispu2Sid,
-+                                                                   kPdiusbHostSid, kPdiusbExtSid,
-+                                                                   kPdiusbKbSid, kPbgmSid,
-+                                                                   kNumericSid, kMpg1Sid,
-+                                                                   kMpg2Sid, kVoiceSid};
++            inline static constexpr std::array<uint32_t, 13> kSids{kPdistrSid, kPdispu2Sid,
++                                                                    kSpupSid, kSputSid,
++                                                                    kPdiusbHostSid, kPdiusbMainSid,
++                                                                    kPdiusbExtSid,
++                                                                    kPdiusbKbSid, kPbgmSid,
++                                                                    kNumericSid, kMpg1Sid,
++                                                                    kMpg2Sid, kVoiceSid};
 +            inline static constexpr std::array<std::string_view, 3> kModuleAliases{"pdistr", "pdispu2", "pdiusb"};
 +
 +            IopHost &m_host;

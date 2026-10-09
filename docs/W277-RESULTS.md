@@ -300,3 +300,31 @@ issue that DMA, so the dispatcher spins on a never-written tag.
 Next action: oracle-trace which IOP module writes `0x00874304` and what the 0x40/0x240 B replies +
 SIF DMA payload actually are, then reproduce the DMA write in the stub. This is still the empty-stub
 gap — not a scheduler/interrupt-delivery bug.
+
+---
+
+## R30n–r — the IOP LLE route opens (Caine's research drop, measured)
+
+Caine's `docs/RESEARCH-IOP-MISSING-2026-10-09.md` reframed the wall: the dispatcher spin is a symptom;
+the missing subsystem is **IOP module execution (LLE)**. Measured this session (probe ON, r30n→r30r):
+
+1. **The R3000A interpreter already runs the disc's own IRX.** 26 `[IOP] loaded IRX` lines, entries
+   executed (`start=0/1/2`), zero physical-load failures. Caine's "0 R3000 lines" was only a missing
+   log line, not a missing interpreter.
+2. **The dominant wall was one unhandled IOP import**: `cdvdman:24` (sceCdReadClock, 0x18) — **199,987
+   calls** returning 0. Implemented it in `iop_cdvd.cpp` (fill a "playing" clock at `currentLsn`).
+   Also routed `modload:16/17/22` through `IopLoadcore::dispatchImport` (was only `modload:13`
+   special-cased). Remaining unhandled: `netdev:11` ×1.
+3. **The physical IRX registers its own sids** (new `[IOP] RegisterRpc` diag in `iop_rpc.cpp`):
+   DBCMAN `0x80001300/131c/131e/131f`, MCMAN/MCSERV `0x80000100/101`, `0x80000400`, `0x80000900`,
+   and **PDICDVD registers PCDV `0x50434456` (func 0xc8640) + Pcdv `0x50636476` (func 0xc8980)**.
+4. **The PDI peripherals (PDISPU2/PDISTR/PDIUSB/USTORAGE) load but do NOT register** their sids —
+   their init returns success yet no `RegisterRpc` for SPUP/STRP/Pusb/PUST appears. Their service
+   registration is deferred (or through a PDI mechanism), so my HLE stubs still answer them, and the
+   producer that would write `0x00874304` over SIF DMA still does not exist. INET jumps to BIOS
+   (`[IOP] execution outside RAM pc=0x8000000`) — a network-module gap, not the boot blocker.
+
+Result r30r: all service binds resolve (HLE), `halt=stuck_in_syscall` back at the dispatcher
+`0x5608e0`, picture still the disclaimer. The route up R4 is now concrete: **make the PDI peripherals
+register their own sids** (find why their init defers registration), then the physical IRX — not the
+stub — is the producer. Record: patch `ps2recomp-linux-w277-r30-pdi-peripherals.patch`.

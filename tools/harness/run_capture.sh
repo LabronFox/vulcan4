@@ -73,10 +73,25 @@ while [ "$(date +%s)" -lt "$end" ]; do
   if [ -n "$WID" ]; then
     n=$((n + 1))
     f="$RUN/${TAG}-win-$(printf '%02d' "$n").png"
-    if DISPLAY="$DISP" import -window "$WID" "$f" 2>/dev/null; then
-      echo "captured $f $(stat -c %s "$f") bytes" >> "$LOG"
+    # W278 2026-10-09. CAPTURE WHAT THE EYE SEES, NOT THE WINDOW'S OWN BUFFER.
+    #
+    # MEASURED: `import -window $WID` on this raylib/GL window returns a near-BLACK frame
+    # (mean 1.08, max 14/255) while the same region read off the ROOT -- i.e. through the
+    # display -- is the real picture (mean 15.1, max 255). `import -screen -window $WID` gives
+    # the same near-black frame, so -screen does not help: the drawable itself is not the
+    # presented image. Every capture this project has judged on was therefore a 5%-brightness
+    # ghost of the screen, while the stored reference was the bright one -- the gate was
+    # comparing two different kinds of image and passing by 0.048 of its 0.05 tolerance.
+    #
+    # So: grab the ROOT and crop the window's own rectangle. The geometry comes back from
+    # xdotool per capture, because find_window() sets those variables in ITS scope only.
+    if eval "$(DISPLAY="$DISP" xdotool getwindowgeometry --shell "$WID" 2>/dev/null)" \
+       && DISPLAY="$DISP" import -window root "$f.full.png" 2>/dev/null \
+       && convert "$f.full.png" -crop "${WIDTH}x${HEIGHT}+${X}+${Y}" +repage "$f" 2>/dev/null; then
+      rm -f "$f.full.png"
+      echo "captured $f $(stat -c %s "$f") bytes (root-crop ${WIDTH}x${HEIGHT}+${X}+${Y})" >> "$LOG"
     else
-      echo "import failed for $f" >> "$LOG"
+      echo "import/crop failed for $f" >> "$LOG"
     fi
   else
     echo "no 640x448 window on $DISP yet" >> "$LOG"

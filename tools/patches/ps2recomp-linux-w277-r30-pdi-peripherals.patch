@@ -46,10 +46,36 @@ index 1eceb08..7fe7956 100644
          virtual bool invokeGuestFunction(uint64_t callToken,
                                           uint32_t address,
 diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
-index ad58fb4..3fc066d 100644
+index ad58fb4..b3e4e98 100644
 --- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
 +++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
-@@ -280,6 +280,26 @@ namespace ps2x::iop::detail
+@@ -40,6 +40,9 @@ namespace ps2x::iop::detail
+         constexpr uint32_t kCdvdSyncTimeout = 15000u;
+         constexpr uint32_t kCdvdmanVersion = 0x0226u;
+ 
++        // W277/R4: cap the per-run cdvd import trace so it can't flood the log.
++        uint64_t s_cdvdTrace = 0u;
++
+         uint32_t alignSectors(uint64_t bytes)
+         {
+             return static_cast<uint32_t>((bytes + kSectorSize - 1u) / kSectorSize);
+@@ -210,6 +213,15 @@ namespace ps2x::iop::detail
+             const uint32_t a1 = cpu.gpr[5];
+             const uint32_t a2 = cpu.gpr[6];
+ 
++            // W277/R4 diagnostic: which cdvdman import the physical DVD modules call, and with what.
++            // Reveals the failing leg of the DVD-init sequence (the Pcdv rpc=0 returns 0).
++            if (s_cdvdTrace < 512u)
++            {
++                ++s_cdvdTrace;
++                std::fprintf(stderr, "[IOP:cdvd] ord=%u a0=0x%x a1=0x%x a2=0x%x\n",
++                             static_cast<unsigned>(ordinal), a0, a1, a2);
++            }
++
+             switch (ordinal)
+             {
+             case 4: // sceCdInit
+@@ -280,6 +292,26 @@ namespace ps2x::iop::detail
                  cpu.gpr[2] = kCdvdReadyComplete;
                  return true;
  
@@ -110,7 +136,7 @@ index e5f63a9..7ce1233 100644
              if (iequals(call.library, "ioman") && ioman.dispatchImport(call.ordinal, cpu, *this))
                  return ImportDisposition::Handled;
 diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
-index cf4fdc6..a632647 100644
+index cf4fdc6..7946157 100644
 --- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
 +++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
 @@ -9,6 +9,7 @@
@@ -136,6 +162,23 @@ index cf4fdc6..a632647 100644
              if (server.serverData != 0u)
              {
                  m_memory.write32(server.serverData + 0x20u, server.sid);
+@@ -298,6 +307,16 @@ namespace ps2x::iop::detail
+                                                                request.send.size,
+                                                                0u,
+                                                                server.gp);
++        // W277/R4 diagnostic: does the physical IRX server complete its rpc, and what does it hand
++        // back? This is the LLE reply — the thing that (if it completes) writes the command the EE
++        // dispatcher is waiting on.
++        {
++            std::ostringstream out;
++            out << "[IOP] RpcServer sid=0x" << std::hex << request.sid
++                << " rpc=0x" << request.function << " func=0x" << server.function
++                << " -> ret=0x" << returnPointer << std::dec;
++            m_host.log(LogLevel::Info, out.str());
++        }
+         if (returnPointer == 0u)
+             returnPointer = server.buffer;
+         if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)
 diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
 index 11262fc..3b73890 100644
 --- a/ps2xIOP/src/iop_subsystem.cpp

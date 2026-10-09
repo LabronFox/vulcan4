@@ -3349,6 +3349,10 @@ int main(int argc, char *argv[])
               << " intr_queued=" << kernelSnapshot.invocationsQueued
               << " intr_run=" << kernelSnapshot.invocationsRun
               << " intr_run_by_kind=" << kernelSnapshot.invocationsRunByKind[0]
+              // W277/R4. Prove the IOP LLE actually executes: the R3000A interpreter's instruction
+              // counter, so "the IOP runs the disc's own IRX" is a number, not a claim.
+              << " iop_instructions=" << runtime.iopDebugSnapshot().emulatorInstructions
+              << " iop_modules=" << runtime.iopDebugSnapshot().emulatorLoadedModules
               // W107. LINK 1 OF THE DISPLAY CHAIN, as a number. The window stays magenta until this is
               // non-zero: the guest has to deliver a FRAME register (0x04/0x05) to tell the GS which
               // RDRAM address holds the picture, and nothing downstream can substitute for that.

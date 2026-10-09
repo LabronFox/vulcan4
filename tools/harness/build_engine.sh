@@ -33,11 +33,15 @@ DEFS="-DPS2_FUNCTION_LOG_TRACKER=1 -DPS2X_ENABLE_IOP_RPC_TRACE=1 -DPS2X_HAS_FFMP
 [ -d "$E" ] || { echo "no engine emit at $E" >&2; exit 1; }
 
 cd "$E"
+# W277. A runtime header change (ps2_runtime_macros.h, the WRITE32/store-watch macros) changes the
+# MEANING of every generated TU without changing its .cpp or the engine's own .h. Same trap as
+# build_harness.sh W98: take the newest header under ps2xRuntime/include and rebuild when it is newer.
+NEWEST_RUNTIME_HEADER=$(find "$R/ps2xRuntime/include" -name '*.h' -newer "$E/ps2_recompiled_functions.h" -print -quit 2>/dev/null || true)
 total=0
 for src in ps2_recompiled_functions_[0-9][0-9].cpp register_functions.cpp; do
     [ -f "$src" ] || continue
     obj="${src%.cpp}.o"
-    if [ -f "$obj" ] && [ "$obj" -nt "$src" ] && [ "$obj" -nt "$E/ps2_recompiled_functions.h" ]; then
+    if [ -f "$obj" ] && [ "$obj" -nt "$src" ] && [ "$obj" -nt "$E/ps2_recompiled_functions.h" ] && [ -z "$NEWEST_RUNTIME_HEADER" ]; then
         continue
     fi
     total=$((total + 1))
@@ -47,13 +51,14 @@ echo "build_engine: $E, $OPT, -j$JOBS, $total unit(s) to (re)build"
 build_one() {
     src=$1
     obj="${src%.cpp}.o"
-    if [ -f "$obj" ] && [ "$obj" -nt "$src" ] && [ "$obj" -nt "$E/ps2_recompiled_functions.h" ]; then
+    if [ -f "$obj" ] && [ "$obj" -nt "$src" ] && [ "$obj" -nt "$E/ps2_recompiled_functions.h" ] && [ -z "$NEWEST_RUNTIME_HEADER" ]; then
         return 0
     fi
     nice -n 10 ionice -c3 g++ -std=c++20 $OPT -msse4.1 $INC $DEFS -c "$src" -o "$obj" 2>"$E/${src%.cpp}.cc.log"
     echo "  ok $obj $(stat -c%s "$obj")"
 }
 export -f build_one
+export NEWEST_RUNTIME_HEADER
 export E INC DEFS OPT
 
 printf '%s\n' ps2_recompiled_functions_[0-9][0-9].cpp register_functions.cpp \

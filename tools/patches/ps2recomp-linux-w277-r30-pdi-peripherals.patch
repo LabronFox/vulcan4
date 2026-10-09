@@ -1650,7 +1650,7 @@ index 94a6fa1..1dca1a5 100644
      X(AddDmacHandler)          \
      X(AddDmacHandler2)         \
 diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
-index 498bbe9..9b6b456 100644
+index 498bbe9..3acd294 100644
 --- a/ps2xRuntime/include/ps2_runtime_macros.h
 +++ b/ps2xRuntime/include/ps2_runtime_macros.h
 @@ -905,6 +905,96 @@ inline void vulcan4W129CopyProbePrint(const char *where,
@@ -1750,6 +1750,27 @@ index 498bbe9..9b6b456 100644
  // W130. THE WRITER-WATCH FILTER AND THE READ PROBE THAT TEACHES IT THE ADDRESSES.
  //
  // The watch set holds up to four 32-bit guest addresses. The read probe (emitted by the translator at
+@@ -963,6 +1053,20 @@ inline void vulcan4W205Check(uint32_t addr, uint32_t value, uint32_t writerPc) n
+ 
+ inline bool vulcan4W130StoreWatch(uint32_t addr, uint32_t value, uint32_t writerPc) noexcept
+ {
++    // W277/R4: THE TAG WRITER. The dispatcher (sub_00560778) polls 0x00874304 for the command tag
++    // (0x010B2400 / 0x010B0000) and it never appears; the dispatcher's own stores to 0x00874300 are
++    // the clear. Catch the writer that sets the tag, so the producer is named instead of inferred.
++    {
++        static uint64_t tagHits = 0;
++        const uint32_t phys = addr & 0x1FFFFFFFu;
++        if ((phys == 0x00874300u || phys == 0x00874304u) && tagHits < 64u)
++        {
++            ++tagHits;
++            std::fprintf(stderr, "[w277:tag] writer_pc=0x%08x addr=0x%08x value=0x%08x\n",
++                         writerPc, addr, value);
++        }
++    }
++
+     // W205 (Sanji). THE CORRUPTED-$ra WRITER. Every 32-bit guest store already calls in here with the
+     // address, the value and the writer pc, so catching the write to the saved-$ra slot 0x010459D8 with
+     // a wild value costs three compares and needs NO observer dispatcher (which perturbs the race ~9x).
 diff --git a/ps2xRuntime/include/runtime/syscall_names.h b/ps2xRuntime/include/runtime/syscall_names.h
 index 4636c5e..7ca6193 100644
 --- a/ps2xRuntime/include/runtime/syscall_names.h

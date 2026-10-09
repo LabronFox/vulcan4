@@ -1750,6 +1750,19 @@ index 498bbe9..9b6b456 100644
  // W130. THE WRITER-WATCH FILTER AND THE READ PROBE THAT TEACHES IT THE ADDRESSES.
  //
  // The watch set holds up to four 32-bit guest addresses. The read probe (emitted by the translator at
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 0e8d454..1da06dd 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -597,6 +597,8 @@ private:
+     bool m_rescheduleRequested = false;
+     bool m_timeSliceExpired = false;
+     bool m_insideInterrupt = false;
++    // W277/R4: round-robin cursor across the ready priority queues (starvation fix).
++    uint32_t m_roundRobinPriority = 0;
+     uint32_t m_pendingEeTimerInterrupts = 0;
+     uint64_t m_eeCycle = 0;
+     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
 diff --git a/ps2xRuntime/include/runtime/syscall_names.h b/ps2xRuntime/include/runtime/syscall_names.h
 index 4636c5e..7ca6193 100644
 --- a/ps2xRuntime/include/runtime/syscall_names.h
@@ -1858,7 +1871,7 @@ index 4636c5e..7ca6193 100644
 -static const unsigned kSyscallNameCount = 58;
 +static const unsigned kSyscallNameCount = 114;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index 4a6e44b..5cfd745 100644
+index 4a6e44b..421f1b7 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -54,6 +54,34 @@ namespace
@@ -2106,10 +2119,27 @@ index 4a6e44b..5cfd745 100644
              ++m_schedulerSteps;
              function(m_rdram, &context, &m_runtime);
              m_insideInterrupt = false;
-@@ -1699,6 +1868,27 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
+@@ -1698,6 +1867,43 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
+ {
      assertExecutor();
      const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
- 
++    // W277/R4 diagnostic: is the SIF0 DMAC interrupt (cause 5) masked? If bit 5 of
++    // m_enabledDmacMask is clear, the REND delivery never reaches the game's DMAC handler.
++    if (dmac && cause == 5u)
++    {
++        static uint64_t s_sif0Irq = 0u;
++        if (s_sif0Irq++ < 16u)
++        {
++            std::fprintf(stderr, "[EE] dispatchIrq dmac=1 cause=5 mask=0x%x bit5=%u dmacHandlers=%zu\n",
++                         mask, (mask >> 5u) & 1u, m_dmacHandlers.size());
++            for (const auto &[id, h] : m_dmacHandlers)
++            {
++                std::fprintf(stderr, "  dmacHandler id=%d cause=%u handler=0x%x enabled=%d\n",
++                             id, h.cause, h.handler, h.enabled ? 1 : 0);
++            }
++        }
++    }
++
 +    // W275 Angle A: dispatchIrq ENTRY. dmac=1 is the DMAC path (drainCompletedDmacHandlers ->
 +    // dispatchDmacHandlersForCause); dmac=0 is INTC. Log the mask and its cause bit so a reject at
 +    // the mask gate below is distinguishable from an empty `matching` set.
@@ -2130,11 +2160,10 @@ index 4a6e44b..5cfd745 100644
 +                  << " pending=" << m_pendingInvocations.size()
 +                  << std::endl;
 +    }
-+
+ 
      // W105. SEPARATE (A) FROM (B). ONE RUN, ONE ANSWER.
      //
-     // vblanks_processed=224 with interrupts_raised=0 means 224 VBlankStart events each called
-@@ -1789,6 +1979,20 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
+@@ -1789,6 +1995,20 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
      }
      std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
                { return left.order < right.order; });
@@ -2155,7 +2184,7 @@ index 4a6e44b..5cfd745 100644
      for (const EeIrqHandler &handler : matching)
      {
          GuestInvocation invocation{};
-@@ -1797,6 +2001,16 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
+@@ -1797,6 +2017,16 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
          SET_GPR_U32(&invocation.context, 4, cause);
          SET_GPR_U32(&invocation.context, 5, handler.argument);
  
@@ -2172,6 +2201,31 @@ index 4a6e44b..5cfd745 100644
          // W111. sub_0100D838 IS THE HANDLER THAT UNBLOCKS THE SPIN. It is
          //     0x100d848  addiu $s1, $v0, 0x50            ; s1 = 0x70002050
          //     0x100d888  ld    $v1, 0x50($s1)
+@@ -2301,8 +2531,15 @@ void EeScheduler::removeReady(GuestThread &item)
+ 
+ GuestThread *EeScheduler::selectReady()
+ {
+-    for (auto &queue : m_readyQueues)
++    // W277/R4: the LGDEV dispatcher (prio 13) busy-polls and the producer (prio 64) is lower
++    // priority, so a strict highest-first select starves the producer and the 0x00874304 tag is
++    // never written. Round-robin across the ready queues (start after the last selected priority,
++    // wrap) so a lower-priority ready thread still gets scheduled. This is a starvation fix, not
++    // the PS2's strict priority rule; it is the mechanism that lets the producer run.
++    for (uint32_t step = 0u; step < kPriorityCount; ++step)
+     {
++        const uint32_t priority = (m_roundRobinPriority + step + 1u) % kPriorityCount;
++        auto &queue = m_readyQueues[priority];
+         if (queue.empty())
+         {
+             continue;
+@@ -2312,6 +2549,7 @@ GuestThread *EeScheduler::selectReady()
+         GuestThread *selected = thread(id);
+         assert(selected != nullptr);
+         assert(selected->status == EeThreadStatus::Ready);
++        m_roundRobinPriority = priority;
+         return selected;
+     }
+     return nullptr;
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
 index dc975ed..054593e 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp

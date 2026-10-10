@@ -13,7 +13,7 @@ assistant over stdio. This is the direct path: newline-delimited JSON straight t
     vg_oracle.py read 0x00874300 64         -> hex dump of guest memory
     vg_oracle.py eval 'v0 + 0x100'          -> expression with symbol support
     vg_oracle.py bp <addr> [cond]           -> set breakpoint
-    vg_oracle.py bps | clearbps             -> list / clear breakpoints
+    vg_oracle.py bps | removebp <addr> | clearbps   -> list / remove one / clear all
     vg_oracle.py watch <addr> [onchange|read|write]  -> memory watchpoint
     vg_oracle.py continue | pause | step | stepover
     vg_oracle.py disasm <addr> [n]
@@ -102,8 +102,18 @@ def main(argv):
             print(json.dumps(o.send(**args), indent=2))
         elif cmd == "bps":
             print(json.dumps(o.send(cmd="list_breakpoints"), indent=2))
+        elif cmd == "removebp":
+            # The DebugServer's verb is `remove_breakpoint` (address). MEASURED 2026-10-10: the
+            # wrapper only had `clearbps`, so removing ONE stale breakpoint (yesterday's SIF call
+            # site at 0x005ae068) meant clearing everything -- and the wrapper's own clear verb was
+            # wrong too, so it simply threw. A single stale breakpoint silently eats every `resume`:
+            # the emulator re-breaks at the old address, `status` reads `paused: true`, and a
+            # probe sequence looks like "the oracle never reaches the PC".
+            print(json.dumps(o.send(cmd="remove_breakpoint", address=argv[2]), indent=2))
         elif cmd == "clearbps":
-            print(json.dumps(o.send(cmd="clear_all_breakpoints"), indent=2))
+            # MEASURED 2026-10-10: `clear_all_breakpoints` is NOT a DebugServer verb; the real one
+            # is `clear_breakpoints` (DebugServer.cpp:843). This call used to raise Unknown command.
+            print(json.dumps(o.send(cmd="clear_breakpoints"), indent=2))
         elif cmd == "watch":
             args = {"cmd": "set_watchpoint", "address": argv[2],
                     "type": (argv[3] if len(argv) > 3 else "onchange")}

@@ -2234,6 +2234,79 @@ int main(int argc, char *argv[])
             break;
         }
 
+        // W280 (2026-10-10, Caine). THE GENERAL PC PROBE — our wire to the oracle.
+        //
+        // WHY THIS EXISTS. Law 13 says a wall must come with the oracle's value beside ours. Until now
+        // this runtime could only stop at the TWO hardcoded addresses the W247 probe below knows, so a
+        // differential against the real machine was a per-wall manual hack. This makes ANY PC stoppable
+        // and prints exactly what a comparison needs: the guest PC, the argument registers, and a window
+        // of RDRAM — so tools/oracle/dual_run.py can lay PCSX2's state and ours side by side at the same
+        // instruction.
+        //
+        //   VULCAN4_PC_PROBE="0x5ae068@0x874300:64,0x5608e0@0x874304:64"
+        //                    ^ pc     ^ memaddr ^ bytes             (comma-separated entries)
+        //
+        // Off by default: unset means this block never executes and the run is byte-for-byte what it was
+        // (Law 12). At most 24 hits per entry, so a hot loop cannot flood the log.
+        {
+            struct PcProbe
+            {
+                uint32_t pc;
+                uint32_t memAddr;
+                uint32_t memLen;
+                uint32_t hits;
+            };
+            static std::vector<PcProbe> s_pcProbes = [] {
+                std::vector<PcProbe> v;
+                const char *spec = std::getenv("VULCAN4_PC_PROBE");
+                if (spec == nullptr)
+                    return v;
+                std::stringstream ss(spec);
+                std::string entry;
+                while (std::getline(ss, entry, ','))
+                {
+                    if (entry.empty())
+                        continue;
+                    unsigned pcv = 0u, memv = 0u, lenv = 0u;
+                    const int n = std::sscanf(entry.c_str(), "%x@%x:%x", &pcv, &memv, &lenv);
+                    if (n < 1)
+                        continue;
+                    PcProbe p{pcv, (n >= 2) ? memv : 0u, (n >= 3) ? (lenv > 256u ? 256u : lenv) : 0u, 0u};
+                    v.push_back(p);
+                }
+                return v;
+            }();
+            if (!s_pcProbes.empty())
+            {
+                for (PcProbe &p : s_pcProbes)
+                {
+                    if (p.pc != ctx.pc || p.hits >= 24u)
+                        continue;
+                    ++p.hits;
+                    std::ostringstream out;
+                    out << "[pcprobe] hit=" << p.hits << " pc=" << toHex(ctx.pc)
+                        << " a0=" << toHex(getRegU32(&ctx, 4)) << " a1=" << toHex(getRegU32(&ctx, 5))
+                        << " a2=" << toHex(getRegU32(&ctx, 6)) << " a3=" << toHex(getRegU32(&ctx, 7))
+                        << " v0=" << toHex(getRegU32(&ctx, 2)) << " v1=" << toHex(getRegU32(&ctx, 3))
+                        << " ra=" << toHex(getRegU32(&ctx, 31));
+                    if (p.memLen != 0u)
+                    {
+                        out << " mem[" << toHex(p.memAddr) << ":" << std::dec << p.memLen << "]=";
+                        const uint32_t base = p.memAddr & 0x1FFFFFFFu;
+                        for (uint32_t k = 0u; k < p.memLen; k += 4u)
+                        {
+                            if (base + k + 4u > 0x02000000u)
+                                break;
+                            uint32_t w = 0u;
+                            std::memcpy(&w, rdram + base + k, 4u);
+                            out << std::hex << std::setw(8) << std::setfill('0') << w << " ";
+                        }
+                    }
+                    std::cout << out.str() << std::dec << std::endl;
+                }
+            }
+        }
+
         // W247. OFF-by-default probe at the engine's FindAddress(0x83) loop head: args + slots.
         {
             static const bool s_w247On = (std::getenv("VULCAN4_FINDADDR") != nullptr);

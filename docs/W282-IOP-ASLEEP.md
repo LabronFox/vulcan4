@@ -95,12 +95,48 @@ instructions are just the five boot modules' init.
 **Consequence for the plan:** W279's step (1) is retired — there is no clock bug to fix. Step (2) and
 (3) (reload the PDI modules, route SIF0) cannot be reached while the EE stalls at `0x00580dd8`.
 
+## The EE side of the same wall: a CD-client retry loop (measured, same day)
+
+`VULCAN4_PC_PROBE=0x580dd8` used to produce **zero** hits in a run whose own PC histogram put 84 % of
+its samples at exactly that address. Cause: a recompiled `bne` back-edge is a direct `goto`, not a
+`dispatchGuestBranch`, and the 24-inline-probe passed to the harness's `pcProbeCheck` was only
+consulted from the guest loop — a loop head never comes back there. W280's note ("the probe anchors on
+function entries") was the same defect firing on the SIF call site.
+
+Fixed in this brick: the runtime has a second observer (`PS2PcObserver`, `ps2_runtime.h`) which
+`PS2Runtime::eeCheckpointDue()` calls — the one place a recompiled back-edge is guaranteed to reach —
+and the harness installs it only when `VULCAN4_PC_PROBE` is set. Unset = one null check per checkpoint
+and otherwise byte-for-byte the previous path.
+
+With both anchors live, `run/boot_w282pc2.log` gives our guest state in the loop:
+
+```
+[pcprobe] hit=1  pc=0x00580dd8 ra=0x00580dac v0=0x000ff821 v1=0xffffffff a0=0x00000020
+                 a1=0xffffffff a2=0x00000001 a3=0x00000040 s0=0x00870000 s1=0x00874fa8 t0=0x20887240
+[pcprobe] hit=24 pc=0x00580dd8 ra=0x00580dac v0=0x000f4021 …   (v0 counts down by 0x800 per sample)
+```
+
+Reading, from the oracle's own disassembly of that region (`0x00580dcc: lui v0,0x0010; li v1,-1;
+addiu v0,-1; bne v0,v1,->0x00580dd8`):
+
+- the guest is burning a **one-million-iteration delay** (≈2 M EE cycles) inside a routine whose
+  caller sits at `0x00580dac`, itself reached from `jal 0x005B17D0` with `a1 = 0x80000592`;
+- `s1 = 0x00874FA8` is **the game's own CD/SIF client** (the same address W276 R20 names as "the real CD
+  client (0x00874FA8)"), and `t0 = 0x20887240` a cached alias of `0x00887240`.
+
+So the EE is not mysteriously spinning: it is **retrying the CDVD side with a delay between attempts**,
+waiting on a reply from the IOP — while the IOP is asleep (section above). The two measurements are one
+cause: no IOP wake ⇒ no reply ⇒ the EE retries forever.
+
 ## Oracle readings (law 13)
 
-- Breakpoint set at `0x00580dd8` on the live oracle; **not hit yet** while the game runs at full speed
-  (~300 M cycles/s, sampled PCs `0x005690b0`, `0x005691f0`, `0x005a4974`). Open item, not a finding:
-  either real GT4 does not execute this PC at all (⇒ our path there is already a divergence) or it
-  reaches it later than the sample window.
+- Breakpoint at `0x00580dd8` on a **freshly relaunched oracle** (paused at `0x01000008`, the loader
+  entry, with the breakpoint armed *before* the resume), then ~100 s of wall clock: **not hit**. Sample:
+  the machine executes BIOS/kernel code at `0x00081FC0` (repeatedly — the real machine runs a BIOS
+  interrupt path we deliberately do not have) and engine dispatcher code at `0x00568460` / `0x00568EE8`
+  — the same region as the 10-09 build's `0x005608E0`. Note the emulator is running well under real
+  time on this box (0.73 G EE cycles in ~100 s ≈ 2.5 s of EE time), so "not hit yet" is **not** yet
+  "never called": a watcher is left running (`run/oracle-bp-580dd8.log`) and the question stays open.
 - Tool defect found and fixed: `tools/oracle/vg_oracle.py`'s `clearbps` called
   `clear_all_breakpoints`, which is **not** a DebugServer verb (the real one is `clear_breakpoints`,
   `DebugServer.cpp:843`), and there was no way to remove a single stale breakpoint. A leftover

@@ -1446,6 +1446,96 @@ static void w276TabStoreObserver(uint32_t addr, uint32_t size, uint64_t val,
     }
 }
 
+// ---- W282 (2026-10-10, Caine). THE PC PROBE, HOISTED OUT OF THE GUEST LOOP AND ANCHORED TWICE.
+//
+// WHY IT MOVED. The probe used to live inline in the guest loop, so it only saw PCs the runtime
+// returned to at a dispatch boundary. Measured 2026-10-10: `VULCAN4_PC_PROBE=0x580dd8` fired **zero**
+// times in a run whose own PC histogram put 84 % of its samples at 0x580dd8 — a `bne` back-edge
+// inside one recompiled function never comes back to that loop. The oracle comparison could not be
+// made at all, twice (the SIF call site in W280, the delay loop here).
+//
+// So the same registry is now consulted from TWO anchors: the guest loop (entry-anchored, as before)
+// and `ps2TracePc`, which the runtime calls from `eeCheckpointDue()` — the one place a recompiled
+// back-edge is guaranteed to reach. Still OFF by default, still at most 24 hits per entry.
+struct PcProbeEntry
+{
+    uint32_t pc = 0;
+    uint32_t memAddr = 0;
+    uint32_t memLen = 0;
+    uint32_t hits = 0;
+};
+
+static uint8_t *g_rdramForPcProbe = nullptr;
+
+static std::vector<PcProbeEntry> &pcProbeList()
+{
+    static std::vector<PcProbeEntry> v = [] {
+        std::vector<PcProbeEntry> parsed;
+        const char *spec = std::getenv("VULCAN4_PC_PROBE");
+        if (spec == nullptr)
+            return parsed;
+        std::stringstream ss(spec);
+        std::string entry;
+        while (std::getline(ss, entry, ','))
+        {
+            if (entry.empty())
+                continue;
+            unsigned pcv = 0u, memv = 0u, lenv = 0u;
+            const int n = std::sscanf(entry.c_str(), "%x@%x:%x", &pcv, &memv, &lenv);
+            if (n < 1)
+                continue;
+            PcProbeEntry p;
+            p.pc = pcv;
+            p.memAddr = (n >= 2) ? memv : 0u;
+            p.memLen = (n >= 3) ? (lenv > 256u ? 256u : lenv) : 0u;
+            parsed.push_back(p);
+        }
+        return parsed;
+    }();
+    return v;
+}
+
+static void pcProbeCheck(const R5900Context &ctx)
+{
+    std::vector<PcProbeEntry> &probes = pcProbeList();
+    if (probes.empty())
+        return;
+    for (PcProbeEntry &p : probes)
+    {
+        if (p.pc != ctx.pc || p.hits >= 24u)
+            continue;
+        ++p.hits;
+        std::ostringstream out;
+        out << "[pcprobe] hit=" << p.hits << " pc=0x" << std::hex << std::setw(8) << std::setfill('0') << ctx.pc
+            << " a0=0x" << std::setw(8) << getRegU32(&ctx, 4) << " a1=0x" << std::setw(8) << getRegU32(&ctx, 5)
+            << " a2=0x" << std::setw(8) << getRegU32(&ctx, 6) << " a3=0x" << std::setw(8) << getRegU32(&ctx, 7)
+            << " v0=0x" << std::setw(8) << getRegU32(&ctx, 2) << " v1=0x" << std::setw(8) << getRegU32(&ctx, 3)
+            << " ra=0x" << std::setw(8) << getRegU32(&ctx, 31)
+            << " s0=0x" << std::setw(8) << getRegU32(&ctx, 16) << " s1=0x" << std::setw(8) << getRegU32(&ctx, 17)
+            << " t0=0x" << std::setw(8) << getRegU32(&ctx, 8);
+        if (p.memLen != 0u && g_rdramForPcProbe != nullptr)
+        {
+            out << " mem[" << std::hex << std::setw(8) << std::setfill('0') << p.memAddr << ":" << std::dec << p.memLen << "]=";
+            const uint32_t base = p.memAddr & 0x1FFFFFFFu;
+            for (uint32_t k = 0u; k < p.memLen; k += 4u)
+            {
+                if (base + k + 4u > 0x02000000u)
+                    break;
+                uint32_t w = 0u;
+                std::memcpy(&w, g_rdramForPcProbe + base + k, 4u);
+                out << std::hex << std::setw(8) << std::setfill('0') << w << " ";
+            }
+        }
+        std::cout << out.str() << std::dec << std::endl;
+    }
+}
+
+static void pcProbeObserver(const R5900Context *ctx)
+{
+    if (ctx != nullptr)
+        pcProbeCheck(*ctx);
+}
+
 int main(int argc, char *argv[])
 {
     const std::string usage =
@@ -1563,6 +1653,15 @@ int main(int argc, char *argv[])
     }
     ps2SetGuestBranchObserver(&watchGuestCallForPath);
     g_rdramForWatch = rdram;
+    // W282. OFF by default: install the back-edge anchor only when a probe was asked for. Unset =
+    // g_ps2PcObserver stays null and eeCheckpointDue's null check is the only cost.
+    g_rdramForPcProbe = rdram;
+    if (!pcProbeList().empty())
+    {
+        ps2SetPcObserver(&pcProbeObserver);
+        std::cout << "VULCAN4 VULCAN4_PC_PROBE entries=" << pcProbeList().size()
+                  << " (anchored at function entries AND recompiled back-edges)" << std::endl;
+    }
     g_runtimeForShadowProbe = &runtime;
 
     // W44. Two probes read the same guest address in the same process and DISAGREE: the store
@@ -2248,64 +2347,9 @@ int main(int argc, char *argv[])
         //
         // Off by default: unset means this block never executes and the run is byte-for-byte what it was
         // (Law 12). At most 24 hits per entry, so a hot loop cannot flood the log.
-        {
-            struct PcProbe
-            {
-                uint32_t pc;
-                uint32_t memAddr;
-                uint32_t memLen;
-                uint32_t hits;
-            };
-            static std::vector<PcProbe> s_pcProbes = [] {
-                std::vector<PcProbe> v;
-                const char *spec = std::getenv("VULCAN4_PC_PROBE");
-                if (spec == nullptr)
-                    return v;
-                std::stringstream ss(spec);
-                std::string entry;
-                while (std::getline(ss, entry, ','))
-                {
-                    if (entry.empty())
-                        continue;
-                    unsigned pcv = 0u, memv = 0u, lenv = 0u;
-                    const int n = std::sscanf(entry.c_str(), "%x@%x:%x", &pcv, &memv, &lenv);
-                    if (n < 1)
-                        continue;
-                    PcProbe p{pcv, (n >= 2) ? memv : 0u, (n >= 3) ? (lenv > 256u ? 256u : lenv) : 0u, 0u};
-                    v.push_back(p);
-                }
-                return v;
-            }();
-            if (!s_pcProbes.empty())
-            {
-                for (PcProbe &p : s_pcProbes)
-                {
-                    if (p.pc != ctx.pc || p.hits >= 24u)
-                        continue;
-                    ++p.hits;
-                    std::ostringstream out;
-                    out << "[pcprobe] hit=" << p.hits << " pc=" << toHex(ctx.pc)
-                        << " a0=" << toHex(getRegU32(&ctx, 4)) << " a1=" << toHex(getRegU32(&ctx, 5))
-                        << " a2=" << toHex(getRegU32(&ctx, 6)) << " a3=" << toHex(getRegU32(&ctx, 7))
-                        << " v0=" << toHex(getRegU32(&ctx, 2)) << " v1=" << toHex(getRegU32(&ctx, 3))
-                        << " ra=" << toHex(getRegU32(&ctx, 31));
-                    if (p.memLen != 0u)
-                    {
-                        out << " mem[" << toHex(p.memAddr) << ":" << std::dec << p.memLen << "]=";
-                        const uint32_t base = p.memAddr & 0x1FFFFFFFu;
-                        for (uint32_t k = 0u; k < p.memLen; k += 4u)
-                        {
-                            if (base + k + 4u > 0x02000000u)
-                                break;
-                            uint32_t w = 0u;
-                            std::memcpy(&w, rdram + base + k, 4u);
-                            out << std::hex << std::setw(8) << std::setfill('0') << w << " ";
-                        }
-                    }
-                    std::cout << out.str() << std::dec << std::endl;
-                }
-            }
-        }
+        // W282: one call, two anchors. This is the entry-anchored one; the same registry is also
+        // consulted from eeCheckpointDue() (see pcProbeObserver above) so a loop head is visible.
+        pcProbeCheck(ctx);
 
         // W247. OFF-by-default probe at the engine's FindAddress(0x83) loop head: args + slots.
         {

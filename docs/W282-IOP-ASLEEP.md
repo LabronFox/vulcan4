@@ -131,12 +131,18 @@ cause: no IOP wake ⇒ no reply ⇒ the EE retries forever.
 ## Oracle readings (law 13)
 
 - Breakpoint at `0x00580dd8` on a **freshly relaunched oracle** (paused at `0x01000008`, the loader
-  entry, with the breakpoint armed *before* the resume), then ~100 s of wall clock: **not hit**. Sample:
-  the machine executes BIOS/kernel code at `0x00081FC0` (repeatedly — the real machine runs a BIOS
-  interrupt path we deliberately do not have) and engine dispatcher code at `0x00568460` / `0x00568EE8`
-  — the same region as the 10-09 build's `0x005608E0`. Note the emulator is running well under real
-  time on this box (0.73 G EE cycles in ~100 s ≈ 2.5 s of EE time), so "not hit yet" is **not** yet
-  "never called": a watcher is left running (`run/oracle-bp-580dd8.log`) and the question stays open.
+  entry, with the breakpoint armed *before* the resume). **Not hit in 20 minutes / 120 samples**
+  (`run/oracle-bp-580dd8.log`, 20:22:05 → 20:41:58). The emulator is genuinely running, not stalled:
+  the EE cycle counter wraps at 2^32 (max sample 4,274,507,922, 82 decreases in 119 intervals — a
+  **wrapping 32-bit counter**, not a reset), and the PC histogram is 62/120 in BIOS/kernel code
+  `0x00081FC0` with the rest spread over the engine's dispatcher region (`0x00563EA0`, `0x005A47B0`,
+  `0x00568460` ≈ the 10-09 build's `0x005608E0`).
+- **Read this as a divergence, with its caveat stated:** with the breakpoint armed from instruction 0,
+  20 minutes of real GT4 never executes the delay loop our EE sits in 84 % of the time. The honest
+  reading is that hardware gets the CDVD reply and therefore never enters the retry path — our EE
+  retries precisely because the IOP never answers. The caveat: the sampler cannot prove "never" for a
+  code path only reached in a phase this run did not enter (e.g. mid-race disc streaming), so the wall
+  rests on the IOP measurement above, not on this negative.
 - Tool defect found and fixed: `tools/oracle/vg_oracle.py`'s `clearbps` called
   `clear_all_breakpoints`, which is **not** a DebugServer verb (the real one is `clear_breakpoints`,
   `DebugServer.cpp:843`), and there was no way to remove a single stale breakpoint. A leftover

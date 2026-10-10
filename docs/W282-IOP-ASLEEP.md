@@ -128,6 +128,27 @@ So the EE is not mysteriously spinning: it is **retrying the CDVD side with a de
 waiting on a reply from the IOP — while the IOP is asleep (section above). The two measurements are one
 cause: no IOP wake ⇒ no reply ⇒ the EE retries forever.
 
+## Side finding — the MENU GATE false-passed on a blank capture (fixed the same day)
+
+`bash .auto/verify-menu.sh` (the project's "is the screen still the ©2005 disclaimer?" gate, and now the
+**stop condition of the daily wall campaign**) exited **0 — GATE PASS** on
+`run/w281-capture.png`: a **1 quantized colour**, max-brightness **14/255** frame, i.e. the near-black
+*g ghost* of the window that W278 was written about. It passed purely because a uniform frame differs
+perceptually from a text screen (diff 14.81 against a threshold of 6), and the v5 structural test needs
+*low colour count AND a non-black fraction within 0.05 of the reference* — 0.1111 vs 0.1831 misses that
+by 0.022.
+
+Fixed as **v6 DEGENERACY FLOOR** in `.auto/verify-menu.sh`: `<= 24` quantized colours **and** max
+brightness `<= 32` now **FAILS** with an explicit message (a blank/ghost frame is not a screen, so it
+can be neither the disclaimer nor the menu); 24–999 colours still passes with a human-look note against
+the 1000-colour bar this project uses for a drawing claim. Re-run on the same capture: `exit=1`,
+"GATE FAIL: DEGENERATE FRAME …".
+
+Same class of bug as gate versions v1–v3 (gating a proxy instead of the deliverable), and it mattered
+here for a specific reason: wired into an automated campaign as the stop condition, a false pass would
+have **stopped the campaign on nothing**. `.auto/` is gitignored, so the fix lives on disk; this note is
+its tracked record.
+
 ## Oracle readings (law 13)
 
 - Breakpoint at `0x00580dd8` on a **freshly relaunched oracle** (paused at `0x01000008`, the loader

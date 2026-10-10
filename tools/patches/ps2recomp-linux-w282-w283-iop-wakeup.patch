@@ -1,0 +1,427 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 686da50..fb3166c 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -719,6 +719,60 @@ namespace ps2x::iop::detail
+         return nextWake;
+     }
+ 
++    IopThreadStats IopKernel::debugStats() const noexcept
++    {
++        IopThreadStats stats;
++        stats.total = m_threads.size();
++        for (const auto &[id, thread] : m_threads)
++        {
++            switch (thread.state)
++            {
++            case IopThreadState::Dormant:   ++stats.dormant; break;
++            case IopThreadState::Ready:     ++stats.ready; break;
++            case IopThreadState::Running:   ++stats.running; break;
++            case IopThreadState::Sleep:     ++stats.sleep; break;
++            case IopThreadState::Delay:
++                ++stats.delay;
++                if (stats.earliestWake == 0u || thread.wakeCycle < stats.earliestWake)
++                    stats.earliestWake = thread.wakeCycle;
++                break;
++            case IopThreadState::Semaphore: ++stats.semaphore; break;
++            case IopThreadState::EventFlag: ++stats.eventFlag; break;
++            case IopThreadState::Suspended: ++stats.suspended; break;
++            case IopThreadState::Dead:      ++stats.dead; break;
++            }
++        }
++        if (m_currentThread != nullptr)
++        {
++            stats.sampleId = m_currentThread->id;
++            stats.samplePc = m_currentThread->cpu.pc;
++            stats.sampleState = static_cast<uint8_t>(m_currentThread->state);
++        }
++        return stats;
++    }
++
++    std::vector<IopThreadInfo> IopKernel::debugThreads() const
++    {
++        std::vector<IopThreadInfo> out;
++        out.reserve(m_threads.size());
++        for (const auto &[id, thread] : m_threads)
++        {
++            IopThreadInfo info;
++            info.id = thread.id;
++            info.state = static_cast<uint8_t>(thread.state);
++            info.entry = thread.entry;
++            info.pc = thread.cpu.pc;
++            info.priority = thread.priority;
++            info.wakeCycle = thread.wakeCycle;
++            info.waitId = thread.waitId;
++            info.waitBits = thread.waitBits;
++            info.waitMode = thread.waitMode;
++            info.wakeupCount = thread.wakeupCount;
++            out.push_back(info);
++        }
++        return out;
++    }
++
+     void IopKernel::endTimeslice(IopThread &thread, uint32_t returnSentinel)
+     {
+         if (thread.cpu.pc == returnSentinel || thread.cpu.stopped)
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 4977102..66e5932 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -5,6 +5,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <map>
++#include <vector>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -43,6 +44,46 @@ namespace ps2x::iop::detail
+         int wakeupCount = 0;
+     };
+ 
++    // W282 DIAGNOSTIC (OFF by default): a read-only snapshot of the IOP thread table.
++    //
++    // W279 left an open question: while the EE spins, is the IOP starved of CYCLES or of RUNNABLE
++    // THREADS? The two need different fixes (an accounting change vs a wakeup), and 1,892 IOP
++    // instructions in a 75 s boot is the kind of number that can be explained both ways on paper.
++    // So expose the thread table and let a run answer it.
++    struct IopThreadStats
++    {
++        size_t total = 0;
++        size_t ready = 0;
++        size_t running = 0;
++        size_t delay = 0;
++        size_t sleep = 0;
++        size_t semaphore = 0;
++        size_t eventFlag = 0;
++        size_t dormant = 0;
++        size_t dead = 0;
++        size_t suspended = 0;
++        uint64_t earliestWake = 0; // 0 = nothing scheduled
++        int sampleId = 0;
++        uint32_t samplePc = 0;
++        uint8_t sampleState = 0;
++    };
++
++    // W282 DIAGNOSTIC (OFF by default): one line per IOP thread, so a blocked IOP can be NAMED
++    // (which module's thread, entry PC, and what it is waiting on) instead of counted.
++    struct IopThreadInfo
++    {
++        int id = 0;
++        uint8_t state = 0;
++        uint32_t entry = 0;
++        uint32_t pc = 0;
++        uint32_t priority = 0;
++        uint64_t wakeCycle = 0;
++        int waitId = 0;
++        uint32_t waitBits = 0;
++        uint32_t waitMode = 0;
++        int wakeupCount = 0;
++    };
++
+     class IopKernel
+     {
+     public:
+@@ -68,6 +109,10 @@ namespace ps2x::iop::detail
+ 
+         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
+ 
++        // W282 DIAGNOSTIC (OFF by default -- only called when VULCAN4_IOP_DIAG is set).
++        [[nodiscard]] IopThreadStats debugStats() const noexcept;
++        [[nodiscard]] std::vector<IopThreadInfo> debugThreads() const;
++
+     private:
+         struct Semaphore
+         {
+diff --git a/ps2xIOP/src/emulator/imports/iop_intrman.cpp b/ps2xIOP/src/emulator/imports/iop_intrman.cpp
+index da3be3b..a83c47d 100644
+--- a/ps2xIOP/src/emulator/imports/iop_intrman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_intrman.cpp
+@@ -4,8 +4,19 @@
+ #include "../core/iop_memory.h"
+ #include "../services/iop_rpc.h"
+ 
++#include <cstdio>
++
+ namespace ps2x::iop::detail
+ {
++    namespace
++    {
++        // W283 diagnostic (low-volume, capped): which INTC lines the physical IRX modules register
++        // and enable. The wall is "nothing wakes the IOP"; the fix is to raise the right INTC line on
++        // an EE->IOP SIF transfer, and this names the line the guest actually registered for. A cap
++        // keeps it a handful of lines at module-init time, never a flood.
++        uint64_t s_intrTrace = 0u;
++    }
++
+     IopIntrman::IopIntrman(IopMemory &memory) noexcept
+         : m_memory(memory)
+     {
+@@ -35,6 +46,12 @@ namespace ps2x::iop::detail
+             return true;
+         case 4: // RegisterIntrHandler
+             m_handlers[static_cast<int>(a0)] = {a2, a3, cpu.gpr[28]};
++            if (s_intrTrace < 64u)
++            {
++                ++s_intrTrace;
++                std::fprintf(stderr, "[IOP:intrman] RegisterIntrHandler line=%u handler=0x%x arg=0x%x gp=0x%x\n",
++                             static_cast<unsigned>(a0), a2, a3, cpu.gpr[28]);
++            }
+             setV0(0u);
+             return true;
+         case 5: // ReleaseIntrHandler
+@@ -43,6 +60,11 @@ namespace ps2x::iop::detail
+             return true;
+         case 6: // EnableIntr
+             m_enabled[static_cast<int>(a0)] = true;
++            if (s_intrTrace < 64u)
++            {
++                ++s_intrTrace;
++                std::fprintf(stderr, "[IOP:intrman] EnableIntr line=%u\n", static_cast<unsigned>(a0));
++            }
+             if (a0 < 32u)
+                 m_memory.setInterruptMask(m_memory.interruptMask() | (1u << a0));
+             setV0(0u);
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 2c9e0c2..4c8355f 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -19,6 +19,8 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <cstdio>
++#include <cstdlib>
+ #include <map>
+ #include <optional>
+ #include <span>
+@@ -37,6 +39,11 @@ namespace ps2x::iop::detail
+         constexpr uint32_t kCallStackSize = 0x2000u;
+         constexpr uint32_t kCallStackCapacity = (kCallStackLimit - kCallStackBase) / kCallStackSize;
+         constexpr uint64_t kCdvdCompletionCycles = 128u;
++        // W283: the IOP INTC line for the SIF1 (EE->IOP) DMA completion, per PCSX2's intrman line
++        // table (IopBios.cpp intrname[]): 0x20+dmaCh, so SIF1 = 0x2B. PCSX2 raises it as iopIntcIrq(3)
++        // (I_STAT DMA bit) -> the BIOS DMA dispatcher -> this per-channel line; our HLE registers the
++        // per-channel line directly. Measured before believing: [IOP:intrman] RegisterIntrHandler lines.
++        constexpr int kSif1Irq = 0x2B;
+ 
+         uint32_t physicalAddress(uint32_t address)
+         {
+@@ -582,6 +589,28 @@ namespace ps2x::iop::detail
+             servicingGuestCallbacks = false;
+         }
+ 
++        // W283: raise the IOP SIF1 (EE->IOP) DMA-completion interrupt when the EE posts a SIF
++        // transfer. OFF by default (VULCAN4_SIF_INTR): unset = the old no-wakeup path, byte for byte.
++        // Spec: PCSX2 Sif1.cpp EndIOP() -> PSX_INT(IopEvt_SIF1) -> sif1Interrupt() ->
++        // psxDmaInterrupt2(3) -> iopIntcIrq(3) (the shared DMA INTC line). Our HLE dispatches the
++        // per-channel line kSif1Irq (0x2B) directly, matching the RegisterIntrHandler line the guest
++        // uses; measured, not invented (see [IOP:intrman] trace).
++        void raiseSifInterrupt()
++        {
++            static const bool enabled = (std::getenv("VULCAN4_SIF_INTR") != nullptr);
++            if (!enabled)
++                return;
++            const bool fired = intrman.dispatchInterrupt(kSif1Irq, *this);
++            static uint64_t s_sifIntrTrace = 0u;
++            if (s_sifIntrTrace < 64u)
++            {
++                ++s_sifIntrTrace;
++                std::fprintf(stderr, "[IOP:sifintr] line=0x%x dispatched=%d instr=%llu threads=%zu\n",
++                             kSif1Irq, fired ? 1 : 0,
++                             (unsigned long long)totalInstructions, kernel.threadCount());
++            }
++        }
++
+         void runCycles(uint64_t cycles) noexcept
+         {
+             try
+@@ -595,6 +624,8 @@ namespace ps2x::iop::detail
+                     IopThread *next = kernel.beginNextReady(totalCycles);
+                     if (!next)
+                     {
++                        if (diagEnabled)
++                            ++diagIdle;
+                         uint64_t nextWake = kernel.nextWakeCycle(target);
+                         for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
+                             nextWake = std::min(nextWake, completionCycle);
+@@ -605,6 +636,8 @@ namespace ps2x::iop::detail
+                         continue;
+                     }
+                     const uint64_t before = totalCycles;
++                    if (diagEnabled)
++                        ++diagSlices;
+                     runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
+                     kernel.endTimeslice(*next, kThreadReturnSentinel);
+                     if (totalCycles == before)
+@@ -614,6 +647,8 @@ namespace ps2x::iop::detail
+             catch (...)
+             {
+                 // Runtime scheduling must never throw through EeScheduler::accountCycles().
++                if (diagEnabled)
++                    ++diagThrows;
+             }
+         }
+ 
+@@ -731,6 +766,59 @@ namespace ps2x::iop::detail
+         uint64_t totalCycles = 0;
+         uint64_t totalInstructions = 0;
+         uint64_t eeCycleCarry = 0;
++        // W282 DIAGNOSTIC (OFF by default): VULCAN4_IOP_DIAG=1.
++        //
++        // W279 measured 1,892 IOP instructions in a whole 75 s boot and left TWO explanations open:
++        // the tick charges almost nothing per EE checkpoint, or the IOP has no runnable thread at
++        // all. They need different fixes, and a run can separate them in one line. These counters
++        // are the whole cost when the flag is unset: one branch on a member bool.
++        const bool diagEnabled = (std::getenv("VULCAN4_IOP_DIAG") != nullptr);
++        uint64_t diagCalls = 0;    // runEeCycles calls
++        uint64_t diagEe = 0;       // EE cycles handed to the IOP
++        uint64_t diagIop = 0;      // IOP cycles those bought (ee/8)
++        uint64_t diagSlices = 0;   // runCycles entries that had a thread to run
++        uint64_t diagIdle = 0;     // runCycles iterations with NO ready thread
++        uint64_t diagThrows = 0;   // exceptions swallowed by runCycles' catch(...)
++
++        void diagReport(uint64_t iopCyclesNow) noexcept
++        {
++            if (!diagEnabled)
++                return;
++            const bool first = diagCalls <= 4u;
++            if (!first && (diagCalls % 20000u) != 0u)
++                return;
++            const IopThreadStats s = kernel.debugStats();
++            std::fprintf(stderr,
++                         "[iopdiag] calls=%llu eeCycles=%llu iopCycles=%llu (+%llu now) instr=%llu "
++                         "cycles=%llu slices=%llu idleIters=%llu throws=%llu | threads=%zu ready=%zu "
++                         "running=%zu delay=%zu sleep=%zu sem=%zu evt=%zu dormant=%zu dead=%zu "
++                         "susp=%zu earliestWake=%llu now=%llu sampleId=%d samplePc=0x%x sampleState=%u\n",
++                         (unsigned long long)diagCalls, (unsigned long long)diagEe,
++                         (unsigned long long)diagIop, (unsigned long long)iopCyclesNow,
++                         (unsigned long long)totalInstructions, (unsigned long long)totalCycles,
++                         (unsigned long long)diagSlices, (unsigned long long)diagIdle,
++                         (unsigned long long)diagThrows, s.total, s.ready, s.running, s.delay,
++                         s.sleep, s.semaphore, s.eventFlag, s.dormant, s.dead, s.suspended,
++                         (unsigned long long)s.earliestWake, (unsigned long long)totalCycles,
++                         s.sampleId, s.samplePc, (unsigned)s.sampleState);
++            std::fflush(stderr);
++
++            // VULCAN4_IOP_DIAG=2 also names the threads: a count of "4 sleeping" is not a wall, the
++            // thread's entry PC and the object it waits on is.
++            const char *verbose = std::getenv("VULCAN4_IOP_DIAG");
++            if (verbose == nullptr || verbose[0] != '2')
++                return;
++            for (const IopThreadInfo &t : kernel.debugThreads())
++            {
++                std::fprintf(stderr,
++                             "[iopdiag:thread] id=%d state=%u entry=0x%x pc=0x%x prio=%u wake=%llu "
++                             "waitId=%d waitBits=0x%x waitMode=%u wakeups=%d\n",
++                             t.id, (unsigned)t.state, t.entry, t.pc, t.priority,
++                             (unsigned long long)t.wakeCycle, t.waitId, t.waitBits, t.waitMode,
++                             t.wakeupCount);
++            }
++            std::fflush(stderr);
++        }
+         CpuState *activeCpu = nullptr;
+         std::string lastError;
+         bool servicingDmaInterrupts = false;
+@@ -773,8 +861,14 @@ namespace ps2x::iop::detail
+         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
+         const uint64_t iopCycles = total / 8u;
+         m_impl->eeCycleCarry = total % 8u;
++        m_impl->diagCalls += 1u;
++        m_impl->diagEe += eeCycles;
+         if (iopCycles)
++        {
++            m_impl->diagIop += iopCycles;
+             m_impl->runCycles(iopCycles);
++        }
++        m_impl->diagReport(iopCycles);
+     }
+ 
+     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
+@@ -790,6 +884,10 @@ namespace ps2x::iop::detail
+     void IopEmulator::onSifTransfer(const SifTransfer &transfer)
+     {
+         m_impl->rpc.onSifTransfer(transfer);
++        // W283: an EE->IOP SIF1 transfer that has just been copied into IOP RAM must raise the IOP's
++        // SIF1 DMA-completion interrupt (see Impl::raiseSifInterrupt). Gated off by default.
++        if (transfer.kind == SifTransferKind::SetDma && transfer.phase == SifTransferPhase::AfterCopy)
++            m_impl->raiseSifInterrupt();
+     }
+ 
+     uint32_t IopEmulator::allocateMemory(uint32_t size, uint32_t alignment)
+diff --git a/ps2xIOP/src/modules/cdvd.cpp b/ps2xIOP/src/modules/cdvd.cpp
+index 5e9465a..f5d2250 100644
+--- a/ps2xIOP/src/modules/cdvd.cpp
++++ b/ps2xIOP/src/modules/cdvd.cpp
+@@ -84,6 +84,17 @@ namespace ps2x::iop::detail
+                     return refuse(request, "not a CD/DVD service id");
+                 }
+ 
++                // W283: GT4's cdvdfsv is per-SID (ps2tek 09 L6805-6813), not the merged ps2sdk
++                // numbering this switch was written for. CdInit (0x80000592) is its OWN server whose
++                // init call is rpc=0 -- MEASURED boot_w283sifrpc.log "CDVDFSV sid=0x80000592 rpc=0 is
++                // not implemented" on the first CDVD rpc GT4 posts. The ps2sdk merged rpc1=init (and
++                // rpc2/3/4 below) is a DIFFERENT interface; GT4 never calls those numbers. Route the
++                // measured rpc=0 to the init reply so the CDVD init stops being refused.
++                if (request.sid == kCdvdSid && request.function == 0u)
++                {
++                    return doInit(request);
++                }
++
+                 switch (request.function)
+                 {
+                 case kCdvdRpcInit:
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 5e62a18..ed889b0 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -998,6 +998,34 @@ inline void ps2SetGuestBranchObserver(PS2GuestBranchObserver observer)
+     g_ps2GuestBranchObserver = observer;
+ }
+ 
++// W282 (2026-10-10, Caine). THE BACK-EDGE PC OBSERVER — because the branch observer never fires for a
++// tight loop INSIDE one recompiled function.
++//
++// Measured twice now: `VULCAN4_PC_PROBE=0x580dd8` produced **zero** hits while the same run's PC
++// histogram put 84 % of its samples at exactly that address. A recompiled `bne` back-edge is a direct
++// goto, not a `dispatchGuestBranch`, and the generated code's only return to the runtime inside such a
++// loop is `eeCheckpointDue()` — so a loop head was invisible to the entry-anchored probe and the
++// comparison against the oracle could not be made at all. This hook is called there.
++//
++// Same contract as the branch observer: one predictable null check per checkpoint when nothing is
++// installed, nothing when the environment does not ask for it (Law 12).
++using PS2PcObserver = void (*)(const R5900Context *ctx);
++
++inline PS2PcObserver g_ps2PcObserver = nullptr;
++
++inline void ps2SetPcObserver(PS2PcObserver observer)
++{
++    g_ps2PcObserver = observer;
++}
++
++inline void ps2TracePc(const R5900Context *ctx)
++{
++    if (g_ps2PcObserver != nullptr)
++    {
++        g_ps2PcObserver(ctx);
++    }
++}
++
+ inline void ps2TraceGuestBranch(const R5900Context *ctx,
+                                 uint32_t sourcePc,
+                                 uint32_t targetPc,
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 34fd689..104dfa1 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -6236,6 +6236,10 @@ void PS2Runtime::postEeEvent(EeEvent event)
+ 
+ bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
+ {
++    // W282. A back-edge inside a recompiled function lands here and NOWHERE else, so this is the only
++    // place a loop head can be observed (see the note on PS2PcObserver in ps2_runtime.h). Null check
++    // when nothing is installed; nothing at all when VULCAN4_PC_PROBE is unset.
++    ps2TracePc(&m_cpuContext);
+     const bool due = m_eeScheduler->checkpointDue(cycles);
+     // W229 DIAGNOSTIC: log the decoder's checkpoint state (pc/regs) when VULCAN4_W229_CK is set.
+     if (std::getenv("VULCAN4_W229_CK") != nullptr)

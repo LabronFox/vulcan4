@@ -1,5 +1,46 @@
 # TODAY'S WALL — SIF0 chained-DMA routing (2026-10-10)
 
+> **UPDATE, same day — the wall MOVED, and this section is the new measurement.**
+>
+> Before writing any routing code I measured the thing the plan would route, and it does not exist yet:
+> **in every run of the current build our IOP executes 1,892 instructions and issues ZERO IOP→EE SIF
+> DMAs.** The SIF0-routing plan is therefore correct but premature — there is no transfer to route.
+>
+> Cross-checked against PCSX2 the same day: real GT4 issues `sceSifSetDma` 36 times in its first
+> minute, and the oracle's `ra=0x5b0d8c` at that call matches our runtime's own log line byte for byte,
+> so we are looking at the right syscall. We simply never get to a state where the IOP produces
+> anything.
+>
+> ### The two regimes (this is the real finding)
+>
+> | run | `functions_entered` | `halt` | `iop_instructions` | IOP modules | PDI modules |
+> |---|---|---|---|---|---|
+> | crew, 09:26 (`boot_w277r30u.log`) | 13,652 | **`stuck_in_syscall`** | **97,529,049** | **26** | 7 (PCDV registered) |
+> | today, desktop (`boot_desk173635.log`) | 144,891 | `wallclock_deadline` | **1,892** | 5 | 0 |
+> | today, handoff (`boot_handoff.log`) | 57,549 | `wallclock_deadline` | **1,892** | 5 | 0 |
+> | today, capture (`boot_w281.log`) | 144,891 | `wallclock_deadline` | **1,892** | 5 | 0 |
+>
+> This is **not** a simple regression — the two runs are in different regimes. When the EE parked in a
+> syscall (09:26) the IOP ran freely: 26 modules, 97.5M instructions, the physical PDI driver live.
+> Today the EE **spins** in its dispatcher for ~145,000 functions until the deadline, and the IOP gets
+> essentially nothing: 1,892 instructions, 5 modules, no PDI driver at all. Nothing loads a producer,
+> so nothing can ever write the tag — which is exactly why the dispatcher spins on an unwritten address.
+>
+> ### The wall this leaves, and where the fix lives
+>
+> **The IOP must advance while the EE spins.** On hardware both CPUs run concurrently; here the IOP's
+> only clock is the EE's checkpoints: `EeScheduler::checkpointDue()` → `accountCycles()` →
+> `PS2Runtime::advanceIopEeCycles()` → `IopSubsystem::runEeCycles()`
+> (`ps2_runtime.cpp:824`, `EeScheduler.cpp:522`). ~145,000 checkpoints bought the IOP 1,892
+> instructions — about 0.013 per checkpoint — so either the charge per checkpoint is near zero on the
+> spin path, or the IOP is asleep and nothing wakes it once the EE stops making the SIF calls that
+> would. Both are checkable and both are in our tree, not in the game.
+>
+> **Order of work, corrected:** (1) make the IOP tick during the EE's spin (measure instructions per
+> checkpoint, then fix the accounting or the wakeups); (2) get the PDI modules loaded again — the
+> guest only requests 5 (`SIO2MAN, MTAPMAN, MCMAN, MCSERV, PADMAN`) where 26 loaded at 09:26;
+> (3) *then* the SIF0 chain routing below, which is already specified and waiting.
+
 Owner: Caine (project lead). Method: law 13 — the wall is stated as a **value**, and the spec is read
 from the reference implementation, not invented.
 
